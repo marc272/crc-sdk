@@ -118,6 +118,7 @@ from crc_sdk.parametric.sources import AnnualSeries, MissingYears, sample_annual
 from crc_sdk.types import SourceProvenance
 from crc_sdk.workflows.portfolio import (
     AssetPortfolio,
+    CellColumn,
     ImpactContextColumns,
     PointColumns,
 )
@@ -388,9 +389,22 @@ def _table_columns(assets: AssetPortfolio | Path) -> tuple[str, ...] | None:
     return None
 
 
-def _registry_needs_cell(impact: Any, context: Any) -> str | None:
-    """The registry factor that needs an H3 cell the plan cannot give, if any."""
+def _registry_needs_cell(
+    impact: Any, context: Any, assets: AssetPortfolio | Path
+) -> str | None:
+    """The registry factor that needs an H3 cell the plan cannot give, if any.
+
+    `LossModel.for_asset` fills the cell from an asset's `CellColumn` when
+    context columns are given; otherwise only a `TransformContext` gives one.
+    """
     if not isinstance(impact, ClimateImpact):
+        return None
+    if (
+        isinstance(assets, AssetPortfolio)
+        and isinstance(assets.location, CellColumn)
+        and isinstance(context, ImpactContextColumns)
+        and context.items()
+    ):
         return None
     factor = str(getattr(impact, "factor", ""))
     entry = next(
@@ -561,7 +575,7 @@ class ParametricPlan:
             absent = [name for name in needed if name not in columns]
             if absent:
                 raise SampleError(f"the asset table has no columns {absent}")
-        factor = _registry_needs_cell(impact, context)
+        factor = _registry_needs_cell(impact, context, portfolio)
         if factor is not None:
             raise SampleError(
                 f"impact {factor!r} needs an H3 cell in its context, and this "
@@ -1179,7 +1193,7 @@ class ParametricPlan:
         return content_hash({"asset_values": pairs, "value_column": column})
 
     def _run(self, *, evaluate: bool) -> _Run:
-        if evaluate and not self.cover_list:
+        if not self.cover_list:
             raise ValueError("the plan has no covers; set them with .covers(...)")
         spec = self.design_spec
         templates = [cover for cover in self.cover_list if cover.free_parameters()]
@@ -1193,14 +1207,14 @@ class ParametricPlan:
             )
         portfolio, samples, record = self._build_samples()
         asset_ids = list(samples)
-        covers = self._covers_for(asset_ids) if self.cover_list else {}
+        covers = self._covers_for(asset_ids)
         pricing = self._pricing()
         designs: list[DesignResult] = []
         tables: list[Any] = []
         for asset_id in asset_ids:
             for fold, train, test in self._blocks(samples[asset_id]):
                 items: list[Cover | DesignResult] = []
-                for cover in covers.get(asset_id, []):
+                for cover in covers[asset_id]:
                     if not cover.free_parameters():
                         items.append(cover)
                         continue
@@ -1273,8 +1287,8 @@ class ParametricPlan:
 
         Each template is designed on each design block (all years without a
         split; the design block of a holdout; each fold's design block)
-        under each objective. Raises `ValueError` without an objective or a
-        basis-risk model, the design errors of `design`, and
+        under each objective. Raises `ValueError` without covers, an objective
+        or a basis-risk model, the design errors of `design`, and
         `SolverUnavailableError` without `crc-sdk[parametric]` on the LP and
         QP routes.
         """

@@ -47,7 +47,7 @@ from crc_sdk.parametric import (
     sample_annual,
 )
 from crc_sdk.types import SourceProvenance
-from crc_sdk.workflows import AssetPortfolio, CellColumn
+from crc_sdk.workflows import AssetPortfolio, CellColumn, ImpactContextColumns
 
 UNTYPED_PLAN: Any = ParametricPlan
 RAMP = PiecewiseLinearImpact([40.0, 120.0], [0.0, 0.5])
@@ -326,6 +326,37 @@ def test_a_registry_impact_that_needs_a_cell_is_refused_without_one() -> None:
         context=TransformContext(cell=cell),
     )
     assert fixed.loss_model.context == TransformContext(cell=cell)
+    # Assets with an H3 cell column fill the cell when context columns are given.
+    stations = pa.table(
+        {
+            "station": ["S1"] * 30,
+            "year": pa.array(range(1991, 2021), pa.int32()),
+            "value": np.linspace(30.0, 150.0, 30),
+        }
+    )
+    located = AssetPortfolio(
+        pa.table(
+            {
+                "asset_id": ["a"],
+                "cell_index": pa.array([cell], pa.uint64()),
+                "station_id": ["S1"],
+                "country": ["DEU"],
+            }
+        ),
+        location=CellColumn(),
+    )
+    by_cell = _plan(
+        stations,
+        located,
+        impact=rx1day,
+        value_column=None,
+        value_unit="1",
+        context=ImpactContextColumns(country="country"),
+        location=StationColumn("station_id"),
+    )
+    sample = by_cell.basis_risk(NoBasisRisk()).samples()["a"]
+    expected = with_cell.evaluate(np.linspace(30.0, 150.0, 30))
+    np.testing.assert_allclose(sample.loss[:, 0], expected)
 
 
 def test_basis_risk_is_required_and_noise_needs_a_seed() -> None:
@@ -538,10 +569,12 @@ def test_designs_follow_the_function_route() -> None:
     assert designs[0].design_sample.content_hash == train.content_hash
 
 
-def test_designs_need_an_objective() -> None:
+def test_designs_need_an_objective_and_covers() -> None:
     plan = _plan().basis_risk(NoBasisRisk()).covers(_step())
     with pytest.raises(ValueError, match="objective"):
         plan.designs()
+    with pytest.raises(ValueError, match="no covers"):
+        _plan().basis_risk(NoBasisRisk()).objective(MSE()).designs()
     with pytest.raises(ValueError, match="free parameters"):
         plan.write_parquet("never.parquet")
 
