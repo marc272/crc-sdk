@@ -6,8 +6,9 @@ points:
 
 ```text
 ParametricPlan.for_evaluation(request, value_column=, value_unit=)   # fitted curves
-  .monte_carlo(n_draws, seed=)          # required: simulated years per asset
+  .monte_carlo(n_draws, seed=)          # required there: simulated years
 ParametricPlan.for_annual_extremes(source, assets, impact=, unit=, provenance=)
+# then, on either plan:
   .basis_risk(model)                    # required: how index and loss differ
   .covers(*covers)                      # resolved covers and templates
   .objective(*objectives, pricing=, budget=, limit=, options=)
@@ -73,7 +74,7 @@ each of `k` contiguous blocks in turn. Every block gets in-sample rows (on
 the design block) and out-of-sample rows (on the held-out block or the fresh
 draws). Resolved covers are evaluated on the same blocks, with the design
 block as their design sample, so their terms are taken as chosen without
-the held-out years.
+the held-out data.
 
 **Output.** `write_parquet(path)` writes one comparison table, as `compare`
 builds it, through a temporary sibling and `os.replace`. Its metadata under
@@ -1616,7 +1617,6 @@ class ParametricPlan:
         if rule is None:
             return [(0, sample, None)]
         if isinstance(rule, FreshDraws):
-            assert fresh is not None
             return [(0, sample, fresh)]
         if isinstance(rule, Holdout):
             train, test = holdout(sample, rule.train_fraction)
@@ -1626,9 +1626,10 @@ class ParametricPlan:
             for fold, (train, test) in enumerate(year_block_kfold(sample, rule.k))
         ]
 
-    def _build_samples(self) -> _Samples:
+    def _build_samples(self, *, fresh: bool = False) -> _Samples:
+        """The samples of every asset; with `fresh`, also their fresh draws."""
         if self._on_curves:
-            return self._curve_samples()
+            return self._curve_samples(fresh=fresh)
         basis_risk = self._require_basis_risk()
         portfolio = self._portfolio()
         rows = self._asset_rows(portfolio)
@@ -1713,7 +1714,7 @@ class ParametricPlan:
             )
         return model.for_asset(portfolio, asset_id)
 
-    def _curve_samples(self) -> _Samples:
+    def _curve_samples(self, *, fresh: bool) -> _Samples:
         basis_risk = self._require_basis_risk()
         draws = self._require_draws()
         request: PortfolioEvaluation = self.source
@@ -1733,7 +1734,7 @@ class ParametricPlan:
         matched = self._curve_rows(
             curves, portfolio.id_column, [asset_id for asset_id, _ in rows]
         )
-        rule = self.split_rule
+        rule = self.split_rule if fresh else None
         fresh_seed = rule.seed if isinstance(rule, FreshDraws) else None
         generators = self._generators(len(rows))
         fresh_generators: list[np.random.Generator | None] = (
@@ -1745,7 +1746,7 @@ class ParametricPlan:
             ]
         )
         samples: dict[str, OutcomeSample] = {}
-        fresh: dict[str, OutcomeSample] = {}
+        fresh_samples: dict[str, OutcomeSample] = {}
         for (asset_id, row), rng, fresh_rng in zip(
             rows, generators, fresh_generators, strict=True
         ):
@@ -1778,7 +1779,7 @@ class ParametricPlan:
 
             samples[asset_id] = draw(draws.n_draws, rng)
             if isinstance(rule, FreshDraws):
-                fresh[asset_id] = draw(rule.n_draws, fresh_rng)
+                fresh_samples[asset_id] = draw(rule.n_draws, fresh_rng)
         record = {
             "curves": int(curves.num_rows),
             "file_sha256": file_sha256,
@@ -1788,7 +1789,7 @@ class ParametricPlan:
         return _Samples(
             portfolio,
             samples,
-            fresh if isinstance(rule, FreshDraws) else None,
+            fresh_samples if isinstance(rule, FreshDraws) else None,
             "canonical_file",
             record,
         )
@@ -1827,7 +1828,7 @@ class ParametricPlan:
                 f"covers {names} have free parameters; design them with "
                 ".objective(...), or resolve them with Cover.with_values"
             )
-        built = self._build_samples()
+        built = self._build_samples(fresh=evaluate)
         portfolio, samples = built.portfolio, built.samples
         asset_ids = list(samples)
         covers = self._covers_for(asset_ids)
@@ -1900,7 +1901,7 @@ class ParametricPlan:
 
         Reads the source and the assets. Each sample holds all of the
         asset's draws or years, before any split (fresh draws are drawn by
-        `designs()` and `write_parquet()` only). Raises `ValueError` without
+        `write_parquet()` only). Raises `ValueError` without
         a basis-risk model or, on fitted curves, without `monte_carlo`;
         `SampleError` for an asset that cannot be located, a curve that
         cannot be sampled (`sample_curve`), several curves for one asset, a

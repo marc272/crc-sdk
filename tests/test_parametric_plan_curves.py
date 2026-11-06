@@ -295,6 +295,13 @@ def test_fresh_draws_use_their_own_seed_and_designs_follow_the_function_route(
     )
     result = plan.write_parquet(dataset.parent / "comparison.parquet")
     samples = result.samples
+    # designs() and samples() need no fresh draws, and give the same designs.
+    assert [d.parameters for d in plan.designs()] == [
+        d.parameters for d in result.designs
+    ]
+    assert {s.content_hash for s in plan.samples().values()} == {
+        s.content_hash for s in samples.values()
+    }
     request = _request(dataset)
     curves = {row["asset_id"]: row for row in request.asset_curves().to_pylist()}
     metadata = request.dataset.metadata()
