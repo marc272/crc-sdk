@@ -257,6 +257,9 @@ def test_the_design_cases_are_present() -> None:
         "binary-upper-grid-eu-pure-individual-synthetic52",
         "binary-upper-grid-mse-coc-individual-synthetic52",
         "step-lower-wcvar-b0_9-pure-individual-handmade",
+        "linear-upper-grid-wcvar-b0_9-pure-individual-handmade",
+        "piecewise-linear-upper-mse-pure-individual-handmade",
+        "piecewise-linear-upper-wcvar-b0_9-coc-individual-handmade",
     }
     kfold = {
         f"step-mse-pure-individual-synthetic52-kfold5-fold{i}" for i in range(5)
@@ -266,7 +269,7 @@ def test_the_design_cases_are_present() -> None:
         "step-wcvar-b0_9-coc-individual-synthetic52-fresh",
     }
     assert in_sample | out_of_sample | newer | kfold | fresh <= names
-    assert len(DESIGN_CASES) >= 37
+    assert len(DESIGN_CASES) >= 40
 
 
 def _split_cases(kind: str) -> list[dict[str, Any]]:
