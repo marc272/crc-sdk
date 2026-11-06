@@ -458,10 +458,10 @@ metadata raises `EvaluationError`. The text reads only the metadata, so the
 same table always gives the same text, and statements that every split or
 sample shares are written once.
 
-- `Seeds` states the plan's seed and the fresh draws' seed, which every
-  evaluation's `details` holds under `"plan_seed"` and `"fresh_draws_seed"`.
-  When merged evaluations record different seeds, each `Split` line states
-  its own.
+- `Seeds` states the plan's seed, which every evaluation's `details` holds
+  under `"plan_seed"`, and the fresh draws' seed, which every fresh-draw
+  evaluation's holds under `"fresh_draws_seed"`. When merged evaluations
+  record different seeds, each `Split` line states its own.
 - `Source` names each source record of the samples: for a fitted curve, its
   hazard, the provider and dataset of its dataset's metadata, and the horizon
   and pathway of its canonical row; for per-year values, the provider and
