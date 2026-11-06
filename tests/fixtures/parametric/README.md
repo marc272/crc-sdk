@@ -1,10 +1,11 @@
 # Parity fixtures for `crc_sdk.parametric`
 
-The cases in `cases/` are golden fixtures for the metrics of
-`crc_sdk.parametric` (`tests/test_parametric_parity.py`). Each case is one JSON
-document: an outcome sample, a cover, a pricing and the values the module must
-reproduce. The tests read them with plain numpy; nothing imports the code that
-generated them.
+The cases in `cases/` are golden fixtures for the metrics
+(`tests/test_parametric_parity.py`) and the designs
+(`tests/test_parametric_design.py`) of `crc_sdk.parametric`. Each case is one
+JSON document: an outcome sample, a cover, a pricing and the values the module
+must reproduce. The tests read them with plain numpy; nothing imports the code
+that generated them.
 
 ## Origin
 
@@ -16,14 +17,26 @@ the cases were generated; its script `parity/scripts/export_crc_fixtures.py`
 regenerates them. Do not edit the cases here: regenerate them there and copy
 them again.
 
-The 25 cases copied (about 270 kB):
+The 41 cases copied (about 490 kB):
 
 - 17 evaluation cases of fixed covers (`*-fixed-*`): 13 linear, binary and
   piecewise-linear covers whose expected values are closed forms, computed in
   exact rational arithmetic, and 4 step covers computed by the reference
   implementation;
 - 8 out-of-sample cases (`*-holdout`): step covers designed on the first 70 %
-  of the years and evaluated on the held-out rest, with the design premium.
+  of the years and evaluated on the held-out rest, with the design premium;
+- 16 in-sample design cases of one asset
+  (`step-{mse,eu,wcvar-b0_9,wcvar-b0_99}-{pure,coc}-individual-{synthetic,thesis}`):
+  step covers designed by the reference implementation for each objective and
+  pricing, with a budget of 0.8 times the expected loss.
+
+The design test reads every case of `kind` `"design"` and `scope`
+`"individual"` in `cases/`, the holdout cases' design blocks included, and
+judges it by its `compare_parameters` (`"exact"`, `"within_ranges"` or
+`"none"`). Design cases for other payout families or for the grid route are
+picked up the same way once they are copied here. The source repository's
+joint cases (`*-joint-*`) are for the joint designs of a later phase and are
+not copied.
 
 ## Licence
 
@@ -37,4 +50,4 @@ The 25 cases copied (about 270 kB):
 The licence notes above are quoted from `parity/crc/README.md` in the source
 repository; the paths in them are paths there, and "described below" refers to
 its "Data sets" section. The `thesis` cases copied here are
-`step-fixed-*-thesis` and `step-*-thesis-holdout`.
+`step-fixed-*-thesis`, `step-*-individual-thesis` and `step-*-thesis-holdout`.
