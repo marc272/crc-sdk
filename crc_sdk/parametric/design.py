@@ -59,9 +59,11 @@ listed (`DesignResult.zeroed`).
 - on the QP route, `unique` is true when `H = B' diag(p) B` over the
   identified amounts is positive definite (smallest eigenvalue above 1e-10
   of the largest);
-- on a grid, `ties` counts the other candidates within
-  `DesignOptions.tie_tolerance` of the best; the first in lexicographic
-  order wins. `unique` is false with ties, else the inner solve's report
+- on a grid, `ties` counts the other candidates whose objective lies
+  within `DesignOptions.feasibility_tolerance` times `max(1, |best|)` of the
+  best, in scaled units; the first in lexicographic order wins. The LP and
+  QP routes have one candidate, so `ties` is 0 there. `unique` is false
+  with ties, else the inner solve's report
   (`None` for a grid evaluated in numpy).
 
 For a weighted CVaR the design records `p_zero_loss` (the probability of a
@@ -162,10 +164,11 @@ class DesignOptions(_DefinitionModel):
     - `max_grid_points`: the largest grid (product of the free parameters'
       grids) a design may search; a larger one raises `DesignError`.
     - `feasibility_tolerance`: the relative tolerance of the checks after a
-      solve, relative to the larger of the bound and the scale.
-    - `tie_tolerance`: grid candidates whose objective is within this share
-      of `max(1, |best|)` of the best tie with it (scaled units for the
-      built-in objectives, the objective's own units for a user objective).
+      solve, relative to the larger of the bound and the scale; also the
+      tie tolerance of a grid: candidates whose objective is within it times
+      `max(1, |best|)` of the best tie with it (in scaled units for the
+      built-in objectives, in the objective's own units for a user
+      objective, whose scaling is unknown).
     - `fill`: `"lowest"` or `"highest"`, the value of unidentified amounts.
     - `ranges`: on the LP route, range every identified amount over the
       near-optimal designs and report `unique` (four extra LPs per amount).
@@ -175,7 +178,6 @@ class DesignOptions(_DefinitionModel):
 
     max_grid_points: StrictInt = 10_000
     feasibility_tolerance: FiniteFloat = 1e-7
-    tie_tolerance: FiniteFloat = 1e-9
     fill: Fill = "lowest"
     ranges: StrictBool = False
 
@@ -184,14 +186,12 @@ class DesignOptions(_DefinitionModel):
         *,
         max_grid_points: int = 10_000,
         feasibility_tolerance: float = 1e-7,
-        tie_tolerance: float = 1e-9,
         fill: Fill = "lowest",
         ranges: bool = False,
     ) -> None:
         super().__init__(
             max_grid_points=max_grid_points,
             feasibility_tolerance=feasibility_tolerance,
-            tie_tolerance=tie_tolerance,
             fill=fill,
             ranges=ranges,
         )
@@ -202,8 +202,6 @@ class DesignOptions(_DefinitionModel):
             raise CoverDefinitionError("max_grid_points must be at least 1")
         if not 0.0 < self.feasibility_tolerance < 1.0:
             raise CoverDefinitionError("feasibility_tolerance must lie in (0, 1)")
-        if not 0.0 <= self.tie_tolerance < 1.0:
-            raise CoverDefinitionError("tie_tolerance must lie in [0, 1)")
         return self
 
     def to_document(self) -> dict[str, Any]:
@@ -213,7 +211,6 @@ class DesignOptions(_DefinitionModel):
             "fill": self.fill,
             "max_grid_points": self.max_grid_points,
             "ranges": self.ranges,
-            "tie_tolerance": self.tie_tolerance,
         }
 
 
@@ -278,7 +275,7 @@ class DesignResult:
     zeroed: tuple[str, ...]
     ranges: Mapping[str, tuple[float, float]] | None
     unique: bool | None
-    ties: int | None
+    ties: int
     profile: Any | None
     grid: Mapping[str, int] | None
     p_zero_loss: float
@@ -734,7 +731,7 @@ def _fill(
         solution = _solve(builder.programme(), "lp", context, solves)
         assert solution.values is not None
         filled = np.where(unidentified, solution.values * context.scale, values)
-        filled = np.minimum(np.maximum(filled, constraints.lower), constraints.upper)
+        filled = _repair(filled, constraints, edges)
     if highest and not np.isfinite(filled[unidentified]).all():
         missing = [name for name, free in zip(names, unidentified, strict=True) if free]
         raise context.error(
@@ -1087,7 +1084,7 @@ def _grid(
             status="infeasible",
         )
     best = min(value for _, value in feasible)
-    allowance = context.options.tie_tolerance * max(1.0, abs(best))
+    allowance = context.options.feasibility_tolerance * max(1.0, abs(best))
     within = [position for position, value in feasible if value - best <= allowance]
     chosen = within[0]
     point = rows[chosen][0]
@@ -1281,7 +1278,7 @@ def design(
     linear = isinstance(payout, LinearInAmounts) and not isinstance(
         objective, UserObjective
     )
-    ties: int | None = None
+    ties = 0
     profile: Any = None
     counts: dict[str, int] | None = None
     amounts: _Amounts | None

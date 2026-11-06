@@ -36,6 +36,7 @@ from crc_sdk.parametric import (
     Limit,
     LinearConstraints,
     LinearPayout,
+    MetricOptions,
     OutcomeSample,
     PiecewiseLinearPayout,
     PurePremium,
@@ -118,6 +119,9 @@ def _case_samples(
     """The design sample and, for a holdout case, the held-out sample."""
     if case["split"] is None:
         return _block_sample(case["sample"], case["case_id"]), None
+    # The k-fold and fresh-draw cases are evaluation cases for now; extend
+    # this reader before copying them here.
+    assert case["split"]["kind"] == "holdout", case["split"]
     design_block, held_out = case["sample"], case["evaluation_sample"]
     merged = {
         key: design_block[key] + held_out[key] for key in ("period", "index", "loss")
@@ -155,6 +159,11 @@ def _check_metrics(
             got,
             value,
         )
+
+
+def _metric_options(case: Mapping[str, Any]) -> MetricOptions:
+    options = case.get("metric_options")
+    return MetricOptions() if options is None else MetricOptions(**options)
 
 
 def _design_case(case: Mapping[str, Any], sample: OutcomeSample) -> DesignResult:
@@ -202,8 +211,15 @@ def test_the_design_cases_are_present() -> None:
         f"step-{o}-{p}-individual-{d}-holdout"
         for o, p, d in itertools.product(("mse", "wcvar-b0_9"), pricings, datasets)
     }
-    assert in_sample | out_of_sample <= names
-    assert len(DESIGN_CASES) >= 24
+    newer = {
+        "binary-upper-mse-pure-individual-synthetic52",
+        "binary-upper-wcvar-b0_9-coc-individual-synthetic52",
+        "binary-upper-grid-eu-pure-individual-synthetic52",
+        "binary-upper-grid-mse-coc-individual-synthetic52",
+        "step-lower-wcvar-b0_9-pure-individual-handmade",
+    }
+    assert in_sample | out_of_sample | newer <= names
+    assert len(DESIGN_CASES) >= 29
 
 
 @pytest.mark.parametrize("path", DESIGN_CASES, ids=lambda path: path.stem)
@@ -243,19 +259,43 @@ def test_design_parity(path: Path) -> None:
         assert case["compare_parameters"] == "none"
     if result.options.fill == "lowest":
         _check_fill_lowest(result, template)
+    shape = [
+        name
+        for name in template.free_parameters()
+        if name not in getattr(template.payout, "amount_names", tuple)()
+    ]
+    for name in shape:
+        # A chosen grid value is compared exactly.
+        assert result.parameters[name] == expected["parameters"][name], name
+    if expected.get("profile") is not None:
+        assert result.route == "grid"
+        profile = _profile(result)
+        assert len(profile) == len(expected["profile"])
+        for row, entry in zip(profile, expected["profile"], strict=True):
+            for name, value in entry["parameters"].items():
+                assert row[name] == value
+            assert row["objective"] is not None
+            target = entry["objective_value"]
+            assert abs(row["objective"] - target) <= (
+                tolerances["objective_value"] * abs(target) + 1e-9 * scale**power
+            )
+        assert result.ties == 0
 
     # 3. The premium and the metrics.
     pricing = pricing_from_document(case["pricing"])
+    options = _metric_options(case)
     if expected["unique"]:
         evaluated: Cover | DesignResult = result
-        row = evaluate(result, sample, split="in_sample").to_pylist()[0]
+        row = evaluate(result, sample, split="in_sample", options=options).to_pylist()[
+            0
+        ]
         assert row["premium_basis"] == "design"
         assert row["design_id"] == result.design_id
         premium = result.premium
     else:
         evaluated = template.with_values(expected["parameters"])
         row = evaluate(
-            evaluated, sample, split="in_sample", pricing=pricing
+            evaluated, sample, split="in_sample", pricing=pricing, options=options
         ).to_pylist()[0]
         premium = row["premium"]
     assert abs(premium - expected["premium"]) <= (
@@ -274,7 +314,13 @@ def test_design_parity(path: Path) -> None:
         out = expected["out_of_sample"]
         assert out["premium_basis"] == "design"
         if expected["unique"]:
-            table = evaluate(result, held_out, split="out_of_sample", fold=out["fold"])
+            table = evaluate(
+                result,
+                held_out,
+                split="out_of_sample",
+                fold=out["fold"],
+                options=options,
+            )
         else:
             table = evaluate(
                 evaluated,
@@ -283,6 +329,7 @@ def test_design_parity(path: Path) -> None:
                 fold=out["fold"],
                 premium=expected["premium"],
                 design_sample=sample,
+                options=options,
             )
         row = table.to_pylist()[0]
         assert row["premium_basis"] == ("design" if expected["unique"] else "stated")
@@ -292,13 +339,17 @@ def test_design_parity(path: Path) -> None:
 def test_parity_routes_and_flags() -> None:
     for path in DESIGN_CASES:
         case = _case(path)
-        if not path.stem.startswith("step-"):
-            continue
         sample, _ = _case_samples(case)
         result = _design_case(case, sample)
         kind = case["objective"]["kind"]
-        assert result.route == ("qp" if kind == "mse" else "lp")
-        assert result.ties is None and result.profile is None
+        amounts = "qp" if kind == "mse" else "lp"
+        assert result.amounts == amounts
+        if case["expected"].get("profile") is None:
+            assert result.route == amounts
+            assert result.profile is None
+        else:
+            assert result.route == "grid"
+        assert result.ties == 0
         assert result.solver is not None and result.solver["name"] == "highs"
         if kind == "weighted_cvar":
             beta = case["objective"]["beta"]
@@ -998,7 +1049,6 @@ def test_design_options_validation() -> None:
     for bad in (
         {"max_grid_points": 0},
         {"feasibility_tolerance": 0.0},
-        {"tie_tolerance": -1.0},
         {"fill": "middle"},
         {"ranges": 1},
     ):
@@ -1009,7 +1059,6 @@ def test_design_options_validation() -> None:
         "fill": "lowest",
         "max_grid_points": 10_000,
         "ranges": False,
-        "tie_tolerance": 1e-9,
     }
 
 
