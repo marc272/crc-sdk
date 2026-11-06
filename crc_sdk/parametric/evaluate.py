@@ -282,12 +282,6 @@ def _check_split(
 ) -> OutcomeSample | None:
     """Check the split for one cover; return its design sample, if known."""
     own = None if item.design is None else item.design.design_sample
-    if own is not None and design_sample is not None:
-        if own.content_hash != design_sample.content_hash:
-            raise ValueError(
-                "design_sample= differs from the design's own design sample; "
-                "leave it out for designed covers"
-            )
     known = own if own is not None else design_sample
     if split == "in_sample":
         if known is not None and known.content_hash != sample.content_hash:
@@ -550,12 +544,19 @@ def _table(
     design_samples: dict[str, OutcomeSample] = {}
     for item in items:
         _check_cover(item.cover, sample)
-        if item.design is not None and (
-            item.design.design_sample.asset_ids != sample.asset_ids
-        ):
+        if item.design is None:
+            continue
+        own = item.design.design_sample
+        if own.asset_ids != sample.asset_ids:
             raise SampleError(
                 "the design sample and the evaluation sample hold different assets"
             )
+        if given is not None and own.content_hash != given.content_hash:
+            raise ValueError(
+                "design_sample= differs from the design's own design sample; "
+                "leave it out for designed covers"
+            )
+    for item in items:
         known = _check_split(item, sample, checked_split, given)
         if known is not None:
             design_samples.setdefault(known.content_hash, known)
@@ -658,8 +659,9 @@ def compare(
 
     The arguments are those of `evaluate`, without `premium`: a design's
     rows use its design premium, and a cover given as is the premium priced
-    on `sample` with `pricing`. `design_sample` applies to the covers given
-    as is; each design brings its own.
+    on `sample` with `pricing`. `design_sample` is for the covers given as
+    is; each design brings its own, and a `design_sample` that differs from
+    it raises `ValueError`.
 
     The table has covers as rows and metrics as columns, in the order of
     `covers`. Its key (`cover_hash`, `design_id`, `asset_id`, `level`,
