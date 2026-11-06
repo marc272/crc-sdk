@@ -190,4 +190,7 @@ counted (draws outside the support, atom draws, dropped years) and notes for
 the setup text. `sample.content_hash` is `sha256:` plus the SHA-256 of the
 canonical long table with its units, semantics and scenario.
 `sample.to_table()` returns that long table, with the metadata under the
-Parquet key `crc.parametric.sample`.
+Parquet key `crc.parametric.sample`, and `OutcomeSample.from_written_table(table)`
+reads it back, in memory or from `pyarrow.parquet.read_table`, with its
+provenance and lineage; a table whose rows no longer match the recorded
+content hash raises `SampleError`.
