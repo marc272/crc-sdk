@@ -2074,14 +2074,16 @@ class ParametricPlan:
 
         Reads the source and the assets. Each sample holds all of the
         asset's draws or years, before any split (fresh draws are drawn by
-        `write_parquet()` only). Raises `ValueError` without
-        a basis-risk model or, on fitted curves, without `monte_carlo`;
-        `SampleError` for an asset that cannot be located, a curve that
+        `write_parquet()` only, which returns them in `fresh_samples`).
+        Raises `ValueError` without a basis-risk model or, on fitted curves,
+        without `monte_carlo`; `SampleError` for an asset that cannot be
+        located (an H3 cell that straddles grid cells included), a curve that
         cannot be sampled (`sample_curve`), several curves for one asset, a
         cover whose index unit is not the dataset's, or a series with a
-        missing year (unless `missing="drop_year"`); and
+        missing year (unless `missing="drop_year"`);
         `ProbabilitySemanticsError` for curves whose semantics are not those
-        of one year.
+        of one year; and `ImportError` for assets located by their H3 cells
+        on per-year values without the `geometry` extra.
         """
         return MappingProxyType(self._build_samples().samples)
 
