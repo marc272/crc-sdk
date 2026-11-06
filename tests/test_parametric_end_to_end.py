@@ -458,7 +458,9 @@ def test_the_plan_from_an_annual_extremes_file(tmp_path: Path) -> None:
         "values_sha256": result.metadata.assets["values_sha256"],
     }
     hazard = next(e for e in stored.sources if e["role"] == "hazard")
-    assert hazard["annual_table"]["file_sha256"].startswith("sha256:")
+    (record,) = stored.source_records
+    assert record["annual_table"]["file_sha256"].startswith("sha256:")
+    assert hazard["annual_table_sha256"] == record["annual_table"]["table_sha256"]
     assert hazard["series"]["kind"] == "nearest_cell"
     assert hazard["series"]["cell"] == {"latitude": 50.875, "longitude": 6.875}
     assert {d["route"] for d in stored.designs} == {"lp"}
