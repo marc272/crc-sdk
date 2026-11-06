@@ -161,11 +161,12 @@ an `ImpactExpression`, a framework `ImpactFunction` (such as
 damage ratio. A value column, and `ImpactContextColumns` for registry impacts,
 are read from the asset's row with `loss_model.for_asset(assets, asset_id)`; a
 missing or repeated asset raises. An `ImpactExpression` declares the hazard
-unit it is calibrated for (`loss_model.exposure_unit`):
-`loss_model.check_hazard_unit(unit)`, or `hazard_unit=` in `evaluate`, raises
-`SampleError` when the hazard is in another unit (compared as `check_exposure`
-compares units, through the framework's aliases). Other impacts declare no
-unit and are not checked.
+unit it is calibrated for (`loss_model.exposure_unit`). Before drawing,
+`sample_curve` and `sample_annual` check the curve's `value_unit` or the hazard
+series' unit against it and raise `SampleError` when they differ (compared as
+`check_exposure` compares units, through the framework's aliases);
+`loss_model.check_hazard_unit(unit)`, or `hazard_unit=` in `evaluate`, is the
+same check by hand. Other impacts declare no unit and are not checked.
 
 **Basis risk** is a required argument:
 

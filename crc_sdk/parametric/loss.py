@@ -22,7 +22,8 @@ An `ImpactExpression` declares the hazard unit it is calibrated for
 argument of `impact_values` and `evaluate`, compares the unit of the hazard
 values with it, as `crc_sdk.impacts.check_exposure` compares units, and raises
 `SampleError` on a mismatch rather than computing losses from values in the
-wrong unit. Other impacts declare no unit, so they are not checked.
+wrong unit; `sample_curve` and `sample_annual` call it before drawing. Other
+impacts declare no unit, so they are not checked.
 """
 
 from __future__ import annotations
