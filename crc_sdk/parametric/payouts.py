@@ -236,8 +236,7 @@ StrictBool = Annotated[bool, Strict()]
 def _severity_candidates(value: float | Free, sign: float) -> list[float]:
     """The severities a threshold can take: its value, or its grid."""
     if isinstance(value, Free):
-        assert value.grid is not None  # checked by _check_thresholds
-        return sorted(sign * point for point in value.grid)
+        return sorted(sign * point for point in value.grid or ())
     return [sign * value]
 
 
@@ -316,6 +315,7 @@ class _BuiltinPayout(_DefinitionModel):
     tail: Tail = "upper"
 
     def __init__(self, **data: Any) -> None:
+        # Explicit, so type checkers do not take pydantic's field-only signature.
         super().__init__(**data)
 
     @property
