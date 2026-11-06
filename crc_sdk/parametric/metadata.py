@@ -435,9 +435,9 @@ class EvaluationMetadata(_EvaluationModel):
 def _number(value: Any, where: str) -> str:
     """A finite number in at most six significant digits, without an exponent."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise EvaluationError(f"setup {where} must be a number, got {value!r}")
+        raise EvaluationError(f"{where} must be a number, got {value!r}")
     if not math.isfinite(value):
-        raise EvaluationError(f"setup {where} must be finite, got {value!r}")
+        raise EvaluationError(f"{where} must be finite, got {value!r}")
     text = format(Decimal(repr(float(f"{value:.6g}") + 0.0)), "f")
     if "." in text:
         text = text.rstrip("0").rstrip(".")
@@ -448,7 +448,7 @@ def _number(value: Any, where: str) -> str:
 
 def _numbers(values: Any, where: str) -> str:
     if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
-        raise EvaluationError(f"setup {where} must be a list of numbers")
+        raise EvaluationError(f"{where} must be a list of numbers")
     if not values:
         return "none"
     return ", ".join(_number(value, f"{where}[{i}]") for i, value in enumerate(values))
@@ -462,7 +462,7 @@ def _get(
     if value is None:
         return None
     if not isinstance(value, kind) or (isinstance(value, bool) and kind is int):
-        raise EvaluationError(f"setup {where}.{key} has the wrong type: {value!r}")
+        raise EvaluationError(f"{where}.{key} has the wrong type: {value!r}")
     return value
 
 
@@ -472,14 +472,14 @@ def _list(entry: Mapping[str, Any], key: str, where: str) -> list[Any]:
     if values is None:
         return []
     if isinstance(values, (str, bytes, Mapping)) or not isinstance(values, Sequence):
-        raise EvaluationError(f"setup {where}.{key} must be a list")
+        raise EvaluationError(f"{where}.{key} must be a list")
     return list(values)
 
 
 def _objects(entry: Mapping[str, Any], key: str, where: str) -> list[Mapping[str, Any]]:
     values = _list(entry, key, where)
     if not all(isinstance(value, Mapping) for value in values):
-        raise EvaluationError(f"setup {where}.{key} must be a list of objects")
+        raise EvaluationError(f"{where}.{key} must be a list of objects")
     return values
 
 
@@ -510,7 +510,7 @@ def _years(sample: Mapping[str, Any] | None, where: str) -> str:
         len(periods) != 2
         or any(isinstance(p, bool) or not isinstance(p, int) for p in periods)
     ):
-        raise EvaluationError(f"setup {where}.periods must be two integers")
+        raise EvaluationError(f"{where}.periods must be two integers")
     count = "an unknown number of" if draws is None else str(draws)
     span = f"{periods[0]} to {periods[1]}" if periods else ""
     if kind == "monte_carlo":
@@ -559,7 +559,7 @@ def _basis_risk(sample: Mapping[str, Any], where: str) -> str:
     if model is None:
         return "not modelled; the index and the loss are used as given"
     if not isinstance(model, Mapping):
-        raise EvaluationError(f"setup {where}.basis_risk must be an object")
+        raise EvaluationError(f"{where}.basis_risk must be an object")
     kind = model.get("kind")
     if kind == "no_basis_risk":
         return "no model"
@@ -586,7 +586,7 @@ def _loss(sample: Mapping[str, Any], where: str) -> str:
     if model is None:
         return f"from the table, in {unit}"
     if not isinstance(model, Mapping):
-        raise EvaluationError(f"setup {where}.loss_model must be an object")
+        raise EvaluationError(f"{where}.loss_model must be an object")
     impact = _get(model, "impact", Mapping, f"{where}.loss_model") or {}
     value = _get(model, "value", Mapping, f"{where}.loss_model") or {}
     kind = {
@@ -619,7 +619,7 @@ def _pricing(pricing: Any, where: str) -> str:
     if pricing is None:
         return "not stated"
     if not isinstance(pricing, Mapping):
-        raise EvaluationError(f"setup {where}.pricing must be an object")
+        raise EvaluationError(f"{where}.pricing must be an object")
     if pricing.get("kind") == "pure":
         return "the pure premium, P = E[payout]"
     if pricing.get("kind") == "cost_of_capital":
@@ -642,7 +642,12 @@ def _split(
     method = _get(evaluation, "method", str, where)
     details = _get(evaluation, "details", Mapping, where) or {}
     folded = "fold not stated" if fold is None else f"fold {fold}"
-    evaluated = _years(samples.get(str(evaluation.get("sample_hash"))), where)
+    sample_hash = evaluation.get("sample_hash")
+    evaluated = (
+        "the evaluation sample, not known yet"
+        if sample_hash is None
+        else _years(samples.get(str(sample_hash)), where)
+    )
     if split == "in_sample":
         return (
             f"Split: in sample, {folded}: evaluated on the design sample itself, "
@@ -671,6 +676,8 @@ def _split(
         how = f"{folded}, split method not stated"
     designs = [str(value) for value in _list(evaluation, "design_samples", where)]
     designed = _join([_years(samples.get(value), where) for value in designs])
+    if "design_samples" not in evaluation:
+        designed = "the design sample, not known yet"
     checked = (
         "the leakage check passed: the two share no period of one source"
         if evaluation.get("leakage_check") == "passed"
@@ -678,14 +685,14 @@ def _split(
     )
     return (
         f"Split: out of sample, {how}: evaluated on {evaluated}; designed on "
-        f"{designed or 'a design sample not stated'}; {checked}."
+        f"{designed or 'no design sample'}; {checked}."
     )
 
 
-def _objective(objective: Any, where: str) -> str:
-    if not isinstance(objective, Mapping):
-        return "not stated"
+def _objective(objective: Mapping[str, Any], where: str) -> str:
     kind = objective.get("kind")
+    if kind is None:
+        return "not stated"
     if kind == "mse":
         return "MSE, E[(L - payout)^2]"
     if kind == "expected_uncovered":
@@ -709,10 +716,11 @@ def _design(
     record: Mapping[str, Any], labels: Mapping[str, str | None], unit: str
 ) -> str:
     design_id = _short(record["design_id"])
-    where = f"design {design_id}"
+    where = f"designs[{design_id}]"
     label = labels.get(str(record.get("cover_hash")))
+    objective = _get(record, "objective", Mapping, where) or {}
     parts = [
-        f"objective: {_objective(record.get('objective'), where)}",
+        f"objective: {_objective(objective, where)}",
         f"pricing: {_pricing(record.get('pricing'), where)}",
     ]
     budget = _get(record, "budget", Mapping, where) or {}
@@ -734,11 +742,9 @@ def _design(
         parts.append(f"design premium: {premium} {unit}")
     if record.get("route") is not None:
         parts.append(f"route: {record['route']}")
-    unique = record.get("unique")
-    answer = (
-        {True: "yes", False: "no"}.get(unique) if isinstance(unique, bool) else None
-    )
-    parts.append(f"unique optimum: {answer or 'not checked'}")
+    unique = _get(record, "unique", bool, where)
+    answer = "not checked" if unique is None else "yes" if unique else "no"
+    parts.append(f"unique optimum: {answer}")
     ties = _get(record, "ties", int, where)
     parts.append("ties: not counted" if ties is None else f"ties: {ties}")
     unidentified = [str(name) for name in _list(record, "unidentified", where)]
@@ -757,26 +763,26 @@ def _design(
         parts.append("degenerate tail: the tail holds at most one draw")
     elif flag is not None:
         parts.append(f"degenerate tail: {flag}")
-    elif (record.get("objective") or {}).get("kind") == "weighted_cvar":
+    elif objective.get("kind") == "weighted_cvar":
         parts.append("tail: not degenerate")
     name = f"{label} ({design_id})" if label else design_id
     return f"Design {name}: {'; '.join(parts)}."
 
 
 def _metrics(options: Mapping[str, Any], unit: str) -> str:
-    where = "metric_options"
-    betas = _numbers(options.get("betas", ()), f"{where}.betas")
-    periods = _numbers(options.get("return_periods", ()), f"{where}.return_periods")
-    losses = _numbers(options.get("loss_thresholds", ()), f"{where}.loss_thresholds")
-    eps = options.get("payout_threshold")
-    payout = (
-        "not stated"
-        if eps is None
-        else f"{_number(eps, f'{where}.payout_threshold')} {unit}"
-    )
+    def stated(key: str, suffix: str) -> str:
+        where = f"setup.metric_options.{key}"
+        if options.get(key) is None:
+            return "not stated"
+        if key == "payout_threshold":
+            return f"{_number(options[key], where)}{suffix}"
+        return f"{_numbers(options[key], where)}{suffix}"
+
     return (
-        f"Metrics: beta {betas}; return periods {periods} years; loss thresholds "
-        f"{losses} {unit}; payout threshold {payout}."
+        f"Metrics: beta {stated('betas', '')}; return periods "
+        f"{stated('return_periods', ' years')}; loss thresholds "
+        f"{stated('loss_thresholds', f' {unit}')}; payout threshold "
+        f"{stated('payout_threshold', f' {unit}')}."
     )
 
 
@@ -847,7 +853,7 @@ def setup_text(
     scenarios: list[str] = []
     units: list[str] = []
     for i, sample in enumerate(samples):
-        where = f"samples[{i}]"
+        where = f"setup.samples[{i}]"
         assets += [str(asset) for asset in _list(sample, "asset_ids", where)]
         scenarios += [_get(sample, "scenario", str, where) or "not stated"]
         units += [_get(sample, "loss_unit", str, where) or "an unstated unit"]
@@ -861,40 +867,46 @@ def setup_text(
     else:
         level = f"asset, one row per asset ({_join(assets)}); no portfolio total"
     basis = setup.get("basis")
+    if basis == "annual":
+        basis = "annual, one draw is one year"
     lines = [
-        f"Level: {level}. Scenario: {_join(scenarios) or 'not stated'}. Basis: "
-        + ("annual, one draw is one year." if basis == "annual" else f"{basis}.")
+        f"Level: {level}. Scenario: {_join(scenarios) or 'not stated'}. "
+        f"Basis: {basis or 'not stated'}."
     ]
 
     pricings = [
-        _pricing(evaluation.get("pricing"), f"evaluations[{i}]")
+        _pricing(evaluation.get("pricing"), f"setup.evaluations[{i}]")
         for i, evaluation in enumerate(evaluations)
     ]
     shared = len(set(pricings)) <= 1
     for i, evaluation in enumerate(evaluations):
-        text = _split(evaluation, by_hash, f"evaluations[{i}]")
+        text = _split(evaluation, by_hash, f"setup.evaluations[{i}]")
         if not shared:
             text += f" Pricing: {pricings[i]}."
         lines.append(text)
     if not evaluations:
         lines.append("Split: not known.")
 
+    # Every sample is checked, also those the text describes only once.
+    years = [_years(sample, f"setup.samples[{i}]") for i, sample in enumerate(samples)]
     descriptions = [
-        _sample_text(sample, f"samples[{i}]") for i, sample in enumerate(samples)
+        _sample_text(sample, f"setup.samples[{i}]") for i, sample in enumerate(samples)
     ]
     if not samples:
         lines.append("Sample: not known.")
     elif len(set(descriptions)) == 1:
         lines.append(f"Sample: {descriptions[0]}")
     else:
-        for i, (sample, text) in enumerate(zip(samples, descriptions, strict=True)):
-            lines.append(f"Sample of {_years(sample, f'samples[{i}]')}: {text}")
+        lines += [
+            f"Sample of {span}: {text}"
+            for span, text in zip(years, descriptions, strict=True)
+        ]
 
     notes: list[str] = []
     for i, sample in enumerate(samples):
-        values = _list(sample, "notes", f"samples[{i}]")
+        values = _list(sample, "notes", f"setup.samples[{i}]")
         if not all(isinstance(note, str) for note in values):
-            raise EvaluationError(f"setup samples[{i}].notes must be a list of text")
+            raise EvaluationError(f"setup.samples[{i}].notes must be a list of text")
         notes += values
     if notes:
         lines.append(f"Sample notes: {' '.join(_first_seen(notes))}")

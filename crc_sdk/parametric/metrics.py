@@ -31,10 +31,10 @@ cover. `metric_values` returns, in this order:
   years, because a draw is a year.
 
 `MetricOptions` states beta, T, the loss thresholds l and the payout
-threshold eps; nothing is hidden. Invalid options and inputs raise
-`EvaluationError`. Labels write the number with the point as
+threshold eps; nothing is hidden. Labels write the number with the point as
 an underscore, as crc-sdk's return-period columns do: beta = 0.99 gives
-`b0_99`, T = 100 gives `rp100`, l = 0 gives `l0`.
+`b0_99`, T = 100 gives `rp100`, l = 0 gives `l0`. Invalid options and inputs
+raise `EvaluationError`.
 
 **VaR and CVaR here are over years.** `VaR_beta(X)` is the smallest x with
 `sum(p[X <= x]) >= beta`, the comparison allowing 1e-10 for rounding, so a
