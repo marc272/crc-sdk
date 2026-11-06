@@ -11,13 +11,14 @@ that generated them.
 
 Copied byte for byte from
 [marc272/parametric-insurance-design](https://github.com/marc272/parametric-insurance-design),
-`parity/crc/cases/` at commit `b9e079e`. That repository's
+`parity/crc/cases/`, at commit `b9e079e` except for the five cases marked
+below, which are at commit `25596db`. That repository's
 `parity/crc/README.md` describes the format, the comparison tolerances and how
 the cases were generated; its script `parity/scripts/export_crc_fixtures.py`
 regenerates them. Do not edit the cases here: regenerate them there and copy
 them again.
 
-The 41 cases copied (about 490 kB):
+The 46 cases copied (about 520 kB):
 
 - 17 evaluation cases of fixed covers (`*-fixed-*`): 13 linear, binary and
   piecewise-linear covers whose expected values are closed forms, computed in
@@ -28,13 +29,22 @@ The 41 cases copied (about 490 kB):
 - 16 in-sample design cases of one asset
   (`step-{mse,eu,wcvar-b0_9,wcvar-b0_99}-{pure,coc}-individual-{synthetic,thesis}`):
   step covers designed by the reference implementation for each objective and
-  pricing, with a budget of 0.8 times the expected loss.
+  pricing, with a budget of 0.8 times the expected loss;
+- 5 further design cases, at commit `25596db`: binary designs with a fixed
+  trigger (`binary-upper-{mse-pure,wcvar-b0_9-coc}-individual-synthetic52`),
+  the grid route with a trigger free on a grid and the objective at every
+  candidate in `expected.profile`
+  (`binary-upper-grid-{eu-pure,mse-coc}-individual-synthetic52`), and a
+  lower-tail step design (`step-lower-wcvar-b0_9-pure-individual-handmade`).
+  These cases carry two fields the older ones lack, `metric_options` and
+  `expected.profile`; the source README documents them.
 
 The design test reads every case of `kind` `"design"` and `scope`
 `"individual"` in `cases/`, the holdout cases' design blocks included, and
 judges it by its `compare_parameters` (`"exact"`, `"within_ranges"` or
-`"none"`). Design cases for other payout families or for the grid route are
-picked up the same way once they are copied here. The source repository's
+`"none"`), and a grid-route case by its `expected.profile` too. Further design
+cases are picked up the same way once they are copied here; the source's
+k-fold and fresh-draw cases need a reader for their splits first. The source's
 joint cases (`*-joint-*`) are for the joint designs of a later phase and are
 not copied.
 
@@ -45,7 +55,7 @@ not copied.
 - The cases of the `thesis` data set (ids ending in `-thesis` or `-thesis-holdout`) hold draws taken from the parity fixture `parity/tests/data/thesis_eventset/`. It is derived from the IRIS event set and licensed CC-BY-4.0 (its `metadata.json`; `docs/data-sources.md`). A copy of these cases keeps the attribution:
   - the draws: Marc Prinzing, parametric-insurance-design, `parity/tests/data/thesis_eventset/`, <https://github.com/marc272/parametric-insurance-design>, CC BY 4.0. Changes: a subsample of 160 years and 3 assets, described below;
   - the hazard data: Sparks, N. and Toumi, R. (2024). The Imperial College Storm Model (IRIS) Dataset. Scientific Data 11, 424, <https://doi.org/10.1038/s41597-024-03250-y>; dataset <https://doi.org/10.6084/m9.figshare.c.6724251.v1> (CC BY 4.0).
-- The cases of the `synthetic` and `handmade` data sets hold no third-party data.
+- The cases of the `synthetic`, `synthetic52` and `handmade` data sets hold no third-party data.
 
 The licence notes above are quoted from `parity/crc/README.md` in the source
 repository; the paths in them are paths there, and "described below" refers to
