@@ -533,7 +533,8 @@ def test_tables_in_other_arrow_forms() -> None:
     assert build(pa.RecordBatchReader.from_batches(table.schema, table.to_batches()))
     assert build(table.to_pydict()).content_hash == expected
     assert build(table).provenance.licences[0]["licence"] == "CC0-1.0"
-    for invalid in (42, [1, 2], iter([])):
+    invalid_tables: tuple[Any, ...] = (42, [1, 2], iter([]))
+    for invalid in invalid_tables:
         with pytest.raises(TypeError):
             build(invalid)
     with pytest.raises(TypeError, match="source"):
