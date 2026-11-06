@@ -356,6 +356,21 @@ def test_with_values_resolves_free_parameters() -> None:
     assert pay(full, [19.0, 20.0, 45.0, 70.0]) == [0.0, 1.0, 2.0, 500.0]
 
 
+def test_with_values_resolves_scalar_parameters() -> None:
+    linear = LinearPayout(Free(20.0, 40.0, grid=5), 50.0, Free(upper=1e6))
+    assert list(linear.parameters()) == ["attachment", "exhaustion", "limit"]
+    resolved = linear.with_values({"attachment": 30.0, "limit": 1e5})
+    assert (resolved.attachment, resolved.limit) == (30.0, 1e5)
+    assert pay(resolved, [30.0, 40.0, 50.0]) == [0.0, 5e4, 1e5]
+    binary = BinaryPayout(Free(-3.0, -1.0, grid=3), Free(), tail="lower")
+    resolved_binary = binary.with_values({"trigger": -2.0, "amount": 2.0})
+    assert pay(resolved_binary, [-1.0, -2.0, -2.5]) == [0.0, 2.0, 2.0]
+    with pytest.raises(CoverDefinitionError, match="strictly increasing"):
+        LinearPayout(Free(20.0, 60.0, grid=[20.0, 60.0]), 50.0, 1.0).with_values(
+            {"attachment": 55.0}
+        )
+
+
 def test_with_values_accepts_values_off_the_grid_within_the_bounds() -> None:
     assert TEMPLATE.with_values({"breakpoints[0]": 15.5}).breakpoints[0] == 15.5
 

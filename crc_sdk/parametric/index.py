@@ -149,7 +149,7 @@ class IndexDefinition(_DefinitionModel):
         unit: str,
         *,
         tail: Tail = "upper",
-        location: AtAsset | AtPoint | AtStation | AtCell | None = None,
+        location: AtAsset | AtPoint | AtStation | AtCell = AtAsset(),
         aggregation: str,
         source: str | None = None,
     ) -> None:
@@ -157,7 +157,7 @@ class IndexDefinition(_DefinitionModel):
             hazard_name=hazard_name,
             unit=unit,
             tail=tail,
-            location=AtAsset() if location is None else location,
+            location=location,
             aggregation=aggregation,
             source=source,
         )
