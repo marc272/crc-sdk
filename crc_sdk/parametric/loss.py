@@ -357,7 +357,8 @@ class LossModel:
         self._require_bound()
         values = np.asarray(impact, dtype=np.float64)
         value = 1.0 if self._value is None else self._value
-        loss = values * value
+        with np.errstate(over="ignore", invalid="ignore"):
+            loss = values * value
         if not np.isfinite(loss).all() or (loss < 0).any():
             raise SampleError("losses must be finite and non-negative")
         return loss
