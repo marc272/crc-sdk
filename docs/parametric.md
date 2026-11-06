@@ -657,7 +657,9 @@ with sorted keys: the crc-sdk, crc-framework and numpy versions, the platform
 and the time; the setup (basis, metric options, every sample with its source,
 semantics, basis-risk and loss models, and every evaluation with its split and
 pricing); every metric column's metric, parameter, unit and definition; every
-cover's document; the designs' records; and the samples' sources, licences
+cover's document; the designs' records, each with its cover's label as
+evaluated (`cover_label`), so two designs that resolve to the same cover keep
+their own labels; and the samples' sources, licences
 and generator states. Asset values are never written. A comparison is derived
 data under its inputs' licences, which the metadata lists.
 
