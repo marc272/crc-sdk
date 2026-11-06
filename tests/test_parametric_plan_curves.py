@@ -260,6 +260,16 @@ def test_for_evaluation_runs_end_to_end_offline(dataset: Path, tmp_path: Path) -
         "in the fresh draws for depot-b",
     ):
         assert label in notes
+    # A count of 1 takes the singular in its sample's note, and the plural
+    # with the other samples' counts.
+    rare = "rarer than the longest fitted return period (500 years)"
+    assert f"1 of 1500 draws is {rare}: the curve is extrapolated there." in (
+        result.samples["depot-b"].provenance.notes
+    )
+    assert (
+        "1 of 1500 in the design sample for depot-b and 3 of 1000 in the fresh "
+        f"draws for depot-b are {rare}"
+    ) in notes
 
 
 def test_samples_follow_sample_curve_on_the_asset_curves_rows(dataset: Path) -> None:

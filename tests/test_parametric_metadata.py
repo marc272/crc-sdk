@@ -1089,6 +1089,11 @@ RARE = (
     "draws are rarer than the longest fitted return period (50 years): the curve "
     "is extrapolated there."
 )
+RARE_ONE = (
+    "draws is rarer than the longest fitted return period (50 years): the curve "
+    "is extrapolated there."
+)
+CLAMPED = "draws fell outside the tabulated knots and {} clamped to the nearest knot."
 POOLED = (
     "The curve pools an ensemble: a draw mixes model spread with year-to-year "
     "variability."
@@ -1199,6 +1204,87 @@ def _fresh(digit: str) -> dict[str, Any]:
             "of 400 in the design sample (sample 222222222222) "
             f"{FREQUENT[6:]}",
             id="two samples that read the same get their hashes",
+        ),
+        pytest.param(
+            [
+                _noted("1", ["design", "evaluation"], "x", f"1 of 400 {RARE_ONE}"),
+                _noted("2", ["evaluation"], "x", f"1 of 400 {RARE_ONE}"),
+            ],
+            [],
+            f"1 of 400 {RARE_ONE}",
+            id="a count of 1 in one sample: the singular, as it is",
+        ),
+        pytest.param(
+            [
+                _noted("1", ["design"], "x", f"1 of 400 {RARE_ONE}"),
+                _noted("2", ["evaluation"], "y", f"3 of 400 {RARE}"),
+            ],
+            [_fresh("2")],
+            f"1 of 400 draws in the design sample and 3 of 400 in the fresh {RARE}",
+            id="a count of 1 and a count of 3: one note, the plural",
+        ),
+        pytest.param(
+            [
+                _noted(
+                    "1",
+                    ["design"],
+                    "x",
+                    f"210 of 400 {FREQUENT}",
+                    f"1 of 400 {RARE_ONE}",
+                ),
+                _noted(
+                    "2",
+                    ["evaluation"],
+                    "y",
+                    f"190 of 400 {FREQUENT}",
+                    f"1 of 400 {RARE_ONE}",
+                ),
+            ],
+            [_fresh("2")],
+            f"210 of 400 draws in the design sample and 190 of 400 in the fresh "
+            f"{FREQUENT} 1 of 400 draws in the design sample and 1 of 400 in the "
+            f"fresh {RARE}",
+            id="counts of 1 in two samples: the plural",
+        ),
+        pytest.param(
+            [
+                _noted(
+                    "1",
+                    ["design"],
+                    "x",
+                    f"210 of 400 {FREQUENT}",
+                    f"1 of 400 {RARE_ONE}",
+                ),
+                _noted("2", ["evaluation"], "y", f"190 of 400 {FREQUENT}"),
+            ],
+            [_fresh("2")],
+            f"210 of 400 draws in the design sample and 190 of 400 in the fresh "
+            f"{FREQUENT} 1 of 400 draws in the design sample "
+            f"{RARE_ONE.removeprefix('draws ')}",
+            id="a count of 1 that only one sample carries: the singular",
+        ),
+        pytest.param(
+            [
+                _noted(
+                    "1", ["design"], "x", f"210 of 400 {FREQUENT}", f"1 of 400 {RARE}"
+                ),
+                _noted("2", ["evaluation"], "y", f"190 of 400 {FREQUENT}"),
+            ],
+            [_fresh("2")],
+            f"210 of 400 draws in the design sample and 190 of 400 in the fresh "
+            f"{FREQUENT} 1 of 400 draws in the design sample "
+            f"{RARE_ONE.removeprefix('draws ')}",
+            id="a count of 1 written with the plural: the singular",
+        ),
+        pytest.param(
+            [
+                _noted("1", ["design"], "x", f"1 of 400 {CLAMPED.format('was')}"),
+                _noted("2", ["evaluation"], "y", f"2 of 300 {CLAMPED.format('were')}"),
+            ],
+            [_fresh("2")],
+            "1 of 400 draws in the design sample and 2 of 300 in the fresh "
+            f"{CLAMPED.format('were')}",
+            id="was and were: one note, the plural",
         ),
     ],
 )

@@ -471,7 +471,9 @@ sample shares are written once.
   counts. In the quick start, the draws beyond the curve's fitted support
   read "2527 of 5000 draws in the design sample and 2464 of 5000 in the fresh
   draws are more frequent than the shortest fitted return period (2 years)",
-  and the same for the longest. Blocks split from one sample share its
+  and the same for the longest. A sample's count of 1 takes the singular ("1
+  of 1500 draws in the design sample is rarer than ..."); counts of several
+  samples together take the plural. Blocks split from one sample share its
   notes, which are written once.
 
 Before execution, `setup_text(plan.explain(format="json")["setup"])`, or

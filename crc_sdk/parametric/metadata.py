@@ -704,6 +704,20 @@ def _seeds_text(plan: int | None, fresh: int | None) -> str:
 _COUNTED = re.compile(r"(\d+) of (\d+) draws (.+)", re.DOTALL)
 """A note that counts draws, such as the draws beyond a curve's fitted support."""
 
+_VERB = re.compile(r"\b(is|are|was|were)\b")
+"""The verb of a counted note's draws: the first `is`, `are`, `was` or `were`."""
+
+
+def _agree(rest: str, *, singular: bool) -> str:
+    """The rest of a counted note, its verb in the singular or the plural.
+
+    A counted note's verb agrees with its count (`1 of 400 draws is rarer`,
+    `2 of 400 draws are rarer`), and the counts of several samples together
+    take the plural.
+    """
+    forms = {"are": "is", "were": "was"} if singular else {"is": "are", "was": "were"}
+    return _VERB.sub(lambda match: forms.get(match[1], match[1]), rest, count=1)
+
 
 def _note_labels(
     groups: Mapping[str, Sequence[int]],
@@ -760,7 +774,8 @@ def _notes(
     between drawn samples only in its counts, such as the draws beyond a
     curve's fitted support in the design sample and in the fresh draws, is
     written once with every sample's own counts, asset by asset and the
-    design sample first.
+    design sample first. Its verb is singular for one sample's count of 1
+    and plural otherwise, whichever form each sample's note has.
     """
     notes: list[list[str]] = []
     roles: list[list[str]] = []
@@ -818,7 +833,7 @@ def _notes(
                 statements.setdefault((False, note), [])
                 continue
             count, total, rest = match.groups()
-            entries = statements.setdefault((True, rest), [])
+            entries = statements.setdefault((True, _agree(rest, singular=False)), [])
             if (count, total, labels[group_of[i]]) not in entries:
                 entries.append((count, total, labels[group_of[i]]))
     lines: list[str] = []
@@ -830,7 +845,8 @@ def _notes(
             f"{count} of {total}{' draws' if j == 0 else ''} {label}"
             for j, (count, total, label) in enumerate(entries)
         ]
-        lines.append(f"{_join(parts)} {text}")
+        singular = len(entries) == 1 and int(entries[0][0]) == 1
+        lines.append(f"{_join(parts)} {_agree(text, singular=singular)}")
     return lines
 
 
@@ -1057,7 +1073,8 @@ def setup_text(
       another series, or a comonotone index and loss. A note that differs
       between drawn samples only in its counts, such as the draws beyond the
       fitted support in the design sample and in the fresh draws, is written
-      once, with each sample's own counts;
+      once, with each sample's own counts, its verb in the singular for one
+      sample's count of 1 and in the plural otherwise;
     - `Pricing`: the pricing of the covers given as is; a design keeps its
       design premium, and a row's `premium_basis` says which premium it uses;
     - `Design`, one line per design: the objective, pricing, budget and
