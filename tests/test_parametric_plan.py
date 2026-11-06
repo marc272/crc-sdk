@@ -45,6 +45,7 @@ from crc_sdk.parametric import (
     design,
     holdout,
     sample_annual,
+    setup_text,
 )
 from crc_sdk.types import SourceProvenance
 from crc_sdk.workflows import AssetPortfolio, CellColumn, ImpactContextColumns
@@ -211,9 +212,9 @@ def test_explain_mirrors_the_written_metadata() -> None:
     setup = document["setup"]
     assert setup["basis"] == "annual"
     assert setup["metric_options"] == OPTIONS.to_document()
-    assert [sample["asset_id"] for sample in setup["samples"]] == [
-        "warehouse-a",
-        "depot-b",
+    assert [sample["asset_ids"] for sample in setup["samples"]] == [
+        ["warehouse-a"],
+        ["depot-b"],
     ]
     sample = setup["samples"][0]
     assert sample["basis_risk"] == {"kind": "impact_noise", "sigma": 0.3, "upper": 1.0}
@@ -228,7 +229,8 @@ def test_explain_mirrors_the_written_metadata() -> None:
         for fold in range(4)
         for split, method in (("in_sample", "in_sample"), ("out_of_sample", "kfold"))
     ]
-    assert setup["evaluations"][1]["details"] == {"k": 4}
+    assert setup["evaluations"][1]["details"] == {"k": 4, "plan_seed": 42}
+    assert setup["evaluations"][0]["details"] == {"plan_seed": 42}
     assert document["designs"]["objectives"] == [
         {"kind": "mse"},
         {"alpha": 0.9, "beta": 0.9, "kind": "weighted_cvar"},
@@ -253,6 +255,27 @@ def test_explain_mirrors_the_written_metadata() -> None:
     assert json.loads(str(plan.explain())) == document
     with pytest.raises(ValueError, match="text"):
         UNTYPED_PLAN.explain(plan, format="yaml")
+
+
+def test_setup_text_states_the_plan_before_execution() -> None:
+    plan = (
+        _plan()
+        .basis_risk(ImpactNoise(0.3, upper=1.0))
+        .covers(_step())
+        .objective(MSE(), budget=Budget(ratio=1.0))
+        .split(Holdout(0.7))
+        .metrics(OPTIONS)
+    )
+    document: Any = plan.explain(format="json")
+    text = setup_text(document["setup"])
+    assert "Level: asset, one row per asset (warehouse-a and depot-b)" in text
+    assert "Basis: annual, one draw is one year." in text
+    assert "Split: out of sample, fold 0, a holdout with train fraction 0.7" in text
+    assert "not known yet" in text
+    assert "impact noise, a mean-one lognormal factor with sigma 0.3" in text
+    assert "times the asset value in column value_eur, in EUR" in text
+    unset: Any = _plan().explain(format="json")
+    assert "Basis risk: not stated." in setup_text(unset["setup"])
 
 
 def test_explain_without_a_split_lists_in_sample_rows_only() -> None:
@@ -635,6 +658,11 @@ def test_write_parquet_writes_every_split_with_its_setup(tmp_path: Path) -> None
     assert "2000000.0" not in metadata.to_json()  # asset values are not written
     methods = {(e["split"], e["method"]) for e in metadata.setup.evaluations}
     assert methods == {("in_sample", "in_sample"), ("out_of_sample", "kfold")}
+    assert all(e["details"]["plan_seed"] == 42 for e in metadata.setup.evaluations)
+    text = setup_text(metadata)
+    assert "fold 3 of a 4-fold split over blocks of years" in text
+    assert "the leakage check passed" in text
+    assert "Design step (mse) (" in text
     hazard = [entry for entry in metadata.sources if entry["role"] == "hazard"]
     assert hazard and all(
         entry["annual_table"]["kind"] == "table"
@@ -658,6 +686,8 @@ def test_without_a_split_every_row_is_in_sample(tmp_path: Path) -> None:
         .write_parquet(tmp_path / "in-sample.parquet")
     )
     assert set(result.table.column("split").to_pylist()) == {"in_sample"}
+    details = [e["details"] for e in result.metadata.setup.evaluations]
+    assert details == [{"plan_seed": 42}]
     assert result.row_count == 2
     sample = result.samples["warehouse-a"]
     assert result.designs[0].design_sample.content_hash == sample.content_hash
@@ -677,6 +707,14 @@ def test_a_written_file_is_replaced_atomically(tmp_path: Path) -> None:
     assert sorted(path.name for path in tmp_path.iterdir()) == ["comparison.parquet"]
     with pytest.raises(ValueError, match="local"):
         plan.write_parquet("s3://bucket/comparison.parquet")
+    unseeded = _plan(assets=_assets("warehouse-a"), seed=None)
+    written = (
+        unseeded.basis_risk(NoBasisRisk())
+        .covers(_linear())
+        .metrics(OPTIONS)
+        .write_parquet(output)
+    )
+    assert [e["details"] for e in written.metadata.setup.evaluations] == [{}]
 
 
 def test_file_sources_and_assets_are_read_at_execution(tmp_path: Path) -> None:

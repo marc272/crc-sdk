@@ -62,8 +62,9 @@ builds it, through a temporary sibling and `os.replace`. Its metadata under
 `crc.parametric.evaluation` (`EvaluationMetadata`) holds the setup of every
 number: the samples with their source, loss and basis-risk models, the
 splits, the pricing, the designs and the covers, plus the source table's
-checksum, the source plan's `explain()`, the licences and the generator
-states. Asset values are never written; the metadata holds a SHA-256 of the
+checksum, the source plan's `explain()`, the licences, the generator
+states and the plan's seed (in every evaluation's `details`, as
+`"plan_seed"`). Asset values are never written; the metadata holds a SHA-256 of the
 (asset id, value) pairs.
 """
 
@@ -793,6 +794,10 @@ class ParametricPlan:
             return None
         return [str(value) for value in column.to_pylist()]
 
+    def _seed_details(self) -> dict[str, Any]:
+        """`{"plan_seed": seed}` for a plan with a seed, else `{}`."""
+        return {} if self.seed is None else {"plan_seed": self.seed}
+
     def _evaluations(self) -> list[dict[str, Any]]:
         pricing = self._pricing().to_document()
         rule = self.split_rule
@@ -807,7 +812,7 @@ class ParametricPlan:
         for fold in range(folds):
             evaluations.append(
                 {
-                    "details": {},
+                    "details": self._seed_details(),
                     "fold": fold,
                     "method": "in_sample",
                     "pricing": pricing,
@@ -817,7 +822,7 @@ class ParametricPlan:
             if method is not None:
                 evaluations.append(
                     {
-                        "details": details,
+                        "details": {**details, **self._seed_details()},
                         "fold": fold,
                         "method": method,
                         "pricing": pricing,
@@ -847,19 +852,23 @@ class ParametricPlan:
     def _explain_document(self) -> dict[str, Any]:
         ids = self._known_asset_ids()
         model = self.basis_risk_model
-        sample = {
-            "basis_risk": None if model is None else model.to_document(),
+        sample: dict[str, Any] = {
             "index_unit": self.unit,
             "loss_model": self.loss_model.to_document(),
             "loss_unit": self.loss_model.value_unit,
+            "notes": [],
+            "scenario": "baseline",
             "semantics": "annual",
             "semantics_source": "data",
             "source_kind": "annual",
         }
-        samples = [
-            {"asset_id": asset_id, **sample}
-            for asset_id in (ids if ids is not None else [None])
-        ]
+        if model is not None:
+            sample["basis_risk"] = model.to_document()
+        samples = (
+            [{**sample, "asset_ids": []}]
+            if ids is None
+            else [{**sample, "asset_ids": [asset_id]} for asset_id in ids]
+        )
         spec = self.design_spec
         designs = None
         if spec is not None:
@@ -936,7 +945,10 @@ class ParametricPlan:
         sample per asset with its source, loss and basis-risk models, and
         the planned evaluations with their split, fold and pricing),
         `covers`, `designs` (the objectives and design terms), `sources`,
-        `assets`, `licences` and `rng` (the seed). What only execution
+        `assets`, `licences` and `rng` (the seed). Its `setup` has the layout
+        of `EvaluationSetup`, so `setup_text(plan.explain(format="json")
+        ["setup"])` states it before anything is read; the plan's seed is in
+        every evaluation's `details` under `"plan_seed"`. What only execution
         knows (the years, the matched cells, the checksums and the hashes
         of the samples and designs) is in the written metadata.
         `format="json"` returns a dict, `"text"` its JSON text.
@@ -1308,8 +1320,9 @@ class ParametricPlan:
         metadata (`EvaluationMetadata`, under `crc.parametric.evaluation`)
         merges that of every block, and adds the source table's record (its
         SHA-256, the source plan's `explain()` and, for a file, its path and
-        SHA-256) to each hazard source, and the asset id column and a
-        SHA-256 of the (asset id, value) pairs to `assets`.
+        SHA-256) to each hazard source, the plan's seed to every evaluation's
+        `details` (`"plan_seed"`), and the asset id column and a SHA-256 of
+        the (asset id, value) pairs to `assets`.
 
         Returns a `ParametricResult`. Raises `ValueError` without covers, a
         basis-risk model, or an objective for templates; and as `samples`,
@@ -1325,6 +1338,11 @@ class ParametricPlan:
             if entry.get("role") == "hazard"
             else entry
             for entry in document["sources"]
+        ]
+        seeded = self._seed_details()
+        document["setup"]["evaluations"] = [
+            {**entry, "details": {**entry.get("details", {}), **seeded}}
+            for entry in document["setup"]["evaluations"]
         ]
         document["assets"] = {
             "count": len(run.samples),

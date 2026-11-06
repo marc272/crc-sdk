@@ -118,7 +118,18 @@ def test_the_docs_quick_start_runs_as_written(
     namespace: dict[str, Any] = {}
     for block in (*quick_start, *by_hand):
         exec(compile(block, str(DOCS), "exec"), namespace)
-    assert '"entry": "for_annual_extremes"' in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    before, after = printed.split("Level:")[1:3]
+    assert "Basis: annual, one draw is one year." in before
+    assert "the evaluation sample, not known yet" in before
+    assert (
+        "Split: out of sample, fold 0, a holdout with train fraction 0.7: "
+        "evaluated on 12 recorded years (2009 to 2020), the held-out block; "
+        "designed on 28 recorded years (1981 to 2008), the design block; the "
+        "leakage check passed"
+    ) in after
+    assert "Design step (expected_uncovered) (" in after
+    assert "Basis risk: impact noise" in after
 
     result = namespace["result"]
     assert (tmp_path / "comparison.parquet").is_file()
@@ -143,7 +154,7 @@ def test_the_docs_quick_start_runs_as_written(
         e for e in result.metadata.setup.evaluations if e["split"] == "out_of_sample"
     ]
     assert out[0]["method"] == "holdout"
-    assert out[0]["details"] == {"train_fraction": 0.7}
+    assert out[0]["details"] == {"train_fraction": 0.7, "plan_seed": 42}
     # The function route by hand gives the plan's sample and design.
     assert namespace["sample"].content_hash == sample.content_hash
     by_hand_design = namespace["designed"]

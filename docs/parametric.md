@@ -56,7 +56,7 @@ from crc_framework import PiecewiseLinearImpact
 from crc_sdk.parametric import (
     MSE, Budget, Cover, ExpectedUncovered, Free, Holdout, ImpactNoise,
     IndexDefinition, LinearPayout, MetricOptions, ParametricPlan, StepPayout,
-    WeightedCVaR,
+    WeightedCVaR, setup_text,
 )
 from crc_sdk.types import SourceProvenance
 
@@ -90,19 +90,21 @@ plan = (
     .basis_risk(ImpactNoise(0.3, upper=1.0))   # stated, never assumed
     .covers(step, linear)                      # a template and a fixed cover
     .objective(MSE(), ExpectedUncovered(), WeightedCVaR(alpha=0.9, beta=0.9),
-               budget=Budget(ratio=1.0))
+               budget=Budget(ratio=0.8))
     .split(Holdout(0.7))                       # design on 1981-2008, test on 2009-2020
     .metrics(MetricOptions(betas=(0.9,), return_periods=(10,)))
 )
-print(plan.explain())                          # the setup; no I/O
+print(setup_text(plan.explain(format="json")["setup"]))   # the setup; no I/O
 
 result = plan.write_parquet("comparison.parquet")   # execution; atomic
 ```
 
-`result.table` is the comparison as written: one row per cover (the three
-designs, labelled `"step (mse)"`, `"step (expected_uncovered)"` and
-`"step (weighted_cvar alpha=0.9 beta=0.9)"`, and the linear cover) and split.
-The out-of-sample rows are the ones to report, each with its setup:
+`plan.explain()` gives the whole plan as JSON text; `setup_text` states its
+setup in plain sentences. `result.table` is the comparison as written: one row
+per cover (the three designs, labelled `"step (mse)"`,
+`"step (expected_uncovered)"` and `"step (weighted_cvar alpha=0.9 beta=0.9)"`,
+and the linear cover) and split. The out-of-sample rows are the ones to report,
+each with its setup:
 
 ```python
 import pyarrow.compute as pc
@@ -112,8 +114,7 @@ out_of_sample = table.filter(pc.equal(table["split"], "out_of_sample"))
 out_of_sample.select(["cover_label", "premium_basis", "premium",
                       "expected_uncovered", "coverage_ratio", "tail_coverage_b0_9",
                       "unique"])
-result.metadata.setup.evaluations    # the split, fold and pricing of every block
-result.metadata.setup.samples        # source, years, loss and basis-risk models
+print(setup_text(result.metadata))   # the setup of these rows, to print with them
 [design.unique for design in result.designs]   # is each design the only optimum?
 ```
 
@@ -235,8 +236,9 @@ Parquet file through a temporary sibling and `os.replace`, and creates the
 parent directory. Its metadata, under `crc.parametric.evaluation`, merges that
 of every block (below) and adds to each hazard source the source table's
 record: its rows, columns and SHA-256, the source plan's `explain()`, and for a
-file its path and SHA-256. `assets` holds the count, the id column and a
-SHA-256 of the (asset id, value) pairs.
+file its path and SHA-256. Every evaluation's `details` holds the plan's seed
+(`"plan_seed"`), and `assets` the count, the id column and a SHA-256 of the
+(asset id, value) pairs.
 
 ## The function route
 
@@ -261,7 +263,7 @@ sample = sample_annual(series, loss_model=loss_model,
                        basis_risk=ImpactNoise(0.3, upper=1.0),
                        asset_id="warehouse-a", rng=rng)
 design_years, held_out = holdout(sample, train_fraction=0.7)
-designed = design(step, design_years, ExpectedUncovered(), budget=Budget(ratio=1.0))
+designed = design(step, design_years, ExpectedUncovered(), budget=Budget(ratio=0.8))
 table = compare([designed, linear], held_out, split="out_of_sample",
                 design_sample=design_years)
 write_comparison(table, "by-hand.parquet")   # atomic
@@ -295,7 +297,7 @@ def draws(seed: int):
                         basis_risk=ImpactNoise(0.3, upper=1.0), asset_id="warehouse-a")
 
 design_draws, fresh_draws = draws(1), draws(2)
-designed = design(step, design_draws, ExpectedUncovered(), budget=Budget(ratio=1.0))
+designed = design(step, design_draws, ExpectedUncovered(), budget=Budget(ratio=0.8))
 table = compare([designed, linear], fresh_draws, split="out_of_sample",
                 design_sample=design_draws)   # the fixed cover needs its design sample
 ```
@@ -310,12 +312,29 @@ A draw is a year only if the curve describes one year's value: its
   fresh draws from a curve. In-sample rows measure the fit on the design years
   and show the gap.
 - State the setup next to every number: the asset, the basis (one draw is one
-  year), the basis-risk model, the pricing and budget, and the split.
-  `result.metadata.setup` and the plan's `explain()` hold all of it.
+  year), the basis-risk model, the pricing and budget, and the split
+  (below).
 - A design is one member of a set of optimal designs unless `unique` is true
   ([non-unique optima](#non-unique-optima)).
 - A comparison holds for its stated setup. The module makes no claim that one
   objective, payout family or cover performs better in general.
+
+### Stating the setup
+
+Every number in a comparison rests on a setup: the asset, the basis, the
+split, the samples' source and basis-risk model, the pricing and, for a design,
+its objective and constraints. `setup_text(result.metadata)`, or
+`setup_text(EvaluationMetadata.from_table(table))` for a table read back,
+states that setup in plain text, one statement per line (`Level`, `Split`,
+`Sample`, `Sample notes`, `Pricing`, `Design`, `Metrics`), for a notebook or a
+report to print next to the numbers. It reads only the metadata, so the same
+table always gives the same text, and statements that every split or sample
+shares are written once. Before execution, `setup_text(plan.explain(
+format="json")["setup"])`, or `setup_text(metadata.setup)`, gives the same
+lines without the design records, and says what only execution knows (the
+years of each block, the leakage check) is not known yet. Out-of-sample rows'
+`Split` line says how the split was made and that the leakage check passed.
+The plan's seed is in every evaluation's `details` under `"plan_seed"`.
 
 ## Define a cover and evaluate its payouts
 
@@ -558,7 +577,7 @@ threshold is hidden. ℓ is in loss units; ε is the payout at or below which a
 year counts as "no payout". Labels write the number with the point as an
 underscore, as crc-sdk's return-period columns do: β = 0.99 gives
 `cvar_uncovered_b0_99`, T = 100 gives `loss_rp100`, ℓ = 0 gives `l0`. Repeated
-values raise `ValueError`.
+values raise `EvaluationError`, a `ValueError`.
 
 **VaR and CVaR.** `VaR_β(X)` is the smallest x with Σ_{X ≤ x} p ≥ β, where the
 comparison allows 1e-10 for the rounding of the summed probabilities, so a β
@@ -625,7 +644,10 @@ between the two.
 | one column per metric | float64, nullable | As defined above; null where undefined |
 
 The key (`cover_hash`, `design_id`, `asset_id`, `level`, `scenario`, `split`,
-`fold`) is unique; `compare` raises `ValueError` for the same cover twice.
+`fold`) is unique; `compare` raises `EvaluationError` for the same cover
+twice. Invalid evaluation arguments, metric options and comparison metadata
+raise `EvaluationError`, a `ValueError`; arguments of the wrong type raise
+`TypeError`.
 `to_long(table)` gives the tidy form: the identity columns, then `column`,
 `metric`, `parameter`, `parameter_value`, `unit` and `value`.
 
