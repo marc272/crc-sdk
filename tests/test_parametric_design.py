@@ -33,6 +33,7 @@ from crc_sdk.parametric import (
     Free,
     IndexDefinition,
     InfeasibleDesignError,
+    LeakageError,
     Limit,
     LinearConstraints,
     LinearPayout,
@@ -53,6 +54,7 @@ from crc_sdk.parametric import (
     evaluate,
     holdout,
     write_comparison,
+    year_block_kfold,
 )
 from crc_sdk.parametric.constraints import budget_from_document, limit_from_document
 from crc_sdk.parametric.design import DESIGN_SEMANTICS_VERSION, Fill
@@ -94,7 +96,9 @@ def _design_cases() -> list[Path]:
 DESIGN_CASES = _design_cases()
 
 
-def _block_sample(block: Mapping[str, Any], name: str) -> OutcomeSample:
+def _block_sample(
+    block: Mapping[str, Any], name: str, *, lineage: str | None = None
+) -> OutcomeSample:
     return OutcomeSample(
         asset_ids=tuple(block["asset_ids"]),
         period=np.asarray(block["period"], dtype=np.int64),
@@ -109,30 +113,66 @@ def _block_sample(block: Mapping[str, Any], name: str) -> OutcomeSample:
             source_kind="table",
             sources=({"role": "table", "name": name},),
             semantics_source="caller",
+            lineage=lineage,
         ),
     )
+
+
+def _full_sample(case: Mapping[str, Any]) -> OutcomeSample:
+    """The full sample of a holdout or k-fold case: both blocks, by period."""
+    design_block, held_out = case["sample"], case["evaluation_sample"]
+    rows = sorted(
+        zip(
+            design_block["period"] + held_out["period"],
+            design_block["index"] + held_out["index"],
+            design_block["loss"] + held_out["loss"],
+            strict=True,
+        )
+    )
+    n = len(rows)
+    block = {
+        **design_block,
+        "period": [row[0] for row in rows],
+        "index": [row[1] for row in rows],
+        "loss": [row[2] for row in rows],
+        "probability": [1.0 / n] * n,
+    }
+    return _block_sample(block, case["case_id"])
 
 
 def _case_samples(
     case: Mapping[str, Any],
 ) -> tuple[OutcomeSample, OutcomeSample | None]:
-    """The design sample and, for a holdout case, the held-out sample."""
-    if case["split"] is None:
+    """The design sample and, out of sample, the evaluation sample.
+
+    A holdout or k-fold case is split again from its full sample by the
+    module's own split, which must return the case's two blocks. A
+    fresh-draw case's draws come from another source, so the two samples get
+    different lineages.
+    """
+    split = case["split"]
+    if split is None:
         return _block_sample(case["sample"], case["case_id"]), None
-    # The k-fold and fresh-draw cases are evaluation cases for now; extend
-    # this reader before copying them here.
-    assert case["split"]["kind"] == "holdout", case["split"]
-    design_block, held_out = case["sample"], case["evaluation_sample"]
-    merged = {
-        key: design_block[key] + held_out[key] for key in ("period", "index", "loss")
-    }
-    n = len(merged["period"])
-    full = _block_sample(
-        {**design_block, **merged, "probability": [1.0 / n] * n}, case["case_id"]
-    )
-    train, test = holdout(full, train_fraction=case["split"]["train_fraction"])
-    assert train.period.tolist() == design_block["period"]
-    assert test.period.tolist() == held_out["period"]
+    if split["kind"] == "fresh_draws":
+        design_sample = _block_sample(
+            case["sample"], case["case_id"], lineage=f"{case['case_id']}/design"
+        )
+        fresh = _block_sample(
+            case["evaluation_sample"],
+            f"{case['case_id']}/fresh",
+            lineage=f"{case['case_id']}/fresh",
+        )
+        assert fresh.period.tolist() == list(range(split["n_draws"]))
+        return design_sample, fresh
+    full = _full_sample(case)
+    if split["kind"] == "holdout":
+        train, test = holdout(full, train_fraction=split["train_fraction"])
+    else:
+        assert split["kind"] == "kfold", split
+        train, test = year_block_kfold(full, k=split["k"])[split["fold"]]
+    for got, block in ((train, case["sample"]), (test, case["evaluation_sample"])):
+        assert got.period.tolist() == block["period"]
+        np.testing.assert_allclose(got.probability, block["probability"], rtol=1e-12)
     return train, test
 
 
@@ -218,8 +258,80 @@ def test_the_design_cases_are_present() -> None:
         "binary-upper-grid-mse-coc-individual-synthetic52",
         "step-lower-wcvar-b0_9-pure-individual-handmade",
     }
-    assert in_sample | out_of_sample | newer <= names
-    assert len(DESIGN_CASES) >= 29
+    kfold = {
+        f"step-mse-pure-individual-synthetic52-kfold5-fold{i}" for i in range(5)
+    } | {"step-wcvar-b0_9-coc-individual-synthetic52-kfold5-fold0"}
+    fresh = {
+        "step-mse-pure-individual-synthetic52-fresh",
+        "step-wcvar-b0_9-coc-individual-synthetic52-fresh",
+    }
+    assert in_sample | out_of_sample | newer | kfold | fresh <= names
+    assert len(DESIGN_CASES) >= 37
+
+
+def _split_cases(kind: str) -> list[dict[str, Any]]:
+    cases = [_case(path) for path in DESIGN_CASES]
+    return [case for case in cases if (case["split"] or {}).get("kind") == kind]
+
+
+def test_the_kfold_cases_split_one_full_sample() -> None:
+    cases = _split_cases("kfold")
+    assert len(cases) == 6
+    full = {_full_sample(case).content_hash for case in cases}
+    assert len(full) == 1
+    # The MSE design has every fold: its held-out blocks partition the sample.
+    mse = sorted(
+        (case for case in cases if case["objective"]["kind"] == "mse"),
+        key=lambda case: case["split"]["fold"],
+    )
+    assert [case["split"]["fold"] for case in mse] == list(range(5))
+    blocks = [case["evaluation_sample"]["period"] for case in mse]
+    assert [period for block in blocks for period in block] == list(range(52))
+    assert [len(block) for block in blocks] == [11, 11, 10, 10, 10]
+
+
+@pytest.mark.parametrize(
+    "case_id",
+    [
+        "step-mse-pure-individual-synthetic52-kfold5-fold0",
+        "step-wcvar-b0_9-coc-individual-synthetic52-kfold5-fold0",
+    ],
+)
+def test_a_held_out_fold_reaches_the_filled_level(case_id: str) -> None:
+    # Fold 0 holds out the one draw in the last bin (60 m/s and above), so
+    # the design leaves levels[5] unidentified, and the fill rule sets the
+    # payout of that held-out draw: the previous level.
+    case = _case(CASES / f"{case_id}.json")
+    sample, held_out = _case_samples(case)
+    assert held_out is not None
+    result = _design_case(case, sample)
+    assert result.unidentified == ("levels[5]",)
+    parameters = result.cover.payout.parameters()
+    assert parameters["levels[5]"] == parameters["levels[4]"]
+    index = held_out.index[:, 0]
+    reached = index >= 60.0
+    assert reached.sum() == 1
+    payout = result.cover.payout_values(index[reached])[0]
+    assert payout == parameters["levels[4]"]
+
+
+def test_fresh_draws_are_another_source() -> None:
+    cases = _split_cases("fresh_draws")
+    assert len(cases) == 2
+    for case in cases:
+        sample, fresh = _case_samples(case)
+        assert fresh is not None and len(fresh) == case["split"]["n_draws"]
+        # The draw numbers overlap the design years; only the lineage tells
+        # the two sources apart.
+        assert set(fresh.period.tolist()) <= set(sample.period.tolist())
+        result = _design_case(case, sample)
+        row = evaluate(result, fresh, split="out_of_sample").to_pylist()[0]
+        assert row["premium"] == result.premium
+        same_source = _block_sample(
+            case["evaluation_sample"], "fresh", lineage=sample.lineage
+        )
+        with pytest.raises(LeakageError):
+            evaluate(result, same_source, split="out_of_sample")
 
 
 @pytest.mark.parametrize("path", DESIGN_CASES, ids=lambda path: path.stem)
@@ -284,18 +396,26 @@ def test_design_parity(path: Path) -> None:
     # 3. The premium and the metrics.
     pricing = pricing_from_document(case["pricing"])
     options = _metric_options(case)
+    # A k-fold design block is a block of its fold; every other sample is fold 0.
+    split = case["split"] or {}
+    fold = split["fold"] if split.get("kind") == "kfold" else 0
     if expected["unique"]:
         evaluated: Cover | DesignResult = result
-        row = evaluate(result, sample, split="in_sample", options=options).to_pylist()[
-            0
-        ]
+        row = evaluate(
+            result, sample, split="in_sample", fold=fold, options=options
+        ).to_pylist()[0]
         assert row["premium_basis"] == "design"
         assert row["design_id"] == result.design_id
         premium = result.premium
     else:
         evaluated = template.with_values(expected["parameters"])
         row = evaluate(
-            evaluated, sample, split="in_sample", pricing=pricing, options=options
+            evaluated,
+            sample,
+            split="in_sample",
+            fold=fold,
+            pricing=pricing,
+            options=options,
         ).to_pylist()[0]
         premium = row["premium"]
     assert abs(premium - expected["premium"]) <= (
@@ -313,6 +433,7 @@ def test_design_parity(path: Path) -> None:
     if held_out is not None:
         out = expected["out_of_sample"]
         assert out["premium_basis"] == "design"
+        assert out["fold"] == fold
         if expected["unique"]:
             table = evaluate(
                 result,
@@ -332,6 +453,7 @@ def test_design_parity(path: Path) -> None:
                 options=options,
             )
         row = table.to_pylist()[0]
+        assert row["split"] == "out_of_sample" and row["fold"] == out["fold"]
         assert row["premium_basis"] == ("design" if expected["unique"] else "stated")
         _check_metrics(row, out["metrics"], case)
 

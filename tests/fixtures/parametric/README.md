@@ -20,7 +20,7 @@ the copies stay byte-identical. A case's `generator.commit` names the commit
 of the code that generated it, which can be older than the commit it was copied
 at.
 
-The 46 cases copied (about 520 kB):
+The 54 cases copied (about 600 kB):
 
 - 17 evaluation cases of fixed covers (`*-fixed-*`): 13 linear, binary and
   piecewise-linear covers whose expected values are closed forms, computed in
@@ -28,6 +28,14 @@ The 46 cases copied (about 520 kB):
   implementation;
 - 8 out-of-sample cases (`*-holdout`): step covers designed on the first 70 %
   of the years and evaluated on the held-out rest, with the design premium;
+- 6 k-fold cases (`*-synthetic52-kfold5-fold<i>`): step covers designed on
+  four of five contiguous blocks of the 52 years and evaluated on the fifth,
+  with the design premium; the MSE design for every fold i, and the weighted
+  CVaR design with cost-of-capital pricing for fold 0;
+- 2 fresh-draw cases (`step-{mse-pure,wcvar-b0_9-coc}-individual-synthetic52-fresh`):
+  step covers designed on the 52 years and evaluated, with the design
+  premium, on 50 further draws of the same synthetic process, which the case
+  gives;
 - 16 in-sample design cases of one asset
   (`step-{mse,eu,wcvar-b0_9,wcvar-b0_99}-{pure,coc}-individual-{synthetic,thesis}`):
   step covers designed by the reference implementation for each objective and
@@ -44,13 +52,28 @@ are null except in the grid-route cases, whose `expected.profile` lists the
 candidates. The source README documents both.
 
 The design test reads every case of `kind` `"design"` and `scope`
-`"individual"` in `cases/`, the holdout cases' design blocks included, and
-judges it by its `compare_parameters` (`"exact"`, `"within_ranges"` or
-`"none"`), and a grid-route case by its `expected.profile` too. Further design
-cases are picked up the same way once they are copied here; the source's
-k-fold and fresh-draw cases need a reader for their splits first. The source's
-joint cases (`*-joint-*`) are for the joint designs of a later phase and are
-not copied.
+`"individual"` in `cases/`, the out-of-sample cases included, and judges it by
+its `compare_parameters` (`"exact"`, `"within_ranges"` or `"none"`), and a
+grid-route case by its `expected.profile` too. An out-of-sample case is also
+evaluated on its `evaluation_sample` with the design premium:
+
+- a holdout or k-fold case joins its two blocks into the full sample, in
+  period order, and splits it again with `holdout` or `year_block_kfold`,
+  which must return the case's two blocks; its rows carry the split's fold;
+- a fresh-draw case's draws come from another source, so the test gives them
+  a lineage of their own. Their periods are draw numbers that overlap the
+  design years; with the design sample's lineage they would raise
+  `LeakageError`.
+
+Further design cases are picked up the same way once they are copied here.
+The source's joint cases (`*-joint-*`) are for the joint designs of a later
+phase and are not copied. Six more of its cases are not copied yet: three
+designs (a linear cover on the grid route and two piecewise-linear designs, on
+`handmade`), and three evaluation cases (two with non-default
+`metric_options`, `*-options`, and a fixed lower-tail step,
+`step-lower-fixed-pure-individual-handmade`), which the metric test does not
+handle yet: it expects exactly 17 evaluation cases and evaluates with the
+default metric options.
 
 ## Licence
 
