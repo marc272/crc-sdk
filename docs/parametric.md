@@ -144,7 +144,8 @@ The designs' rows use the design premium (`premium_basis` `"design"`), the
 linear cover's rows the premium of its payouts on the fresh draws
 (`"evaluation"`). The setup text also states what the curve's fitted range
 means for these draws: with a shortest fitted return period of 2 years, about
-half of the simulated years lie below it, where the curve is extrapolated. Any
+half of the simulated years are more frequent than it, where the curve is
+extrapolated. Any
 number read from this table describes this synthetic curve under this setup
 and nothing more.
 
