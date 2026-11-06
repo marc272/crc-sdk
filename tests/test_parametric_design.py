@@ -597,6 +597,161 @@ def test_non_unique_lp_optimum_is_reported_with_ranges() -> None:
     assert row["unique"] is False
 
 
+# -- ranging on one solver instance ------------------------------------------
+
+
+NON_UNIQUE = _sample([0.0, 1.0, 2.0, 3.0], [0.0, 10.0, 20.0, 40.0])
+
+
+def test_the_ranging_lps_share_one_solver_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh: list[Mapping[str, Any] | None] = []
+    sessions: list[Any] = []
+    solve_lp, session = _solver.solve_lp, _solver.LPSession
+
+    def counted_solve(
+        programme: _solver.Programme, options: Mapping[str, Any] | None = None
+    ) -> _solver.Solution:
+        fresh.append(options)
+        return solve_lp(programme, options)
+
+    def counted_session(*args: Any, **kwargs: Any) -> _solver.LPSession:
+        sessions.append(args)
+        return session(*args, **kwargs)
+
+    monkeypatch.setattr(_solver, "solve_lp", counted_solve)
+    monkeypatch.setattr(_solver, "LPSession", counted_session)
+    result = design(
+        _step([Free(), Free()]),
+        NON_UNIQUE,
+        ExpectedUncovered(),
+        budget=Budget(amount=5.0),
+        options=DesignOptions(ranges=True),
+    )
+    # The design LP is solved on its own; the 4 ranging LPs of each of the
+    # 2 amounts share one instance and are still counted as solves.
+    assert fresh == [None]
+    assert len(sessions) == 1
+    assert sessions[0][1] == _solver.RANGING_OPTIONS
+    assert result.solves == 1 + 4 * 2
+    assert result.ranges is not None
+    assert result.ranges["levels[1]"] == pytest.approx((20 / 3, 20.0))
+
+
+def _small_lp(cost: Sequence[float], upper: float | None = None) -> _solver.Programme:
+    """`min cost @ x` s.t. `x0 + x1 >= 1`, `0 <= x <= 1`, and `x0 + 2 x1 <= upper`."""
+    rows, columns, values = [0, 0], [0, 1], [1.0, 1.0]
+    row_lower, row_upper = [1.0], [math.inf]
+    if upper is not None:
+        rows, columns, values = rows + [1, 1], columns + [0, 1], values + [1.0, 2.0]
+        row_lower, row_upper = row_lower + [-math.inf], row_upper + [upper]
+    matrix = _solver.sparse_columns(
+        np.array(rows), np.array(columns), np.array(values), (len(row_lower), 2)
+    )
+    return _solver.Programme(
+        cost=np.asarray(cost, dtype=np.float64),
+        col_lower=np.zeros(2),
+        col_upper=np.ones(2),
+        matrix=matrix,
+        row_lower=np.array(row_lower),
+        row_upper=np.array(row_upper),
+    )
+
+
+def test_a_session_solves_as_a_fresh_instance_would() -> None:
+    session = _solver.LPSession(_small_lp([1.0, 2.0]), _solver.RANGING_OPTIONS)
+    assert session.n_rows == 1
+    # Each step's optimum is a unique vertex, so both solves must find it.
+    steps: list[tuple[list[float], float | None, float]] = [
+        ([1.0, 2.0], None, 1.0),  # x = (1, 0)
+        ([0.5, -1.0], None, -1.0),  # x = (0, 1)
+        ([0.5, -1.0], 1.5, -0.25),  # x = (0.5, 0.5)
+        ([0.5, -1.0], 1.2, 0.2),  # x = (0.8, 0.2)
+        ([-1.0, -1.0], 1.2, -1.1),  # x = (1, 0.1)
+    ]
+    row: int | None = None
+    for cost, upper, optimum in steps:
+        if upper is not None:
+            if row is None:
+                row = session.add_row(np.array([1.0, 2.0]), -math.inf, math.inf)
+                assert row == 1 and session.n_rows == 2
+            session.change_row_bounds(row, -math.inf, upper)
+        session.change_cost(np.array(cost))
+        warm = session.solve()
+        cold = _solver.solve_lp(_small_lp(cost, upper), _solver.RANGING_OPTIONS)
+        assert warm.status == cold.status == "optimal"
+        assert warm.objective == pytest.approx(optimum, abs=1e-12)
+        assert cold.objective == pytest.approx(optimum, abs=1e-12)
+        assert warm.values is not None and cold.values is not None
+        np.testing.assert_allclose(warm.values, cold.values, atol=1e-12)
+    # An option for one solve, here presolve off, does not stay set.
+    assert session.solve({"presolve": "off"}).status == "optimal"
+    assert session.solve().status == "optimal"
+
+
+def test_a_session_rejects_bad_changes() -> None:
+    hessian = _solver.sparse_columns(
+        np.array([0, 1]), np.array([0, 1]), np.array([1.0, 1.0]), (2, 2)
+    )
+    lp = _small_lp([1.0, 2.0])
+    qp = _solver.Programme(
+        cost=lp.cost,
+        col_lower=lp.col_lower,
+        col_upper=lp.col_upper,
+        matrix=lp.matrix,
+        row_lower=lp.row_lower,
+        row_upper=lp.row_upper,
+        hessian=hessian,
+    )
+    with pytest.raises(ValueError, match="hessian"):
+        _solver.LPSession(qp)
+    with pytest.raises(ValueError, match="rejected the option"):
+        _solver.LPSession(lp, {"no_such_option": 1})
+    session = _solver.LPSession(lp)
+    with pytest.raises(ValueError, match="one entry per column"):
+        session.change_cost(np.zeros(3))
+    with pytest.raises(ValueError, match="finite"):
+        session.change_cost(np.array([1.0, math.nan]))
+    with pytest.raises(ValueError, match="one coefficient per column"):
+        session.add_row(np.zeros(1), 0.0, 1.0)
+    with pytest.raises(ValueError, match="finite"):
+        session.add_row(np.array([1.0, math.inf]), 0.0, 1.0)
+    with pytest.raises(ValueError, match="row 1"):
+        session.change_row_bounds(1, 0.0, 1.0)
+    with pytest.raises(ValueError, match="rejected the option"):
+        session.solve({"no_such_option": 1})
+
+
+@pytest.mark.parametrize("status", ["infeasible_or_unbounded", "error"])
+def test_a_failed_ranging_solve_raises(
+    monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    calls: list[Mapping[str, Any] | None] = []
+
+    def failed(
+        self: _solver.LPSession, options: Mapping[str, Any] | None = None
+    ) -> _solver.Solution:
+        calls.append(options)
+        return _solver.Solution(status, None, None, f"patched {status}", 0, 0.0)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(_solver.LPSession, "solve", failed)
+    with pytest.raises(DesignError) as raised:
+        design(
+            _step([Free(), Free()]),
+            NON_UNIQUE,
+            ExpectedUncovered(),
+            budget=Budget(amount=5.0),
+            options=DesignOptions(ranges=True),
+        )
+    assert type(raised.value) is DesignError
+    assert raised.value.status == status
+    assert raised.value.solver_message == f"patched {status}"
+    # An ambiguous status is solved again without presolve.
+    expected = [None, {"presolve": "off"}] if status != "error" else [None]
+    assert calls == expected
+
+
 def test_mse_closed_forms() -> None:
     # Without a budget each level is its band's mean loss.
     free = design(_step([Free(), Free()]), SAMPLE, MSE())
