@@ -21,8 +21,9 @@ the dependence assumptions all differ, and the two are never compared.
   above the VaR, a pro-rata share of the remaining mass where `x` equals it,
   0 elsewhere. They sum to `1 - beta`.
 
-Sums use `math.fsum`, so the results do not depend on the platform's
-summation order.
+`Draws(x, p)` sorts the values once and answers each of these at several
+levels. Expectations use `math.fsum`, so they do not depend on the
+platform's summation order.
 """
 
 from __future__ import annotations
