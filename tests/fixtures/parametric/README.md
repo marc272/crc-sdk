@@ -11,12 +11,14 @@ that generated them.
 
 Copied byte for byte from
 [marc272/parametric-insurance-design](https://github.com/marc272/parametric-insurance-design),
-`parity/crc/cases/`, at commit `b9e079e` except for the five cases marked
-below, which are at commit `25596db`. That repository's
+`parity/crc/cases/`, all at commit `101326a`. That repository's
 `parity/crc/README.md` describes the format, the comparison tolerances and how
 the cases were generated; its script `parity/scripts/export_crc_fixtures.py`
 regenerates them. Do not edit the cases here: regenerate them there and copy
-them again.
+them again, every case from one commit, with `git show <commit>:<path>` so that
+the copies stay byte-identical. A case's `generator.commit` names the commit
+of the code that generated it, which can be older than the commit it was copied
+at.
 
 The 46 cases copied (about 520 kB):
 
@@ -30,14 +32,16 @@ The 46 cases copied (about 520 kB):
   (`step-{mse,eu,wcvar-b0_9,wcvar-b0_99}-{pure,coc}-individual-{synthetic,thesis}`):
   step covers designed by the reference implementation for each objective and
   pricing, with a budget of 0.8 times the expected loss;
-- 5 further design cases, at commit `25596db`: binary designs with a fixed
-  trigger (`binary-upper-{mse-pure,wcvar-b0_9-coc}-individual-synthetic52`),
-  the grid route with a trigger free on a grid and the objective at every
-  candidate in `expected.profile`
-  (`binary-upper-grid-{eu-pure,mse-coc}-individual-synthetic52`), and a
-  lower-tail step design (`step-lower-wcvar-b0_9-pure-individual-handmade`).
-  These cases carry two fields the older ones lack, `metric_options` and
-  `expected.profile`; the source README documents them.
+- 5 further design cases: binary designs with a fixed trigger
+  (`binary-upper-{mse-pure,wcvar-b0_9-coc}-individual-synthetic52`), the grid
+  route with a trigger free on a grid and the objective at every candidate in
+  `expected.profile` (`binary-upper-grid-{eu-pure,mse-coc}-individual-synthetic52`),
+  and a lower-tail step design
+  (`step-lower-wcvar-b0_9-pure-individual-handmade`).
+
+Every case carries the fields `metric_options` and `expected.profile`; they
+are null except in the grid-route cases, whose `expected.profile` lists the
+candidates. The source README documents both.
 
 The design test reads every case of `kind` `"design"` and `scope`
 `"individual"` in `cases/`, the holdout cases' design blocks included, and
