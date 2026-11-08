@@ -33,9 +33,11 @@ from crc_sdk.parametric import (
     OutcomeSample,
     SampleError,
     SampleProvenance,
+    holdout,
     sample_annual,
     sample_curve,
     sample_curves,
+    year_block_kfold,
 )
 from crc_sdk.parametric.sample import _check_out_of_sample
 from crc_sdk.parametric.sources import AnnualSeries
@@ -748,6 +750,117 @@ def test_details_and_options_reach_every_asset() -> None:
         assert sample.provenance.parts[asset]["sources"][0]["details"] == {
             "file_sha256": "abc"
         }
+
+
+# -- splits ------------------------------------------------------------------
+
+
+def _holdout(sample: OutcomeSample) -> Any:
+    return holdout(sample)
+
+
+def _kfold(sample: OutcomeSample) -> Any:
+    return year_block_kfold(sample, 3)
+
+
+SPLITS = [(_holdout, "holdout"), (_kfold, "year_block_kfold")]
+OTHER_MODELS: list[Any] = [Independent(), Comonotonic()]
+
+
+@pytest.mark.parametrize(("split", "name"), SPLITS)
+def test_a_split_of_a_copula_sample_is_refused_naming_fresh_draws(
+    split: Any, name: str
+) -> None:
+    sample = _draws(EmpiricalCopula(_reference()))
+    with pytest.raises(SampleError, match=rf"{name} cannot split .*FreshDraws"):
+        split(sample)
+
+
+@pytest.mark.parametrize(("split", "name"), SPLITS)
+def test_a_split_of_a_written_copula_sample_is_refused(split: Any, name: str) -> None:
+    table = _draws(EmpiricalCopula(_reference())).to_table()
+    with pytest.raises(SampleError, match=name):
+        split(OutcomeSample.from_written_table(table))
+
+
+@pytest.mark.parametrize(("split", "name"), SPLITS)
+def test_a_split_of_selected_copula_rows_is_refused(split: Any, name: str) -> None:
+    selected = _draws(EmpiricalCopula(_reference())).select(np.arange(60))
+    with pytest.raises(SampleError, match=name):
+        split(selected)
+
+
+@pytest.mark.parametrize(("split", "name"), SPLITS)
+def test_a_split_of_one_assets_copula_rows_is_refused(split: Any, name: str) -> None:
+    # The rows of one asset's view still come in reference-year blocks.
+    view = _draws(EmpiricalCopula(_reference())).asset("site-c")
+    assert view.provenance.dependence is None
+    with pytest.raises(SampleError, match=name):
+        split(view)
+
+
+def test_selecting_periods_of_a_copula_sample_is_not_refused() -> None:
+    sample = _draws(EmpiricalCopula(_reference()))
+    selected = sample.select(np.arange(30))
+    assert len(selected) == 30
+    assert selected.lineage == sample.lineage
+
+
+@pytest.mark.parametrize("model", OTHER_MODELS)
+def test_holdout_splits_the_other_models_on_every_asset(model: Any) -> None:
+    sample = _draws(model)
+    design, held_out = holdout(sample, train_fraction=0.7)
+    assert len(design) == 210
+    assert len(held_out) == 90
+    assert design.asset_ids == held_out.asset_ids == ASSETS
+    assert np.array_equal(design.index, sample.index[:210])
+    assert np.array_equal(design.loss, sample.loss[:210])
+    assert np.array_equal(held_out.index, sample.index[210:])
+    assert np.array_equal(held_out.loss, sample.loss[210:])
+    assert design.lineage == held_out.lineage == sample.lineage
+    assert design.provenance.dependence is not None
+    assert dict(design.provenance.dependence) == model.to_document()
+    _check_out_of_sample(design, held_out)
+    with pytest.raises(LeakageError):
+        _check_out_of_sample(design, sample)
+
+
+@pytest.mark.parametrize("model", OTHER_MODELS)
+def test_year_block_kfold_splits_the_other_models_on_every_asset(model: Any) -> None:
+    sample = _draws(model)
+    folds = year_block_kfold(sample, 3)
+    assert len(folds) == 3
+    held = np.concatenate([held_out.period for _, held_out in folds])
+    assert held.tolist() == list(range(300))
+    for design, held_out in folds:
+        assert design.asset_ids == held_out.asset_ids == ASSETS
+        assert np.array_equal(design.index, sample.index[design.period])
+        assert np.array_equal(held_out.loss, sample.loss[held_out.period])
+        _check_out_of_sample(design, held_out)
+
+
+@pytest.mark.parametrize("model", OTHER_MODELS)
+def test_one_assets_rows_of_the_other_models_split(model: Any) -> None:
+    view = _draws(model).asset("site-c")
+    design, held_out = holdout(view)
+    assert (len(design), len(held_out)) == (210, 90)
+    assert len(year_block_kfold(view, 3)) == 3
+
+
+def test_fresh_draws_share_the_reference_and_need_a_multiple_too() -> None:
+    copula = EmpiricalCopula(_reference())
+    design = _draws(copula)
+    fresh = _draws(copula, n=600, rngs=_rngs(100))
+    assert design.provenance.dependence is not None
+    assert fresh.provenance.dependence is not None
+    assert (
+        design.provenance.dependence["content_hash"]
+        == fresh.provenance.dependence["content_hash"]
+    )
+    assert fresh.provenance.dependence["k"] == 20
+    _check_out_of_sample(design, fresh)
+    with pytest.raises(SampleError, match="600 and 630"):
+        _draws(copula, n=601, rngs=_rngs(100))
 
 
 # -- leakage -----------------------------------------------------------------

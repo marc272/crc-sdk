@@ -930,9 +930,11 @@ takes a larger draw; negate a reference that moves the other way.
   `k` each, in year order, so a tie adds no dependence between assets.
 - Inside a block the reference says nothing, so the assets are independent
   there. Dependence finer than one year in `m` is assumed, not observed.
-- The rows come in reference-year blocks, so the out-of-sample test is a fresh
-  sample: call `sample_curves` again with new generators and the same reference.
-  The reference is part of the stated model, so the two samples share it.
+- The rows come in reference-year blocks, so `holdout` and `year_block_kfold`
+  raise `SampleError` on such a sample and on one asset's sample taken from it.
+  The out-of-sample test is a fresh sample: call `sample_curves` again with new
+  generators and the same reference. The reference is part of the stated model,
+  so the two samples share it.
 
 **The record.** `sample.provenance.dependence` holds the model's document:
 `{"kind": "independent"}`, `{"kind": "comonotonic"}`, or for `EmpiricalCopula`

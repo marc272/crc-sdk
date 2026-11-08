@@ -156,9 +156,10 @@ class EmpiricalCopula:
 
     Inside a block the reference says nothing, so the columns are independent
     there: dependence finer than one year in `m` is assumed, not observed.
-    Because the rows come in reference-year blocks, the out-of-sample test for
-    such a sample is a fresh sample with new generators and the same
-    reference, which is part of the stated model.
+    Because the rows come in reference-year blocks, `holdout` and
+    `year_block_kfold` raise `SampleError` on such a sample. Its out-of-sample
+    test is a fresh sample with new generators and the same reference, which
+    is part of the stated model.
 
     Raises `SampleError` for a reference it cannot use, and `TypeError` for
     anything but an `OutcomeSample`.
