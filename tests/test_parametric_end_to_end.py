@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import inspect
 import warnings
 from collections.abc import Iterator
 from pathlib import Path
@@ -173,10 +174,13 @@ def test_the_docs_quick_start_runs_as_written(
         "hazard rx1day, horizon 2050 and pathway ssp245; their provider and "
         "dataset are not known yet.\n"
     ) in before
+    checksum = result.metadata.source_records[0]["canonical_file"]["file_sha256"]
     assert (
         "\nSource: the hazard curve rx1day from provider example, dataset "
-        "synthetic rx1day, horizon 2050 and pathway ssp245.\n"
+        "synthetic rx1day, horizon 2050 and pathway ssp245, read from the canonical "
+        f"dataset rx1day.parquet, SHA-256 {checksum.removeprefix('sha256:')}.\n"
     ) in after
+    assert "\nDesign step, planned: objective: E[U], the expected uncovered" in before
     # The support note as "Stating the setup" quotes it.
     assert (
         "2527 of 5000 draws in the design sample and 2464 of 5000 in the fresh "
@@ -587,3 +591,29 @@ def test_the_plan_from_an_annual_extremes_file(tmp_path: Path) -> None:
         in {s["sample_hash"] for s in stored.setup.samples if "design" in s["roles"]}
         for d in result.designs
     )
+
+
+def _docs_text() -> str:
+    """The docs page with its line breaks read as spaces."""
+    return " ".join(DOCS.read_text(encoding="utf-8").split())
+
+
+def test_the_docs_state_the_loss_model_as_it_is_called() -> None:
+    impact, *keywords = inspect.signature(LossModel).parameters.values()
+    named = [f"{p.name}={p.default!r}".replace("'", '"') for p in keywords]
+    assert f"`LossModel({impact.name}, *, {', '.join(named)})`" in _docs_text()
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "`cell=H3Cell(r)` records the asset's H3 cell, so the caller's resolution "
+        "sets how much is disclosed",
+        "a source plan's `explain()` records its `area` whole",
+        "because a contract names where its index is read",
+        "`setup.samples[i].periods` therefore holds draw numbers",
+        "the calendar years are in `setup.samples[i].pool.years`",
+    ],
+)
+def test_the_docs_say_what_a_result_file_records(statement: str) -> None:
+    assert statement in _docs_text()

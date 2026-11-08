@@ -783,6 +783,47 @@ def _trend_fit(fit: Mapping[str, Any], where: str) -> str:
     )
 
 
+def _span(values: Sequence[float], say: Callable[[float], str]) -> str:
+    """The range of `values` in words: `a to b`, or `a` when it is one value."""
+    low, high = say(min(values)), say(max(values))
+    return low if low == high else f"{low} to {high}"
+
+
+def _trend_fits(fits: Sequence[Mapping[str, Any]], where: str) -> str:
+    """Each series' fit in words; above `_MANY_ASSETS` assets, the ranges.
+
+    A sample of several assets, as `Joint()` makes, has one fit per asset and
+    run, so its line would grow with assets times runs. Above `_MANY_ASSETS`
+    assets each role and unit states the range of its slopes and intercepts
+    and the series they range over; the sample's trend record keeps every fit.
+    """
+    stated = [_trend_fit(fit, f"{where}.fits[{i}]") for i, fit in enumerate(fits)]
+    assets = _first_seen(
+        str(fit["asset_id"]) for fit in fits if fit.get("asset_id") is not None
+    )
+    if len(assets) <= _MANY_ASSETS:
+        return "; ".join(stated)
+    groups: dict[tuple[str, str | None], list[Mapping[str, Any]]] = {}
+    for fit in fits:
+        key = (fit.get("role") or "series", fit.get("unit"))
+        groups.setdefault(key, []).append(fit)
+
+    def say(value: float) -> str:
+        return _number(value, where)
+
+    parts: list[str] = []
+    for (role, unit), group in groups.items():
+        slopes = _span([fit["slope"] for fit in group], say)
+        intercepts = _span([fit["intercept"] for fit in group], say)
+        owners = len({fit.get("asset_id") for fit in group})
+        parts.append(
+            f"{role} slope {slopes}{f' {unit}' if unit else ''} per year and "
+            f"intercept {intercepts}{f' {unit}' if unit else ''}, over "
+            f"{len(group)} series of {owners} assets"
+        )
+    return f"{'; '.join(parts)}; the sample's trend record holds each series' fit"
+
+
 def _trend_text(record: Mapping[str, Any], where: str) -> str:
     """One trend record of a per-year sample in words, as far as it is known."""
     kind = record.get("kind")
@@ -811,13 +852,10 @@ def _trend_text(record: Mapping[str, Any], where: str) -> str:
             f"{_get(record, 'min_years', int, where)} fit years; the fit years, "
             "slope and intercept are not known yet"
         )
-    stated = "; ".join(
-        _trend_fit(fit, f"{where}.fits[{i}]") for i, fit in enumerate(fits)
-    )
     return (
         f"{removed}, fitted on {len(fit_years)} years ({_year_spans(fit_years)}), "
         f"reference year {reference}, where each intercept is the fitted value: "
-        f"{stated}"
+        f"{_trend_fits(fits, where)}"
     )
 
 
@@ -826,7 +864,8 @@ def _trend_lines(samples: Sequence[Mapping[str, Any]]) -> list[str]:
 
     Every per-year sample has one. Its record is under `trend`; a null or
     absent one reads as the years as recorded. Samples that treat the trend
-    alike share a line; lines that differ name their assets.
+    alike share a line; lines that differ name their assets, or count them
+    above `_MANY_ASSETS`.
     """
     stated: dict[str, list[str]] = {}
     for i, sample in enumerate(samples):
@@ -841,7 +880,7 @@ def _trend_lines(samples: Sequence[Mapping[str, Any]]) -> list[str]:
     if len(stated) == 1:
         return [f"Trend: {next(iter(stated))}."]
     return [
-        f"Trend of {_join(_first_seen(assets))}: {text}."
+        f"Trend of {_named_assets(_first_seen(assets))}: {text}."
         if assets
         else f"Trend: {text}."
         for text, assets in stated.items()
@@ -956,18 +995,63 @@ def _series_pathway(
     return _recorded({"scenario": values[0]}, "scenario", place)
 
 
-def _source_record(entry: Mapping[str, Any], where: str) -> str:
+def _canonical_place(path: str | None) -> str:
+    """A canonical dataset in words, by its path if one is recorded."""
+    if path is None:
+        return "a canonical dataset, its path not recorded"
+    return f"the canonical dataset {path}"
+
+
+def _canonical_files(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, Mapping[str, Any]]:
+    """The canonical files of a comparison's `source_records`, by their SHA-256."""
+    files: dict[str, Mapping[str, Any]] = {}
+    for i, record in enumerate(records):
+        where = f"source_records[{i}]"
+        file = _get(record, "canonical_file", Mapping, where)
+        if file is None:
+            continue
+        checksum = _recorded(file, "file_sha256", f"{where}.canonical_file")
+        if checksum is not None:
+            files[checksum] = file
+    return files
+
+
+def _canonical_file(
+    entry: Mapping[str, Any], files: Mapping[str, Mapping[str, Any]], where: str
+) -> str:
+    """Which canonical file a curve was read from, if a plan recorded it.
+
+    A plan's curve names its file by `canonical_file_sha256`, and the file's
+    path is in the `source_records` entry of that checksum.
+    """
+    checksum = _recorded(entry, "canonical_file_sha256", where)
+    if checksum is None:
+        return ""
+    path = _recorded(files.get(checksum, {}), "path", f"{where}.canonical_file")
+    digest = checksum.removeprefix("sha256:")
+    return f", read from {_canonical_place(path)}, SHA-256 {digest}"
+
+
+def _source_record(
+    entry: Mapping[str, Any],
+    where: str,
+    files: Mapping[str, Mapping[str, Any]] | None = None,
+) -> str:
     """One source record: what it is, and its provider, dataset, horizon, pathway.
 
     A curve's provider and dataset come from its dataset metadata's `source`
     block, and its hazard, horizon and pathway from its canonical row; a
     per-year series' provider and dataset from its provenance's `source`, and
     its pathway as `_series_pathway` says. A field the record does not hold
-    is said to be not recorded.
+    is said to be not recorded. A curve that a plan read also names its
+    canonical file, the path and the SHA-256 that `files` holds of it.
     """
     role = _recorded(entry, "role", where) or "source"
     row = _get(entry, "row", Mapping, where) or {}
     pathway = _recorded(row, "pathway", f"{where}.row")
+    file = ""
     document: Mapping[str, Any]
     if entry.get("kind") == "curve":
         metadata = _get(entry, "metadata", Mapping, where) or {}
@@ -976,6 +1060,7 @@ def _source_record(entry: Mapping[str, Any], where: str) -> str:
         hazard = _recorded(row, "hazard_name", f"{where}.row")
         if hazard is not None:
             head += f" {hazard}"
+        file = _canonical_file(entry, files or {}, where)
     elif "series" in entry:
         series = _get(entry, "series", Mapping, where) or {}
         if isinstance(series.get("source"), str):
@@ -1007,7 +1092,7 @@ def _source_record(entry: Mapping[str, Any], where: str) -> str:
     text = head + (f" from {_join(known)}" if known else "")
     if missing:
         text += f", with {_join(missing)} not recorded"
-    return text
+    return text + file
 
 
 _SELECTION = (
@@ -1044,12 +1129,7 @@ def _planned_source(entry: Mapping[str, Any], where: str) -> str:
     """
     kind = _get(entry, "kind", str, where)
     if kind == "canonical_dataset":
-        path = _recorded(entry, "path", where)
-        place = (
-            "a canonical dataset, its path not recorded"
-            if path is None
-            else f"the canonical dataset {path}"
-        )
+        place = _canonical_place(_recorded(entry, "path", where))
         selection = _get(entry, "selection", Mapping, where)
         if selection is None:
             chosen = "its selection not recorded"
@@ -1079,12 +1159,115 @@ def _planned_source(entry: Mapping[str, Any], where: str) -> str:
     return f"{text}, read from a source plan{'' if name is None else f' {name}'}"
 
 
-def _sources(sources: Sequence[Mapping[str, Any]], *, planned: bool = False) -> str:
-    describe = _planned_source if planned else _source_record
-    records = _first_seen(
-        describe(entry, f"sources[{i}]") for i, entry in enumerate(sources)
+def _sources(
+    sources: Sequence[Mapping[str, Any]],
+    *,
+    planned: bool = False,
+    records: Sequence[Mapping[str, Any]] = (),
+) -> str:
+    """The `Source` line; `records` are the comparison's `source_records`."""
+    files = _canonical_files(records)
+    stated = _first_seen(
+        _planned_source(entry, f"sources[{i}]")
+        if planned
+        else _source_record(entry, f"sources[{i}]", files)
+        for i, entry in enumerate(sources)
     )
-    return f"Source: {'; '.join(records) or 'not recorded'}."
+    return f"Source: {'; '.join(stated) or 'not recorded'}."
+
+
+_LOCATED_BY: dict[str | None, str] = {
+    None: "a point, in the nearest grid cell",
+    "h3_cell": "the asset's H3 cell, in the grid cell that holds it",
+}
+"""A nearest-cell series' `asset_location` in words; absent, it had a point."""
+
+
+def _degrees(value: float) -> str:
+    """Degrees as recorded, without rounding a grid cell's centre to six digits."""
+    return f"{value:.10g}"
+
+
+def _latitude_longitude(
+    series: Mapping[str, Any], key: str, where: str
+) -> tuple[float, float]:
+    """`series[key]`, a mapping of a latitude and a longitude, as two numbers."""
+    pair = _get(series, key, Mapping, where) or {}
+    place = f"{where}.{key}"
+    _number(pair.get("latitude"), f"{place}.latitude")
+    _number(pair.get("longitude"), f"{place}.longitude")
+    return float(pair["latitude"]), float(pair["longitude"])
+
+
+def _series_owner(
+    entry: Mapping[str, Any], samples: Mapping[str, Mapping[str, Any]], where: str
+) -> str:
+    """The asset of a `sources` entry, from the entry or its sample of one asset."""
+    owner = _recorded(entry, "asset_id", where)
+    if owner is not None:
+        return owner
+    sample = samples.get(str(entry.get("sample_hash")), {})
+    assets = _list(sample, "asset_ids", f"{where}.sample")
+    return str(assets[0]) if len(assets) == 1 else "an asset not stated"
+
+
+def _location_lines(
+    sources: Sequence[Mapping[str, Any]], samples: Mapping[str, Mapping[str, Any]]
+) -> list[str]:
+    """One line per way nearest-cell series were located, with the cells matched.
+
+    A series read at the nearest grid cell records the cell's centre, the grid
+    step and, when its asset was located by an H3 cell, `asset_location`. It
+    records neither the asset's point nor its distance to the cell, so the
+    text states neither. Series of one role, located alike on one grid step,
+    share a line that names each asset and its cell or, above `_MANY_ASSETS`,
+    counts the assets and cells and gives the range of the centres. An asset
+    with several cells for one role, as on the different grids of a pool's
+    models, has each run named. Other series record no cell and have no line.
+    """
+    groups: dict[tuple[str, str, str], dict[tuple[str, float, float], list[str]]] = {}
+    cells: dict[tuple[str, str], set[tuple[float, float]]] = {}
+    for i, entry in enumerate(sources):
+        where = f"sources[{i}]"
+        series = _get(entry, "series", Mapping, where)
+        if series is None or series.get("kind") != "nearest_cell":
+            continue
+        place = f"{where}.series"
+        role = _recorded(entry, "role", where) or "source"
+        located = _get(series, "asset_location", str, place)
+        how = _LOCATED_BY.get(located) or f"{located}, in a matched grid cell"
+        latitude, longitude = _latitude_longitude(series, "cell", place)
+        steps = _latitude_longitude(series, "spacing_degrees", place)
+        step = f"{_degrees(steps[0])} by {_degrees(steps[1])}"
+        owner = _series_owner(entry, samples, where)
+        model = _recorded(entry, "model", where)
+        run = "" if model is None else f"{model} {_recorded(entry, 'member', where)}"
+        group = groups.setdefault((role, how, step), {})
+        group.setdefault((owner, latitude, longitude), []).append(run)
+        cells.setdefault((role, owner), set()).add((latitude, longitude))
+    lines: list[str] = []
+    for (role, how, step), matched in groups.items():
+        owners = _first_seen(owner for owner, _, _ in matched)
+        if len(owners) > _MANY_ASSETS:
+            places = {(latitude, longitude) for _, latitude, longitude in matched}
+            latitudes = _span([latitude for latitude, _ in places], _degrees)
+            longitudes = _span([longitude for _, longitude in places], _degrees)
+            which = (
+                f"{len(owners)} assets in {len(places)} cells, with centres at "
+                f"latitudes {latitudes} and longitudes {longitudes}"
+            )
+        else:
+            named: list[str] = []
+            for (owner, latitude, longitude), runs in matched.items():
+                several = all(runs) and len(cells[(role, owner)]) > 1
+                name = f"{owner} of {_join(_first_seen(runs))}" if several else owner
+                named.append(f"{name} at ({_degrees(latitude)}, {_degrees(longitude)})")
+            which = f"{_join(named)}, the cell centres as (latitude, longitude)"
+        lines.append(
+            f"Location: {role} series, located by {how} (grid step {step} degrees): "
+            f"{which}."
+        )
+    return lines
 
 
 _ROW_KEYS = ("sample_hash", "split", "fold", "design_id")
@@ -1215,7 +1398,12 @@ def _agree(rest: str, *, singular: bool) -> str:
 
 
 _MANY_ASSETS = 5
-"""Above this many assets, a note gives a count's range, not each asset's count."""
+"""Above this many assets, the text gives counts and ranges, not each asset's values."""
+
+
+def _named_assets(assets: Sequence[str]) -> str:
+    """The assets by name, or their number above `_MANY_ASSETS`."""
+    return f"{len(assets)} assets" if len(assets) > _MANY_ASSETS else _join(assets)
 
 
 def _owned_note(note: str, assets: Collection[str]) -> tuple[str, str] | None:
@@ -1620,12 +1808,8 @@ def _unidentified(record: Mapping[str, Any], where: str) -> list[str]:
     ]
 
 
-def _design(
-    record: Mapping[str, Any], labels: Mapping[str, str | None], unit: str
-) -> str:
-    design_id = _short(record["design_id"])
-    where = f"designs[{design_id}]"
-    label = labels.get(str(record["design_id"]))
+def _design_terms(record: Mapping[str, Any], unit: str, where: str) -> list[str]:
+    """What a design is made under: its scope if joint, objective, pricing, terms."""
     objective = _get(record, "objective", Mapping, where) or {}
     scope = _get(record, "scope", Mapping, where) or {}
     joint = scope.get("kind") == "joint"
@@ -1661,6 +1845,20 @@ def _design(
         )
     else:
         parts.append("no limit")
+    return parts
+
+
+def _design(
+    record: Mapping[str, Any], labels: Mapping[str, str | None], unit: str
+) -> str:
+    design_id = _short(record["design_id"])
+    where = f"designs[{design_id}]"
+    label = labels.get(str(record["design_id"]))
+    objective = _get(record, "objective", Mapping, where) or {}
+    scope = _get(record, "scope", Mapping, where) or {}
+    joint = scope.get("kind") == "joint"
+    on_total = " on the total" if joint else ""
+    parts = _design_terms(record, unit, where)
     if record.get("premium") is not None:
         premium = _number(record["premium"], f"{where}.premium")
         parts.append(f"design premium: {premium} {unit}{on_total}")
@@ -1693,6 +1891,47 @@ def _design(
         parts.append("tail: not degenerate")
     name = f"{label} ({design_id})" if label else design_id
     return f"Design {name}: {'; '.join(parts)}."
+
+
+def _planned_designs(
+    document: Mapping[str, Any], assets: Sequence[str], unit: str
+) -> list[str]:
+    """One `Design` line per scope and objective of a plan's `explain()` document.
+
+    The document states the terms of the designs to be made: `designs` (the
+    objectives, the pricing, the budget, the limit and the templates) and,
+    under `Joint()`, `scopes`. The line names the templates and states those
+    terms as a designed line does; what only a design knows is not known yet.
+    Without templates nothing is designed, so there is no line.
+    """
+    where = "designs"
+    terms = _get(document, where, Mapping, "document")
+    if terms is None:
+        return []
+    covers = {
+        str(cover.get("hash")): cover
+        for cover in _objects(document, "covers", "document")
+    }
+    names = _first_seen(
+        _get(covers.get(str(template), {}), "label", str, "covers") or _short(template)
+        for template in _list(terms, "templates", where)
+    )
+    if not names:
+        return []
+    scopes = _objects(document, "scopes", "document") or [{"kind": "individual"}]
+    return [
+        f"Design {_join(names)}, planned: "
+        + "; ".join(
+            _design_terms(
+                {**terms, "objective": objective, "scope": scope, "asset_ids": assets},
+                unit,
+                where,
+            )
+        )
+        + "; design premium, route and non-uniqueness report: not known yet."
+        for scope in scopes
+        for objective in _objects(terms, "objectives", where)
+    ]
 
 
 def _metrics(options: Mapping[str, Any], unit: str) -> str:
@@ -1819,13 +2058,20 @@ def setup_text(
       asset, when the assets differ) and the dependence between the assets;
     - `Source`: each source record of the samples, such as a hazard curve or
       a per-year series, with its provider, dataset, horizon and pathway, and
-      which of them the record does not hold; before execution, the sources
-      that a plan's `explain()` document states (a canonical dataset's path
-      and selection, or a per-year source's provider and dataset, and the
+      which of them the record does not hold, and for a curve that a plan
+      read, its canonical dataset's path and SHA-256; before execution, the
+      sources that a plan's `explain()` document states (a canonical dataset's
+      path and selection, or a per-year source's provider and dataset, and the
       file, table or plan it is read from);
+    - `Location`, for per-year series read at the nearest grid cell: whether
+      each asset was located by a point or by its H3 cell, the grid step and
+      the matched cell's centre, one line per role, way and grid step; above
+      five assets, the number of assets and cells and the range of the
+      centres. The asset's point and its distance to the cell are not recorded;
     - `Trend`, for per-year samples: the years as recorded, the window of
       recent years, or the linear trend removed, with its fit years, each
       series' slope and intercept with their units, and the reference year;
+      above five assets, the range of the slopes and of the intercepts;
     - `Pool`, for pooled model-years: the runs, the pathway, the years, the
       number of rows, that every run has the same weight, and that a draw
       mixes model spread with year-to-year variability and that the number
@@ -1845,7 +2091,10 @@ def setup_text(
     - `Design`, one line per design: the objective, pricing, budget and
       limit, the design premium, the route, the non-uniqueness report
       (`unique`, `ties`, amounts no design year reaches) and a degenerate
-      tail; for a joint design also its scope and which assets it covers;
+      tail; for a joint design also its scope and which assets it covers.
+      Before execution, one line per objective and scope that a plan's
+      `explain()` document plans, naming its templates, with the objective,
+      pricing, budget and limit;
     - `Metrics`: the levels beta, the return periods and the loss and payout
       thresholds.
 
@@ -1870,15 +2119,17 @@ def setup_text(
       names no evaluation: its text is that of the whole comparison, after
       a `Rows` line that says so;
     - a plan's `explain(format="json")` document (a mapping with a `setup`
-      and no `samples`): its setup, and a `Source` line from its `sources`;
+      and no `samples`): its setup, a `Source` line from its `sources` and a
+      `Design` line per planned objective from its `designs`;
     - a setup alone: an `EvaluationSetup`, or a mapping in its layout, such
       as a setup known before anything is drawn.
 
-    A setup alone has no design or source records, so it has no `Design` or
-    `Source` lines; an `explain()` document has no `Design` lines. Keys that
-    a setup does not know yet (sample hashes, counts) may be missing: the
-    text then says what is not known. The text depends only on `metadata`,
-    so the same metadata gives the same text; nothing is read or written.
+    A setup alone has no design or source records, so it has no `Design`,
+    `Source` or `Location` lines, and an `explain()` document has no `Location`
+    lines. Keys that a setup does not know yet (sample hashes, counts) may be
+    missing: the text then says what is not known. The text depends only on
+    `metadata`, so the same metadata gives the same text; nothing is read or
+    written.
 
     Raises `EvaluationError` for setup and document values of the wrong
     type, for a table without valid `crc.parametric.evaluation` metadata,
@@ -1892,25 +2143,29 @@ def setup_text(
     labels: dict[str, str | None] = {}
     source: str | None = None
     rows: str | None = None
+    recorded: Sequence[Mapping[str, Any]] = ()
+    explained: Mapping[str, Any] | None = None
     if _is_document(metadata) and "schema_version" in metadata:
         # The metadata's own JSON document, as `to_json` writes it.
         metadata = EvaluationMetadata(**metadata)
     if isinstance(metadata, pa.Table):
         whole = EvaluationMetadata.from_table(metadata)
         setup: Mapping[str, Any]
-        setup, designs, sources, rows = _of_rows(whole, metadata)
+        setup, designs, recorded, rows = _of_rows(whole, metadata)
         labels = _design_labels(designs, whole.covers)
-        source = _sources(sources)
+        source = _sources(recorded, records=whole.source_records)
     elif isinstance(metadata, EvaluationMetadata):
         setup = metadata.setup.model_dump(mode="json")
         designs = metadata.designs
         labels = _design_labels(designs, metadata.covers)
-        source = _sources(metadata.sources)
+        recorded = metadata.sources
+        source = _sources(recorded, records=metadata.source_records)
     elif isinstance(metadata, EvaluationSetup):
         setup = metadata.model_dump(mode="json")
     elif _is_document(metadata):
-        # A plan's explain() document: its setup, and its sources as far as
-        # they are known before execution.
+        # A plan's explain() document: its setup, and its sources and designs
+        # as far as they are known before execution.
+        explained = metadata
         setup = _get(metadata, "setup", Mapping, "document") or {}
         source = _sources(_objects(metadata, "sources", "document"), planned=True)
     elif isinstance(metadata, Mapping):
@@ -2008,6 +2263,7 @@ def setup_text(
 
     if source is not None:
         lines.append(source)
+    lines += _location_lines(recorded, by_hash)
     lines += _trend_lines(samples)
     lines += _pool_lines(samples)
     notes = _notes(samples, evaluations)
@@ -2032,6 +2288,8 @@ def setup_text(
         priced += " A joint design's premium is that of one contract on the total."
     lines.append(priced)
     lines += [_design(record, labels, unit) for record in designs]
+    if explained is not None:
+        lines += _planned_designs(explained, assets, unit)
     options = setup.get("metric_options")
     if isinstance(options, Mapping):
         lines.append(_metrics(options, unit))

@@ -1142,3 +1142,24 @@ def test_designs_on_templates_pay_on_the_index_series(tmp_path: Path) -> None:
         document["index"]["location"] == {"kind": "station", "station_id": "S2"}
         for document in documents.values()
     )
+
+
+def test_setup_text_states_where_the_hazard_and_the_index_were_matched(
+    tmp_path: Path,
+) -> None:
+    result = (
+        _nearest(_plan())
+        .basis_risk(NoBasisRisk())
+        .covers(_linear())
+        .metrics(OPTIONS)
+        .write_parquet(tmp_path / "comparison.parquet")
+    )
+    text = setup_text(result.metadata)
+    assert [line for line in text.splitlines() if line.startswith("Location")] == [
+        "Location: hazard series, located by a point, in the nearest grid cell (grid "
+        "step 0.25 by 0.25 degrees): a at (50.875, 6.875) and b at (51.125, 7.125), "
+        "the cell centres as (latitude, longitude).",
+        "Location: index series, located by a point, in the nearest grid cell (grid "
+        "step 0.5 by 0.5 degrees): a at (50.75, 6.75) and b at (51.25, 7.25), the "
+        "cell centres as (latitude, longitude).",
+    ]

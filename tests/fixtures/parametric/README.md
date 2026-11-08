@@ -2,11 +2,14 @@
 
 The cases in `cases/` are golden fixtures for the metrics
 (`tests/test_parametric_parity.py`), the designs
-(`tests/test_parametric_design.py`) and the joint designs
-(`tests/test_parametric_joint.py`) of `crc_sdk.parametric`. Each case is one
-JSON document: an outcome sample, a cover, a pricing and the values the module
-must reproduce. The tests read them with plain numpy; nothing imports the code
-that generated them.
+(`tests/test_parametric_design.py`), the joint designs
+(`tests/test_parametric_joint.py`), the totals of joint designs
+(`tests/test_parametric_evaluate_joint.py`) and the plan on fitted curves
+(`tests/test_parametric_plan_parity.py`) of `crc_sdk.parametric`, and
+`tests/test_parametric_fixtures_readme.py` checks this README against them.
+Each case is one JSON document: an outcome sample, a cover, a pricing and the
+values the module must reproduce. The tests read them with plain numpy; nothing
+imports the code that generated them.
 
 ## Origin
 
@@ -92,8 +95,8 @@ The joint design test reads every case of `kind` `"design"` and `scope`
 judges the objective value, the parameters by the case's `compare_parameters`,
 the premium and `unique`. A non-unique case's premium is that of the templates
 resolved with `expected.parameters`, priced on the total payout. The cases'
-`expected.metrics` aren't read yet: they are the metrics of the total, and
-`evaluate` doesn't take a joint design yet.
+`expected.metrics` are the metrics of the total, and
+`tests/test_parametric_evaluate_joint.py` judges them on its `"total"` row.
 
 Further cases are picked up the same way once they are copied here. Every
 case in the source is copied.

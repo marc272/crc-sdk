@@ -615,6 +615,72 @@ def test_explain_states_the_draws_per_reference_year(dataset: Path) -> None:
     assert ", 3 draws per year" in setup_text(document)
 
 
+_PLANNED_MSE = (
+    "objective: MSE, E[(L - payout)^2]; pricing: the pure premium, P = E[payout]; "
+    "budget: premium at most 0.8 x E[L] of the {base}; no limit; design premium, "
+    "route and non-uniqueness report: not known yet."
+)
+_PLANNED_JOINT = (
+    "Design step, planned: scope: joint, one objective, one budget and one premium "
+    "on the total of warehouse-a, depot-b and store-c, with one cover per asset; "
+    + _PLANNED_MSE.format(base="total of the design sample")
+)
+_PLANNED_INDIVIDUAL = "Design step, planned: " + _PLANNED_MSE.format(
+    base="design sample"
+)
+
+
+def _designs(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.startswith("Design")]
+
+
+def test_setup_text_states_a_planned_joint_design(dataset: Path) -> None:
+    per_year: Any = (
+        _designed_per_year(_per_year()).scopes(Joint()).explain(format="json")
+    )
+    assert _designs(setup_text(per_year)) == [_PLANNED_JOINT]
+    on_curves: Any = (
+        _designed_on_curves(dataset)
+        .scopes(Joint())
+        .dependence(Comonotonic())
+        .explain(format="json")
+    )
+    assert _designs(setup_text(on_curves)) == [_PLANNED_JOINT]
+
+
+def test_setup_text_states_each_scope_a_plan_designs_in() -> None:
+    plan: Any = _designed_per_year(_per_year()).scopes(Individual(), Joint())
+    assert _designs(setup_text(plan.explain(format="json"))) == [
+        _PLANNED_INDIVIDUAL,
+        _PLANNED_JOINT,
+    ]
+
+
+def test_a_planned_joint_design_says_the_assets_are_not_known_yet(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "assets.parquet"
+    pq.write_table(_asset_table(), path)
+    plan: Any = _designed_per_year(_per_year(assets=path)).scopes(Joint())
+    document = plan.explain(format="json")
+    assert document["setup"]["samples"][0]["asset_ids"] == []
+    assert "on the total of its assets, with one cover per asset" in setup_text(
+        document
+    )
+
+
+def test_a_planned_and_a_written_joint_design_state_the_same_terms(
+    tmp_path: Path,
+) -> None:
+    plan = _designed_per_year(_per_year()).scopes(Joint())
+    planned: Any = plan.explain(format="json")
+    result = plan.write_parquet(tmp_path / "comparison.parquet")
+    written = _designs(setup_text(result.metadata))[0]
+    terms = _PLANNED_JOINT.split(": ", 1)[1].split("; design premium, route")[0]
+    assert terms in written
+    assert terms in _designs(setup_text(planned))[0]
+
+
 def test_explain_states_both_scopes_when_the_plan_holds_both() -> None:
     plan = _designed_per_year(_per_year()).scopes(Individual(), Joint())
     document: Any = plan.explain(format="json")

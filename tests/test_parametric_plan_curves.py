@@ -256,8 +256,11 @@ def test_for_evaluation_runs_end_to_end_offline(dataset: Path, tmp_path: Path) -
     assert "\nSeeds: the plan's seed 42; the fresh draws' seed 7.\n" in text
     assert (
         "\nSource: the hazard curve rx1day from provider example, dataset "
-        "synthetic rx1day, horizon 2050 and pathway ssp245.\n"
+        f"synthetic rx1day, horizon 2050 and pathway ssp245, read from the canonical "
+        f"dataset {dataset}, SHA-256 {record['file_sha256'].removeprefix('sha256:')}.\n"
     ) in text
+    # The Location line is for series read at a grid cell; a curve is read by H3.
+    assert "\nLocation" not in text
     # One note per kind, with the counts of each asset's design and fresh draws.
     notes = next(line for line in text.splitlines() if line.startswith("Sample notes"))
     design_draws = result.samples["warehouse-a"]
@@ -720,10 +723,19 @@ def test_builders_and_explain_do_no_io(tmp_path: Path) -> None:
     )
     lines = text.splitlines()
     after = next(i for i, line in enumerate(lines) if line.startswith("Sample: "))
+    # And the design it plans: one template and one objective.
+    design = (
+        "Design step, planned: objective: MSE, E[(L - payout)^2]; pricing: the pure "
+        "premium, P = E[payout]; budget: premium at most 1 x E[L] of the design "
+        "sample; no limit; design premium, route and non-uniqueness report: not "
+        "known yet."
+    )
     assert setup_text(document).splitlines() == [
         *lines[: after + 1],
         source,
-        *lines[after + 1 :],
+        *lines[after + 1 : -1],
+        design,
+        lines[-1],
     ]
     assert not absent.exists()
 

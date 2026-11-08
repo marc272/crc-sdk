@@ -2522,8 +2522,10 @@ class ParametricPlan:
         fitted curves adds `monte_carlo` (the draws, the semantics stated by
         the caller, `outside_support` and the fresh draws), and a plan with
         `cell=` adds what it states to `assets` as `cell`. Its `setup` has
-        the layout of `EvaluationSetup`, so `setup_text(plan.explain(
-        format="json")["setup"])` states it before anything is read; the
+        the layout of `EvaluationSetup`, so
+        `setup_text(plan.explain(format="json"))` states the whole document
+        before anything is read: the setup, the sources and the planned
+        designs (`setup_text` of its `["setup"]` states the setup alone). The
         plan's seed is in every evaluation's `details` under `"plan_seed"`,
         and the fresh draws' under `"fresh_draws_seed"`. What only execution
         knows is in the written metadata: the years and the matched cells or
