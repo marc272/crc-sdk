@@ -9,6 +9,7 @@ import crc_sdk.parametric as parametric
 
 PUBLIC = [
     "AnnualSeries",
+    "AsRecorded",
     "AtAsset",
     "AtCell",
     "AtPoint",
@@ -45,6 +46,7 @@ PUBLIC = [
     "LinearConstraints",
     "LinearInAmounts",
     "LinearPayout",
+    "LinearTrend",
     "LossModel",
     "MSE",
     "MetricOptions",
@@ -58,6 +60,7 @@ PUBLIC = [
     "PiecewiseLinearPayout",
     "ProbabilitySemanticsError",
     "PurePremium",
+    "RecentYears",
     "SampleError",
     "SampleProvenance",
     "SolverUnavailableError",

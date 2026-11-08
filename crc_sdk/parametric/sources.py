@@ -30,11 +30,13 @@ then only puts that asset's rows in another order.
 
 **Per-year values** (`AnnualSeries`, `sample_annual`). The years of an
 `annual_extremes()` table (ERA5, CMIP6, NEX-GDDP-CMIP6, stations) become the
-rows; nothing is assumed about probabilities, and no trend is removed. A
-missing or null year raises, unless `missing="drop_year"` drops it and lists
-it in the provenance. A second series as `index=` reads the index at another
-cell, station or hazard than the loss: the dependence between index and loss
-is then the data's own.
+rows; nothing is assumed about probabilities. A missing or null year raises,
+unless `missing="drop_year"` drops it and lists it in the provenance. A second
+series as `index=` reads the index at another cell, station or hazard than the
+loss: the dependence between index and loss is then the data's own. `trend=`
+states how the climate trend is treated (`AsRecorded`, the default,
+`RecentYears` or `LinearTrend`; see `crc_sdk.parametric.trend`), and `scenario=`
+is the caller's name for the rows.
 
 **Hazard units.** Before anything is drawn, both functions check the hazard's
 unit (the curve's `value_unit`, the hazard series' `unit`) against the loss
@@ -101,6 +103,7 @@ from crc_sdk.parametric.sample import (
     _source_document,
     _thaw,
 )
+from crc_sdk.parametric.trend import AsRecorded, Trend, _require_trend, _Series
 from crc_sdk.providers.era5 import ERA5_ATTRIBUTION, ERA5_LICENCE
 from crc_sdk.types import CurveParameters, HazardDatasetMetadata
 from crc_sdk.workflows.distributions import (
@@ -1367,6 +1370,8 @@ def sample_annual(
     index: AnnualSeries | None = None,
     rng: np.random.Generator | None = None,
     missing: MissingYears = "raise",
+    trend: Trend = AsRecorded(),
+    scenario: str = "baseline",
 ) -> OutcomeSample:
     """Build a sample whose rows are the years of a per-year series.
 
@@ -1377,16 +1382,64 @@ def sample_annual(
 
     Each year is one row with probability `1/n`, and `period` is the year.
     A year without a value (in either series) raises, unless
-    `missing="drop_year"`; dropped years are listed in the provenance. No
-    trend is removed. `rng` is needed only by a basis-risk model that draws,
-    such as `ImpactNoise`.
+    `missing="drop_year"`; dropped years are listed in the provenance. `rng`
+    is needed only by a basis-risk model that draws, such as `ImpactNoise`.
+
+    `trend` states how the climate trend is treated: `AsRecorded()` (the
+    default), `RecentYears(n)` or `LinearTrend(...)`
+    (`crc_sdk.parametric.trend`). The steps come in this order: the window of
+    `RecentYears`; the missing years; the fit and the adjustment of the hazard
+    and of the index, one fit each, on the same years with the same reference
+    year; the impact on the adjusted hazard; the basis-risk model. The
+    sample's `index` and `hazard` hold the adjusted values, and the
+    provenance's `trend` records what was done. A sample whose `LinearTrend`
+    was fitted on years it is later tested on is refused at evaluation
+    (`LeakageError`): to hold out a block, state the design years with
+    `LinearTrend(fit_years=...)`.
+
+    `scenario` is the caller's name for the rows, in `to_table`,
+    `content_hash` and the comparison's `scenario` column. It is not derived
+    from the source (the `scenario` column of a CMIP6 table is its pathway,
+    another thing) and the lineage leaves it out, so a relabelled sample still
+    counts as sharing its rows.
 
     Raises `SampleError` for a hazard unit the loss model's impact is not
     calibrated for (checked before any draw; the `index` series is not
-    checked, as the loss does not read it), missing years, mismatched years
-    or invalid arguments, and `TypeError` for wrong types. Warns with
-    `ComonotoneIndexWarning` for `NoBasisRisk()` without an `index` series.
+    checked, as the loss does not read it), missing years, mismatched years,
+    a trend the series cannot take (`RecentYears` above its length, too few
+    fit years, fit years it does not hold, a non-finite or newly negative
+    adjusted value) or invalid arguments, and `TypeError` for wrong types.
+    Warns with `ComonotoneIndexWarning` for `NoBasisRisk()` without an `index`
+    series.
     """
+    sample = _annual_rows(
+        hazard,
+        loss_model=loss_model,
+        basis_risk=basis_risk,
+        asset_id=asset_id,
+        index=index,
+        rng=rng,
+        missing=missing,
+        trend=trend,
+        scenario=scenario,
+    )
+    _warn_comonotone(basis_risk, separate_index=index is not None)
+    return sample
+
+
+def _annual_rows(
+    hazard: AnnualSeries,
+    *,
+    loss_model: LossModel,
+    basis_risk: BasisRisk,
+    asset_id: str,
+    index: AnnualSeries | None,
+    rng: np.random.Generator | None,
+    missing: MissingYears,
+    trend: Trend,
+    scenario: str,
+) -> OutcomeSample:
+    """`sample_annual`, without its warning: a plan rebuilds a sample per fold."""
     if not isinstance(hazard, AnnualSeries):
         raise TypeError(f"hazard must be an AnnualSeries, got {type(hazard).__name__}")
     if index is not None and not isinstance(index, AnnualSeries):
@@ -1401,6 +1454,8 @@ def sample_annual(
         raise SampleError(
             f"missing must be one of {get_args(MissingYears)}, got {missing!r}"
         )
+    trend = _require_trend(trend)
+    scenario = _identifier("scenario", scenario)
     years = hazard.years
     if index is not None and not np.array_equal(index.years, years):
         only_hazard = np.setdiff1d(years, index.years)[:10].tolist()
@@ -1409,8 +1464,14 @@ def sample_annual(
             "the index series' years differ from the hazard's; only in the hazard: "
             f"{only_hazard}, only in the index: {only_index}"
         )
-    hazard_missing = np.isnan(hazard.values)
-    index_missing = np.isnan(index.values) if index is not None else hazard_missing
+    first_row = trend._first_row(years.shape[0])
+    years = years[first_row:]
+    hazard_recorded = hazard.values[first_row:]
+    index_recorded = None if index is None else index.values[first_row:]
+    hazard_missing = np.isnan(hazard_recorded)
+    index_missing = (
+        np.isnan(index_recorded) if index_recorded is not None else hazard_missing
+    )
     gaps = hazard_missing | index_missing
     dropped = [int(year) for year in years[gaps]]
     if dropped and missing == "raise":
@@ -1430,10 +1491,12 @@ def sample_annual(
     if not keep.any():
         raise SampleError("no year has a value")
     kept_years = years[keep]
-    hazard_values = np.array(hazard.values[keep])
-    index_values = (
-        np.array(index.values[keep]) if index is not None else hazard_values.copy()
-    )
+    series = [_Series("hazard", hazard.unit, np.array(hazard_recorded[keep]))]
+    if index is not None and index_recorded is not None:
+        series.append(_Series("index", index.unit, np.array(index_recorded[keep])))
+    adjusted, trend_record = trend._apply(years, kept_years, series)
+    hazard_values = adjusted[0]
+    index_values = adjusted[1] if index is not None else hazard_values.copy()
     n = kept_years.shape[0]
 
     impact = loss_model.impact_values(hazard_values)
@@ -1443,7 +1506,7 @@ def sample_annual(
     )
     loss = loss_model.loss_values(impact)
 
-    notes = ["The years are used as recorded; no trend is removed."]
+    notes: list[str] = []
     if dropped:
         noun, verb = ("year", "was") if len(dropped) == 1 else ("years", "were")
         notes.append(
@@ -1476,6 +1539,7 @@ def sample_annual(
             "dropped_years": dropped,
             "index_from": "series" if index is not None else "hazard",
             "basis_risk": basis_summary,
+            "trend": trend_record,
         },
         notes=tuple(notes),
         lineage=content_hash(
@@ -1486,8 +1550,9 @@ def sample_annual(
                 "index": None if index is None else _series_identity(index),
             }
         ),
+        trend=trend_record,
     )
-    sample = OutcomeSample(
+    return OutcomeSample(
         asset_ids=(asset,),
         period=kept_years,
         probability=np.full(n, 1.0 / n),
@@ -1498,6 +1563,5 @@ def sample_annual(
         loss_unit=loss_model.value_unit,
         semantics="annual",
         provenance=provenance,
+        scenario=scenario,
     )
-    _warn_comonotone(basis_risk, separate_index=index is not None)
-    return sample

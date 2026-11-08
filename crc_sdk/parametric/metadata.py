@@ -650,6 +650,100 @@ def _recorded(document: Mapping[str, Any], key: str, where: str) -> str | None:
     return None if value is None or value == "" else str(value)
 
 
+def _year_spans(years: Sequence[int]) -> str:
+    """Years as runs, as in `1981 to 1988 and 1997 to 2020`."""
+    spans: list[list[int]] = []
+    for year in years:
+        if spans and year == spans[-1][1] + 1:
+            spans[-1][1] = year
+        else:
+            spans.append([year, year])
+    return _join([str(a) if a == b else f"{a} to {b}" for a, b in spans])
+
+
+def _trend_fit(fit: Mapping[str, Any], where: str) -> str:
+    """One series' fit: its role, its asset, its slope and intercept with units."""
+    role = _get(fit, "role", str, where) or "series"
+    asset = _get(fit, "asset_id", str, where)
+    unit = _get(fit, "unit", str, where)
+    per_year = f" {unit} per year" if unit else " per year"
+    amount = f" {unit}" if unit else ""
+    return (
+        f"{role}{'' if asset is None else f' of {asset}'} slope "
+        f"{_number(fit.get('slope'), f'{where}.slope')}{per_year}, intercept "
+        f"{_number(fit.get('intercept'), f'{where}.intercept')}{amount}"
+    )
+
+
+def _trend_text(record: Mapping[str, Any], where: str) -> str:
+    """One trend record of a per-year sample in words, as far as it is known."""
+    kind = record.get("kind")
+    if kind == "as_recorded":
+        return "the years are used as recorded; no trend is removed"
+    if kind == "recent_years":
+        n = _get(record, "n", int, where)
+        years = _list(record, "years", where)
+        span = f" ({years[0]} to {years[1]})" if len(years) == 2 else ""
+        kept = f"only the last {n} years" if n is not None else "only the last years"
+        return f"{kept} of the series are kept{span}, as recorded; no value changes"
+    if kind != "linear_trend":
+        return f"{kind}, as stated"
+    removed = (
+        "an additive linear trend in the mean is removed, by ordinary least "
+        "squares on the year"
+    )
+    reference = _get(record, "reference_year", int, where)
+    fit_years = _list(record, "fit_years", where)
+    fits = _objects(record, "fits", where)
+    if not fit_years or not fits:
+        # A plan before execution: each fold's fit is not made yet.
+        at = reference if reference is not None else "the last year of the series"
+        return (
+            f"{removed}, with reference year {at} and at least "
+            f"{_get(record, 'min_years', int, where)} fit years; the fit years, "
+            "slope and intercept are not known yet"
+        )
+    stated = "; ".join(
+        _trend_fit(fit, f"{where}.fits[{i}]") for i, fit in enumerate(fits)
+    )
+    return (
+        f"{removed}, fitted on {len(fit_years)} years ({_year_spans(fit_years)}), "
+        f"reference year {reference}, where each intercept is the fitted value: "
+        f"{stated}"
+    )
+
+
+def _trend_lines(samples: Sequence[Mapping[str, Any]]) -> list[str]:
+    """One line for each way the per-year samples treat the trend.
+
+    Every per-year sample has one. Its record is under `trend` or, in what
+    `compare` writes, in its `details`; a document with neither reads as the
+    years as recorded. Samples that treat the trend alike share a line; lines
+    that differ name their assets.
+    """
+    stated: dict[str, list[str]] = {}
+    for i, sample in enumerate(samples):
+        where = f"setup.samples[{i}]"
+        if _get(sample, "source_kind", str, where) != "annual":
+            continue
+        details = _get(sample, "details", Mapping, where) or {}
+        record = _get(sample, "trend", Mapping, where) or _get(
+            details, "trend", Mapping, f"{where}.details"
+        )
+        text = _trend_text(record or {"kind": "as_recorded"}, f"{where}.trend")
+        stated.setdefault(text, []).extend(
+            str(asset) for asset in _list(sample, "asset_ids", where)
+        )
+    if len(stated) == 1:
+        return [f"Trend: {next(iter(stated))}."]
+    return [
+        f"Trend of {_join(_first_seen(assets))}: {text}."
+        if assets
+        else f"Trend: {text}."
+        for text, assets in stated.items()
+    ]
+
+
 _CMIP_COLUMNS = ("model", "member", "scenario")
 """The columns that make a per-year table's `scenario` a CMIP6 pathway."""
 
@@ -1283,6 +1377,9 @@ def setup_text(
       that a plan's `explain()` document states (a canonical dataset's path
       and selection, or a per-year source's provider and dataset, and the
       file, table or plan it is read from);
+    - `Trend`, for per-year samples: the years as recorded, the window of
+      recent years, or the linear trend removed, with its fit years, each
+      series' slope and intercept with their units, and the reference year;
     - `Sample notes`: what the sources recorded, such as draws beyond the
       fitted support, a pooled ensemble, dropped years, an index read from
       another series, or a comonotone index and loss. A note that differs
@@ -1446,6 +1543,7 @@ def setup_text(
 
     if source is not None:
         lines.append(source)
+    lines += _trend_lines(samples)
     notes = _notes(samples, evaluations)
     if notes:
         lines.append(f"Sample notes: {' '.join(notes)}")
