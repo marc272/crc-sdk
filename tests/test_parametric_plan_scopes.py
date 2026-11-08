@@ -1111,7 +1111,7 @@ def test_an_allocation_without_a_value_column_shares_by_the_damage_ratios(
     assert result.metadata.assets["values_sha256"] is not None
 
 
-def test_an_allocation_needs_a_joint_design() -> None:
+def test_an_allocation_needs_a_joint_design(tmp_path: Path) -> None:
     plan = (
         _per_year()
         .basis_risk(NoBasisRisk())
@@ -1121,7 +1121,7 @@ def test_an_allocation_needs_a_joint_design() -> None:
         .allocation("value")
     )
     with pytest.raises(EvaluationError, match="no entry is a joint design"):
-        plan.write_parquet("unused.parquet")
+        plan.write_parquet(tmp_path / "out.parquet")
 
 
 def test_a_resolved_cover_under_joint_is_a_set_of_contracts(tmp_path: Path) -> None:
@@ -1164,7 +1164,11 @@ def test_a_plan_holding_both_scopes_keeps_their_rows_apart(tmp_path: Path) -> No
     for asset, each in zip(ALL, result.designs[1:], strict=True):
         assert each.design_sample.content_hash == train.asset(asset).content_hash
         assert each.cover.label == "step (mse)"
-    assert len({row["cover_hash"] for row in rows if row["level"] == "total"}) == 2
+    # A set of designs is no design: only the joint design has an id at the total.
+    assert {row["design_id"] for row in rows if row["level"] == "total"} == {
+        joint_design.design_id,
+        None,
+    }
 
 
 # -- the setup text, on real output ----------------------------------------------
