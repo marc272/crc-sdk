@@ -1251,7 +1251,8 @@ def test_a_real_cmip6_plans_lineage_is_the_same_after_a_fetch(tmp_path: Path) ->
         .canonicalize()
     )
     before = _per_year(_read_station(plan))
-    assert plan.explain(format="json")["resolved_dataset"] is None
+    document: Any = plan.explain(format="json")
+    assert document["resolved_dataset"] is None
 
     # As a fetch leaves it: the years' files, their manifest and the catalogue.
     (directory / CATALOGUE_CACHE).parent.mkdir(parents=True)
@@ -1273,7 +1274,7 @@ def test_a_real_cmip6_plans_lineage_is_the_same_after_a_fetch(tmp_path: Path) ->
             "licence": "CC-BY-4.0",
         }
     write_manifest(directory, {"entries": entries})
-    fetched = plan.explain(format="json")
+    fetched: Any = plan.explain(format="json")
     assert fetched["resolved_dataset"] == "one.dataset"
     assert fetched["catalogue"] == str(directory / CATALOGUE_CACHE)
     assert fetched["cache"]["years_cached"] == [2015, 2016]
