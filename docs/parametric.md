@@ -646,9 +646,18 @@ also implement `LinearInAmounts`.
 Covers are designed and evaluated on an `OutcomeSample`: rows (draws) with a
 probability each, and for each row an index value and a loss. One draw is one
 year: a cover pays once per draw, on that draw's index, against that draw's
-loss. `period` is the year, or the draw number of a simulated sample. A sample
-holds one asset; `index` and `loss` are `(n, 1)` arrays, and `hazard` keeps the
-value the loss model read when it differs from the index.
+loss. `period` is the year, or the draw number of a simulated sample. `index`
+and `loss` have one row per draw and one column per asset, and `hazard` keeps
+the value the loss model read when it differs from the index.
+
+A sample can hold several assets. `OutcomeSample.join` puts one-asset samples of
+the same years side by side and `OutcomeSample.from_table` reads a table of
+several assets; `sample.asset(asset_id)` takes one asset's sample back out, and
+keeps its lineage. A sample of several assets states where the dependence
+between them comes from: for `join` and `from_table` it is the data's own, the
+same years of the data. `join` refuses Monte Carlo samples, because independent
+draws line up by draw number only. `design`, `evaluate` and `compare` take one
+asset's sample and raise `SampleError` on a sample of several.
 
 | Source | Function | One draw is | Probability |
 | --- | --- | --- | --- |
@@ -1078,9 +1087,12 @@ years or fresh draws, are the ones to report.
 
 ## What this version does not do
 
-- **Several assets in one sample.** Each asset is designed and evaluated on its
-  own sample. Nothing sums over assets: there are no designs for a goal over
-  several assets, and no dependence between assets is assumed.
+- **Designs or evaluations over several assets.** A sample can hold several
+  assets, but each asset is designed and evaluated on its own sample:
+  `design`, `evaluate` and `compare` raise `SampleError` on a sample of several,
+  so take each asset with `sample.asset(asset_id)`. Nothing sums over assets:
+  there are no designs for a goal over several assets, and a plan builds one
+  sample per asset, so it assumes no dependence between them.
 - **Several hazards in one index.** An index is one hazard at one location.
 - **Several scenarios at once.** Every sample is `"baseline"`, and a plan on
   fitted curves samples one hazard, horizon and pathway per asset; the
