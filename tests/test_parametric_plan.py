@@ -330,6 +330,11 @@ def test_setup_text_states_the_plan_before_execution() -> None:
     ]
 
 
+def test_the_docstring_of_explain_names_the_whole_document() -> None:
+    stated = " ".join((ParametricPlan.explain.__doc__ or "").split())
+    assert 'setup_text(plan.explain(format="json"))' in stated
+
+
 def test_setup_text_states_one_design_per_planned_objective() -> None:
     plan = (
         _plan()
