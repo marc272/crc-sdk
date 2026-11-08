@@ -640,10 +640,10 @@ def _source_plan_names(document: Mapping[str, Any]) -> dict[str, str]:
     other document implies nothing.
     """
     for provider, marks, names in _SOURCE_PLANS:
-        parts = [document.get(name) for name in names]
-        if all(mark in document for mark in marks) and all(
-            isinstance(part, str) and part for part in parts
-        ):
+        parts = [
+            part for part in map(document.get, names) if isinstance(part, str) and part
+        ]
+        if len(parts) == len(names) and all(mark in document for mark in marks):
             return {"provider": provider, "dataset": " ".join(parts)}
     return {}
 
