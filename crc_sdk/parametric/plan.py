@@ -45,7 +45,9 @@ inside one grid cell), or the station an asset column names
 `provenance` (a `SourceProvenance`) the source's licence, attribution and
 version: annual-extremes tables carry no licence of their own. Each asset
 gets one `OutcomeSample` from `sample_annual`: its years are the rows, each
-with probability 1/n, and no trend is removed.
+with probability 1/n, and no trend is removed. `cell=` gives point assets the
+H3 cell that some registry impacts need in their context: the name of an
+asset column, or `H3Cell(resolution=r)` for the cell of the asset's point.
 
 On both routes the loss is `impact(hazard) × value`, with the value from an
 asset column or 1 (the damage ratio), and the basis-risk model is required:
@@ -158,6 +160,7 @@ from crc_sdk.parametric.sources import (
     AnnualSeries,
     MissingYears,
     OutsideSupport,
+    _coordinate,
     sample_annual,
     sample_curve,
 )
@@ -175,6 +178,7 @@ from crc_sdk.workflows.portfolio import (
 
 __all__ = [
     "FreshDraws",
+    "H3Cell",
     "Holdout",
     "KFold",
     "NearestCell",
@@ -402,6 +406,41 @@ class StationColumn:
 
 
 @dataclass(frozen=True)
+class H3Cell:
+    """Give each asset the H3 cell of its point, at a stated resolution.
+
+    For `for_annual_extremes(..., cell=H3Cell(resolution=r))`: the impact's
+    context gets the cell at resolution `r` of each asset's point
+    (`PointColumns`). The cells are computed at execution, with
+    `crc_sdk.geometry.h3.point_to_cell`, which needs the `geometry` extra
+    (`crc-sdk[geometry]`); stating one needs nothing. There is no default
+    resolution: which one a registry impact expects is the caller's to state.
+    The cell is recorded in each sample's provenance and the point is not, so
+    a fine resolution records the asset's place to within that cell.
+
+    Raises `ValueError` unless `resolution` is an integer from 0 to 15.
+    """
+
+    resolution: int
+
+    def __post_init__(self) -> None:
+        value = self.resolution
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, np.integer))
+            or not 0 <= int(value) <= 15
+        ):
+            raise ValueError(
+                f"resolution must be an integer from 0 to 15, got {value!r}"
+            )
+        object.__setattr__(self, "resolution", int(value))
+
+    def to_document(self) -> dict[str, Any]:
+        """Return `{"kind": "h3_cell", "resolution": r}`."""
+        return {"kind": "h3_cell", "resolution": self.resolution}
+
+
+@dataclass(frozen=True)
 class _DesignSpec:
     """What `.objective(...)` states: the objectives and the design terms.
 
@@ -561,14 +600,15 @@ def _table_columns(assets: AssetPortfolio | Path) -> tuple[str, ...] | None:
 
 
 def _registry_needs_cell(
-    impact: Any, context: Any, assets: AssetPortfolio | Path
+    impact: Any, context: Any, assets: AssetPortfolio | Path, cell: Any
 ) -> str | None:
     """The registry factor that needs an H3 cell the plan cannot give, if any.
 
-    `LossModel.for_asset` fills the cell from an asset's `CellColumn` when
-    context columns are given; otherwise only a `TransformContext` gives one.
+    `cell=` gives one. `LossModel.for_asset` fills the cell from an asset's
+    `CellColumn` when context columns are given; otherwise only a
+    `TransformContext` gives one.
     """
-    if not isinstance(impact, ClimateImpact):
+    if cell is not None or not isinstance(impact, ClimateImpact):
         return None
     if (
         isinstance(assets, AssetPortfolio)
@@ -592,6 +632,43 @@ def _registry_needs_cell(
         if isinstance(given, TransformContext) and given.cell is not None:
             return None
     return factor
+
+
+def _check_cell(cell: Any, impact: Any, context: Any) -> None:
+    """Check `cell=`: what it states, and that the impact can take the cell."""
+    if isinstance(cell, str):
+        _column_name("cell", cell)
+    elif not isinstance(cell, H3Cell):
+        raise TypeError(
+            "cell must be the name of an asset column or H3Cell(resolution=r), "
+            f"got {type(cell).__name__}"
+        )
+    if not _takes_context(impact):
+        raise SampleError(
+            "cell= fills the impact's context, and impact expressions and "
+            "callables take none"
+        )
+    for given in (getattr(impact, "context", None), context):
+        if isinstance(given, TransformContext) and given.cell is not None:
+            raise ValueError(
+                "cell= states each asset's H3 cell, and the impact's context "
+                "already holds one; state one of them"
+            )
+
+
+def _cell_origin(cell: str | H3Cell) -> str:
+    """Where `cell=` takes an asset's H3 cell from, in words."""
+    if isinstance(cell, H3Cell):
+        return f"the cell at resolution {cell.resolution} of the asset's point"
+    return f"the asset column {cell}"
+
+
+def _noted(sample: OutcomeSample, note: str) -> OutcomeSample:
+    """`sample` with one more note in its provenance."""
+    provenance = dataclasses.replace(
+        sample.provenance, notes=(*sample.provenance.notes, note)
+    )
+    return dataclasses.replace(sample, provenance=provenance)
 
 
 def _listed(values: Sequence[Any] | None) -> list[Any] | None:
@@ -659,25 +736,32 @@ def _takes_context(impact: Any) -> bool:
     ) and isinstance(impact, ImpactFunction)
 
 
-def _curve_context(
+def _cell_context(
     impact: Any,
-    curve: Mapping[str, Any],
+    cell: Any,
     asset: Mapping[str, Any],
-    columns: ImpactContextColumns | None,
+    context: ImpactContextColumns | TransformContext | None,
 ) -> TransformContext:
-    """The context `PortfolioEvaluation` gives an impact for one matched row.
+    """The context an impact gets for one asset with an H3 cell.
 
-    The impact's own context, with the matched H3 cell and the asset's
-    context columns on top; null asset values keep the impact's own.
+    As `PortfolioEvaluation` gives it for a matched row: the impact's own
+    context, or a fixed `context` in its place, with the H3 cell and the
+    asset's context columns on top; null asset values keep the impact's own.
     """
-    base = getattr(impact, "context", None)
+    base = (
+        context
+        if isinstance(context, TransformContext)
+        else getattr(impact, "context", None)
+    )
     fields: dict[str, Any] = {
         name: getattr(base, name) if isinstance(base, TransformContext) else None
         for name in _CONTEXT_FIELDS
     }
-    if curve.get("cell_index") is not None:
-        fields["cell"] = int(curve["cell_index"])
-    for field_name, column_name in columns.items() if columns is not None else ():
+    if cell is not None:
+        fields["cell"] = int(cell)
+    for field_name, column_name in (
+        context.items() if isinstance(context, ImpactContextColumns) else ()
+    ):
         if column_name not in asset:
             raise SampleError(f"the asset table has no column {column_name!r}")
         value = asset[column_name]
@@ -689,15 +773,8 @@ def _curve_context(
     return TransformContext(**fields)
 
 
-def _h3_cell(
-    asset_id: str, value: Any, column: str
-) -> tuple[str, tuple[float, float], tuple[tuple[float, float], ...]]:
-    """An asset's H3 cell: its text, its centre and its boundary vertices.
-
-    The centre and the vertices are `(latitude, longitude)` pairs in degrees.
-    Raises `SampleError` for a missing or invalid cell, and `ImportError`
-    without the `geometry` extra.
-    """
+def _h3_index(asset_id: str, value: Any, column: str) -> int:
+    """An asset's H3 cell as an integer; `SampleError` if it is not one."""
     if value is None:
         raise SampleError(f"asset {asset_id!r} has no H3 cell in column {column!r}")
     if (
@@ -709,6 +786,35 @@ def _h3_cell(
             f"asset {asset_id!r} has {value!r} in column {column!r}, which is not "
             "an unsigned 64-bit H3 cell index"
         )
+    return int(value)
+
+
+def _point_cell(longitude: Any, latitude: Any, resolution: int) -> int:
+    """The H3 cell of a point; `ImportError` without the `geometry` extra."""
+    latitude = _coordinate("latitude", latitude, 90.0)
+    longitude = _coordinate("longitude", longitude, 360.0)
+    try:
+        # Here, so that importing this module does not need the extra.
+        from crc_sdk.geometry.h3 import point_to_cell
+
+        return point_to_cell(longitude, latitude, resolution)
+    except ImportError as error:
+        raise ImportError(
+            "H3Cell computes each asset's H3 cell from its point, which requires "
+            "`pip install crc-sdk[geometry]`"
+        ) from error
+
+
+def _h3_cell(
+    asset_id: str, value: Any, column: str
+) -> tuple[str, tuple[float, float], tuple[tuple[float, float], ...]]:
+    """An asset's H3 cell: its text, its centre and its boundary vertices.
+
+    The centre and the vertices are `(latitude, longitude)` pairs in degrees.
+    Raises `SampleError` for a missing or invalid cell, and `ImportError`
+    without the `geometry` extra.
+    """
+    index = _h3_index(asset_id, value, column)
     try:
         import h3  # type: ignore[import-untyped]
     except ImportError as error:
@@ -716,10 +822,10 @@ def _h3_cell(
             "NearestCell locates assets by their H3 cells (CellColumn) with the "
             "cells' geometry, which requires `pip install crc-sdk[geometry]`"
         ) from error
-    text = str(h3.int_to_str(int(value)))
+    text = str(h3.int_to_str(index))
     if not h3.is_valid_cell(text):
         raise SampleError(
-            f"asset {asset_id!r} has {int(value)} in column {column!r}, which is "
+            f"asset {asset_id!r} has {index} in column {column!r}, which is "
             "not a valid H3 cell"
         )
     latitude, longitude = h3.cell_to_latlng(text)
@@ -766,7 +872,8 @@ class ParametricPlan:
     `entry` names the entry point. On the curve route `source` is the
     request, `unit` and `provenance` are `None` (the dataset's metadata
     states them at execution) and `draws` holds what `monte_carlo` states.
-    `pricing_rule` holds what `.pricing(...)` states.
+    `pricing_rule` holds what `.pricing(...)` states, and `cell` what
+    `for_annual_extremes(..., cell=...)` states.
     """
 
     source: Any
@@ -788,6 +895,7 @@ class ParametricPlan:
     entry: Literal["for_annual_extremes", "for_evaluation"] = "for_annual_extremes"
     draws: _MonteCarlo | None = None
     pricing_rule: Pricing | None = None
+    cell: str | H3Cell | None = None
 
     # -- the entry points -----------------------------------------------------
 
@@ -903,6 +1011,7 @@ class ParametricPlan:
         years: Sequence[int] | None = None,
         missing: MissingYears = "raise",
         seed: int | None = None,
+        cell: str | H3Cell | None = None,
     ) -> ParametricPlan:
         """Plan covers on per-year hazard values at each asset.
 
@@ -932,15 +1041,24 @@ class ParametricPlan:
           a value and lists it, instead of raising.
         - `seed` seeds the basis-risk draws: one child of
           `numpy.random.SeedSequence(seed)` per asset, in asset order.
+        - `cell` puts an H3 cell for each asset in the impact's context, on
+          top of `context`: the name of an asset column of unsigned 64-bit
+          H3 cells, or `H3Cell(resolution=r)` for the cell of the asset's
+          point, which needs the `geometry` extra at execution. The series
+          is still located by `location`. Each sample records the cell, not
+          the point. `H3Cell` needs a point, so it cannot serve assets
+          located by `CellColumn`.
 
         Raises `TypeError` for arguments of the wrong type, `SampleError`
-        for a unit the impact is not calibrated for or a missing asset
-        column, and `ValueError` for other invalid arguments. A registry
-        impact that needs an H3 cell in its context (such as `rx1day`)
-        raises `SampleError` unless the impact or `context` is a
+        for a unit the impact is not calibrated for, a missing asset column
+        or a `cell` for an impact that takes no context, and `ValueError`
+        for other invalid arguments, among them a `cell` where the impact's
+        context already holds one. A registry impact that needs an H3 cell
+        in its context (such as `rx1day`) raises `SampleError` unless
+        `cell` states each asset's, the impact or `context` is a
         `TransformContext` with a cell, or the assets are located by their
-        H3 cells (`CellColumn`) and `context` names context columns: a point
-        asset has no cell on this route.
+        H3 cells (`CellColumn`) and `context` names context columns: without
+        one of these, a point asset has no cell on this route.
         """
         _source_kind(source)
         portfolio = _assets(assets)
@@ -959,24 +1077,29 @@ class ParametricPlan:
                 "location must be NearestCell() or StationColumn(name), got "
                 f"{type(location).__name__}"
             )
+        if cell is not None:
+            _check_cell(cell, impact, context)
         columns = _table_columns(portfolio)
         if columns is not None:
             needed = [value_column] if value_column is not None else []
             if isinstance(location, StationColumn):
                 needed.append(location.name)
+            if isinstance(cell, str):
+                needed.append(cell)
             if isinstance(context, ImpactContextColumns):
                 needed += [name for _, name in context.items()]
             absent = [name for name in needed if name not in columns]
             if absent:
                 raise SampleError(f"the asset table has no columns {absent}")
-        factor = _registry_needs_cell(impact, context, portfolio)
+        factor = _registry_needs_cell(impact, context, portfolio, cell)
         if factor is not None:
             raise SampleError(
                 f"impact {factor!r} needs an H3 cell in its context, and this "
-                "route reads none for an asset; give the impact a context with "
-                "the cell (crc_framework.impacts.for_factor(..., context="
-                "TransformContext(cell=...))), or pass context= a "
-                "TransformContext with it"
+                "route reads none for an asset; state each asset's cell with "
+                "cell= (an asset column, or H3Cell(resolution=r)), give the "
+                "impact a context with the cell (crc_framework.impacts."
+                "for_factor(..., context=TransformContext(cell=...))), or pass "
+                "context= a TransformContext with it"
             )
         _column_name("year_column", year_column)
         _column_name("hazard_column", hazard_column)
@@ -1014,6 +1137,7 @@ class ParametricPlan:
             years=window,
             missing=missing,
             seed=None if seed is None else int(seed),
+            cell=cell,
         )
 
     # -- builders ---------------------------------------------------------------
@@ -1388,7 +1512,13 @@ class ParametricPlan:
             "index_unit": self.unit,
             "loss_model": self.loss_model.to_document(),
             "loss_unit": self.loss_model.value_unit,
-            "notes": [],
+            "notes": (
+                []
+                if self.cell is None
+                else [
+                    f"The impact reads each asset's H3 cell: {_cell_origin(self.cell)}."
+                ]
+            ),
             "scenario": "baseline",
             "semantics": "annual",
             "semantics_source": "data",
@@ -1504,6 +1634,10 @@ class ParametricPlan:
             },
             "sources": [self._source_description()],
         }
+        if isinstance(self.cell, H3Cell):
+            document["assets"]["cell"] = self.cell.to_document()
+        elif self.cell is not None:
+            document["assets"]["cell"] = {"kind": "column", "column": self.cell}
         if self._on_curves:
             rule = self.split_rule
             document["monte_carlo"] = {
@@ -1531,7 +1665,8 @@ class ParametricPlan:
         `covers`, `designs` (the objectives and design terms), `sources`,
         `assets`, `licences`, `rng` (the seeds) and `entry`; a plan on
         fitted curves adds `monte_carlo` (the draws, the semantics stated by
-        the caller, `outside_support` and the fresh draws). Its `setup` has
+        the caller, `outside_support` and the fresh draws), and a plan with
+        `cell=` adds what it states to `assets` as `cell`. Its `setup` has
         the layout of `EvaluationSetup`, so `setup_text(plan.explain(
         format="json")["setup"])` states it before anything is read; the
         plan's seed is in every evaluation's `details` under `"plan_seed"`,
@@ -1539,7 +1674,8 @@ class ParametricPlan:
         knows is in the written metadata: the years and the matched cells or
         curves, the checksums, the hashes of the samples and designs and, on
         fitted curves, the dataset's metadata (its units, semantics and
-        licence, so `licences` is `None` here). `format="json"` returns a
+        licence, so `licences` is `None` here); with `cell=`, the cells are
+        known only there too. `format="json"` returns a
         dict, `"text"` its JSON text.
         """
         document = self._explain_document()
@@ -1660,6 +1796,29 @@ class ParametricPlan:
         elif kind == "file":
             document["file_sha256"] = _file_sha256(Path(self.source))
         return document
+
+    def _asset_cell(
+        self, portfolio: AssetPortfolio, asset_id: str, row: Mapping[str, Any]
+    ) -> int | None:
+        """The H3 cell `cell=` states for one asset; `None` without `cell=`."""
+        stated = self.cell
+        if stated is None:
+            return None
+        if isinstance(stated, str):
+            if stated not in row:
+                raise SampleError(f"the asset table has no column {stated!r}")
+            return _h3_index(asset_id, row[stated], stated)
+        located = portfolio.location
+        if not isinstance(located, PointColumns):
+            raise SampleError(
+                "H3Cell computes an asset's H3 cell from its point, and these "
+                f"assets have none ({type(located).__name__}); name the column "
+                "that holds their cells with cell="
+            )
+        longitude, latitude = row.get(located.longitude), row.get(located.latitude)
+        if longitude is None or latitude is None:
+            raise SampleError(f"asset {asset_id!r} has no longitude or latitude")
+        return _point_cell(longitude, latitude, stated.resolution)
 
     def _series(
         self,
@@ -1805,14 +1964,20 @@ class ParametricPlan:
         basis_risk = self._require_basis_risk()
         portfolio = self._portfolio()
         rows = self._asset_rows(portfolio)
+        # Before the source is read, which may take long or download data.
+        cells = [self._asset_cell(portfolio, asset_id, row) for asset_id, row in rows]
         table, record = self._read_source()
         source = self._series_source()
         generators = self._generators(len(rows))
         samples: dict[str, OutcomeSample] = {}
-        for (asset_id, row), rng in zip(rows, generators, strict=True):
+        for (asset_id, row), rng, cell in zip(rows, generators, cells, strict=True):
             series = self._series(table, row, asset_id, portfolio, source)
-            loss_model = self.loss_model.for_asset(portfolio, asset_id)
-            samples[asset_id] = sample_annual(
+            loss_model = (
+                self.loss_model.for_asset(portfolio, asset_id)
+                if cell is None
+                else self._cell_loss_model(portfolio, asset_id, row, cell)
+            )
+            sample = sample_annual(
                 series,
                 loss_model=loss_model,
                 basis_risk=basis_risk,
@@ -1820,6 +1985,14 @@ class ParametricPlan:
                 rng=rng,
                 missing=self.missing,
             )
+            if cell is not None:
+                assert self.cell is not None
+                sample = _noted(
+                    sample,
+                    f"The impact reads H3 cell {cell:x} for asset {asset_id}: "
+                    f"{_cell_origin(self.cell)}.",
+                )
+            samples[asset_id] = sample
         return _Samples(portfolio, samples, None, "annual_table", record)
 
     # -- the curve route ---------------------------------------------------------
@@ -1861,27 +2034,21 @@ class ParametricPlan:
             matched[asset_id] = found[0]
         return matched
 
-    def _curve_loss_model(
+    def _cell_loss_model(
         self,
         portfolio: AssetPortfolio,
         asset_id: str,
         asset: Mapping[str, Any],
-        curve: Mapping[str, Any],
+        cell: Any,
     ) -> LossModel:
-        """The loss model for one asset, with the context its matched row gives."""
+        """The loss model for one asset, with its H3 cell in the impact's context."""
         model = self.loss_model
         if _takes_context(model.impact):
-            context = model.context
             model = LossModel(
                 model.impact,
                 value_column=model.value_column,
                 value_unit=model.value_unit,
-                context=_curve_context(
-                    model.impact,
-                    curve,
-                    asset,
-                    context if isinstance(context, ImpactContextColumns) else None,
-                ),
+                context=_cell_context(model.impact, cell, asset, model.context),
                 name=model.name,
             )
         return model.for_asset(portfolio, asset_id)
@@ -1923,7 +2090,9 @@ class ParametricPlan:
             rows, generators, fresh_generators, strict=True
         ):
             curve = matched[asset_id]
-            loss_model = self._curve_loss_model(portfolio, asset_id, row, curve)
+            loss_model = self._cell_loss_model(
+                portfolio, asset_id, row, curve.get("cell_index")
+            )
             canonical = {
                 name: curve[name] for name in _CURVE_ROW_COLUMNS if name in curve
             }
@@ -2082,8 +2251,10 @@ class ParametricPlan:
         cover whose index unit is not the dataset's, or a series with a
         missing year (unless `missing="drop_year"`);
         `ProbabilitySemanticsError` for curves whose semantics are not those
-        of one year; and `ImportError` for assets located by their H3 cells
-        on per-year values without the `geometry` extra.
+        of one year; and `ImportError` without the `geometry` extra for
+        assets located by their H3 cells on per-year values, or for
+        `cell=H3Cell(...)`, whose cells are computed before the source is
+        read.
         """
         return MappingProxyType(self._build_samples().samples)
 

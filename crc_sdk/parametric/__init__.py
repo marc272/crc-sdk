@@ -81,6 +81,7 @@ from crc_sdk.parametric.payouts import (
 )
 from crc_sdk.parametric.plan import (
     FreshDraws,
+    H3Cell,
     Holdout,
     KFold,
     NearestCell,
@@ -118,6 +119,7 @@ __all__ = [
     "ExpectedUncovered",
     "Free",
     "FreshDraws",
+    "H3Cell",
     "Holdout",
     "ImpactNoise",
     "IndexDefinition",
