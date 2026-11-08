@@ -419,7 +419,7 @@ def test_nearest_cell_locates_assets_by_their_h3_cells() -> None:
         unit="mm/day",
         source=PROVENANCE.model_dump(mode="json"),
     )
-    assert series["cell"] == by_hand.provenance["cell"]
+    assert series["distance_km"] == by_hand.provenance["distance_km"]
     expected = sample_annual(
         by_hand,
         loss_model=LossModel(

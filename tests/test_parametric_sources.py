@@ -758,7 +758,7 @@ def test_nearest_cell_accepts_a_centre_within_half_a_step() -> None:
     )
     assert series.provenance["cell"] == {"latitude": 50.0, "longitude": 7.0}
     assert series.provenance["spacing_degrees"] == {"latitude": 0.25, "longitude": 0.25}
-    assert "distance_km" not in series.provenance
+    assert 10.0 < series.provenance["distance_km"] < 15.0
     assert "6.9" not in str(series.provenance)  # the asset's point is not recorded
     assert series.values.tolist() == [1.0, 11.0, 21.0, 31.0, 41.0]
 
@@ -1372,7 +1372,7 @@ def test_only_a_source_plans_document_is_cut_down() -> None:
     )
 
 
-def test_a_nearest_cell_series_records_the_cell_not_the_distance() -> None:
+def test_two_points_in_one_grid_cell_share_a_lineage() -> None:
     first, second = (
         AnnualSeries.nearest_cell(
             GRID, longitude=x, latitude=y, unit="mm/day", source="s"
@@ -1380,22 +1380,28 @@ def test_a_nearest_cell_series_records_the_cell_not_the_distance() -> None:
         for x, y in ((6.9, 50.1), (7.05, 49.95))
     )
     assert first.provenance["cell"] == second.provenance["cell"]
-    assert "distance_km" not in first.provenance
-    # Both points read the cell's rows: the leakage check links them...
+    assert first.provenance["distance_km"] != second.provenance["distance_km"]
+    # Both points read the cell's rows, so the leakage check links them.
+    design, evaluation = _per_year(first), _per_year(second)
+    assert design.lineage == evaluation.lineage
     with pytest.raises(LeakageError, match="shares 5 periods"):
-        _check_out_of_sample(_per_year(first), _per_year(second))
-    # ...and so does a grid step stated instead of inferred, or an H3 cell's
-    # centre standing in for the point: the rows are the same cell's.
+        _check_out_of_sample(design, evaluation)
+
+
+def test_how_a_series_found_its_rows_is_not_in_its_lineage() -> None:
+    # A grid step stated instead of inferred, or an H3 cell's centre standing
+    # in for the point: the rows are the same cell's.
+    plain = _read_cell("s")
     stated = _read_cell("s", spacing=(0.5, 0.5))
     assert stated.provenance["spacing_degrees"]["latitude"] == 0.5
-    assert _per_year(stated).lineage == _per_year(_read_cell("s")).lineage
+    assert _per_year(stated).lineage == _per_year(plain).lineage
     by_h3 = AnnualSeries(
-        first.years,
-        first.values,
-        first.unit,
-        {**first.provenance, "asset_location": "h3_cell"},
+        plain.years,
+        plain.values,
+        plain.unit,
+        {**plain.provenance, "asset_location": "h3_cell"},
     )
-    assert _per_year(by_h3).lineage == _per_year(first).lineage
+    assert _per_year(by_h3).lineage == _per_year(plain).lineage
 
 
 def test_an_era5_series_records_the_terms_crc_sdk_holds_for_era5() -> None:
