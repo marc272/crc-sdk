@@ -149,12 +149,12 @@ def test_the_fixture_files_are_present() -> None:
     assert closed_form | core | options <= names
     assert all("-fixed-" in name for name in names)
     assert len(HOLDOUT_CASES) == 8
-    # Every case is of one asset, and is an evaluation case (read here) or a
-    # design case (read by the design test).
+    # Every case is an evaluation case of one asset (read here) or a design
+    # case (read by the design tests), of one asset or of several.
     for path in _paths("*.json"):
         case = _case(path)
-        assert case["scope"] == "individual", path.stem
         assert case["kind"] in ("evaluate", "design"), path.stem
+        assert case["scope"] == "individual" or case["kind"] == "design", path.stem
 
 
 @pytest.mark.parametrize("path", EVALUATE_CASES, ids=lambda path: path.stem)
