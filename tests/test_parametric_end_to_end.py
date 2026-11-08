@@ -119,8 +119,8 @@ def test_the_docs_quick_start_runs_as_written(
     per_year = _python_blocks("## Next step: per-year values")
     curve_by_hand = _python_blocks("### From a fitted curve")
     annual_by_hand = _python_blocks("### From per-year values")
-    assert [len(blocks) for blocks in (quick_start, builders, per_year)] == [2, 1, 2]
-    assert [len(blocks) for blocks in (curve_by_hand, annual_by_hand)] == [1, 1]
+    assert [len(blocks) for blocks in (quick_start, builders, per_year)] == [2, 1, 3]
+    assert [len(blocks) for blocks in (curve_by_hand, annual_by_hand)] == [1, 2]
     monkeypatch.chdir(tmp_path)
     namespace: dict[str, Any] = {}
 
@@ -251,6 +251,22 @@ def test_the_docs_quick_start_runs_as_written(
     ]
     assert held[0]["details"] == {"train_fraction": 0.7, "plan_seed": 42}
 
+    # A stated climate trend: the rows are fitted on the design years only.
+    trended_result = namespace["trended_result"]
+    trended_sample = trended_result.samples["warehouse-a"]
+    assert len(trended_sample.provenance.trend["fit_years"]) == 40
+    trend_lines = [
+        line
+        for line in setup_text(trended_result.metadata).splitlines()
+        if line.startswith("Trend: ")
+    ]
+    assert len(trend_lines) == 1
+    assert "fitted on 28 years (1981 to 2008), reference year 2020" in trend_lines[0]
+    assert "hazard slope " in trend_lines[0]
+    assert set(trended_result.table.column("scenario").to_pylist()) == {
+        "1981-2020, moved to 2020"
+    }
+
     # The index read elsewhere: the covers pay on the station's series.
     station_result = namespace["station_result"]
     assert station_result.row_count == 4
@@ -283,6 +299,8 @@ def test_the_docs_quick_start_runs_as_written(
     assert namespace["sample"].content_hash == annual_sample.content_hash
     assert namespace["designed"].parameters == annual_result.designs[1].parameters
     _assert_by_hand(tmp_path / "by-hand-annual.parquet", annual_result.table)
+    assert namespace["fitted"].provenance.trend["fit_years"][-1] == 2008
+    assert namespace["design_years"].period[-1] == 2008
 
 
 def _assert_by_hand(path: Path, planned: Any) -> None:

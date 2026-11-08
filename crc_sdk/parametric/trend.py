@@ -202,10 +202,11 @@ class LinearTrend:
     - `min_years` is the least number of fit years. Fewer raise `SampleError`.
       The default of 10 is a floor against a slope that is nearly all noise,
       not a statement that ten years are enough.
-    - `fit_years` states the fit years; by default they are every kept year. A
-      year the series does not hold raises `SampleError`. A year dropped as
-      missing is left out, so the record lists the years actually used. On a
-      plan it raises `ValueError`, because the plan sets it per fold.
+    - `fit_years` states the fit years, as any sequence of integers, kept as a
+      sorted tuple; by default they are every kept year. A year the series
+      does not hold raises `SampleError`. A year dropped as missing is left
+      out, so the record lists the years actually used. On a plan it raises
+      `ValueError`, because the plan sets it per fold.
 
     Raises `SampleError` for a `reference_year` that is not an integer, a
     `min_years` below 3, which would leave no residual, and `fit_years` that
@@ -214,7 +215,9 @@ class LinearTrend:
 
     reference_year: int | None = None
     min_years: int = field(default=10, kw_only=True)
-    fit_years: tuple[int, ...] | None = field(default=None, kw_only=True)
+    fit_years: Sequence[int] | NDArray[np.integer[Any]] | None = field(
+        default=None, kw_only=True
+    )
 
     def __post_init__(self) -> None:
         if self.reference_year is not None:
