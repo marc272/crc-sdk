@@ -1244,8 +1244,12 @@ def test_a_real_cmip6_plans_lineage_is_the_same_after_a_fetch(tmp_path: Path) ->
     pytest.importorskip("h5netcdf")
     directory = tmp_path / "cmip6"
     dataset = HazardDataset.cmip6("rx1day", model="M", scenario="ssp245")
-    plan = dataset.for_area((-1.0, -1.0, 1.0, 1.0)).years(2015, 2016)
-    plan = plan.cache(directory).canonicalize()
+    plan = (
+        dataset.for_area((-1.0, -1.0, 1.0, 1.0))
+        .years(2015, 2016)
+        .cache(directory)
+        .canonicalize()
+    )
     before = _per_year(_read_station(plan))
     assert plan.explain(format="json")["resolved_dataset"] is None
 

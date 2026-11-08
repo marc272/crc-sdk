@@ -376,9 +376,10 @@ The builders, splits, seeding and outputs are those above.
   within it. An H3 cell that straddles two grid cells does not say which
   series is the asset's, so it raises `SampleError`; give that asset a point.
   Such a series records `"asset_location": "h3_cell"`.
-  `StationColumn("station_id")` reads per-station tables: the asset column names each asset's station, matched
-  against the table's `station` column (`table_column="station_id"` for NOAA
-  water levels). An asset that cannot be located raises; none is dropped.
+  `StationColumn("station_id")` reads per-station tables: the asset column
+  names each asset's station, matched against the table's `station` column
+  (`table_column="station_id"` for NOAA water levels). An asset that cannot be
+  located raises; none is dropped.
 - **`unit`** is the unit of the table's values. It is checked against the
   impact's calibration (an `ImpactExpression` or a registry impact), against a
   `unit` column of the table, and against the source plan's `explain()`.
