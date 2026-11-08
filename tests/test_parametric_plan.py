@@ -56,6 +56,7 @@ from crc_sdk.parametric import (
 from crc_sdk.parametric.metadata import EVALUATION_METADATA_KEY
 from crc_sdk.types import SourceProvenance
 from crc_sdk.workflows import AssetPortfolio, CellColumn, ImpactContextColumns
+from crc_sdk.workflows.noaa_water_levels import NOAAExtremeWaterLevelPlan
 
 UNTYPED_PLAN: Any = ParametricPlan
 RAMP = PiecewiseLinearImpact([40.0, 120.0], [0.0, 0.5])
@@ -1435,3 +1436,109 @@ def test_the_repr_is_short() -> None:
     text = repr(plan)
     assert text.startswith("ParametricPlan.for_annual_extremes(Table, assets=2")
     assert "objectives=1" in text and len(text) < 200
+
+
+class _CMIP6Plan(_SourcePlan):
+    """A source plan whose `explain()` states a CMIP6 pathway."""
+
+    def __init__(self, table: Any, pathway: str = "ssp245") -> None:
+        super().__init__(table)
+        self.pathway = pathway
+
+    def explain(self, *, format: str = "text") -> Any:
+        return {
+            **super().explain(format=format),
+            "archive": "aws",
+            "catalogue": "https://example.org/pangeo-cmip6.csv",
+            "pathway": self.pathway,
+            "model": "M",
+            "member": "r1i1p1f1",
+        }
+
+
+def test_a_cmip6_plans_pathway_is_stated_beside_the_callers_source(
+    tmp_path: Path,
+) -> None:
+    source = _CMIP6Plan(_annual())
+    result = (
+        _plan(source, _assets("warehouse-a"))
+        .basis_risk(NoBasisRisk())
+        .covers(_linear())
+        .metrics(OPTIONS)
+        .write_parquet(tmp_path / "comparison.parquet")
+    )
+    assert source.calls == ["annual_extremes", "explain"]
+    assert _lines(setup_text(result.metadata))["Source"] == [
+        "Source: the hazard series from provider example, dataset synthetic rx1day "
+        "and pathway ssp245, with horizon not recorded."
+    ]
+    series = result.samples["warehouse-a"].provenance.sources[0]["series"]
+    assert series["pathway"] == "ssp245"
+    # The caller's own document is left as it is.
+    assert "pathway" not in series["source"]
+    assert series["source"]["licence"] == "CC0-1.0"
+
+
+def test_a_plans_pathway_tells_its_samples_apart() -> None:
+    def lineage(pathway: str) -> str | None:
+        plan = _plan(_CMIP6Plan(_annual(), pathway), _assets("warehouse-a"))
+        sample = plan.basis_risk(NoBasisRisk()).samples()["warehouse-a"]
+        return sample.lineage
+
+    assert lineage("ssp245") == lineage("ssp245")
+    assert lineage("ssp245") != lineage("ssp585")
+
+
+def test_a_plan_without_a_pathway_records_none() -> None:
+    sample = (
+        _plan(_SourcePlan(_annual()), _assets("warehouse-a"))
+        .basis_risk(NoBasisRisk())
+        .samples()["warehouse-a"]
+    )
+    assert "pathway" not in sample.provenance.sources[0]["series"]
+
+
+def test_a_noaa_plan_works_on_the_per_year_route(tmp_path: Path) -> None:
+    rng = np.random.default_rng(5)
+
+    class WithoutTheFetch(NOAAExtremeWaterLevelPlan):
+        def annual_extremes(self) -> Any:
+            return pa.table(
+                {
+                    "station_id": ["8518750"] * 30,
+                    "year": pa.array(range(1991, 2021), pa.int32()),
+                    "detrended_extreme_m": rng.gumbel(70.0, 12.0, 30),
+                }
+            )
+
+    assets = pa.table(
+        {
+            "asset_id": ["quay"],
+            "longitude": [-74.0],
+            "latitude": [40.7],
+            "station_id": ["8518750"],
+            "value_eur": [2e6],
+        }
+    )
+    result = (
+        _plan(
+            WithoutTheFetch.for_station("8518750"),
+            assets,
+            unit="m",
+            location=StationColumn("station_id", table_column="station_id"),
+            hazard_column="detrended_extreme_m",
+        )
+        .basis_risk(NoBasisRisk())
+        .covers(
+            Cover(
+                IndexDefinition("water_level", "m", aggregation="annual_maximum"),
+                LinearPayout(60.0, 120.0, 5e5),
+                payout_unit="EUR",
+            )
+        )
+        .metrics(OPTIONS)
+        .write_parquet(tmp_path / "comparison.parquet")
+    )
+    (record,) = result.metadata.source_records
+    assert record["annual_table"]["explain"]["station_id"] == "8518750"
+    assert result.row_count == 1

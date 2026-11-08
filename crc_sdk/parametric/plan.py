@@ -161,6 +161,7 @@ from crc_sdk.parametric.sources import (
     MissingYears,
     OutsideSupport,
     _coordinate,
+    _source_plan_document,
     sample_annual,
     sample_curve,
 )
@@ -567,6 +568,12 @@ def _table_sha256(table: Any) -> str:
     with pa.ipc.new_stream(sink, data.schema) as writer:
         writer.write_table(data)
     return f"sha256:{hashlib.sha256(sink.getvalue().to_pybytes()).hexdigest()}"
+
+
+def _stated_pathway(explained: Any) -> str | None:
+    """The pathway a source plan's `explain()` document states, if any."""
+    pathway = explained.get("pathway") if isinstance(explained, dict) else None
+    return pathway if isinstance(pathway, str) and pathway else None
 
 
 def _source_kind(source: Any) -> Literal["table", "file", "plan"]:
@@ -1031,7 +1038,9 @@ class ParametricPlan:
           and against the source plan's `explain()` at execution.
         - `provenance` states the source's licence, attribution and version
           (annual-extremes tables carry none); it identifies the series in
-          every sample, so one source has one `provenance`.
+          every sample, so one source has one `provenance`. A pathway that
+          the source plan's `explain()` states, as a CMIP6 plan's does, is
+          recorded beside it at execution, so that the setup text states it.
         - `location` finds each asset's series: `NearestCell()` (the
           default), for assets located by a point or by an H3 cell that lies
           within one grid cell, or `StationColumn(name)`. `year_column` and
@@ -1768,9 +1777,10 @@ class ParametricPlan:
             table = _arrow_table(
                 self.source.annual_extremes(), "the source's annual_extremes()"
             )
-            explain = getattr(self.source, "explain", None)
             explained = (
-                _json_safe(explain(format="json")) if callable(explain) else None
+                _json_safe(_source_plan_document(self.source))
+                if callable(getattr(self.source, "explain", None))
+                else None
             )
             record["explain"] = explained
             stated = explained.get("unit") if isinstance(explained, dict) else None
@@ -1968,10 +1978,19 @@ class ParametricPlan:
         cells = [self._asset_cell(portfolio, asset_id, row) for asset_id, row in rows]
         table, record = self._read_source()
         source = self._series_source()
+        pathway = _stated_pathway(record.get("explain"))
         generators = self._generators(len(rows))
         samples: dict[str, OutcomeSample] = {}
         for (asset_id, row), rng, cell in zip(rows, generators, cells, strict=True):
             series = self._series(table, row, asset_id, portfolio, source)
+            if pathway is not None:
+                # Beside the caller's source: the plan does not rewrite it.
+                series = AnnualSeries(
+                    series.years,
+                    series.values,
+                    series.unit,
+                    {**_thaw(series.provenance), "pathway": pathway},
+                )
             loss_model = (
                 self.loss_model.for_asset(portfolio, asset_id)
                 if cell is None

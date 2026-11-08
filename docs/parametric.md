@@ -388,7 +388,9 @@ The builders, splits, seeding and outputs are those above.
   plan that also materializes curves, `HazardDataset.local(path).provenance()`
   of its canonical file). It identifies the series of every sample, so give
   one source the same provenance each time: the leakage checks then link its
-  blocks.
+  blocks. A pathway that a source plan's `explain()` states, as a CMIP6 plan's
+  does, is recorded beside it at execution, and the setup text states it;
+  before execution the plan does not read its source, so the text cannot.
 - **The loss model** is `LossModel(impact, value_column=..., value_unit=...,
   context=...)`: loss = `impact(hazard) × value`, the value from an asset
   column, or 1 with `value_unit="1"` (the damage ratio). A registry impact
@@ -688,11 +690,33 @@ describes one year's value:
   `"clamp"` is stated.
 
 **Per-year values.** `AnnualSeries.from_table(table, *, year, value, where,
-unit)` reads one location of an `annual_extremes()` table (a station with
-`where={"station": ...}`), and `AnnualSeries.nearest_cell(table, *, longitude,
-latitude, unit)` the grid cell whose centre lies within half a grid step of a
-point. A year without a value raises in `sample_annual`, unless
-`missing="drop_year"`, which lists the dropped years. No trend is removed.
+unit, source=None)` reads one location of an `annual_extremes()` table (a
+station with `where={"station": ...}`), and `AnnualSeries.nearest_cell(table,
+*, longitude, latitude, unit, source=None)` the grid cell whose centre lies
+within half a grid step of a point. A year without a value raises in
+`sample_annual`, unless `missing="drop_year"`, which lists the dropped years.
+No trend is removed.
+
+`source` describes the table in the series' provenance: a name, a
+`SourceProvenance`, a mapping such as a plan's `explain(format="json")`, or
+the source plan itself, of which only `explain()` is called, so no data is
+fetched. An ERA5 or CMIP6 plan's document names no provider or dataset, so
+they are named from what it states; an ERA5 document states no terms either,
+so the series records crc-sdk's `ERA5_LICENCE` and `ERA5_ATTRIBUTION`, without
+the year of retrieval that fitted curves add, which `explain()` does not know.
+A mapping's own names and terms win.
+
+The leakage checks link two series through their source. What a source plan's
+document says of its cache and its run is left out of that link, and so are
+the years it asks for and, where the series' cell or filter names its rows,
+the area: each fetch and each window of one source is linked, and two series
+that share rows and a source raise. A `source` of your own is kept whole. A
+table's `retrieved_at` column is left out too.
+
+A nearest-cell series records the cell's centre, the grid step and the
+distance from the point to the centre, not the point itself. The distance with
+the centre narrows the point to a ring around that centre, and a result file
+discloses that much of an asset's location.
 
 **Loss model.** `LossModel(impact, *, value_column=None, value=None,
 value_unit="1", context=None)` computes `impact(hazard) × value`. `impact` is

@@ -29,6 +29,7 @@ from crc_sdk.parametric import (
     AnnualSeries,
     ComonotoneIndexWarning,
     ImpactNoise,
+    LeakageError,
     LossModel,
     NoBasisRisk,
     OutcomeSample,
@@ -39,13 +40,17 @@ from crc_sdk.parametric import (
     sample_curve,
 )
 from crc_sdk.parametric.sample import _check_out_of_sample
+from crc_sdk.providers.era5 import ERA5_ATTRIBUTION, ERA5_LICENCE
 from crc_sdk.types import (
     CurveParameters,
     EnsembleDescriptor,
     HazardDatasetMetadata,
     SourceProvenance,
 )
-from crc_sdk.workflows import ReturnPeriodExtrapolationWarning
+from crc_sdk.workflows import HazardDataset, ReturnPeriodExtrapolationWarning
+from crc_sdk.workflows._remote import file_checksum, write_manifest
+from crc_sdk.workflows.cmip6 import CATALOGUE_CACHE
+from crc_sdk.workflows.noaa_water_levels import NOAAExtremeWaterLevelPlan
 
 UNTYPED_CURVE: Any = sample_curve  # for calls with deliberately invalid arguments
 UNTYPED_ANNUAL: Any = sample_annual
@@ -1136,3 +1141,317 @@ def test_impacts_without_a_unit_are_not_checked_by_either_route() -> None:
         for sample in (curve, annual):
             assert sample.provenance.loss_model is not None
             assert sample.provenance.loss_model["impact"]["exposure_unit"] is None
+
+
+# -- what a per-year series records of its source -----------------------------
+
+ERA5_DOCUMENT: dict[str, Any] = {
+    "recipe": "rx1day",
+    "unit": "mm/day",
+    "store": "arco-0p25",
+    "store_url": "gs://bucket/era5.zarr",
+    "grid_degrees": 0.25,
+    "requested_version": "latest",
+    "area": (5.0, 49.0, 9.0, 52.0),
+    "years": (2000, 2004),
+    "cache": {"mode": "stream", "directory": None, "years_cached": []},
+    "execution": "network and fitting occur only at prefetch/materialize/write",
+}
+CMIP6_DOCUMENT: dict[str, Any] = {
+    "recipe": "rx1day",
+    "unit": "mm/day",
+    "model": "M",
+    "pathway": "ssp245",
+    "member": "r1i1p1f1",
+    "variable": "pr",
+    "archive": "aws",
+    "catalogue": "https://example.org/pangeo-cmip6.csv",
+    "requested_version": "latest",
+    "resolved_dataset": None,
+    "calendar": None,
+    "licence": None,
+    "area": (5.0, 49.0, 9.0, 52.0),
+    "years": (2000, 2004),
+    "cache": {"mode": "stream", "directory": None, "years_cached": []},
+}
+
+
+def _fetched(document: dict[str, Any]) -> dict[str, Any]:
+    """The same plan's document, once its years are fetched and cached."""
+    fetched = {
+        **document,
+        "cache": {
+            "mode": "reuse",
+            "directory": "/cache",
+            "years_cached": [2000, 2001, 2002, 2003, 2004],
+        },
+    }
+    if "archive" in document:
+        fetched.update(
+            catalogue="/cache/pangeo-cmip6-daily.parquet",
+            resolved_dataset="CMIP6.ScenarioMIP.X.M.ssp245.r1i1p1f1.day.pr.gn.v1",
+            calendar="proleptic_gregorian",
+            licence="CC-BY-4.0",
+        )
+    return fetched
+
+
+def _read_station(source: Any, **options: Any) -> AnnualSeries:
+    return AnnualSeries.from_table(
+        STATIONS, where={"station": "S2"}, unit="mm/day", source=source, **options
+    )
+
+
+def _read_cell(source: Any, **options: Any) -> AnnualSeries:
+    return AnnualSeries.nearest_cell(
+        GRID, longitude=7.0, latitude=50.0, unit="mm/day", source=source, **options
+    )
+
+
+READS = pytest.mark.parametrize(
+    "read", [_read_station, _read_cell], ids=["from_table", "nearest_cell"]
+)
+
+
+def _per_year(series: AnnualSeries) -> OutcomeSample:
+    return sample_annual(
+        series,
+        loss_model=LOSS,
+        basis_risk=NOISE,
+        asset_id="a",
+        rng=np.random.default_rng(0),
+    )
+
+
+@READS
+@pytest.mark.parametrize(
+    "document", [ERA5_DOCUMENT, CMIP6_DOCUMENT], ids=["era5", "cmip6"]
+)
+def test_a_lineage_does_not_move_with_the_cache_state(
+    read: Any, document: dict[str, Any]
+) -> None:
+    before = _per_year(read(document))
+    for source in (_fetched(document), _SourcePlan(_fetched(document))):
+        after = _per_year(read(source))
+        assert after.lineage == before.lineage
+        # The overlap check still sees the rows the two series share.
+        with pytest.raises(LeakageError, match="shares 5 periods"):
+            _check_out_of_sample(before, after)
+
+
+def test_a_real_cmip6_plans_lineage_is_the_same_after_a_fetch(tmp_path: Path) -> None:
+    pytest.importorskip("zarr")
+    pytest.importorskip("h5netcdf")
+    directory = tmp_path / "cmip6"
+    dataset = HazardDataset.cmip6("rx1day", model="M", scenario="ssp245")
+    plan = (
+        dataset.for_area((-1.0, -1.0, 1.0, 1.0))
+        .years(2015, 2016)
+        .cache(directory)
+        .canonicalize()
+    )
+    before = _per_year(_read_station(plan))
+    document: Any = plan.explain(format="json")
+    assert document["resolved_dataset"] is None
+
+    # As a fetch leaves it: the years' files, their manifest and the catalogue.
+    (directory / CATALOGUE_CACHE).parent.mkdir(parents=True)
+    (directory / CATALOGUE_CACHE).write_bytes(b"a local copy of the catalogue")
+    entries = {}
+    for year in (2015, 2016):
+        path = directory / f"{year}.nc"
+        path.write_bytes(b"a year's extremes")
+        entries[plan._key("one.dataset", year)] = {
+            "year": year,
+            "dataset_id": "one.dataset",
+            "resolved_version": "v1",
+            "model": "M",
+            "scenario": "ssp245",
+            "member": "r1i1p1f1",
+            "local": path.name,
+            "checksum": file_checksum(path),
+            "calendar": "noleap",
+            "licence": "CC-BY-4.0",
+        }
+    write_manifest(directory, {"entries": entries})
+    fetched: Any = plan.explain(format="json")
+    assert fetched["resolved_dataset"] == "one.dataset"
+    assert fetched["catalogue"] == str(directory / CATALOGUE_CACHE)
+    assert fetched["cache"]["years_cached"] == [2015, 2016]
+
+    after = _per_year(_read_station(plan))
+    assert after.lineage == before.lineage
+    with pytest.raises(LeakageError, match="shares 5 periods"):
+        _check_out_of_sample(before, after)
+
+
+@READS
+@pytest.mark.parametrize(
+    ("document", "key", "value"),
+    [
+        (ERA5_DOCUMENT, "recipe", "rx5day"),
+        (ERA5_DOCUMENT, "store", "other"),
+        (ERA5_DOCUMENT, "store_url", "gs://bucket/other.zarr"),
+        (ERA5_DOCUMENT, "grid_degrees", 0.5),
+        (ERA5_DOCUMENT, "requested_version", "2024"),
+        (ERA5_DOCUMENT, "unit", "mm"),
+        (CMIP6_DOCUMENT, "model", "N"),
+        (CMIP6_DOCUMENT, "member", "r2i1p1f1"),
+        (CMIP6_DOCUMENT, "pathway", "ssp585"),
+        (CMIP6_DOCUMENT, "variable", "tasmax"),
+        (CMIP6_DOCUMENT, "archive", "gcs"),
+    ],
+)
+def test_a_lineage_still_tells_sources_apart(
+    read: Any, document: dict[str, Any], key: str, value: Any
+) -> None:
+    design = _per_year(read(document))
+    other = _per_year(read({**document, key: value}))
+    assert other.lineage != design.lineage
+    _check_out_of_sample(design, other)  # no shared source, so no overlap
+
+
+def test_windows_of_one_source_plan_share_a_lineage() -> None:
+    def window(first: int, last: int) -> OutcomeSample:
+        document = {**ERA5_DOCUMENT, "years": (first, last)}
+        return _per_year(_read_station(document, years=range(first, last + 1)))
+
+    with pytest.raises(LeakageError, match="shares 1 periods"):
+        _check_out_of_sample(window(2000, 2002), window(2002, 2004))
+    _check_out_of_sample(window(2000, 2002), window(2003, 2004))
+
+
+@READS
+def test_a_located_series_does_not_depend_on_the_area_asked_for(read: Any) -> None:
+    wider = {**ERA5_DOCUMENT, "area": (0.0, 45.0, 15.0, 55.0)}
+    assert _per_year(read(wider)).lineage == _per_year(read(ERA5_DOCUMENT)).lineage
+
+
+def test_an_unlocated_series_is_told_apart_by_the_area_asked_for() -> None:
+    # One location per table and no filter: only the area says which it is.
+    rows = STATIONS.filter(pa.compute.equal(STATIONS.column("station"), "S2"))
+
+    def read(area: tuple[float, ...]) -> OutcomeSample:
+        return _per_year(
+            AnnualSeries.from_table(
+                rows, unit="mm/day", source={**ERA5_DOCUMENT, "area": area}
+            )
+        )
+
+    assert read((5.0, 49.0, 9.0, 52.0)).lineage != read((0.0, 0.0, 1.0, 1.0)).lineage
+
+
+def test_a_table_read_again_keeps_its_lineage() -> None:
+    # NEX-GDDP-CMIP6's rows carry the time they were read.
+    def read(stamp: str, version: str = "v1") -> OutcomeSample:
+        table = STATIONS.append_column(
+            "retrieved_at", pa.array([stamp] * STATIONS.num_rows)
+        ).append_column("version", pa.array([version] * STATIONS.num_rows))
+        return _per_year(
+            AnnualSeries.from_table(
+                table, where={"station": "S2"}, unit="mm/day", source="nex"
+            )
+        )
+
+    assert read("2026-01-01T00:00:00").lineage == read("2026-06-01T00:00:00").lineage
+    assert (
+        read("2026-01-01T00:00:00").lineage != read("2026-01-01T00:00:00", "v2").lineage
+    )
+
+
+def test_only_a_source_plans_document_is_cut_down() -> None:
+    # A caller's own mapping, which has no cache record, is identified whole.
+    one = _per_year(_read_station({"name": "x", "years": [2000], "licence": "a"}))
+    other = _per_year(_read_station({"name": "x", "years": [2001], "licence": "a"}))
+    assert one.lineage != other.lineage
+    stated = SourceProvenance(provider="lab", dataset="rx1day", licence="a")
+    changed = SourceProvenance(provider="lab", dataset="rx1day", licence="b")
+    assert (
+        _per_year(_read_station(stated)).lineage
+        != _per_year(_read_station(changed)).lineage
+    )
+
+
+def test_two_points_in_one_grid_cell_share_a_lineage() -> None:
+    first, second = (
+        AnnualSeries.nearest_cell(
+            GRID, longitude=x, latitude=y, unit="mm/day", source="s"
+        )
+        for x, y in ((6.9, 50.1), (7.05, 49.95))
+    )
+    assert first.provenance["cell"] == second.provenance["cell"]
+    assert first.provenance["distance_km"] != second.provenance["distance_km"]
+    # Both points read the cell's rows, so the leakage check links them.
+    design, evaluation = _per_year(first), _per_year(second)
+    assert design.lineage == evaluation.lineage
+    with pytest.raises(LeakageError, match="shares 5 periods"):
+        _check_out_of_sample(design, evaluation)
+
+
+def test_how_a_series_found_its_rows_is_not_in_its_lineage() -> None:
+    # A grid step stated instead of inferred, or an H3 cell's centre standing
+    # in for the point: the rows are the same cell's.
+    plain = _read_cell("s")
+    stated = _read_cell("s", spacing=(0.5, 0.5))
+    assert stated.provenance["spacing_degrees"]["latitude"] == 0.5
+    assert _per_year(stated).lineage == _per_year(plain).lineage
+    by_h3 = AnnualSeries(
+        plain.years,
+        plain.values,
+        plain.unit,
+        {**plain.provenance, "asset_location": "h3_cell"},
+    )
+    assert _per_year(by_h3).lineage == _per_year(plain).lineage
+
+
+def test_an_era5_series_records_the_terms_crc_sdk_holds_for_era5() -> None:
+    for source in (ERA5_DOCUMENT, _SourcePlan(ERA5_DOCUMENT)):
+        recorded = _read_station(source).provenance["source"]
+        assert recorded["licence"] == ERA5_LICENCE
+        assert recorded["attribution"] == ERA5_ATTRIBUTION
+    assert _per_year(_read_cell(ERA5_DOCUMENT)).provenance.licences[0] == {
+        "role": "hazard",
+        "source": "arco-0p25 rx1day",
+        "licence": ERA5_LICENCE,
+        "attribution": ERA5_ATTRIBUTION,
+    }
+    # A document's own terms win, and CMIP6's are read only once it is fetched.
+    own = {**ERA5_DOCUMENT, "licence": "theirs", "attribution": "their text"}
+    recorded = _read_station(own).provenance["source"]
+    assert (recorded["licence"], recorded["attribution"]) == ("theirs", "their text")
+    # Terms say nothing about which rows these are.
+    assert (
+        _per_year(_read_station(own)).lineage
+        == _per_year(_read_station(ERA5_DOCUMENT)).lineage
+    )
+    assert _read_station(CMIP6_DOCUMENT).provenance["source"]["licence"] is None
+    assert "attribution" not in _read_station(CMIP6_DOCUMENT).provenance["source"]
+    assert _read_station(_fetched(CMIP6_DOCUMENT)).provenance["source"]["licence"] == (
+        "CC-BY-4.0"
+    )
+
+
+def test_a_noaa_plan_explains_itself_without_a_format() -> None:
+    plan = NOAAExtremeWaterLevelPlan.for_station("8518750")
+    source = _read_station(plan).provenance["source"]
+    assert source["station_id"] == "8518750"
+    assert "provider" not in source  # nothing is implied by a document it does not mark
+    # Where the plan keeps its cache is not part of what it names.
+    cached = plan.cache("/somewhere/else", mode="offline")
+    assert (
+        _per_year(_read_station(cached)).lineage
+        == _per_year(_read_station(plan)).lineage
+    )
+
+
+def test_a_source_plan_is_asked_for_json_when_it_can_be() -> None:
+    class Keywords:
+        def explain(self, **options: Any) -> Any:
+            return {"format": options["format"]}
+
+    class Positional:
+        def explain(self) -> Any:
+            return {"format": "not asked"}
+
+    assert _read_station(Keywords()).provenance["source"]["format"] == "json"
+    assert _read_station(Positional()).provenance["source"]["format"] == "not asked"
