@@ -1361,6 +1361,26 @@ def _require_one_asset(sample: OutcomeSample, function: str) -> None:
         )
 
 
+def _refuse_reference_year_blocks(sample: OutcomeSample, function: str) -> None:
+    """Raise `SampleError` if `sample`'s rows come in reference-year blocks.
+
+    A row block of such a sample is a set of reference years, so a split
+    would not hold out independent draws. One asset's sample taken from it
+    has no `dependence` of its own, but its `selection` records the reordering.
+    """
+    provenance = sample.provenance
+    models = {step.get("dependence") for step in provenance.selection}
+    if provenance.dependence is not None:
+        models.add(provenance.dependence["kind"])
+    if "empirical_copula" in models:
+        raise SampleError(
+            f"{function} cannot split an EmpiricalCopula sample: its rows come in "
+            "reference-year blocks, so a block of rows is a set of reference years; "
+            "test it out of sample on fresh draws (FreshDraws on a plan, or "
+            "sample_curves with new generators and the same reference)"
+        )
+
+
 def holdout(
     sample: OutcomeSample, train_fraction: float = 0.7
 ) -> tuple[OutcomeSample, OutcomeSample]:
@@ -1374,9 +1394,11 @@ def holdout(
     that overlaps its design block raises `LeakageError`.
 
     Raises `SampleError` unless `train_fraction` is a number in (0, 1) that
-    leaves at least one period in each block.
+    leaves at least one period in each block, and for an `EmpiricalCopula`
+    sample, whose rows come in reference-year blocks: use fresh draws.
     """
     sample = _require_sample(sample)
+    _refuse_reference_year_blocks(sample, "holdout")
     if (
         isinstance(train_fraction, bool)
         or not isinstance(train_fraction, Real)
@@ -1413,9 +1435,12 @@ def year_block_kfold(
     `(design, held_out)` pair per fold, in fold order; each sample's
     probabilities are rescaled to sum to 1.
 
-    Raises `SampleError` unless `k` is an integer with `2 <= k <= n`.
+    Raises `SampleError` unless `k` is an integer with `2 <= k <= n`, and for
+    an `EmpiricalCopula` sample, whose rows come in reference-year blocks: use
+    fresh draws.
     """
     sample = _require_sample(sample)
+    _refuse_reference_year_blocks(sample, "year_block_kfold")
     n = len(sample)
     if isinstance(k, bool) or not isinstance(k, (int, np.integer)) or not 2 <= k <= n:
         raise SampleError(f"k must be an integer in [2, {n}], got {k!r}")
