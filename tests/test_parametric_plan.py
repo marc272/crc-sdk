@@ -49,11 +49,13 @@ from crc_sdk.parametric import (
     WeightedCVaR,
     compare,
     design,
+    evaluate,
     holdout,
     sample_annual,
     setup_text,
 )
 from crc_sdk.parametric.metadata import EVALUATION_METADATA_KEY
+from crc_sdk.parametric.sources import _great_circle_km
 from crc_sdk.types import SourceProvenance
 from crc_sdk.workflows import AssetPortfolio, CellColumn, ImpactContextColumns
 from crc_sdk.workflows.noaa_water_levels import NOAAExtremeWaterLevelPlan
@@ -419,7 +421,7 @@ def test_nearest_cell_locates_assets_by_their_h3_cells() -> None:
         unit="mm/day",
         source=PROVENANCE.model_dump(mode="json"),
     )
-    assert series["distance_km"] == by_hand.provenance["distance_km"]
+    assert series == {**by_hand.provenance, "asset_location": "h3_cell"}
     expected = sample_annual(
         by_hand,
         loss_model=LossModel(
@@ -680,6 +682,104 @@ def test_the_cell_is_recorded_and_the_point_is_not(tmp_path: Path) -> None:
     for name, record in records.items():
         assert str(longitude) not in record, name
         assert str(latitude) not in record, name
+
+
+def _assert_no_distance_or_point(
+    records: dict[str, str],
+    matched: Any,
+    longitude: float,
+    latitude: float,
+    *others: Any,
+) -> None:
+    """No record states the distance to the matched cell, or where the asset is."""
+    distance = float(
+        _great_circle_km(
+            latitude,
+            longitude,
+            np.array([matched["latitude"]]),
+            np.array([matched["longitude"]]),
+        )[0]
+    )
+    assert distance > 0.0
+    for name in ("provenance", "metadata"):
+        assert '"cell"' in records[name], name  # these records carry the series
+    for name, record in records.items():
+        assert "distance_km" not in record, name
+        for value in (distance, longitude, latitude, *others):
+            assert str(value) not in record, name
+
+
+def test_no_nearest_cell_record_of_the_function_route_locates_the_asset() -> None:
+    longitude, latitude = 6.9613, 50.9427
+    series = AnnualSeries.nearest_cell(
+        _annual(),
+        longitude=longitude,
+        latitude=latitude,
+        unit="mm/day",
+        source=PROVENANCE.model_dump(mode="json"),
+    )
+    sample = sample_annual(
+        series,
+        loss_model=LossModel(RAMP, value=2e6, value_unit="EUR"),
+        basis_risk=ImpactNoise(0.3, upper=1.0),
+        asset_id="a",
+        rng=np.random.default_rng(0),
+    )
+    table = evaluate(_linear(), sample, split="in_sample")
+    records = {
+        "series": str(series.provenance),
+        "provenance": json.dumps(sample.provenance.to_document()),
+        "metadata": EvaluationMetadata.from_table(table).to_json(),
+        "setup text": setup_text(table),
+    }
+    _assert_no_distance_or_point(
+        records, series.provenance["cell"], longitude, latitude
+    )
+
+
+@pytest.mark.parametrize("located_by", ["point", "h3_cell"])
+def test_no_nearest_cell_record_of_the_plan_route_locates_the_asset(
+    located_by: str, tmp_path: Path
+) -> None:
+    longitude, latitude = 6.9613, 50.9427
+    others: tuple[Any, ...] = ()
+    assets: Any = pa.table(
+        {
+            "asset_id": ["a"],
+            "longitude": [longitude],
+            "latitude": [latitude],
+            "value_eur": [2e6],
+        }
+    )
+    if located_by == "h3_cell":
+        cell = point_to_cell(longitude, latitude, 7)
+        assets = _cell_assets(cell, ids=("a",))
+        # The point of an asset located by its H3 cell is that cell's centre.
+        latitude, longitude = h3.cell_to_latlng(h3.int_to_str(cell))
+        others = (cell, format(cell, "x"))
+    plan = (
+        _plan(assets=assets)
+        .basis_risk(ImpactNoise(0.3, upper=1.0))
+        .covers(_linear())
+        .split(Holdout(0.7))
+        .metrics(OPTIONS)
+    )
+    planned: Any = plan.explain(format="json")
+    result = plan.write_parquet(tmp_path / "nearest.parquet")
+    sample = result.samples["a"]
+    schema = pq.read_schema(result.output).metadata
+    records = {
+        "provenance": json.dumps(sample.provenance.to_document()),
+        "metadata": result.metadata.to_json(),
+        "file": schema[EVALUATION_METADATA_KEY.encode("utf-8")].decode("utf-8"),
+        "setup text": setup_text(result.metadata),
+        "setup text of the rows": setup_text(result.table),
+        "explain": json.dumps(planned),
+        "setup text of the plan": setup_text(planned),
+    }
+    series = sample.provenance.sources[0]["series"]
+    assert ("asset_location" in series) == (located_by == "h3_cell")
+    _assert_no_distance_or_point(records, series["cell"], longitude, latitude, *others)
 
 
 def test_a_cell_column_is_named_in_the_setup_text() -> None:

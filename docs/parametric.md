@@ -375,11 +375,11 @@ The builders, splits, seeding and outputs are those above.
   cell nearest the H3 cell's centre is accepted only if the whole H3 cell lies
   within it. An H3 cell that straddles two grid cells does not say which
   series is the asset's, so it raises `SampleError`; give that asset a point.
-  Such a series records `"asset_location": "h3_cell"`, and its `distance_km`
-  is measured from the H3 cell's centre. `StationColumn("station_id")` reads
-  per-station tables: the asset column names each asset's station, matched
-  against the table's `station` column (`table_column="station_id"` for NOAA
-  water levels). An asset that cannot be located raises; none is dropped.
+  Such a series records `"asset_location": "h3_cell"`.
+  `StationColumn("station_id")` reads per-station tables: the asset column
+  names each asset's station, matched against the table's `station` column
+  (`table_column="station_id"` for NOAA water levels). An asset that cannot be
+  located raises; none is dropped.
 - **`unit`** is the unit of the table's values. It is checked against the
   impact's calibration (an `ImpactExpression` or a registry impact), against a
   `unit` column of the table, and against the source plan's `explain()`.
@@ -713,10 +713,9 @@ the area: each fetch and each window of one source is linked, and two series
 that share rows and a source raise. A `source` of your own is kept whole. A
 table's `retrieved_at` column is left out too.
 
-A nearest-cell series records the cell's centre, the grid step and the
-distance from the point to the centre, not the point itself. The distance with
-the centre narrows the point to a ring around that centre, and a result file
-discloses that much of an asset's location.
+A nearest-cell series records the cell's centre and the grid step, not the
+point itself: it says which grid cell holds the asset, not where in the cell it
+lies.
 
 **Loss model.** `LossModel(impact, *, value_column=None, value=None,
 value_unit="1", context=None)` computes `impact(hazard) × value`. `impact` is

@@ -182,7 +182,7 @@ _PLAN_STATE = frozenset(
 """The keys of a source plan's `explain()` document left out of a lineage."""
 _PLAN_PLACE = frozenset({"area", "areas", "station_selection", "stations"})
 """The places a plan asks for, left out where the series' cell or filter names one."""
-_ROW_SEARCH = ("asset_location", "distance_km", "spacing_degrees")
+_ROW_SEARCH = ("asset_location", "spacing_degrees")
 """What a series records of how it found its rows, which are the same either way."""
 
 
@@ -923,11 +923,9 @@ class AnnualSeries:
         and in longitude; otherwise this raises. `spacing` is the grid step
         `(latitude, longitude)` in degrees; by default the smallest step
         between the table's distinct latitudes and longitudes. Longitudes are
-        compared modulo 360. The cell centre, the distance in km and the
-        step are recorded, not the point itself; the distance with the centre
-        narrows the point to a ring around that centre. By default the series
-        must cover every year the table holds: a year the cell lacks is
-        missing.
+        compared modulo 360. The cell centre and the step are recorded, not
+        the point itself. By default the series must cover every year the
+        table holds: a year the cell lacks is missing.
         `years`, `source` and the other arguments are as in `from_table`.
 
         Raises `SampleError` if no cell centre is close enough, two are
@@ -995,7 +993,6 @@ class AnnualSeries:
                 "longitude": longitude_column,
             },
             "cell": {"latitude": cell_lat, "longitude": cell_lon},
-            "distance_km": float(distance[best[0]]),
             "spacing_degrees": {"latitude": step_lat, "longitude": step_lon},
         }
         return cls._from_rows(
