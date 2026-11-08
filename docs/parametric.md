@@ -439,8 +439,9 @@ The builders, splits, seeding and outputs are those above.
 
 The years of a record carry the climate's trend over them, so using them as
 they are is a choice like any other, and the plan states it. `trend=` takes one
-of three options, on `for_annual_extremes` and on `sample_annual`. Which one
-suits a hazard is your choice, and the module says nothing about it.
+of three options, on `for_annual_extremes`, `sample_annual` and
+`sample_annual_pool`. Which one suits a hazard is your choice, and the module
+says nothing about it.
 
 | Option | What it does | What the sample records in `provenance.trend` |
 | --- | --- | --- |
