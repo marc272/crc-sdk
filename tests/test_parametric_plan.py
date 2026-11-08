@@ -30,6 +30,7 @@ from crc_sdk.parametric import (
     EvaluationMetadata,
     ExpectedUncovered,
     Free,
+    H3Cell,
     Holdout,
     ImpactNoise,
     IndexDefinition,
@@ -39,6 +40,7 @@ from crc_sdk.parametric import (
     MetricOptions,
     NearestCell,
     NoBasisRisk,
+    OutcomeSample,
     ParametricPlan,
     PurePremium,
     SampleError,
@@ -549,6 +551,293 @@ def test_a_registry_impact_that_needs_a_cell_is_refused_without_one() -> None:
     np.testing.assert_allclose(
         gridded.loss[:, 0], with_cell.evaluate(gridded.index[:, 0])
     )
+
+
+RX1DAY = framework_impacts.for_factor("rx1day")
+A_CELL = point_to_cell(6.96, 50.94, 7)
+
+
+def _with_cells(assets: Any, *cells: Any, name: str = "h3") -> Any:
+    return assets.append_column(name, pa.array(list(cells), pa.uint64()))
+
+
+def _no_noise(plan: ParametricPlan) -> Any:
+    return plan.basis_risk(NoBasisRisk()).samples()
+
+
+def _fixed_context(sample: OutcomeSample) -> Any:
+    return sample.provenance.to_document()["loss_model"]["context"]["fixed"]
+
+
+def test_cell_gives_each_point_asset_its_own_cell() -> None:
+    # A point on another continent, where rx1day has other coefficients: the
+    # same hazard values must give another loss through its own cell.
+    points = {"cologne": (6.96, 50.94), "accra": (-0.19, 5.60)}
+    cells = {name: point_to_cell(*point, 7) for name, point in points.items()}
+    values = np.linspace(30.0, 150.0, 30)
+    stations = pa.table(
+        {
+            "station": ["S1"] * 30 + ["S2"] * 30,
+            "year": pa.array([*range(1991, 2021)] * 2, pa.int32()),
+            "value": np.concatenate([values, values]),
+        }
+    )
+    assets = pa.table(
+        {
+            "asset_id": list(points),
+            "longitude": [point[0] for point in points.values()],
+            "latitude": [point[1] for point in points.values()],
+            "station_id": ["S1", "S2"],
+        }
+    )
+    arguments: dict[str, Any] = {
+        "impact": RX1DAY,
+        "value_column": None,
+        "value_unit": "1",
+        "location": StationColumn("station_id"),
+    }
+    computed = _no_noise(
+        _plan(stations, assets, **arguments, cell=H3Cell(resolution=7))
+    )
+    read = _no_noise(
+        _plan(stations, _with_cells(assets, *cells.values()), **arguments, cell="h3")
+    )
+    losses = {}
+    for name, cell in cells.items():
+        by_hand = framework_impacts.for_factor(
+            "rx1day", context=TransformContext(cell=cell)
+        )
+        for sample in (computed[name], read[name]):
+            np.testing.assert_allclose(sample.loss[:, 0], by_hand.evaluate(values))
+            assert _fixed_context(sample)["cell"] == format(cell, "x")
+        assert computed[name].content_hash == read[name].content_hash
+        losses[name] = computed[name].loss[:, 0]
+    assert not np.allclose(losses["cologne"], losses["accra"])
+
+
+def test_cell_works_for_assets_on_a_grid_and_in_a_file(tmp_path: Path) -> None:
+    # The hazard is still read at the point; only the impact gets the cell.
+    by_cell = _no_noise(
+        _plan(assets=_assets("warehouse-a"), impact=RX1DAY, cell=H3Cell(7))
+    )["warehouse-a"]
+    by_point = _no_noise(_plan(assets=_assets("warehouse-a")))["warehouse-a"]
+    np.testing.assert_array_equal(by_cell.index, by_point.index)
+    assert by_cell.provenance.sources[0]["series"]["cell"] == {
+        "latitude": 50.875,
+        "longitude": 6.875,
+    }
+    # Assets in a file are read at execution, as ever.
+    file = tmp_path / "assets.parquet"
+    plan = _plan(assets=file, impact=RX1DAY, cell=H3Cell(7)).basis_risk(NoBasisRisk())
+    document: Any = plan.explain(format="json")
+    assert document["assets"]["cell"] == {"kind": "h3_cell", "resolution": 7}
+    assert not file.exists()
+    pq.write_table(_assets("warehouse-a"), file)
+    assert plan.samples()["warehouse-a"].content_hash == by_cell.content_hash
+
+
+def test_the_cell_is_recorded_and_the_point_is_not(tmp_path: Path) -> None:
+    longitude, latitude = 6.9613, 50.9427
+    cell = format(point_to_cell(longitude, latitude, 7), "x")
+    assets = pa.table(
+        {
+            "asset_id": ["a"],
+            "longitude": [longitude],
+            "latitude": [latitude],
+            "value_eur": [2e6],
+        }
+    )
+    plan = (
+        _plan(assets=assets, impact=RX1DAY, cell=H3Cell(resolution=7))
+        .basis_risk(NoBasisRisk())
+        .covers(_linear())
+        .split(Holdout(0.7))
+        .metrics(OPTIONS)
+    )
+    planned: Any = plan.explain(format="json")
+    assert planned["assets"]["cell"] == {"kind": "h3_cell", "resolution": 7}
+    origin = "the cell at resolution 7 of the asset's point."
+    assert f"The impact reads each asset's H3 cell: {origin}" in setup_text(planned)
+
+    result = plan.write_parquet(tmp_path / "cell.parquet")
+    sample = result.samples["a"]
+    assert _fixed_context(sample)["cell"] == cell
+    note = f"The impact reads H3 cell {cell} for asset a: {origin}"
+    assert note in sample.provenance.notes
+    schema = pq.read_schema(result.output).metadata
+    records = {
+        "provenance": json.dumps(sample.provenance.to_document()),
+        "metadata": result.metadata.to_json(),
+        "file": schema[EVALUATION_METADATA_KEY.encode("utf-8")].decode("utf-8"),
+        "setup text": setup_text(result.metadata),
+        "setup text of the rows": setup_text(result.table),
+    }
+    for name, record in records.items():
+        assert cell in record, name
+    records["explain"] = json.dumps(planned)
+    records["setup text of the plan"] = setup_text(planned)
+    for name, record in records.items():
+        assert str(longitude) not in record, name
+        assert str(latitude) not in record, name
+
+
+def test_a_cell_column_is_named_in_the_setup_text() -> None:
+    assets = _with_cells(_assets("warehouse-a"), A_CELL)
+    plan = _plan(assets=assets, impact=RX1DAY, cell="h3").basis_risk(NoBasisRisk())
+    planned: Any = plan.explain(format="json")
+    assert planned["assets"]["cell"] == {"kind": "column", "column": "h3"}
+    assert "H3 cell: the asset column h3." in setup_text(planned)
+    sample = plan.samples()["warehouse-a"]
+    assert (
+        f"The impact reads H3 cell {A_CELL:x} for asset warehouse-a: the asset "
+        "column h3." in sample.provenance.notes
+    )
+
+
+def test_only_computing_a_cell_needs_the_geometry_extra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _SourcePlan(_annual())
+    assets = _assets("warehouse-a")
+    monkeypatch.setitem(sys.modules, "h3", None)
+    plan = _plan(source, assets, impact=RX1DAY, cell=H3Cell(resolution=7))
+    plan.explain()
+    with pytest.raises(ImportError, match=r"crc-sdk\[geometry\]"):
+        plan.basis_risk(NoBasisRisk()).samples()
+    # Refused before the source is read.
+    assert source.calls == []
+    # Reading the cell from a column computes nothing.
+    read = _plan(assets=_with_cells(assets, A_CELL), impact=RX1DAY, cell="h3")
+    assert _fixed_context(_no_noise(read)["warehouse-a"])["cell"] == f"{A_CELL:x}"
+
+
+def test_a_plan_without_cell_is_as_before() -> None:
+    plan = _plan().basis_risk(NoBasisRisk())
+    assert plan.cell is None
+    document: Any = plan.explain(format="json")
+    assert "cell" not in document["assets"]
+    assert {str(s["notes"]) for s in document["setup"]["samples"]} == {"[]"}
+    sample = plan.samples()["warehouse-a"]
+    assert sample.provenance.to_document()["loss_model"]["context"] is None
+    assert not any("H3" in note for note in sample.provenance.notes)
+    with pytest.raises(SampleError, match=r"cell= \(an asset column"):
+        _plan(impact=RX1DAY, value_column=None, value_unit="1")
+    # Assets with an H3 cell are refused too without context columns or cell=.
+    with pytest.raises(SampleError, match="H3 cell"):
+        _plan(assets=_cell_assets(A_CELL), impact=RX1DAY)
+
+
+def test_cell_goes_on_top_of_the_context() -> None:
+    assets = _assets("warehouse-a").append_column("country", pa.array(["DEU"]))
+    fixed = {
+        "building_type": None,
+        "cell": f"{A_CELL:x}",
+        "continent": None,
+        "country": "DEU",
+        "historic_mean": None,
+    }
+    for options in (
+        {"context": ImpactContextColumns(country="country")},
+        {"context": TransformContext(country="DEU")},
+        {
+            "impact": framework_impacts.for_factor(
+                "rx1day", context=TransformContext(country="DEU")
+            )
+        },
+    ):
+        arguments: dict[str, Any] = {"impact": RX1DAY, **options}
+        sample = _no_noise(_plan(assets=assets, cell=H3Cell(7), **arguments))
+        assert _fixed_context(sample["warehouse-a"]) == fixed
+    # Assets located by their H3 cells may name the column, and may not ask
+    # for a cell computed from a point they do not have.
+    located = _plan(assets=_cell_assets(A_CELL), impact=RX1DAY, cell="cell_index")
+    assert _fixed_context(_no_noise(located)["warehouse-a"])["cell"] == f"{A_CELL:x}"
+    plan = _plan(assets=_cell_assets(A_CELL), impact=RX1DAY, cell=H3Cell(7))
+    with pytest.raises(SampleError, match="from its point"):
+        _no_noise(plan)
+
+
+def test_cell_is_checked_when_the_plan_is_built() -> None:
+    wrong: tuple[Any, ...] = (-1, 16, True, 7.0, "7")
+    for resolution in wrong:
+        with pytest.raises(ValueError, match="resolution"):
+            H3Cell(resolution)
+    numpy_integer: Any = np.int64(4)
+    assert H3Cell(numpy_integer).resolution == 4
+    assert H3Cell(7).to_document() == {"kind": "h3_cell", "resolution": 7}
+    with pytest.raises(TypeError, match="H3Cell"):
+        _plan(cell=7)
+    with pytest.raises(ValueError, match="column"):
+        _plan(cell="")
+    with pytest.raises(SampleError, match="no columns"):
+        _plan(cell="h3")
+    # An impact that takes no context cannot take a cell.
+    calibration = ImpactCalibration(
+        exposure_variable="rx1day",
+        exposure_unit="mm/day",
+        impact_metric="damage_ratio",
+        impact_unit="1",
+    )
+    expression = ImpactExpression.tabulated(
+        [(0.0, 0.0), (200.0, 1.0)], calibration=calibration
+    )
+    for impact in (expression, lambda values: values / 200.0):
+        with pytest.raises(SampleError, match="take none"):
+            _plan(impact=impact, cell=H3Cell(7))
+    # Two statements of the cell are not resolved silently.
+    held = TransformContext(cell=A_CELL)
+    with pytest.raises(ValueError, match="state one"):
+        _plan(impact=RX1DAY, context=held, cell=H3Cell(7))
+    with pytest.raises(ValueError, match="state one"):
+        _plan(impact=framework_impacts.for_factor("rx1day", context=held), cell="h3")
+
+
+def test_assets_without_a_usable_cell_raise(tmp_path: Path) -> None:
+    def plan(assets: Any, cell: Any, **options: Any) -> ParametricPlan:
+        return _plan(assets=assets, impact=RX1DAY, cell=cell, **options)
+
+    assets = _assets("warehouse-a")
+    with pytest.raises(SampleError, match="no longitude or latitude"):
+        _no_noise(
+            plan(
+                assets.set_column(1, "longitude", pa.array([None], pa.float64())),
+                H3Cell(7),
+            )
+        )
+    stations = pa.table(
+        {
+            "station": ["S1"] * 3,
+            "year": pa.array([2000, 2001, 2002], pa.int32()),
+            "value": [50.0, 60.0, 70.0],
+        }
+    )
+    outside = assets.set_column(2, "latitude", pa.array([95.0])).append_column(
+        "station_id", pa.array(["S1"])
+    )
+    with pytest.raises(SampleError, match="latitude"):
+        _no_noise(
+            _plan(
+                stations,
+                outside,
+                impact=RX1DAY,
+                cell=H3Cell(7),
+                location=StationColumn("station_id"),
+            )
+        )
+    with pytest.raises(SampleError, match="has no H3 cell"):
+        _no_noise(plan(_with_cells(assets, None), "h3"))
+    text = assets.append_column("h3", pa.array([f"{A_CELL:x}"]))
+    with pytest.raises(SampleError, match="unsigned 64-bit"):
+        _no_noise(plan(text, "h3"))
+    file = tmp_path / "assets.parquet"
+    pq.write_table(assets, file)
+    with pytest.raises(SampleError, match="no column 'h3'"):
+        _no_noise(plan(file, "h3"))
+    # The registry impact refuses what is not a cell, or too coarse a cell.
+    with pytest.raises(ValueError, match="H3"):
+        _no_noise(plan(_with_cells(assets, 12345), "h3"))
+    with pytest.raises(ValueError, match="H3"):
+        _no_noise(plan(assets, H3Cell(3)))
 
 
 def test_basis_risk_is_required_and_noise_needs_a_seed() -> None:

@@ -28,6 +28,7 @@ PUBLIC = [
     "ExpectedUncovered",
     "Free",
     "FreshDraws",
+    "H3Cell",
     "Holdout",
     "ImpactNoise",
     "IndexDefinition",
@@ -91,3 +92,49 @@ def test_importing_the_module_loads_no_solver() -> None:
         [sys.executable, "-c", code], capture_output=True, text=True, check=True
     )
     assert result.stdout.strip() == "[]"
+
+
+def test_only_computing_an_h3_cell_needs_the_geometry_extra() -> None:
+    # With the geometry extra's packages made unimportable, as in a base
+    # install, the module imports and an H3Cell can be stated; a plan built
+    # with one explains itself; only computing the cells raises, and says so.
+    code = """
+import sys
+
+sys.modules["h3"] = None
+sys.modules["shapely"] = None
+
+import numpy as np
+import pyarrow as pa
+
+from crc_framework import PiecewiseLinearImpact
+from crc_sdk.parametric import H3Cell, NoBasisRisk, ParametricPlan
+from crc_sdk.types import SourceProvenance
+
+annual = pa.table(
+    {
+        "year": pa.array([2000, 2001], pa.int32()),
+        "latitude": [50.0, 50.0],
+        "longitude": [7.0, 8.0],
+        "value": [1.0, 2.0],
+    }
+)
+assets = pa.table({"asset_id": ["a"], "longitude": [7.0], "latitude": [50.0]})
+plan = ParametricPlan.for_annual_extremes(
+    annual,
+    assets,
+    impact=PiecewiseLinearImpact([0.0, 1.0], [0.0, 1.0]),
+    unit="mm/day",
+    provenance=SourceProvenance(provider="p", dataset="d"),
+    cell=H3Cell(resolution=7),
+).basis_risk(NoBasisRisk())
+plan.explain()
+try:
+    plan.samples()
+except ImportError as error:
+    print(error)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    )
+    assert "crc-sdk[geometry]" in result.stdout

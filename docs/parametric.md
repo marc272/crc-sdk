@@ -392,11 +392,18 @@ The builders, splits, seeding and outputs are those above.
 - **The loss model** is `LossModel(impact, value_column=..., value_unit=...,
   context=...)`: loss = `impact(hazard) × value`, the value from an asset
   column, or 1 with `value_unit="1"` (the damage ratio). A registry impact
-  that needs an H3 cell in its context (such as `rx1day`) raises unless the
-  impact, or `context`, is a `TransformContext` with the cell, or the assets
-  have H3 cells (`CellColumn`) and `context` names context columns
-  (`ImpactContextColumns`), which give each asset's impact its own cell. A
-  point asset has no cell on this route.
+  that needs an H3 cell in its context (such as `rx1day`) raises unless
+  `cell=` states each asset's, the impact, or `context`, is a
+  `TransformContext` with the cell, or the assets have H3 cells (`CellColumn`)
+  and `context` names context columns (`ImpactContextColumns`), which give
+  each asset's impact its own cell.
+- **`cell`** gives each asset an H3 cell for the impact's context, as point
+  assets need for such an impact: `cell="h3_cell"` reads it from an asset
+  column of unsigned 64-bit H3 cells, and `cell=H3Cell(resolution=r)` computes
+  the cell of the asset's point at resolution `r`, at execution, which needs
+  the `geometry` extra (`crc-sdk[geometry]`). There is no default resolution;
+  state the one the impact expects. The series is still located by `location`.
+  Each sample's provenance and the setup text record the cell, not the point.
 - **`years`** states the years every series must cover (by default the years
   the table holds); a year without a value raises, unless `missing="drop_year"`
   drops it and lists it. No trend is removed.
@@ -1062,8 +1069,5 @@ years or fresh draws, are the ones to report.
   asset. On per-year values, `sample_annual(..., index=series)` reads it at
   another cell, station or hazard; on fitted curves, an index elsewhere needs
   a joint distribution of two curves, which the curves do not give.
-- **An H3 cell for registry impacts on point assets on per-year values.** Give
-  the impact a context with the cell, or locate the assets by their H3 cells,
-  as above. On fitted curves the plan passes each asset's matched cell.
 - **Pooled k-fold metrics, bootstrap intervals, trend removal.** Each fold has
   its own rows, and years are used as recorded.
