@@ -52,7 +52,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal, Self, TypeGuard
 
@@ -203,8 +203,9 @@ class EvaluationSetup(_EvaluationModel):
 
     `samples` holds one document per sample (each with its `sample_hash`
     and `roles`, `"evaluation"` and/or `"design"`), and `evaluations` one per
-    evaluation run (each with its `sample_hash`, `split` and `fold`).
-    Raises `EvaluationError` otherwise.
+    evaluation run (each with its `sample_hash`, `split` and `fold`, and, in
+    what `compare` and `evaluate` write, the `level` and `scope` of its rows
+    and its `allocation`). Raises `EvaluationError` otherwise.
     """
 
     basis: Literal["annual"] = "annual"
@@ -713,12 +714,14 @@ def _dependence(sample: Mapping[str, Any], where: str) -> str | None:
         return "Comonotonic(), a stated assumption"
     if kind == "empirical_copula":
         place = f"{where}.dependence"
-        years = _number(model.get("m"), f"{place}.m")
-        first = _number(model.get("first_year"), f"{place}.first_year")
-        last = _number(model.get("last_year"), f"{place}.last_year")
+        years = _get(model, "m", int, place)
+        first = _get(model, "first_year", int, place)
+        last = _get(model, "last_year", int, place)
+        draws = _get(model, "k", int, place)
         return (
             f"EmpiricalCopula, a stated assumption: the ranks of {years} reference "
             f"years, {first} to {last} ({_short(model.get('content_hash'))})"
+            + ("" if draws is None else f", {draws} draws per year")
         )
     return f"{kind}, as stated"
 
@@ -1029,6 +1032,111 @@ def _agree(rest: str, *, singular: bool) -> str:
     return _VERB.sub(lambda match: forms.get(match[1], match[1]), rest, count=1)
 
 
+_MANY_ASSETS = 5
+"""Above this many assets, a note gives a count's range, not each asset's count."""
+
+
+def _owned_note(note: str, assets: Collection[str]) -> tuple[str, str] | None:
+    """The asset and the text of a note written `Asset <id>: <text>`, if it is one.
+
+    An asset id may hold a colon, so each `: ` is tried against `assets`.
+    """
+    prefix = "Asset "
+    if not note.startswith(prefix):
+        return None
+    end = note.find(": ", len(prefix))
+    while end != -1:
+        if note[len(prefix) : end] in assets:
+            return note[len(prefix) : end], note[end + 2 :]
+        end = note.find(": ", end + 1)
+    return None
+
+
+def _counted_by_asset(
+    samples: Sequence[Mapping[str, Any]],
+) -> tuple[list[Mapping[str, Any]], bool]:
+    """The samples, with each per-asset counted note on one entry per asset.
+
+    A sample of several assets writes a counted note per asset, as
+    `Asset <id>: <n> of <m> draws ...`. Each asset's counted notes move to an
+    entry of their own, so they are counted as the notes of one-asset samples
+    are. Whether any moved is the second item.
+    """
+    expanded: list[Mapping[str, Any]] = []
+    moved = False
+    for i, sample in enumerate(samples):
+        where = f"setup.samples[{i}]"
+        values = _list(sample, "notes", where)
+        if not all(isinstance(note, str) for note in values):
+            raise EvaluationError(f"{where}.notes must be a list of text")
+        assets = {str(asset) for asset in _list(sample, "asset_ids", where)}
+        kept: list[str] = []
+        own: dict[str, list[str]] = {}
+        for note in values:
+            owned = _owned_note(note, assets)
+            if owned is not None and _COUNTED.fullmatch(owned[1]):
+                own.setdefault(owned[0], []).append(owned[1])
+            else:
+                kept.append(note)
+        if not own:
+            expanded.append(sample)
+            continue
+        moved = True
+        key = sample.get("lineage") or sample.get("sample_hash") or f"#{i}"
+        expanded.append({**sample, "lineage": key, "notes": kept})
+        expanded += [
+            {
+                **sample,
+                "asset_ids": [asset],
+                "lineage": f"{key}#{asset}",
+                "notes": notes,
+            }
+            for asset, notes in own.items()
+        ]
+    return expanded, moved
+
+
+def _note_kind(
+    members: Sequence[int],
+    samples: Sequence[Mapping[str, Any]],
+    roles: Sequence[Sequence[str]],
+    fresh: set[str],
+) -> str | None:
+    """Which kind of sample a group is; `None` if its blocks play both roles."""
+    kinds = set()
+    for i in members:
+        if "design" in roles[i]:
+            kinds.add("the design sample")
+        elif str(samples[i].get("sample_hash")) in fresh:
+            kinds.add("the fresh draws")
+        else:
+            kinds.add("the evaluation sample")
+    return kinds.pop() if len(kinds) == 1 else None
+
+
+def _shared_asset_notes(lines: Sequence[str], assets: Collection[str]) -> list[str]:
+    """Write a note that several assets share once, naming them."""
+    shared: dict[str, list[str]] = {}
+    owned = {line: _owned_note(line, assets) for line in lines}
+    for found in owned.values():
+        if found is not None:
+            shared.setdefault(found[1], []).append(found[0])
+    written: list[str] = []
+    for line in lines:
+        found = owned[line]
+        if found is None or len(shared[found[1]]) == 1:
+            written.append(line)
+        elif found[0] == shared[found[1]][0]:
+            names = shared[found[1]]
+            who = (
+                f"{len(names)} assets"
+                if len(names) > _MANY_ASSETS
+                else f"Assets {_join(names)}"
+            )
+            written.append(f"{who}: {found[1]}")
+    return written
+
+
 def _note_labels(
     groups: Mapping[str, Sequence[int]],
     samples: Sequence[Mapping[str, Any]],
@@ -1048,18 +1156,11 @@ def _note_labels(
     several = len(_first_seen(asset for assets in owners for asset in assets)) > 1
     labels: dict[str, str] = {}
     for key, members in groups.items():
-        kinds = set()
-        for i in members:
-            if "design" in roles[i]:
-                kinds.add("the design sample")
-            elif str(samples[i].get("sample_hash")) in fresh:
-                kinds.add("the fresh draws")
-            else:
-                kinds.add("the evaluation sample")
+        kind = _note_kind(members, samples, roles, fresh)
         assets = _first_seen(asset for i in members for asset in owners[i])
         owner = f"for {_join(assets)}" if several and assets else ""
-        if len(kinds) == 1:
-            labels[key] = " ".join(["in", kinds.pop(), owner]).rstrip()
+        if kind is not None:
+            labels[key] = " ".join(["in", kind, owner]).rstrip()
         else:
             labels[key] = owner or "in the sample split into blocks"
     for label in set(labels.values()):
@@ -1074,6 +1175,37 @@ def _note_labels(
     return labels
 
 
+def _counted_parts(
+    entries: Sequence[tuple[str, str, str, str, str | None]],
+) -> tuple[list[str], bool]:
+    """The counts of one note, and whether its verb is singular.
+
+    Each entry is a count, a total, the label of its sample, the kind of that
+    sample and the asset it is for. Up to `_MANY_ASSETS` assets each has its
+    own count; above that, each kind of sample states the range of the counts.
+    """
+    assets = _first_seen(entry[4] for entry in entries if entry[4] is not None)
+    if len(assets) <= _MANY_ASSETS:
+        parts = [
+            f"{count} of {total}{' draws' if j == 0 else ''} {label}"
+            for j, (count, total, label, _, _) in enumerate(entries)
+        ]
+        return parts, len(entries) == 1 and int(entries[0][0]) == 1
+    ranges: dict[tuple[str, str], list[int]] = {}
+    for count, total, _, kind, _ in entries:
+        ranges.setdefault((total, kind), []).append(int(count))
+    parts = []
+    for j, ((total, kind), counts) in enumerate(ranges.items()):
+        low, high = min(counts), max(counts)
+        span = str(low) if low == high else f"{low} to {high}"
+        place = f" in {kind}" if kind else ""
+        parts.append(
+            f"{span} of {total}{' draws' if j == 0 else ''}{place} for each of "
+            f"{len(counts)} assets"
+        )
+    return parts, False
+
+
 def _notes(
     samples: Sequence[Mapping[str, Any]], evaluations: Sequence[Mapping[str, Any]]
 ) -> list[str]:
@@ -1085,17 +1217,20 @@ def _notes(
     curve's fitted support in the design sample and in the fresh draws, is
     written once with every sample's own counts, asset by asset and the
     design sample first. Its verb is singular for one sample's count of 1
-    and plural otherwise, whichever form each sample's note has.
+    and plural otherwise, whichever form each sample's note has. The counted
+    notes that a sample of several assets writes per asset
+    (`Asset <id>: <n> of <m> draws ...`) are written the same way; above
+    `_MANY_ASSETS` assets, each kind of sample states the range of their
+    counts. A note that several assets share word for word is written once,
+    naming them.
     """
+    samples, moved = _counted_by_asset(samples)
     notes: list[list[str]] = []
     roles: list[list[str]] = []
     owners: list[list[str]] = []
     for i, sample in enumerate(samples):
         where = f"setup.samples[{i}]"
-        values = _list(sample, "notes", where)
-        if not all(isinstance(note, str) for note in values):
-            raise EvaluationError(f"{where}.notes must be a list of text")
-        notes.append(values)
+        notes.append(_list(sample, "notes", where))
         roles.append([str(role) for role in _list(sample, "roles", where)])
         owners.append([str(asset) for asset in _list(sample, "asset_ids", where)])
     groups: dict[str, list[int]] = {}
@@ -1111,9 +1246,12 @@ def _notes(
         )
         for members in groups.values()
     }
-    if len(counted) <= 1:
+    every_asset = {asset for assets in owners for asset in assets}
+    if len(counted) <= 1 and not moved:
         # One drawn sample, or the same counts in each: the notes as they are.
-        return _first_seen(note for values in notes for note in values)
+        return _shared_asset_notes(
+            _first_seen(note for values in notes for note in values), every_asset
+        )
 
     fresh = {
         str(evaluation.get("sample_hash"))
@@ -1133,9 +1271,14 @@ def _notes(
         asset = first[owners[i][0]] if owners[i] else len(first)
         return asset, group_of[i] not in designed
 
+    kinds = {
+        key: _note_kind(members, samples, roles, fresh) or ""
+        for key, members in groups.items()
+    }
+
     # A note as it is (no entries), or the rest of a counted note with each
-    # drawn sample's counts and label.
-    statements: dict[tuple[bool, str], list[tuple[str, str, str]]] = {}
+    # drawn sample's counts, label, kind and asset.
+    statements: dict[tuple[bool, str], list[tuple[str, str, str, str, str | None]]] = {}
     for i in sorted(range(len(samples)), key=place):
         for note in notes[i]:
             match = _COUNTED.fullmatch(note)
@@ -1144,20 +1287,18 @@ def _notes(
                 continue
             count, total, rest = match.groups()
             entries = statements.setdefault((True, _agree(rest, singular=False)), [])
-            if (count, total, labels[group_of[i]]) not in entries:
-                entries.append((count, total, labels[group_of[i]]))
+            asset = owners[i][0] if len(owners[i]) == 1 else None
+            entry = (count, total, labels[group_of[i]], kinds[group_of[i]], asset)
+            if entry not in entries:
+                entries.append(entry)
     lines: list[str] = []
     for (is_counted, text), entries in statements.items():
         if not is_counted:
             lines.append(text)
             continue
-        parts = [
-            f"{count} of {total}{' draws' if j == 0 else ''} {label}"
-            for j, (count, total, label) in enumerate(entries)
-        ]
-        singular = len(entries) == 1 and int(entries[0][0]) == 1
+        parts, singular = _counted_parts(entries)
         lines.append(f"{_join(parts)} {_agree(text, singular=singular)}")
-    return lines
+    return _shared_asset_notes(lines, every_asset)
 
 
 def _pricing(pricing: Any, where: str) -> str:
@@ -1429,7 +1570,11 @@ def _levels_of(
     if set(levels) <= {"asset"} and set(scopes) <= {"individual"}:
         return levels, scopes, None
     sums: list[str] = []
-    for evaluation in evaluations:
+    for i, evaluation in enumerate(evaluations):
+        if "total" not in _named(
+            evaluation, "level", "asset", f"setup.evaluations[{i}]"
+        ):
+            continue
         sample = samples.get(str(evaluation.get("sample_hash")))
         summed = None if sample is None else sample.get("asset_ids")
         sums.append(_join([str(asset) for asset in summed or assets]) or "its assets")
@@ -1458,7 +1603,7 @@ def _levels_of(
     elif scopes == ["individual"]:
         text += ". Scope: individual, each cover standing on its own"
     else:
-        text += f". Scope: {_join(scopes)}, kept apart by the scope column"
+        text += f". Scope: {_join(sorted(scopes))}, kept apart by the scope column"
     return levels, scopes, text
 
 
@@ -1498,11 +1643,14 @@ def setup_text(
       file, table or plan it is read from);
     - `Sample notes`: what the sources recorded, such as draws beyond the
       fitted support, a pooled ensemble, dropped years, an index read from
-      another series, or a comonotone index and loss. A note that differs
-      between drawn samples only in its counts, such as the draws beyond the
-      fitted support in the design sample and in the fresh draws, is written
-      once, with each sample's own counts, its verb in the singular for one
-      sample's count of 1 and in the plural otherwise;
+      another series, a comonotone index and loss, or the assumption of a
+      dependence model. A note that differs between drawn samples or assets
+      only in its counts, such as the draws beyond the fitted support in the
+      design sample and in the fresh draws, is written once, with each
+      sample's or asset's own counts, its verb in the singular for one count
+      of 1 and in the plural otherwise; above five assets it gives the range
+      of the counts. A note that several assets share is written once, naming
+      them;
     - `Pricing`: the pricing of the covers given as is; a design keeps its
       design premium, and a row's `premium_basis` says which premium it uses;
     - `Design`, one line per design: the objective, pricing, budget and

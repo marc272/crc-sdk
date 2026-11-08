@@ -904,7 +904,7 @@ def _parts_entry(provenance: Mapping[str, Any]) -> dict[str, Any] | None:
     if parts is None:
         return None
     return {
-        asset: {key: part[key] for key in ("basis_risk", "loss_model")}
+        asset: {key: part[key] for key in ("basis_risk", "loss_model") if key in part}
         for asset, part in parts.items()
     }
 

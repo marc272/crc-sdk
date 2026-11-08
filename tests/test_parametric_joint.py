@@ -3,8 +3,8 @@
 The fixture cases are read as JSON with plain numpy, as
 `tests/fixtures/parametric/README.md` describes; no reference code is
 imported. Every design case of several assets in the folder is judged, so new
-ones are picked up when they are copied. The metrics of the total are
-evaluated elsewhere: `evaluate` doesn't take a joint design yet.
+ones are picked up when they are copied. The metrics of the total are in
+`tests/test_parametric_evaluate_joint.py`.
 """
 
 from __future__ import annotations
