@@ -650,16 +650,47 @@ def _recorded(document: Mapping[str, Any], key: str, where: str) -> str | None:
     return None if value is None or value == "" else str(value)
 
 
+_CMIP_COLUMNS = ("model", "member", "scenario")
+"""The columns that make a per-year table's `scenario` a CMIP6 pathway."""
+
+
+def _series_pathway(
+    series: Mapping[str, Any], document: Mapping[str, Any], where: str
+) -> str | None:
+    """A per-year series' pathway: its source's, else its rows' one scenario.
+
+    A CMIP6 plan's `explain()` document states `pathway`. A table of CMIP6
+    runs, such as NEX-GDDP-CMIP6's `annual_extremes()`, has `model`, `member`
+    and `scenario` columns instead, and the `scenario` of the series' rows is
+    the pathway when they hold one. A table with only a `scenario` column
+    states no pathway: there the word need not mean one.
+    """
+    stated = _recorded(document, "pathway", where)
+    if stated is not None:
+        return stated
+    columns = _get(series, "table_columns", Mapping, f"{where}.series") or {}
+    if not all(name in columns for name in _CMIP_COLUMNS):
+        return None
+    place = f"{where}.series.table_columns"
+    scenario = _get(columns, "scenario", Mapping, place) or {}
+    values = _list(scenario, "values", f"{place}.scenario")
+    if len(values) != 1:
+        return None
+    return _recorded({"scenario": values[0]}, "scenario", place)
+
+
 def _source_record(entry: Mapping[str, Any], where: str) -> str:
     """One source record: what it is, and its provider, dataset, horizon, pathway.
 
     A curve's provider and dataset come from its dataset metadata's `source`
     block, and its hazard, horizon and pathway from its canonical row; a
-    per-year series' from its provenance's `source`. A field the record does
-    not hold is said to be not recorded.
+    per-year series' provider and dataset from its provenance's `source`, and
+    its pathway as `_series_pathway` says. A field the record does not hold
+    is said to be not recorded.
     """
     role = _recorded(entry, "role", where) or "source"
     row = _get(entry, "row", Mapping, where) or {}
+    pathway = _recorded(row, "pathway", f"{where}.row")
     document: Mapping[str, Any]
     if entry.get("kind") == "curve":
         metadata = _get(entry, "metadata", Mapping, where) or {}
@@ -675,6 +706,8 @@ def _source_record(entry: Mapping[str, Any], where: str) -> str:
         else:
             document = _get(series, "source", Mapping, f"{where}.series") or {}
         head = f"the {role} series"
+        if pathway is None:
+            pathway = _series_pathway(series, document, where)
     else:
         document = entry
         head = f"the {role}"
@@ -685,7 +718,7 @@ def _source_record(entry: Mapping[str, Any], where: str) -> str:
         "provider": _recorded(document, "provider", where),
         "dataset": _recorded(document, "dataset", where),
         "horizon": _recorded(row, "horizon", f"{where}.row"),
-        "pathway": _recorded(row, "pathway", f"{where}.row"),
+        "pathway": pathway,
     }
     known = [f"{key} {value}" for key, value in fields.items() if value is not None]
     missing = [key for key, value in fields.items() if value is None]

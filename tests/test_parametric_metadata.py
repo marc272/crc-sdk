@@ -48,6 +48,7 @@ from crc_sdk.parametric import (
 from crc_sdk.parametric.evaluate import DesignedCover
 from crc_sdk.parametric.metadata import EVALUATION_METADATA_KEY, EvaluationSetup
 from crc_sdk.types import EnsembleDescriptor, HazardDatasetMetadata, SourceProvenance
+from crc_sdk.workflows import HazardDataset
 
 UNTYPED_SETUP_TEXT: Any = setup_text
 
@@ -981,6 +982,30 @@ def test_setup_text_names_the_source() -> None:
             r"sources\[0\]\.row\.horizon has the wrong type",
         ),
         ({"series": {"source": 3}}, r"sources\[0\]\.series\.source has the wrong"),
+        (
+            {"series": {"source": {"pathway": 1.5}}},
+            r"sources\[0\]\.pathway has the wrong type",
+        ),
+        (
+            {"series": {"table_columns": "x"}},
+            r"sources\[0\]\.series\.table_columns has the wrong type",
+        ),
+        (
+            {"series": {"table_columns": {"model": 1, "member": 1, "scenario": "x"}}},
+            r"sources\[0\]\.series\.table_columns\.scenario has the wrong type",
+        ),
+        (
+            {
+                "series": {
+                    "table_columns": {
+                        "model": 1,
+                        "member": 1,
+                        "scenario": {"values": [1.5]},
+                    }
+                }
+            },
+            r"sources\[0\]\.series\.table_columns\.scenario has the wrong type",
+        ),
     ],
 )
 def test_setup_text_rejects_malformed_source_records(
@@ -989,6 +1014,208 @@ def test_setup_text_rejects_malformed_source_records(
     metadata = _metadata(evaluate(COVER, _sample(), split="in_sample"))
     with pytest.raises(EvaluationError, match=message):
         setup_text(metadata.model_copy(update={"sources": (record,)}))
+
+
+ERA5_EXPLAIN: dict[str, Any] = {
+    "recipe": "rx1day",
+    "definition": "annual maximum one-day precipitation total (UTC days)",
+    "unit": "mm/day",
+    "store": "arco-0p25",
+    "store_url": "gs://bucket/era5.zarr",
+    "grid_degrees": 0.25,
+    "requested_version": "latest",
+    "area": (-1.0, -1.0, 1.0, 1.0),
+    "land_only": False,
+    "years": (2000, 2001, 2002),
+    "return_period_tail": "upper",
+    "daily_boundary": "UTC",
+    "fitting": {"family": "genextreme", "method": "sample_lmoments"},
+    "cache": {"mode": "stream", "directory": None, "years_cached": []},
+    "execution": "network and fitting occur only at prefetch/materialize/write",
+}
+"""The document of an ERA5 plan's `explain(format="json")`."""
+CMIP6_EXPLAIN: dict[str, Any] = {
+    "recipe": "rx1day",
+    "definition": "annual maximum one-day precipitation total",
+    "unit": "mm/day",
+    "model": "MPI-ESM1-2-HR",
+    "pathway": "ssp245",
+    "member": "r1i1p1f1",
+    "variable": "pr",
+    "grid_label": None,
+    "archive": "aws",
+    "catalogue": "https://example.org/pangeo-cmip6.csv",
+    "requested_version": "latest",
+    "resolved_dataset": None,
+    "calendar": None,
+    "licence": None,
+    "strict_licence": False,
+    "area": (-1.0, -1.0, 1.0, 1.0),
+    "years": (2015, 2016, 2017),
+    "return_period_tail": "upper",
+    "ensemble": "single_member (one model, one member, one pathway)",
+    "fitting": {"family": "genextreme", "method": "sample_lmoments"},
+    "cache": {"mode": "stream", "directory": None, "years_cached": []},
+    "execution": "catalogue lookup, network and fitting occur only at materialize",
+}
+"""The document of a CMIP6 plan's `explain(format="json")`."""
+ANNUAL_CELLS = pa.table(
+    {
+        "year": pa.array([y for y in range(2000, 2003) for _ in (0, 1)], pa.int32()),
+        "latitude": [50.0, 50.25] * 3,
+        "longitude": [7.0, 7.0] * 3,
+        "value": [50.0, 51.0, 70.0, 71.0, 100.0, 101.0],
+    }
+)
+ANNUAL_ROWS = pa.table({"year": [2000, 2001, 2002], "value": [50.0, 70.0, 100.0]})
+ERA5_RECORD = (
+    "Source: the hazard series from provider era5 and dataset arco-0p25 rx1day, "
+    "with horizon and pathway not recorded."
+)
+CMIP6_RECORD = (
+    "Source: the hazard series from provider cmip6, dataset MPI-ESM1-2-HR "
+    "r1i1p1f1 rx1day and pathway ssp245, with horizon not recorded."
+)
+
+
+class _SourcePlanStub:
+    """A source plan: `explain()` answers, and fetching its data raises."""
+
+    def __init__(self, document: dict[str, Any]) -> None:
+        self.document = document
+
+    def annual_extremes(self, **_: Any) -> Any:
+        raise AssertionError("a source's annual_extremes() must not be called")
+
+    def explain(self, *, format: str = "text") -> Any:
+        assert format == "json"
+        return self.document
+
+
+def _by_rows(source: Any) -> AnnualSeries:
+    return AnnualSeries.from_table(ANNUAL_ROWS, unit="mm/day", source=source)
+
+
+def _by_cell(source: Any) -> AnnualSeries:
+    return AnnualSeries.nearest_cell(
+        ANNUAL_CELLS,
+        longitude=7.0,
+        latitude=50.0,
+        unit="mm/day",
+        spacing=(0.25, 0.25),
+        source=source,
+    )
+
+
+def _source_line(series: AnnualSeries) -> list[str]:
+    """The `Source` line of the setup text of a sample of `series`."""
+    sample = sample_annual(
+        series,
+        loss_model=LossModel(
+            PiecewiseLinearImpact([40.0, 100.0], [0.0, 1.0]),
+            value=1e6,
+            value_unit="EUR",
+        ),
+        basis_risk=NoBasisRisk(),
+        asset_id="warehouse-a",
+    )
+    return _lines(setup_text(_metadata(evaluate(LINEAR, sample, split="in_sample"))))[
+        "Source"
+    ]
+
+
+@pytest.mark.filterwarnings("ignore::crc_sdk.parametric.ComonotoneIndexWarning")
+@pytest.mark.parametrize("read", [_by_rows, _by_cell], ids=["from_table", "cell"])
+@pytest.mark.parametrize(
+    ("document", "record"),
+    [(ERA5_EXPLAIN, ERA5_RECORD), (CMIP6_EXPLAIN, CMIP6_RECORD)],
+    ids=["era5", "cmip6"],
+)
+def test_setup_text_names_a_per_year_source_plan(
+    read: Any, document: dict[str, Any], record: str
+) -> None:
+    from_plan = read(_SourcePlanStub(document))
+    assert _source_line(from_plan) == [record]
+    # The plan's document, passed directly, is the same source.
+    assert _source_line(read(document)) == [record]
+
+
+def test_the_stubbed_source_plans_have_the_real_plans_shape() -> None:
+    pytest.importorskip("zarr")
+    pytest.importorskip("h5netcdf")
+    bounds = (-1.0, -1.0, 1.0, 1.0)
+    era5 = HazardDataset.era5("rx1day").for_area(bounds).years(1991, 2020)
+    cmip6 = HazardDataset.cmip6("rx1day", model="M", scenario="ssp245")
+    plans: tuple[tuple[Any, dict[str, Any], str], ...] = (
+        (era5.canonicalize(), ERA5_EXPLAIN, "arco-0p25 rx1day"),
+        (
+            cmip6.for_area(bounds).years(2015, 2044).canonicalize(),
+            CMIP6_EXPLAIN,
+            "M r1i1p1f1 rx1day",
+        ),
+    )
+    for plan, stub, dataset in plans:
+        assert set(plan.explain(format="json")) == set(stub)
+        # Only explain() is called: a plan without a cache cannot fetch its years.
+        source = _by_rows(plan).provenance["source"]
+        assert source["provider"] == plan._provider
+        assert source["dataset"] == dataset
+
+
+@pytest.mark.filterwarnings("ignore::crc_sdk.parametric.ComonotoneIndexWarning")
+@pytest.mark.parametrize(
+    ("columns", "pathway"),
+    [
+        ({"scenario": ["ssp245"] * 3, "model": ["M"] * 3, "member": ["r1"] * 3}, True),
+        (
+            {
+                "scenario": ["ssp126", "ssp245", "ssp245"],
+                "model": ["M"] * 3,
+                "member": ["r1"] * 3,
+            },
+            False,
+        ),
+        ({"scenario": ["ssp245"] * 3}, False),
+    ],
+    ids=["one scenario", "two scenarios", "no CMIP6 columns"],
+)
+def test_setup_text_takes_the_pathway_from_a_tables_one_scenario(
+    columns: dict[str, list[str]], pathway: bool
+) -> None:
+    table = pa.table({"year": [2000, 2001, 2002], "value": [50.0, 70.0, 100.0]})
+    for name, values in columns.items():
+        table = table.append_column(name, pa.array(values))
+    provenance = SourceProvenance(provider="nasa", dataset="NEX-GDDP-CMIP6")
+    series = AnnualSeries.from_table(table, unit="mm/day", source=provenance)
+    assert _source_line(series) == [
+        (
+            "Source: the hazard series from provider nasa, dataset NEX-GDDP-CMIP6 "
+            "and pathway ssp245, with horizon not recorded."
+            if pathway
+            else "Source: the hazard series from provider nasa and dataset "
+            "NEX-GDDP-CMIP6, with horizon and pathway not recorded."
+        )
+    ]
+
+
+@pytest.mark.filterwarnings("ignore::crc_sdk.parametric.ComonotoneIndexWarning")
+def test_setup_text_keeps_the_callers_own_names_for_a_per_year_source() -> None:
+    # A SourceProvenance names the source, and a plan's document is not read.
+    stated = SourceProvenance(provider="lab", dataset="our rx1day")
+    assert _source_line(_by_rows(stated)) == [
+        "Source: the hazard series from provider lab and dataset our rx1day, with "
+        "horizon and pathway not recorded."
+    ]
+    # So do a mapping's own provider, dataset and pathway, over the table's too.
+    table = ANNUAL_ROWS.append_column("scenario", pa.array(["ssp585"] * 3))
+    table = table.append_column("model", pa.array(["M"] * 3))
+    table = table.append_column("member", pa.array(["r1"] * 3))
+    document = {**CMIP6_EXPLAIN, "provider": "lab", "dataset": "our cmip6"}
+    series = AnnualSeries.from_table(table, unit="mm/day", source=document)
+    assert _source_line(series) == [
+        "Source: the hazard series from provider lab, dataset our cmip6 and pathway "
+        "ssp245, with horizon not recorded."
+    ]
 
 
 def test_setup_text_takes_a_comparison_table(tmp_path: Path) -> None:

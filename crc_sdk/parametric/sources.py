@@ -61,6 +61,7 @@ from crc_framework.distributions import (
     TabulatedDistribution,
 )
 from numpy.typing import NDArray
+from pydantic import BaseModel
 
 from crc_sdk.parametric._canonical import content_hash
 from crc_sdk.parametric.basis_risk import BasisRisk, ImpactNoise, NoBasisRisk
@@ -140,6 +141,15 @@ _TABLE_PROVENANCE_COLUMNS = (
     "version",
 )
 _MAX_RECORDED_VALUES = 20
+_SOURCE_PLANS = (
+    ("era5", ("store_url", "grid_degrees"), ("store", "recipe")),
+    ("cmip6", ("archive", "catalogue", "pathway"), ("model", "member", "recipe")),
+)
+"""How the `explain()` documents of ERA5 and CMIP6 plans are read.
+
+For each: the provider, as the plan records it on its fitted curves; the keys
+that mark its document; and the keys whose values name the dataset.
+"""
 
 
 # -- shared checks ------------------------------------------------------------
@@ -623,6 +633,45 @@ def _recorded_columns(rows: Any) -> dict[str, Any]:
     return recorded
 
 
+def _source_plan_names(document: Mapping[str, Any]) -> dict[str, str]:
+    """The provider and dataset that an ERA5 or CMIP6 `explain()` document implies.
+
+    These plans' documents state what was asked for, not who holds it. Any
+    other document implies nothing.
+    """
+    for provider, marks, names in _SOURCE_PLANS:
+        parts = [
+            part for part in map(document.get, names) if isinstance(part, str) and part
+        ]
+        if len(parts) == len(names) and all(mark in document for mark in marks):
+            return {"provider": provider, "dataset": " ".join(parts)}
+    return {}
+
+
+def _series_source_document(source: Any) -> dict[str, Any]:
+    """Return a per-year series' `source` as a plain JSON document.
+
+    As `_source_document`, and `source` may be a source plan too: then its
+    `explain(format="json")` is the document, and nothing else of the plan is
+    called, so no data is fetched. The provider and dataset of an ERA5 or
+    CMIP6 document are added, unless the document states its own.
+    """
+    if callable(getattr(source, "explain", None)):
+        source = source.explain(format="json")
+        if not isinstance(source, Mapping):
+            raise SampleError(
+                "a source plan's explain(format='json') must return a mapping, "
+                f"got {type(source).__name__}"
+            )
+    elif source is not None and not isinstance(source, (str, Mapping, BaseModel)):
+        raise TypeError(
+            "source must be a name, a SourceProvenance, a mapping or a plan with "
+            f"explain(), got {type(source).__name__}"
+        )
+    document = _source_document(source)
+    return {**_source_plan_names(document), **document}
+
+
 @dataclass(frozen=True, eq=False)
 class AnnualSeries:
     """One hazard's value per year at one location.
@@ -740,10 +789,13 @@ class AnnualSeries:
         years without a row are missing. By default the series covers every
         year from the first to the last row, so a gap is a missing year.
         `source` describes the table for the provenance: a name, a
-        `SourceProvenance` or a mapping such as the plan's
-        `explain(format="json")`. Columns such as `attribution`,
-        `archive_licence`, `source_url` or `station` are recorded too. If the
-        table has a `unit` column, it must equal `unit`.
+        `SourceProvenance`, a mapping such as the plan's
+        `explain(format="json")`, or the source plan itself, of which only
+        `explain(format="json")` is called. An ERA5 or CMIP6 plan's document
+        states no provider or dataset, so they are named from what it does
+        state; a mapping's own `provider` and `dataset` win. Columns such as
+        `attribution`, `archive_licence`, `source_url` or `station` are
+        recorded too. If the table has a `unit` column, it must equal `unit`.
 
         `table` is an in-memory Arrow table, record batches (for example
         NEX-GDDP-CMIP6's `annual_extremes()` iterator) or any table Arrow
@@ -778,7 +830,7 @@ class AnnualSeries:
             raise SampleError(f"no rows of the annual table match where={where!r}")
         provenance: dict[str, Any] = {
             "kind": "table",
-            "source": _source_document(source),
+            "source": _series_source_document(source),
             "columns": {"year": year, "value": value},
             "where": filter_document,
         }
@@ -877,7 +929,7 @@ class AnnualSeries:
             requested = np.unique(all_years)
         provenance: dict[str, Any] = {
             "kind": "nearest_cell",
-            "source": _source_document(source),
+            "source": _series_source_document(source),
             "columns": {
                 "year": year,
                 "value": value,
