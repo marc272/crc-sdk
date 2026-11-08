@@ -1,7 +1,8 @@
 """End to end, offline: from synthetic sources to a written comparison file.
 
 - the quick start of `docs/parametric.md` (the plan on a fitted curve), its
-  per-year step and both function routes, executed as written;
+  per-year step, both function routes and its joint design, executed as
+  written;
 - the function route from a synthetic canonical file of fitted curves;
 - the plan from a synthetic annual-extremes file, with k-fold splits.
 """
@@ -52,6 +53,7 @@ from crc_sdk.parametric import (
     to_long,
     write_comparison,
 )
+from crc_sdk.parametric.metadata import IDENTITY_COLUMNS
 from crc_sdk.types import HazardDatasetMetadata, SourceProvenance
 from crc_sdk.workflows import ReturnPeriodExtrapolationWarning
 
@@ -301,6 +303,55 @@ def test_the_docs_quick_start_runs_as_written(
     _assert_by_hand(tmp_path / "by-hand-annual.parquet", annual_result.table)
     assert namespace["fitted"].provenance.trend["fit_years"][-1] == 2008
     assert namespace["design_years"].period[-1] == 2008
+
+
+def test_the_docs_joint_design_runs_as_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    quick_start = _python_blocks("## Quick start")
+    per_year = _python_blocks("## Next step: per-year values")
+    joint = _python_blocks("## Joint design over several assets")
+    assert len(joint) == 2
+    monkeypatch.chdir(tmp_path)
+    namespace: dict[str, Any] = {}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ReturnPeriodExtrapolationWarning)
+        for block in [quick_start[0], per_year[0], *joint]:
+            exec(compile(block, str(DOCS), "exec"), namespace)
+
+    printed = capsys.readouterr().out
+    assert "Level: total, the sum over warehouse-a and warehouse-b in each draw" in (
+        printed
+    )
+    assert "Scope: joint, one objective and one budget on the owner's total" in printed
+    assert "Dependence between the assets: the data's own" in printed
+    result = namespace["joint_result"]
+    assert (tmp_path / "joint-comparison.parquet").is_file()
+    # A total and two allocated rows, in and out of sample; the scope is one.
+    assert result.row_count == 6
+    assert set(result.table.column("level").to_pylist()) == {"total", "asset_by_value"}
+    assert set(result.table.column("scope").to_pylist()) == {"joint"}
+    assert "asset_by_value, one row per asset" in setup_text(result.metadata)
+
+    # The function route gives the plan's sample and design and its rows.
+    (planned,) = result.designs
+    assert result.joint_sample.content_hash == namespace["joined"].content_hash
+    assert namespace["joint_design"].parameters == planned.parameters
+    held_out = result.table.filter(pc.equal(result.table["split"], "out_of_sample"))
+    table = namespace["joint_table"]
+    for column in ("level", "asset_id", "premium", "expected_payout", "sample_hash"):
+        assert table.column(column).to_pylist() == held_out.column(column).to_pylist()
+
+
+def test_the_docs_comparison_table_lists_every_identity_column() -> None:
+    page = DOCS.read_text(encoding="utf-8")
+    section = page[page.index("### The comparison table") :]
+    section = section[: section.index("\n## ")]
+    for column in IDENTITY_COLUMNS:
+        assert f"`{column}`" in section
+    for level in ("asset", "total", "asset_by_value", "asset_by_loss"):
+        assert f'`"{level}"`' in section
+    assert '`"individual"`' in section and '`"joint"`' in section
 
 
 def _assert_by_hand(path: Path, planned: Any) -> None:

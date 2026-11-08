@@ -37,6 +37,7 @@ There are two ways to use the module:
 | Objective | `MSE`, `ExpectedUncovered`, `WeightedCVaR`, `UserObjective` | What a design minimises |
 | Pricing and constraints | `PurePremium`, `CostOfCapitalLoad`, `Budget`, `Limit` | The premium of a payout, and what a design must respect |
 | Design | `design`, `DesignResult` | A template's resolved cover and its design record |
+| Scope | `Individual()`, `Joint()` | Whether each asset's cover is designed on its own or several together, for one objective on the owner's total ([joint design](#joint-design-over-several-assets)) |
 | Comparison | `compare`, a `pyarrow.Table` | Covers as rows, metrics as columns, in and out of sample |
 | Plan | `ParametricPlan`, `ParametricResult` | The lazy workflow from a portfolio evaluation's curves (or per-year values) to a written comparison |
 
@@ -165,8 +166,12 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
   .pricing(PurePremium() | CostOfCapitalLoad(rate, q))   # optional
   .split(FreshDraws(n_draws, seed=...) | Holdout(train_fraction) | KFold(k))
   .metrics(MetricOptions(...))                # optional
+  .scopes(Individual() | Joint())             # optional; default Individual()
+  .dependence(Independent() | Comonotonic() | EmpiricalCopula(reference))
+                                              # fitted curves; required with Joint()
+  .allocation("value" | "loss")               # optional: a joint design's asset rows
   .explain(format="text")                     # no I/O
-  .samples() / .designs() / .write_parquet(path)   # execution points
+  .samples() / .joint_sample() / .designs() / .write_parquet(path)   # execution
 ```
 
 ### Fitted curves
@@ -218,6 +223,9 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
 | `.pricing(pricing)` | The plan's pricing, `PurePremium()` or `CostOfCapitalLoad(rate, q)`, for a plan of resolved covers that has no `.objective(...)` |
 | `.split(rule)` | `FreshDraws(n_draws, seed=...)` (fitted curves), `Holdout(train_fraction)` or `KFold(k)`, below |
 | `.metrics(options)` | The `MetricOptions` of every row |
+| `.scopes(*scopes)` | `Individual()`, the default, designs each asset on its own; `Joint()` designs each template on the owner's total ([joint design](#joint-design-over-several-assets)) |
+| `.dependence(model)` | Fitted curves only, and required there with `Joint()`: how the assets' draws are put side by side (`Independent()`, `Comonotonic()` or `EmpiricalCopula(reference)`). A plan on per-year values raises: its dependence is the data's own |
+| `.allocation(rule)` | With `Joint()`: adds a joint design's per-asset rows, under `"value"` or `"loss"` |
 
 A designed cover keeps the template's label (or the first 12 hex digits of its
 hash) followed by the objective, for example `"step (mse)"`; its hash and
@@ -274,7 +282,9 @@ samples as they were. Each child draws the hazard first, then the basis-risk
 model. Fresh draws spawn their children from `SeedSequence(FreshDraws.seed)`
 in the same way. On per-year values only the basis-risk model draws, so
 `ImpactNoise` needs a seed there. Each sample's provenance records its
-generator's state before each draw.
+generator's state before each draw. With `Joint()` on fitted curves,
+`sample_curves` takes those same children, one per asset, and its dependence
+model reorders the rows without any further random number.
 
 ### Explain, execute, write
 
@@ -290,9 +300,10 @@ semantics the caller states and the fresh draws; the dataset's own metadata
 
 | Execution point | Returns |
 | --- | --- |
-| `.samples()` | One `OutcomeSample` per asset, all draws or years, in asset order |
-| `.designs()` | Every `DesignResult`, in asset, fold, cover and objective order |
-| `.write_parquet(path)` | A `ParametricResult`: `output`, `table`, `metadata`, `samples`, `designs`, `fresh_samples` and `row_count` |
+| `.samples()` | One `OutcomeSample` per asset, all draws or years, in asset order; with `Joint()`, each asset's view of `.joint_sample()` |
+| `.joint_sample()` | With `Joint()` only: the `OutcomeSample` of all the assets, all draws or years |
+| `.designs()` | Every `DesignResult`, in asset, fold, cover and objective order; with `Joint()`, every `JointDesignResult`, in fold, cover and objective order |
+| `.write_parquet(path)` | A `ParametricResult`: `output`, `table`, `metadata`, `samples`, `designs`, `fresh_samples`, `joint_sample`, `fresh_joint_sample` and `row_count` |
 
 `write_parquet` writes the rows of every asset, split and fold to one local
 Parquet file through a temporary sibling and `os.replace`, and creates the
@@ -316,7 +327,9 @@ sample per asset with all its draws or years, and, with `FreshDraws`,
 `fresh_samples`, one sample per asset of the fresh draws, whose
 `content_hash` is the `sample_hash` of the out-of-sample rows (`None` without
 fresh draws). With `LinearTrend` and a holdout or k-fold split, `samples` are
-fitted on all the years, and the rows come from one sample per fold.
+fitted on all the years, and the rows come from one sample per fold. With
+`Joint()`, `joint_sample` and `fresh_joint_sample` hold the samples of all the
+assets, and `samples` and `fresh_samples` each asset's view of them.
 
 ## Next step: per-year values
 
@@ -696,13 +709,13 @@ the held-out years.
 - Report out-of-sample rows (`split == "out_of_sample"`): held-out years, or
   fresh draws from a curve. In-sample rows measure the fit on the design years
   and show the gap.
-- State the setup next to every number: the asset, the basis (one draw is one
-  year), the basis-risk model, the pricing and budget, and the split
-  (below).
+- State the setup next to every number: the asset, or which assets a total
+  sums and the dependence between them, the basis (one draw is one year), the
+  basis-risk model, the pricing and budget, and the split (below).
 - A design is one member of a set of optimal designs unless `unique` is true
   ([non-unique optima](#non-unique-optima)).
 - A comparison holds for its stated setup. The module makes no claim that one
-  objective, payout family or cover performs better in general.
+  objective, payout family, cover or scope performs better in general.
 
 ### Stating the setup
 
@@ -874,8 +887,10 @@ keeps its lineage. A sample of several assets states where the dependence
 between them comes from: for `join` and `from_table` it is the data's own, the
 same years of the data. `join` refuses Monte Carlo samples, because independent
 draws line up by draw number only: [`sample_curves`](#several-assets-from-fitted-curves)
-draws several assets under a dependence you state. `design`, `evaluate` and
-`compare` take one asset's sample and raise `SampleError` on a sample of several.
+draws several assets under a dependence you state. `design` takes one asset's
+sample and raises `SampleError` on a sample of several; `design_joint` takes a
+sample of several ([joint design](#joint-design-over-several-assets)), and
+`evaluate` and `compare` take either.
 
 | Source | Function | One draw is | Probability |
 | --- | --- | --- | --- |
@@ -1072,7 +1087,8 @@ with its own provenance; a reordering is a step of its `selection`.
 The dependence model is what you assume about the assets, and the module does
 not choose it. The same generators give the same draws under every model, so
 the lineage doesn't depend on the model: evaluating out of sample needs other
-generators, whichever models the two samples state.
+generators, whichever models the two samples state. On a plan,
+`.dependence(model)` states it and `.joint_sample()` returns the sample.
 
 ## Evaluate and compare covers
 
@@ -1081,7 +1097,9 @@ metrics on a sample; `compare(covers, sample, *, split, ...)` returns one row
 per cover, with covers as rows and metrics as columns. A cover is a resolved
 `Cover` (a template raises `UnresolvedParameterError`) or a design, which
 brings its design sample and its premium. The cover's payout unit, index unit
-and asset must be the sample's.
+and asset must be the sample's. On a sample of several assets an entry is a
+`JointDesignResult`, or a mapping from every asset id to that asset's cover or
+design ([the rows](#the-rows-of-a-joint-design)).
 
 ```python
 from crc_sdk.parametric import (CostOfCapitalLoad, MetricOptions, compare,
@@ -1180,22 +1198,25 @@ between the two.
 
 | Column | Type | Meaning |
 | --- | --- | --- |
-| `cover_label` | string | The cover's label, or the first 12 hex digits of its hash |
-| `cover_hash` | string | `Cover.definition_hash` |
-| `design_id` | string, nullable | The design's id; null for a cover given as is |
-| `asset_id` | string | The asset |
-| `level` | string | `"asset"` |
+| `cover_label` | string | The cover's label, or the first 12 hex digits of its hash. On `"total"` and allocated rows, the covers' label if they all share one, else the first 12 hex digits of `cover_hash` |
+| `cover_hash` | string | `Cover.definition_hash`. On `"total"` and allocated rows, the hash of the set of covers, one per asset |
+| `design_id` | string, nullable | The design's id; null for a cover given as is, and on the `"total"` row of a set of covers |
+| `asset_id` | string, nullable | The asset; null exactly on `"total"` rows |
+| `level` | string | `"asset"`: an asset's own cover. `"total"`: the sum over the assets of one owner, draw by draw. `"asset_by_value"`, `"asset_by_loss"`: an asset's share of a joint design's total payout, under the rule in the name |
+| `scope` | string | `"individual"`, each cover standing on its own, or `"joint"`, one objective and one budget on the owner's total |
 | `scenario` | string | The sample's scenario, `"baseline"` by default |
 | `split` | string | `"in_sample"` or `"out_of_sample"` |
 | `fold` | int32 | 0 for a holdout and fresh draws; the fold for k-fold |
 | `sample_hash` | string | The evaluation sample's `content_hash` |
-| `premium_basis` | string | `"stated"`, `"design"` or `"evaluation"` |
+| `premium_basis` | string, nullable | `"stated"`, `"design"` or `"evaluation"`; null exactly on allocated rows |
 | `unique`, `ties`, `degenerate_tail` | bool, int32, string; nullable | The design's non-uniqueness report; null for a cover given as is |
 | one column per metric | float64, nullable | As defined above; null where undefined |
 
-The key (`cover_hash`, `design_id`, `asset_id`, `level`, `scenario`, `split`,
-`fold`) is unique; `compare` raises `EvaluationError` for the same cover
-twice. Invalid evaluation arguments, metric options and comparison metadata
+A comparison on one asset has `level` `"asset"` and `scope` `"individual"`
+on every row. [Joint design](#the-rows-of-a-joint-design) says what the other
+values hold. The key (`cover_hash`, `design_id`, `asset_id`, `level`,
+`scenario`, `split`, `fold`) is unique; `compare` raises `EvaluationError` for
+the same cover twice. Invalid evaluation arguments, metric options and comparison metadata
 raise `EvaluationError`, a `ValueError`; arguments of the wrong type raise
 `TypeError`.
 `to_long(table)` gives the tidy form: the identity columns, then `column`,
@@ -1205,8 +1226,8 @@ raise `EvaluationError`, a `ValueError`; arguments of the wrong type raise
 key `crc.parametric.evaluation`, validated by `EvaluationMetadata` and written
 with sorted keys: the crc-sdk, crc-framework and numpy versions, the platform
 and the time; the setup (basis, metric options, every sample with its source,
-semantics, basis-risk and loss models, and every evaluation with its split and
-pricing); every metric column's metric, parameter, unit and definition; every
+semantics, basis-risk and loss models and dependence, and every evaluation with
+its split, pricing, levels, scopes and allocation); every metric column's metric, parameter, unit and definition; every
 cover's document; the designs' records, each with its cover's label as
 evaluated (`cover_label`), so two designs that resolve to the same cover keep
 their own labels; the samples' sources, licences and generator states; and,
@@ -1386,14 +1407,190 @@ metadata's `designs`, with the solver in `solvers`. In-sample rows of a design
 measure its fit on the years it was chosen on; out-of-sample rows, on held-out
 years or fresh draws, are the ones to report.
 
+## Joint design over several assets
+
+A risk owner with several sites may ask for one objective on the total: what
+the owner loses and is paid across the sites in the same year. A joint design
+states that objective. It is a method, and this page describes what it does
+and what it optimises. It makes no statement about how a joint design does
+against covers designed asset by asset.
+
+### What a joint design optimises
+
+`design_joint(templates, sample, objective, *, pricing=PurePremium(),
+budget=None, limit=None, options=DesignOptions())` takes one template per asset
+of a sample of several assets. On each draw d, the owner's total loss is
+L_d = Σ_j L_{d,j} and the total payout π_d = Σ_j π_{d,j}.
+
+- **The objective and the premium** of [Design a cover](#design-a-cover) are
+  taken on L_d and π_d. `Budget(ratio=κ)` means P ≤ κ·E[L] on the total, and
+  `Budget(amount=B)` means P ≤ B on the total.
+- **Each asset keeps its own cover**, on its own index, and each cover pays by
+  its own terms. `limit=` is each cover's own limit, because a limit is a term
+  of one contract.
+- **It is solved** as the LP or QP of `design`, on the block basis
+  [B_1 | … | B_m], with the summed loss.
+- **Thresholds are fixed.** Only amounts may be `Free`, so a joint design has no
+  grid route: a free threshold, a `UserObjective` or a payout without
+  `LinearInAmounts` raises `DesignError`. To look at other thresholds, run the
+  design once per choice.
+- **The solver's split between the assets is often not identified.** The covers
+  enter the objective through their sum, so several splits of one total payout
+  can be optimal. Unless `unique` is true, a design's per-asset amounts are one
+  member of an optimal set, and `DesignOptions(ranges=True)` reports their
+  ranges on the LP route ([non-unique optima](#non-unique-optima)).
+
+`JointDesignResult` holds the record of a design, with these differences:
+`covers` (asset id to resolved `Cover`) replaces `cover`, `template_hashes`
+replaces `template_hash`, `covers_hash` identifies the set, and `parameters`,
+`unidentified`, `zeroed` and `ranges` are keyed by asset id. `premium`,
+`objective_value` and `expected_loss` are on the total.
+
+### On the plan
+
+`.scopes(Joint())` runs the same design from a plan: each template is designed
+once per objective and block, for one objective and one budget on the total. It
+needs at least two assets, and `.objective(...)` as for every template. Here two
+sites on the per-year table of the [next step](#next-step-per-year-values):
+
+```python
+from crc_sdk.parametric import Joint
+
+book = pa.table({"asset_id": ["warehouse-a", "warehouse-b"],
+                 "longitude": [6.96, 7.10], "latitude": [50.94, 51.10],
+                 "value_eur": [2e6, 1.5e6]})
+joint_plan = (
+    ParametricPlan.for_annual_extremes(
+        annual, book,
+        impact=PiecewiseLinearImpact([40.0, 120.0], [0.0, 0.5]),   # damage ratio
+        unit="mm/day", value_column="value_eur", value_unit="EUR",
+        provenance=provenance, seed=42,
+    )
+    .basis_risk(ImpactNoise(0.3, upper=1.0))
+    .covers(step)                              # one cover per asset, on its own index
+    .objective(WeightedCVaR(alpha=0.9, beta=0.9), budget=Budget(ratio=0.8))
+    .split(Holdout(0.7))
+    .metrics(MetricOptions(betas=(0.9,), return_periods=(10,)))
+    .scopes(Joint())
+    .allocation("value")                       # optional: the rows per asset, below
+)
+print(setup_text(joint_plan.explain(format="json")))   # the setup; no I/O
+joint_result = joint_plan.write_parquet("joint-comparison.parquet")
+```
+
+- **The sample.** On per-year values, `OutcomeSample.join` of each asset's
+  sample; the dependence is the data's own, and `.dependence(...)` raises. The
+  assets must hold the same years: different windows raise, and a stated
+  `years=` resolves them. On fitted curves, `sample_curves` under the model that
+  `.dependence(...)` must state, and without one `explain()` and every execution
+  point raise `ValueError`:
+
+  ```text
+  ParametricPlan.for_evaluation(request, value_column="value_eur", value_unit="EUR")
+      .monte_carlo(5_000, seed=42)
+      .scopes(Joint())
+      .dependence(Comonotonic())          # Independent(), EmpiricalCopula(reference)
+      .split(FreshDraws(5_000, seed=7))   # the test of an EmpiricalCopula
+  ```
+
+  `.joint_sample()` returns the sample and `.samples()` each asset's view of it.
+  `EmpiricalCopula` takes `FreshDraws`: `Holdout` and `KFold` raise `SampleError`,
+  as a block of its rows is a set of reference years.
+- **The covers.** A cover must be written for no asset, as it applies to every
+  asset (the plan raises otherwise); `design_joint` takes different terms per
+  asset. A resolved cover is evaluated as one contract per asset, with
+  `scope` `"individual"`.
+- **A climate trend.** Under `LinearTrend` with `Holdout` or `KFold`, each
+  asset's sample is fitted on the fold's design years and the assets are
+  joined fold by fold, so a joint design sees no held-out year. `.joint_sample()`
+  holds all the years, fitted on all of them.
+- **An index read elsewhere.** `.index(...)` composes with `Joint()`: each
+  asset's cover is bound to the location of its own index series.
+- **`.scopes`** may hold both scopes, and the `scope` column keeps the rows of
+  each scope apart. This page runs `Joint()` alone.
+
+The designs are in `joint_result.designs`, one `JointDesignResult` per template,
+objective and block, and `setup_text(joint_result.metadata)` states the setup of
+the rows: which assets a total sums, the dependence, the allocation.
+
+### The function route
+
+The plan's steps by hand, for the same two sites. With the plan's generators,
+the sample and the designs are the plan's:
+
+```python
+from crc_sdk.parametric import (AnnualSeries, LossModel, OutcomeSample, compare,
+                                design_joint, holdout, sample_annual)
+
+sites = [("warehouse-a", 6.96, 50.94, 2e6), ("warehouse-b", 7.10, 51.10, 1.5e6)]
+children = np.random.SeedSequence(42).spawn(len(sites))
+joined = OutcomeSample.join(
+    sample_annual(
+        AnnualSeries.nearest_cell(annual, longitude=lon, latitude=lat,
+                                  unit="mm/day", source=provenance),
+        loss_model=LossModel(PiecewiseLinearImpact([40.0, 120.0], [0.0, 0.5]),
+                             value=value, value_unit="EUR"),
+        basis_risk=ImpactNoise(0.3, upper=1.0),
+        asset_id=asset,
+        rng=np.random.default_rng(child),
+    )
+    for (asset, lon, lat, value), child in zip(sites, children)
+)
+joint_years, joint_held_out = holdout(joined, train_fraction=0.7)
+joint_design = design_joint([step, step], joint_years,
+                            WeightedCVaR(alpha=0.9, beta=0.9),
+                            budget=Budget(ratio=0.8))
+joint_table = compare([joint_design], joint_held_out, split="out_of_sample",
+                      allocation="value",
+                      values={"warehouse-a": 2e6, "warehouse-b": 1.5e6})
+```
+
+### The rows of a joint design
+
+`evaluate` and `compare` take a sample of several assets and, as each entry,
+a `JointDesignResult` or a mapping from every asset id to that asset's cover or
+design, which are all covers or all designs. `allocation=` and `values=` ask for
+a joint design's per-asset rows.
+
+| Entry | Rows |
+| --- | --- |
+| A `JointDesignResult` | One `"total"` row, `scope="joint"`, and one allocated row per asset when `allocation` is set. No `"asset"` row, because the split of the total payout across the assets is the solver's choice |
+| A set of individual covers | One `"asset"` row per asset and one `"total"` row, all `scope="individual"` |
+
+- **`"total"` rows** hold every metric of [the table](#metrics) on L_d and π_d.
+  A joint design's premium is its design premium, the price of one contract on
+  the total. A set of individual covers pays one premium per contract, so its
+  total's premium is the sum of the asset rows' premiums, and its `design_id`,
+  `unique`, `ties` and `degenerate_tail` are null.
+- **Allocated rows** (`level` `"asset_by_value"` or `"asset_by_loss"`) share a
+  joint design's total payout out over its assets: π_{d,i} = π_d · v_i / Σ_k v_k
+  by value, and π_{d,i} = π_d · L_{d,i} / L_d by loss, by value in a draw without
+  loss. `premium` and the net-loss columns are null, as a pricing prices the
+  total payout and not a part of it. `expected_loss` and `expected_payout` add
+  up to the total row's under both rules, and `expected_uncovered` under `"loss"`
+  only; the other metrics don't add up.
+- **A rule is an accounting statement** about the total payout, not the payout
+  of an asset's cover. The rule is in `level`, so no row can be read as the
+  solver's split.
+- **The values.** `values=` maps every asset id to its value in the loss unit: a
+  sample holds no asset values. On a plan `.allocation(rule)` reads the values
+  its loss model read. Only their hash is written.
+
+Report the out-of-sample rows, each with its setup, as for any comparison. The
+`scope` column keeps the rows of each scope apart and makes no statement about
+them.
+
 ## What this version does not do
 
-- **Designs or evaluations over several assets.** A sample can hold several
-  assets, but each asset is designed and evaluated on its own sample:
-  `design`, `evaluate` and `compare` raise `SampleError` on a sample of several,
-  so take each asset with `sample.asset(asset_id)`. Nothing sums over assets:
-  there are no designs for a goal over several assets, and a plan builds one
-  sample per asset, so it assumes no dependence between them.
+- **Clusters of assets, free thresholds in a joint design.** A joint design
+  covers all the assets of its sample, as one scope, with fixed thresholds
+  only. A `Limit` is each cover's own: a limit on the total isn't offered. By
+  default, each asset is designed and evaluated on its own sample and a plan
+  builds one sample per asset, so it assumes no dependence between them.
+- **Different terms per asset on the plan.** Under `Joint()` a plan applies each
+  cover to every asset. `design_joint` takes one template per asset.
+- **A `GaussianCopula` between curve samples.** The dependence models are
+  `Independent()`, `Comonotonic()` and `EmpiricalCopula(reference)`.
 - **Several hazards in one index.** An index is one hazard at one location.
 - **Several scenarios at once.** A per-year plan names one `scenario` for its
   rows, a sample on fitted curves is `"baseline"`, and a plan on fitted curves

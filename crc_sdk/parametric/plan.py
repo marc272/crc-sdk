@@ -186,7 +186,7 @@ from crc_sdk.parametric.dependence import (
     EmpiricalCopula,
     Independent,
 )
-from crc_sdk.parametric.design import DesignOptions, design
+from crc_sdk.parametric.design import DesignOptions, DesignResult, design
 from crc_sdk.parametric.errors import ProbabilitySemanticsError, SampleError
 from crc_sdk.parametric.evaluate import Allocation, Split, compare, write_comparison
 from crc_sdk.parametric.index import AtAsset, AtPoint, AtStation, IndexDefinition
@@ -1580,7 +1580,8 @@ class ParametricPlan:
         checked against its `unit`, and a cover may also name the location
         that the index is read at (`AtStation` or `AtPoint`, the kind that
         `.index`'s `location` resolves to), which is checked at execution.
-        Replaces any covers set before.
+        Under `Joint()` a cover must be written for no asset, as it applies to
+        every asset. Replaces any covers set before.
 
         Raises `TypeError` for a non-cover, `SampleError` for a cover in
         other units or on an index read elsewhere, and `ValueError` for no
@@ -2041,7 +2042,7 @@ class ParametricPlan:
         if self.draws is None:
             return model.to_document()
         ids = self._known_asset_ids()
-        columns = () if ids is None else tuple(ids)
+        columns: tuple[str, ...] = () if ids is None else tuple(ids)
         if isinstance(model, EmpiricalCopula) and ids is None:
             columns = model.reference.asset_ids
         return model.record(self.draws.n_draws, columns)
@@ -3150,7 +3151,7 @@ class ParametricPlan:
         train: OutcomeSample,
         objective: Objective,
         label: str,
-    ) -> Any:
+    ) -> DesignResult:
         """One template's design on one asset's design block, labelled `label`."""
         spec = self.design_spec
         assert spec is not None
