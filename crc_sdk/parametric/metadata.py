@@ -11,12 +11,15 @@ with sorted keys. It holds:
 - `setup`, the setup a published number needs next to it: the basis (one
   draw is one year), the metric options, every sample (source kind, draws
   and periods, semantics and who stated them, the basis-risk and loss
-  models, units, lineage and split steps) and every evaluation (sample,
-  split, fold, how the split was made, the design samples checked for
-  leakage, the pricing);
+  models, units, lineage and split steps, the dependence between its assets)
+  and every evaluation (sample, split, fold, how the split was made, the
+  design samples checked for leakage, the pricing, the levels and scopes of
+  its rows and the allocation rule);
 - `columns`: for every metric column, its metric, parameter, unit and a
   one-line definition;
-- `covers`: every cover's label, hash and full document;
+- `covers`: every cover's label, hash and full document, and the hash of every
+  set of covers a `"total"` or allocated row names, with the asset ids and
+  cover hashes it is made of;
 - `designs`: the record of every design evaluated, with the label of its
   cover as evaluated (`cover_label`);
 - `sources`, `licences` and `rng`: the samples' source documents, their
@@ -26,8 +29,13 @@ with sorted keys. It holds:
   canonical file, or the annual table), empty for a comparison that
   `compare` or `evaluate` builds;
 - `assets`: the number of assets; the id column and the hash of the
-  (asset id, value) pairs when the caller knows them. Asset values are never
-  written.
+  (asset id, value) pairs when the caller knows them, as a plan does and as
+  an allocation's `values=` state them. Asset values are never written.
+
+A document or table without the `scope` column, or without an evaluation's
+`level`, `scope` and `allocation` or a sample's `dependence`, reads as rows of
+single assets: `level` `["asset"]`, `scope` `["individual"]`, no allocation and
+no dependence.
 
 The module claims no licence of its own for a comparison: it is derived data
 under its inputs' terms, which `licences` lists.
@@ -44,7 +52,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal, Self, TypeGuard
 
@@ -76,6 +84,7 @@ IDENTITY_COLUMNS = (
     "design_id",
     "asset_id",
     "level",
+    "scope",
     "scenario",
     "split",
     "fold",
@@ -87,6 +96,9 @@ IDENTITY_COLUMNS = (
 )
 """The columns of a comparison table before its metric columns."""
 
+_ADDED_IDENTITY_COLUMNS = ("scope",)
+"""The identity columns that a table written earlier doesn't have."""
+
 KEY_COLUMNS = (
     "cover_hash",
     "design_id",
@@ -97,6 +109,16 @@ KEY_COLUMNS = (
     "fold",
 )
 """The columns whose values identify a row of a comparison table."""
+
+
+def _identity_columns(names: Iterable[str]) -> list[str]:
+    """The identity columns among `names`, those added since optional."""
+    present = set(names)
+    return [
+        name
+        for name in IDENTITY_COLUMNS
+        if name in present or name not in _ADDED_IDENTITY_COLUMNS
+    ]
 
 
 def _json_text(value: Any) -> str:
@@ -360,10 +382,26 @@ class EvaluationMetadata(_EvaluationModel):
         asset_ids = {
             asset_id for sample in samples.values() for asset_id in sample["asset_ids"]
         }
-        assets = {key: value for key, value in first.assets.items() if key != "count"}
+        # An evaluation without an allocation needs no asset values, so it
+        # states none: a hash that another one states stands for both.
+        stated = next(
+            (
+                item.assets["values_sha256"]
+                for item in items
+                if item.assets.get("values_sha256") is not None
+            ),
+            None,
+        )
+
+        def asset_record(item: EvaluationMetadata) -> dict[str, Any]:
+            kept = {key: value for key, value in item.assets.items() if key != "count"}
+            if stated is not None and kept.get("values_sha256") is None:
+                kept["values_sha256"] = stated
+            return kept
+
+        assets = asset_record(first)
         for item in items[1:]:
-            other = {key: value for key, value in item.assets.items() if key != "count"}
-            if _json_text(other) != _json_text(assets):
+            if _json_text(asset_record(item)) != _json_text(assets):
                 raise EvaluationError("the metadata differ in their asset records")
         return cls(
             creation_version=first.creation_version,
@@ -402,13 +440,15 @@ class EvaluationMetadata(_EvaluationModel):
         """Check that this metadata describes `table`, a comparison table.
 
         The table must have the identity columns and exactly the metric
-        columns of `columns`; its key (`cover_hash`, `design_id`,
-        `asset_id`, `level`, `scenario`, `split`, `fold`) must be unique;
-        and every cover, design, sample and evaluation it names must be
-        described here. Raises `EvaluationError` otherwise.
+        columns of `columns`; a table written before `scope` was added may
+        lack it. Its key (`cover_hash`, `design_id`, `asset_id`, `level`,
+        `scenario`, `split`, `fold`) must be unique; and every cover, design,
+        sample and evaluation it names must be described here. Raises
+        `EvaluationError` otherwise.
         """
         names = list(getattr(table, "column_names", ()))
-        missing = [name for name in IDENTITY_COLUMNS if name not in names]
+        identity = _identity_columns(names)
+        missing = [name for name in identity if name not in names]
         if missing:
             raise EvaluationError(f"the comparison table lacks the columns {missing}")
         metrics = [name for name in names if name not in IDENTITY_COLUMNS]
@@ -419,7 +459,7 @@ class EvaluationMetadata(_EvaluationModel):
                 "the table's metric columns differ from the metadata's: "
                 f"undescribed {unknown}, absent {absent}"
             )
-        rows = table.select(list(IDENTITY_COLUMNS)).to_pylist()
+        rows = table.select(identity).to_pylist()
         keys = [tuple(row[name] for name in KEY_COLUMNS) for row in rows]
         if len(set(keys)) != len(keys):
             raise EvaluationError("the comparison table repeats a row key")
@@ -635,11 +675,64 @@ def _loss(sample: Mapping[str, Any], where: str) -> str:
     return f"{text}, in {unit}"
 
 
+def _for_each_part(
+    sample: Mapping[str, Any],
+    where: str,
+    describe: Callable[[Mapping[str, Any], str], str],
+) -> str:
+    """`describe` of a sample, or of each of its assets when they have parts.
+
+    On a sample of several assets the loss and basis-risk models are per
+    asset. Parts that read the same are written once.
+    """
+    parts = _get(sample, "parts", Mapping, where)
+    if not parts:
+        return describe(sample, where)
+    texts = {
+        str(asset): describe(
+            {**part, "loss_unit": sample.get("loss_unit")}, f"{where}.parts.{asset}"
+        )
+        for asset, part in parts.items()
+    }
+    if len(set(texts.values())) == 1:
+        return next(iter(texts.values()))
+    return "; ".join(f"{asset}: {text}" for asset, text in texts.items())
+
+
+def _dependence(sample: Mapping[str, Any], where: str) -> str | None:
+    """Where the dependence between a sample's assets comes from, if stated."""
+    model = _get(sample, "dependence", Mapping, where)
+    if model is None:
+        return None
+    kind = model.get("kind")
+    if kind == "data":
+        return "the data's own, the rows being the same years of the data"
+    if kind == "independent":
+        return "Independent(), a stated assumption"
+    if kind == "comonotonic":
+        return "Comonotonic(), a stated assumption"
+    if kind == "empirical_copula":
+        place = f"{where}.dependence"
+        years = _number(model.get("m"), f"{place}.m")
+        first = _number(model.get("first_year"), f"{place}.first_year")
+        last = _number(model.get("last_year"), f"{place}.last_year")
+        return (
+            f"EmpiricalCopula, a stated assumption: the ranks of {years} reference "
+            f"years, {first} to {last} ({_short(model.get('content_hash'))})"
+        )
+    return f"{kind}, as stated"
+
+
 def _sample_text(sample: Mapping[str, Any], where: str) -> str:
-    return (
-        f"{_source(sample, where)}. Basis risk: {_basis_risk(sample, where)}. "
-        f"Loss: {_loss(sample, where)}."
+    text = (
+        f"{_source(sample, where)}. "
+        f"Basis risk: {_for_each_part(sample, where, _basis_risk)}. "
+        f"Loss: {_for_each_part(sample, where, _loss)}."
     )
+    dependence = _dependence(sample, where)
+    if dependence is not None:
+        text += f" Dependence between the assets: {dependence}."
+    return text
 
 
 def _recorded(document: Mapping[str, Any], key: str, where: str) -> str | None:
@@ -848,14 +941,26 @@ def _of_rows(
             "Rows: none; this is the setup of the whole comparison that the "
             "table's metadata describes.",
         )
-    rows = table.select(list(_ROW_KEYS)).to_pylist()
-    named = {(row["sample_hash"], row["split"], row["fold"]) for row in rows}
+    described = [name for name in ("level", "scope") if name in table.column_names]
+    rows = table.select([*_ROW_KEYS, *described]).to_pylist()
+    # The levels and scopes of the rows the table still holds.
+    named: dict[Any, dict[str, list[str]]] = {}
+    for row in rows:
+        entry = named.setdefault(
+            (row["sample_hash"], row["split"], row["fold"]),
+            {name: [] for name in described},
+        )
+        for name in described:
+            if row[name] not in entry[name]:
+                entry[name].append(row[name])
     evaluations = [
-        entry
+        {**entry, **named[(entry["sample_hash"], entry["split"], entry["fold"])]}
         for entry in setup["evaluations"]
         if (entry["sample_hash"], entry["split"], entry["fold"]) in named
     ]
-    unknown = named - {(e["sample_hash"], e["split"], e["fold"]) for e in evaluations}
+    unknown = set(named) - {
+        (e["sample_hash"], e["split"], e["fold"]) for e in evaluations
+    }
     if unknown:
         sample_hash, split, fold = min(unknown, key=str)
         raise EvaluationError(
@@ -1115,7 +1220,9 @@ def _split(
     else:
         how = f"{folded}, split method not stated"
     designs = [str(value) for value in _list(evaluation, "design_samples", where)]
-    designed = _join([_years(samples.get(value), where) for value in designs])
+    designed = _join(
+        _first_seen(_years(samples.get(value), where) for value in designs)
+    )
     if "design_samples" not in evaluation:
         designed = "the design sample, not known yet"
     checked = (
@@ -1178,6 +1285,18 @@ def _design_labels(
     return labels
 
 
+def _unidentified(record: Mapping[str, Any], where: str) -> list[str]:
+    """The amounts no design year reaches: flat, or by asset on a joint design."""
+    by_asset = record.get("unidentified")
+    if not isinstance(by_asset, Mapping):
+        return [str(name) for name in _list(record, "unidentified", where)]
+    return [
+        f"{asset} {name}"
+        for asset in by_asset
+        for name in _list(by_asset, asset, f"{where}.unidentified")
+    ]
+
+
 def _design(
     record: Mapping[str, Any], labels: Mapping[str, str | None], unit: str
 ) -> str:
@@ -1185,27 +1304,43 @@ def _design(
     where = f"designs[{design_id}]"
     label = labels.get(str(record["design_id"]))
     objective = _get(record, "objective", Mapping, where) or {}
-    parts = [
+    scope = _get(record, "scope", Mapping, where) or {}
+    joint = scope.get("kind") == "joint"
+    on_total = " on the total" if joint else ""
+    parts: list[str] = []
+    if joint:
+        assets = [str(asset) for asset in _list(record, "asset_ids", where)]
+        parts.append(
+            "scope: joint, one objective, one budget and one premium on the total "
+            f"of {_join(assets) or 'its assets'}, with one cover per asset"
+        )
+    parts += [
         f"objective: {_objective(objective, where)}",
         f"pricing: {_pricing(record.get('pricing'), where)}",
     ]
     budget = _get(record, "budget", Mapping, where) or {}
     if budget.get("ratio") is not None:
         ratio = _number(budget["ratio"], f"{where}.budget.ratio")
-        parts.append(f"budget: premium at most {ratio} x E[L] of the design sample")
+        expected = "E[L] of the total" if joint else "E[L]"
+        parts.append(
+            f"budget: premium at most {ratio} x {expected} of the design sample"
+        )
     elif budget.get("amount") is not None:
         amount = _number(budget["amount"], f"{where}.budget.amount")
-        parts.append(f"budget: premium at most {amount} {unit}")
+        parts.append(f"budget: premium at most {amount} {unit}{on_total}")
     else:
         parts.append("no budget")
     limit = _get(record, "limit", Mapping, where) or {}
     if limit.get("amount") is not None:
-        parts.append(f"limit: {_number(limit['amount'], f'{where}.limit')} {unit}")
+        each = " on each cover" if joint else ""
+        parts.append(
+            f"limit: {_number(limit['amount'], f'{where}.limit')} {unit}{each}"
+        )
     else:
         parts.append("no limit")
     if record.get("premium") is not None:
         premium = _number(record["premium"], f"{where}.premium")
-        parts.append(f"design premium: {premium} {unit}")
+        parts.append(f"design premium: {premium} {unit}{on_total}")
     if record.get("route") is not None:
         parts.append(f"route: {record['route']}")
     unique = _get(record, "unique", bool, where)
@@ -1213,7 +1348,9 @@ def _design(
     parts.append(f"unique optimum: {answer}")
     ties = _get(record, "ties", int, where)
     parts.append("ties: not counted" if ties is None else f"ties: {ties}")
-    unidentified = [str(name) for name in _list(record, "unidentified", where)]
+    if joint and unique is not True:
+        parts.append("the amounts of each asset are one member of an optimal set")
+    unidentified = _unidentified(record, where)
     if unidentified:
         parts.append(
             f"amounts no design year reaches: {_join(unidentified)}, set to the "
@@ -1252,6 +1389,79 @@ def _metrics(options: Mapping[str, Any], unit: str) -> str:
     )
 
 
+_ALLOCATED_LEVELS = {
+    "asset_by_value": "in proportion to its stated value",
+    "asset_by_loss": (
+        "in proportion to its loss in the draw, and to its stated value in a draw "
+        "without loss"
+    ),
+}
+"""The levels of allocated rows, and how each shares out the total payout."""
+
+
+def _named(
+    evaluation: Mapping[str, Any], key: str, default: str, where: str
+) -> list[str]:
+    """An evaluation's levels or scopes, or those of a row of one asset."""
+    if evaluation.get(key) is None:
+        return [default]
+    return [str(value) for value in _list(evaluation, key, where)]
+
+
+def _levels_of(
+    evaluations: Sequence[Mapping[str, Any]],
+    samples: Mapping[str, Mapping[str, Any]],
+    assets: Sequence[str],
+) -> tuple[list[str], list[str], str | None]:
+    """The rows' levels, their scopes, and the words for levels beyond assets."""
+    levels = _first_seen(
+        level
+        for i, evaluation in enumerate(evaluations)
+        for level in _named(evaluation, "level", "asset", f"setup.evaluations[{i}]")
+    )
+    scopes = _first_seen(
+        scope
+        for i, evaluation in enumerate(evaluations)
+        for scope in _named(
+            evaluation, "scope", "individual", f"setup.evaluations[{i}]"
+        )
+    )
+    if set(levels) <= {"asset"} and set(scopes) <= {"individual"}:
+        return levels, scopes, None
+    sums: list[str] = []
+    for evaluation in evaluations:
+        sample = samples.get(str(evaluation.get("sample_hash")))
+        summed = None if sample is None else sample.get("asset_ids")
+        sums.append(_join([str(asset) for asset in summed or assets]) or "its assets")
+    each = _join(assets) or "the assets not stated"
+    words: list[str] = []
+    for level in levels:
+        if level == "asset":
+            words.append(f"asset, one row per asset ({each})")
+        elif level == "total":
+            words.append(
+                f"total, the sum over {' or over '.join(_first_seen(sums))} in each "
+                "draw: the owner's total loss against the total payout"
+            )
+        elif level in _ALLOCATED_LEVELS:
+            words.append(
+                f"{level}, one row per asset ({each}): its share of the joint "
+                f"design's total payout {_ALLOCATED_LEVELS[level]}, an accounting "
+                "rule and not the payout of the asset's cover, with no premium or "
+                "net-loss values"
+            )
+        else:
+            words.append(level)
+    text = "; ".join(words)
+    if scopes == ["joint"]:
+        text += ". Scope: joint, one objective and one budget on the owner's total"
+    elif scopes == ["individual"]:
+        text += ". Scope: individual, each cover standing on its own"
+    else:
+        text += f". Scope: {_join(scopes)}, kept apart by the scope column"
+    return levels, scopes, text
+
+
 def _is_document(value: Any) -> TypeGuard[Mapping[str, Any]]:
     """Whether `value` is a whole document, such as `explain()`'s, not a setup."""
     return isinstance(value, Mapping) and "setup" in value and "samples" not in value
@@ -1267,8 +1477,10 @@ def setup_text(
 
     - `Rows`, first and only for a table whose rows are not identified (see
       below): that the text is the setup of the whole comparison;
-    - `Level`, `Scenario`, `Basis`: one row per asset, the assets, the
-      scenario, and the annual basis (one draw is one year);
+    - `Level`, `Scope`, `Scenario`, `Basis`: the level of the rows and the
+      assets (one row per asset; which assets a total sums; the rule of an
+      allocation), the scope when it is not that of rows of single assets,
+      the scenario, and the annual basis (one draw is one year);
     - `Split`, one line per evaluation: in or out of sample, the fold, how
       the split was made (a holdout and its train fraction, k-fold and k,
       fresh draws, a separate sample), the evaluation and design samples
@@ -1276,7 +1488,8 @@ def setup_text(
     - `Seeds`: the plan's seed (`plan_seed`) and the fresh draws' seed
       (`fresh_draws_seed`) that the evaluations' `details` record, if any;
     - `Sample`: the source kind, the probability semantics and who stated
-      them, the basis-risk model and its parameters, and the loss model;
+      them, the basis-risk model and its parameters, the loss model (of each
+      asset, when the assets differ) and the dependence between the assets;
     - `Source`: each source record of the samples, such as a hazard curve or
       a per-year series, with its provider, dataset, horizon and pathway, and
       which of them the record does not hold; before execution, the sources
@@ -1295,7 +1508,7 @@ def setup_text(
     - `Design`, one line per design: the objective, pricing, budget and
       limit, the design premium, the route, the non-uniqueness report
       (`unique`, `ties`, amounts no design year reaches) and a degenerate
-      tail;
+      tail; for a joint design also its scope and which assets it covers;
     - `Metrics`: the levels beta, the return periods and the loss and payout
       thresholds.
 
@@ -1313,11 +1526,12 @@ def setup_text(
       `crc.parametric.evaluation` metadata is read as
       `EvaluationMetadata.from_table` reads it, and the text states the setup
       of its rows: the evaluations the rows name (by `sample_hash`, `split`
-      and `fold`), the samples those are evaluated and designed on, their
-      sources, and the designs the rows name (by `design_id`). All the rows
-      of a comparison give the text of its metadata. A table without those
-      columns or without rows names no evaluation: its text is that of the
-      whole comparison, after a `Rows` line that says so;
+      and `fold`) with the levels and scopes of those rows, the samples
+      those are evaluated and designed on, their sources, and the designs
+      the rows name (by `design_id`). All the rows of a comparison give the
+      text of its metadata. A table without those columns or without rows
+      names no evaluation: its text is that of the whole comparison, after
+      a `Rows` line that says so;
     - a plan's `explain(format="json")` document (a mapping with a `setup`
       and no `samples`): its setup, and a `Source` line from its `sources`;
     - a setup alone: an `EvaluationSetup`, or a mapping in its layout, such
@@ -1388,7 +1602,10 @@ def setup_text(
     assets, scenarios, units = map(_first_seen, (assets, scenarios, units))
     unit = units[0] if len(units) == 1 else "loss units"
 
-    if not assets:
+    levels, scopes, described = _levels_of(evaluations, by_hash, assets)
+    if described is not None:
+        level = described
+    elif not assets:
         level = "asset, the assets not stated"
     elif len(assets) == 1:
         level = f"asset ({assets[0]})"
@@ -1415,12 +1632,20 @@ def setup_text(
     plan_seeds = {plan for plan, _ in seeds if plan is not None}
     fresh_seeds = {fresh for _, fresh in seeds if fresh is not None}
     one_seed = len(plan_seeds) <= 1 and len(fresh_seeds) <= 1
+    written: set[tuple[str, str]] = set()
     for i, evaluation in enumerate(evaluations):
         text = _split(evaluation, by_hash, f"setup.evaluations[{i}]")
         if not one_seed and _seeds_text(*seeds[i]):
             text += f" Seeds: {_seeds_text(*seeds[i])}."
         if not shared:
             text += f" Pricing: {pricings[i]}."
+        # Comparisons of one sample at different levels share their split;
+        # evaluations of different samples keep a line each.
+        if evaluation.get("sample_hash") is not None:
+            key = (str(evaluation["sample_hash"]), text)
+            if key in written:
+                continue
+            written.add(key)
         lines.append(text)
     if not evaluations:
         lines.append("Split: not known.")
@@ -1454,11 +1679,19 @@ def setup_text(
         pricing = "not stated"
     else:
         pricing = pricings[0] if shared else "as each split states"
-    lines.append(
+    priced = (
         f"Pricing: {pricing}, on the evaluation sample, for the covers given as "
         "is; a design keeps its design premium, and premium_basis says which "
         "premium a row uses."
     )
+    if "total" in levels and "individual" in scopes:
+        priced += (
+            " The total row of a set of covers holds the sum of their premiums, "
+            "one per contract, unless a total premium is stated."
+        )
+    if "joint" in scopes:
+        priced += " A joint design's premium is that of one contract on the total."
+    lines.append(priced)
     lines += [_design(record, labels, unit) for record in designs]
     options = setup.get("metric_options")
     if isinstance(options, Mapping):
