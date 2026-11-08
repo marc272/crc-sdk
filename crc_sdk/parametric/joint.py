@@ -408,14 +408,14 @@ def design_joint(
     suit the sample; `ValueError` when no template has free parameters; and
     `TypeError` for arguments of the wrong type.
     """
-    covers_in = _check_templates(templates, scope)
+    templates = _check_templates(templates, scope)
     _check_terms(sample, objective, pricing, budget, limit, options)
-    _check_problem(covers_in, sample, objective)
+    _check_problem(templates, sample, objective)
     _solver.require()
     assets = sample.asset_ids
     named = [
         _for_asset(template, asset)
-        for asset, template in zip(assets, covers_in, strict=True)
+        for asset, template in zip(assets, templates, strict=True)
     ]
     index = np.array(sample.index, dtype=np.float64)
     loss = np.array(sample.loss, dtype=np.float64)
@@ -523,14 +523,14 @@ def design_joint(
             "sample_hash": sample.content_hash,
             "scope": scope.to_document(),
             "semantics_version": DESIGN_SEMANTICS_VERSION,
-            "template_hashes": [template.definition_hash for template in covers_in],
+            "template_hashes": [template.definition_hash for template in templates],
         }
     )
     return JointDesignResult(
         covers=covers,
         template_hashes={
             asset: template.definition_hash
-            for asset, template in zip(assets, covers_in, strict=True)
+            for asset, template in zip(assets, templates, strict=True)
         },
         covers_hash=covers_hash(covers),
         design_id=design_id,
