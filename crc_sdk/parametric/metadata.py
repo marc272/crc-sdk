@@ -11,8 +11,8 @@ with sorted keys. It holds:
 - `setup`, the setup a published number needs next to it: the basis (one
   draw is one year), the metric options, every sample (source kind, draws
   and periods, semantics and who stated them, the basis-risk and loss
-  models, units, lineage and split steps, the dependence between its assets
-  and its trend record)
+  models, units, lineage and split steps, the dependence between its assets,
+  its trend record and its pool of model-years, without the row arrays)
   and every evaluation (sample, split, fold, how the split was made, the
   design samples checked for leakage, the pricing, the levels and scopes of
   its rows and the allocation rule);
@@ -37,7 +37,7 @@ A document or table without the `scope` column, or without an evaluation's
 `level`, `scope` and `allocation` or a sample's `dependence`, reads as rows of
 single assets: `level` `["asset"]`, `scope` `["individual"]`, no allocation and
 no dependence. A sample without `trend` has none recorded, which on per-year
-values reads as the years as recorded.
+values reads as the years as recorded, and a sample without `pool` is no pool.
 
 The module claims no licence of its own for a comparison: it is derived data
 under its inputs' terms, which `licences` lists.
@@ -579,6 +579,11 @@ def _years(sample: Mapping[str, Any] | None, where: str) -> str:
     span = f"{periods[0]} to {periods[1]}" if periods else ""
     if kind == "monte_carlo":
         text = f"{count} simulated years" + (f" (draws {span})" if span else "")
+    elif kind == "annual" and _get(sample, "pool", Mapping, where) is not None:
+        years = _list(sample["pool"], "years", f"{where}.pool")
+        text = f"{count} pooled model-years" + (
+            f" ({_year_spans(years)})" if years else ""
+        )
     elif kind == "annual":
         text = f"{count} recorded years" + (f" ({span})" if span else "")
     else:
@@ -616,6 +621,8 @@ def _source(sample: Mapping[str, Any], where: str) -> str:
             f"semantics, {who.get(stated or '', 'stated by no one recorded')}"
         )
     if kind == "annual":
+        if _get(sample, "pool", Mapping, where) is not None:
+            return "pooled per-year values, one row per model-year"
         return "per-year values, one row per recorded year"
     if kind == "table":
         return "rows of a user table, each a year as the caller states"
@@ -720,10 +727,11 @@ def _dependence(sample: Mapping[str, Any], where: str) -> str | None:
         first = _get(model, "first_year", int, place)
         last = _get(model, "last_year", int, place)
         draws = _get(model, "k", int, place)
+        row = "year" if _get(model, "pool", Mapping, place) is None else "model-year"
         return (
             f"EmpiricalCopula, a stated assumption: the ranks of {years} reference "
-            f"years, {first} to {last} ({_short(model.get('content_hash'))})"
-            + ("" if draws is None else f", {draws} draws per year")
+            f"{row}s, {first} to {last} ({_short(model.get('content_hash'))})"
+            + ("" if draws is None else f", {draws} draws per {row}")
         )
     return f"{kind}, as stated"
 
@@ -760,14 +768,16 @@ def _year_spans(years: Sequence[int]) -> str:
 
 
 def _trend_fit(fit: Mapping[str, Any], where: str) -> str:
-    """One series' fit: its role, its asset, its slope and intercept with units."""
+    """One series' fit: its role, asset and run, its slope and intercept with units."""
     role = _get(fit, "role", str, where) or "series"
     asset = _get(fit, "asset_id", str, where)
+    model = _get(fit, "model", str, where)
+    run = "" if model is None else f" ({model} {_get(fit, 'member', str, where)})"
     unit = _get(fit, "unit", str, where)
     per_year = f" {unit} per year" if unit else " per year"
     amount = f" {unit}" if unit else ""
     return (
-        f"{role}{'' if asset is None else f' of {asset}'} slope "
+        f"{role}{'' if asset is None else f' of {asset}'}{run} slope "
         f"{_number(fit.get('slope'), f'{where}.slope')}{per_year}, intercept "
         f"{_number(fit.get('intercept'), f'{where}.intercept')}{amount}"
     )
@@ -838,6 +848,81 @@ def _trend_lines(samples: Sequence[Mapping[str, Any]]) -> list[str]:
     ]
 
 
+_POOL_STATEMENTS = (
+    "A draw mixes model spread with year-to-year variability. The rows are not "
+    "independent years: rows of one run share that model's climate and rows of one "
+    "year the pathway's forcing, so the number of rows is not an effective sample "
+    "size."
+)
+"""What a pool's rows are not, stated next to every number made from them."""
+
+
+def _pool_head(pool: Mapping[str, Any], where: str) -> str:
+    """A pool's runs and pathway in words; before execution, what will name them."""
+    runs = _objects(pool, "runs", where)
+    if not runs:
+        columns = [
+            _get(pool, key, str, where) or "not stated"
+            for key in ("model_column", "member_column", "pathway_column")
+        ]
+        return (
+            "model-years of several runs are pooled for each asset, every run with "
+            f"the same weight; a run is named by the columns {_join(columns)}, or by "
+            "its source plan; the runs, the pathway and the years are not known yet"
+        )
+    names = [
+        f"{_get(run, 'model', str, where)} {_get(run, 'member', str, where)}"
+        for run in runs
+    ]
+    return (
+        f"{len(runs)} runs under pathway {_get(pool, 'pathway', str, where)} "
+        f"({'; '.join(names)}), with the same years and the same weight each"
+    )
+
+
+def _pool_lines(samples: Sequence[Mapping[str, Any]]) -> list[str]:
+    """One line per pool: its runs, pathway, years and rows, and what they are not.
+
+    The blocks of a split share a pool's line, and its years are those of all
+    its blocks; each `Split` line states its own. Pools of the same runs share
+    a line too, and lines that differ name their assets.
+    """
+    stated: dict[str, dict[str, Any]] = {}
+    for i, sample in enumerate(samples):
+        where = f"setup.samples[{i}]"
+        pool = _get(sample, "pool", Mapping, where)
+        if pool is None:
+            continue
+        place = f"{where}.pool"
+        years = [int(year) for year in _list(pool, "years", place)]
+        count = len(_objects(pool, "runs", place))
+        group = stated.setdefault(
+            _pool_head(pool, place),
+            {"assets": [], "count": count, "whole": True, "years": set()},
+        )
+        group["assets"] += [str(asset) for asset in _list(sample, "asset_ids", where)]
+        group["years"] |= set(years)
+        rows = _get(pool, "rows", int, place)
+        group["whole"] &= rows is None or rows == count * len(years)
+    lines: list[str] = []
+    for head, group in stated.items():
+        known = sorted(group["years"])
+        size = ""
+        if known:
+            size = f": {len(known)} years ({_year_spans(known)})"
+            if group["whole"]:
+                size += f", {group['count'] * len(known)} rows"
+            else:
+                size += ", on a selection of the rows"
+        label = (
+            "Pool"
+            if len(stated) == 1 or not group["assets"]
+            else f"Pool of {_join(_first_seen(group['assets']))}"
+        )
+        lines.append(f"{label}: {head}{size}. {_POOL_STATEMENTS}")
+    return lines
+
+
 _CMIP_COLUMNS = ("model", "member", "scenario")
 """The columns that make a per-year table's `scenario` a CMIP6 pathway."""
 
@@ -898,8 +983,13 @@ def _source_record(entry: Mapping[str, Any], where: str) -> str:
         else:
             document = _get(series, "source", Mapping, f"{where}.series") or {}
         head = f"the {role} series"
+        model = _recorded(entry, "model", where)
+        if model is not None:
+            head += f" of {model} {_recorded(entry, 'member', where)}"
         if pathway is None:
-            pathway = _series_pathway(series, document, where)
+            pathway = _recorded(entry, "pathway", where) or _series_pathway(
+                series, document, where
+            )
     else:
         document = entry
         head = f"the {role}"
@@ -1736,6 +1826,10 @@ def setup_text(
     - `Trend`, for per-year samples: the years as recorded, the window of
       recent years, or the linear trend removed, with its fit years, each
       series' slope and intercept with their units, and the reference year;
+    - `Pool`, for pooled model-years: the runs, the pathway, the years, the
+      number of rows, that every run has the same weight, and that a draw
+      mixes model spread with year-to-year variability and that the number
+      of rows is not an effective sample size;
     - `Sample notes`: what the sources recorded, such as draws beyond the
       fitted support, a pooled ensemble, dropped years, an index read from
       another series, a comonotone index and loss, or the assumption of a
@@ -1915,6 +2009,7 @@ def setup_text(
     if source is not None:
         lines.append(source)
     lines += _trend_lines(samples)
+    lines += _pool_lines(samples)
     notes = _notes(samples, evaluations)
     if notes:
         lines.append(f"Sample notes: {' '.join(notes)}")

@@ -13,7 +13,8 @@ fitted curve, `sample_annual` reads the years of an `AnnualSeries`, and
 `OutcomeSample.from_table` takes a user table. `LossModel` turns the hazard
 into a loss and a `BasisRisk` model states how index and loss differ. On
 per-year samples, `AsRecorded`, `RecentYears` and `LinearTrend` state how the
-climate trend is treated.
+climate trend is treated, and `sample_annual_pool` pools the model-years of
+several `ModelRun`s.
 
 `design` chooses a template's free parameters on an outcome sample for an
 objective (`MSE`, `ExpectedUncovered`, `WeightedCVaR` or a `UserObjective`)
@@ -96,6 +97,7 @@ from crc_sdk.parametric.plan import (
     H3Cell,
     Holdout,
     KFold,
+    ModelPool,
     NearestCell,
     ParametricPlan,
     ParametricResult,
@@ -110,7 +112,9 @@ from crc_sdk.parametric.sample import (
 )
 from crc_sdk.parametric.sources import (
     AnnualSeries,
+    ModelRun,
     sample_annual,
+    sample_annual_pool,
     sample_curve,
     sample_curves,
 )
@@ -159,6 +163,8 @@ __all__ = [
     "LossModel",
     "MSE",
     "MetricOptions",
+    "ModelPool",
+    "ModelRun",
     "NearestCell",
     "NoBasisRisk",
     "OutcomeSample",
@@ -187,6 +193,7 @@ __all__ = [
     "holdout",
     "register_payout",
     "sample_annual",
+    "sample_annual_pool",
     "sample_curve",
     "sample_curves",
     "setup_text",

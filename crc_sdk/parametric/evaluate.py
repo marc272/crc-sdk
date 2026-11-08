@@ -94,6 +94,7 @@ from crc_sdk.parametric.pricing import CostOfCapitalLoad, Pricing, PurePremium
 from crc_sdk.parametric.sample import (
     OutcomeSample,
     _check_out_of_sample,
+    _pool_entry,
     _require_one_asset,
 )
 
@@ -925,6 +926,7 @@ def _sample_entry(sample: OutcomeSample, roles: set[str]) -> dict[str, Any]:
         "parent": provenance["parent"],
         "parts": _parts_entry(provenance),
         "periods": [int(sample.period[0]), int(sample.period[-1])],
+        "pool": _pool_entry(provenance["pool"]),
         "probability_semantics": provenance["probability_semantics"],
         "roles": sorted(roles),
         "sample_hash": sample.content_hash,

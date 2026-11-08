@@ -33,7 +33,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 from crc_sdk.parametric.errors import SampleError
-from crc_sdk.parametric.sample import _PROBABILITY_TOLERANCE, OutcomeSample
+from crc_sdk.parametric.sample import (
+    _PROBABILITY_TOLERANCE,
+    OutcomeSample,
+    _sample_years,
+)
 
 __all__ = ["Comonotonic", "Dependence", "EmpiricalCopula", "Independent"]
 
@@ -161,6 +165,10 @@ class EmpiricalCopula:
     test is a fresh sample with new generators and the same reference, which
     is part of the stated model.
 
+    A reference may be a pool of model-years: `m` is then its number of rows,
+    each model-year taking a block of its own, and the first and last year in
+    its record are the pool's calendar years.
+
     Raises `SampleError` for a reference it cannot use, and `TypeError` for
     anything but an `OutcomeSample`.
     """
@@ -195,14 +203,16 @@ class EmpiricalCopula:
         """Return the kind, and the reference's hash, sources, licences and years."""
         reference = self.reference
         document = reference.provenance.to_document()
+        years = _sample_years(reference)
         return {
             "kind": "empirical_copula",
             "content_hash": reference.content_hash,
             "sources": document["sources"],
             "licences": document["licences"],
-            "first_year": int(reference.period[0]),
-            "last_year": int(reference.period[-1]),
+            "first_year": int(years[0]),
+            "last_year": int(years[-1]),
             "m": len(reference),
+            **_pooled(reference),
         }
 
     def record(self, n_draws: int, columns: Sequence[str]) -> dict[str, Any]:
@@ -217,7 +227,8 @@ class EmpiricalCopula:
             lower = max(n_draws // m, 1) * m
             raise SampleError(
                 f"EmpiricalCopula needs n_draws to be a whole multiple of the "
-                f"reference's {m} years, got {n_draws}; the nearest valid counts "
+                f"reference's {m} {_rows_are(self.reference)}s, got {n_draws}; the "
+                "nearest valid counts "
                 f"are {lower} and {lower + m}"
             )
         held = sorted(self.reference.asset_ids)
@@ -232,13 +243,15 @@ class EmpiricalCopula:
         """Return the sentences that state this model next to a number."""
         reference = self.reference
         m = len(reference)
+        years = _sample_years(reference)
+        row = _rows_are(reference)
         return _assumption(
             between,
             f"their draws are reordered to the ranks of the stated reference, "
-            f"{m} years from {reference.period[0]} to {reference.period[-1]} "
-            f"({reference.content_hash[:19]}), {n_draws // m} draws per year. "
-            f"Inside a reference year's block the {between} are independent: "
-            f"dependence finer than one year in {m} is assumed, not observed. The "
+            f"{m} {row}s from {years[0]} to {years[-1]} "
+            f"({reference.content_hash[:19]}), {n_draws // m} draws per {row}. "
+            f"Inside a reference {row}'s block the {between} are independent: "
+            f"dependence finer than one {row} in {m} is assumed, not observed. The "
             "reference is part of this stated model, so a design and its fresh "
             "draws share it.",
         )
@@ -253,6 +266,24 @@ class EmpiricalCopula:
             values = ranked[:, reference.asset_ids.index(column)]
             order[:, j] = _rank_blocks(uniforms[:, j], values, k)
         return order
+
+
+def _rows_are(reference: OutcomeSample) -> str:
+    """What one row of a reference is."""
+    return "year" if reference.provenance.pool is None else "model-year"
+
+
+def _pooled(reference: OutcomeSample) -> dict[str, Any]:
+    """What a pooled reference holds, in its record; nothing for any other."""
+    pool = reference.provenance.pool
+    if pool is None:
+        return {}
+    return {
+        "pool": {
+            "runs": len(pool["runs"]),
+            "years": int(_sample_years(reference).shape[0]),
+        }
+    }
 
 
 Dependence = Independent | Comonotonic | EmpiricalCopula
