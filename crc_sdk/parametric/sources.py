@@ -38,7 +38,18 @@ states how the climate trend is treated (`AsRecorded`, the default,
 `RecentYears` or `LinearTrend`; see `crc_sdk.parametric.trend`), and `scenario=`
 is the caller's name for the rows.
 
-**Hazard units.** Before anything is drawn, both functions check the hazard's
+**Pooled model-years** (`ModelRun`, `sample_annual_pool`). One climate model
+gives few years for a tail, so the years of several models can be pooled for
+one asset under one pathway. Every model-year is one row with probability
+`1/N`, in (year, model, member) order, with models and members in UTF-8 byte
+order; `period` is the draw number, and each row's identity is recorded in the
+provenance's `pool`. Every run must hold the same years, and a model appears
+once, whatever its member, so every model has the same weight. A draw mixes
+model spread with year-to-year variability, and the rows are not independent
+years: rows of one run share that model's climate and rows of one year the
+pathway's forcing, so the number of rows is not an effective sample size.
+
+**Hazard units.** Before anything is drawn, these functions check the hazard's
 unit (the curve's `value_unit`, the hazard series' `unit`) against the loss
 model's impact with `LossModel.check_hazard_unit`: an `ImpactExpression`
 calibrated for another unit raises `SampleError`. Impacts that declare no
@@ -55,8 +66,8 @@ import hashlib
 import inspect
 import math
 import warnings
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from numbers import Real
 from typing import Any, Literal, get_args
 
@@ -86,6 +97,7 @@ from crc_sdk.parametric.errors import (
     SampleError,
 )
 from crc_sdk.parametric.loss import LossModel
+from crc_sdk.parametric.metadata import _year_spans
 from crc_sdk.parametric.sample import (
     COMONOTONE_MESSAGE,
     OutcomeSample,
@@ -116,8 +128,10 @@ __all__ = [
     "AnnualSemantics",
     "AnnualSeries",
     "MissingYears",
+    "ModelRun",
     "OutsideSupport",
     "sample_annual",
+    "sample_annual_pool",
     "sample_curve",
     "sample_curves",
 ]
@@ -1427,6 +1441,20 @@ def sample_annual(
     return sample
 
 
+def _annual_lineage(
+    asset_id: str, hazard: AnnualSeries, index: AnnualSeries | None
+) -> str:
+    """The lineage of a per-year sample, and of the same run in a pool."""
+    return content_hash(
+        {
+            "kind": "annual",
+            "asset_id": asset_id,
+            "hazard": _series_identity(hazard),
+            "index": None if index is None else _series_identity(index),
+        }
+    )
+
+
 def _annual_rows(
     hazard: AnnualSeries,
     *,
@@ -1541,14 +1569,7 @@ def _annual_rows(
             "basis_risk": basis_summary,
         },
         notes=tuple(notes),
-        lineage=content_hash(
-            {
-                "kind": "annual",
-                "asset_id": asset,
-                "hazard": _series_identity(hazard),
-                "index": None if index is None else _series_identity(index),
-            }
-        ),
+        lineage=_annual_lineage(asset, hazard, index),
         trend=trend_record,
     )
     return OutcomeSample(
@@ -1559,6 +1580,356 @@ def _annual_rows(
         loss=loss,
         hazard=None if np.array_equal(new_index, hazard_values) else hazard_values,
         index_unit=hazard.unit if index is None else index.unit,
+        loss_unit=loss_model.value_unit,
+        semantics="annual",
+        provenance=provenance,
+        scenario=scenario,
+    )
+
+
+# -- pooled model-years --------------------------------------------------------
+
+
+@dataclass(frozen=True, eq=False)
+class ModelRun:
+    """One model run's `AnnualSeries` at one location, for `sample_annual_pool`.
+
+    `model`, `member` and `pathway` name the run: for CMIP6 and NEX-GDDP-CMIP6,
+    the source id, the variant label and the experiment. They are the caller's
+    statement and are recorded with the run.
+
+    Raises `TypeError` for a `series` that is not an `AnnualSeries`, and
+    `SampleError` for a name that is not a non-empty string without surrounding
+    whitespace.
+    """
+
+    series: AnnualSeries
+    model: str = field(kw_only=True)
+    member: str = field(kw_only=True)
+    pathway: str = field(kw_only=True)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.series, AnnualSeries):
+            raise TypeError(
+                f"series must be an AnnualSeries, got {type(self.series).__name__}"
+            )
+        for name in ("model", "member", "pathway"):
+            _identifier(name, getattr(self, name))
+
+    @property
+    def name(self) -> str:
+        """The run's model and member, as an error message names it."""
+        return f"{self.model} {self.member}"
+
+
+def _stated_recipes(series: AnnualSeries) -> set[str]:
+    """The recipes a series' provenance states, if any."""
+    provenance = _thaw(series.provenance)
+    source = provenance.get("source")
+    stated = (source.get("recipe") if isinstance(source, Mapping) else None) or None
+    recipes = {str(stated)} if stated is not None else set()
+    recorded = provenance.get("table_columns")
+    if isinstance(recorded, Mapping):
+        recipes |= {
+            str(value) for value in (recorded.get("recipe") or {}).get("values", ())
+        }
+    return recipes
+
+
+def _checked_runs(runs: Any) -> tuple[ModelRun, ...]:
+    """A pool's runs in (model, member) order, after the refusals of a pool."""
+    if isinstance(runs, (str, bytes, Mapping)) or not isinstance(runs, Iterable):
+        raise TypeError(
+            f"runs must be an iterable of ModelRun, got {type(runs).__name__}"
+        )
+    given = tuple(runs)
+    for run in given:
+        if not isinstance(run, ModelRun):
+            raise TypeError(f"runs must hold ModelRun, got {type(run).__name__}")
+    if len(given) < 2:
+        raise SampleError(f"a pool needs two runs or more, got {len(given)}")
+    pathways = sorted({run.pathway for run in given})
+    if len(pathways) > 1:
+        raise SampleError(
+            f"a pool holds one pathway, but its runs are under {pathways}; "
+            "'historical' is a pathway too, so a pool cannot span historical and "
+            "SSP experiments"
+        )
+    units = sorted({run.series.unit for run in given})
+    if len(units) > 1:
+        raise SampleError(f"a pool needs one unit in every run, got {units}")
+    recipes = sorted(
+        {recipe for run in given for recipe in _stated_recipes(run.series)}
+    )
+    if len(recipes) > 1:
+        raise SampleError(f"a pool needs one recipe in every run, got {recipes}")
+    models = [run.model for run in given]
+    repeated = sorted({model for model in models if models.count(model) > 1})
+    if repeated:
+        members = {
+            model: sorted(run.member for run in given if run.model == model)
+            for model in repeated
+        }
+        raise SampleError(
+            f"a model appears once in a pool, whatever its member, so that every "
+            f"model has the same weight; got {members}"
+        )
+    return tuple(
+        sorted(
+            given,
+            key=lambda run: (run.model.encode("utf-8"), run.member.encode("utf-8")),
+        )
+    )
+
+
+def _pool_years(
+    runs: Sequence[ModelRun], trend: Trend, missing: MissingYears
+) -> tuple[IntArray, IntArray, list[FloatArray], list[list[int]], list[int]]:
+    """The years a pool holds, after the window and the missing years.
+
+    Returns all the years of the runs' windows, the years kept, each run's
+    values on them, the years each run had no value for, and the years dropped.
+    Raises `SampleError` unless every run holds the same years then.
+    """
+    windows: list[IntArray] = []
+    values: list[FloatArray] = []
+    for run in runs:
+        try:
+            first_row = trend._first_row(len(run.series))
+        except SampleError as error:
+            raise SampleError(f"run {run.name}: {error}") from error
+        windows.append(run.series.years[first_row:])
+        values.append(run.series.values[first_row:])
+    lacked = [
+        [int(year) for year in years[np.isnan(recorded)]]
+        for years, recorded in zip(windows, values, strict=True)
+    ]
+    dropped = sorted({year for years in lacked for year in years})
+    if dropped and missing == "raise":
+        listed = "; ".join(
+            f"{run.name}: {_year_spans(years)}"
+            for run, years in zip(runs, lacked, strict=True)
+            if years
+        )
+        years_have, them = (
+            ("year has", "it") if len(dropped) == 1 else ("years have", "them")
+        )
+        raise SampleError(
+            f"{len(dropped)} {years_have} no value in a run ({listed}); pass "
+            f"missing='drop_year' to drop {them} from every run, listed in the "
+            "provenance"
+        )
+    gone = np.array(dropped, dtype=np.int64)
+    held = [years[~np.isin(years, gone)] for years in windows]
+    if any(not np.array_equal(years, held[0]) for years in held[1:]):
+        listed = "; ".join(
+            f"{run.name}: {_year_spans([int(year) for year in years])}"
+            for run, years in zip(runs, held, strict=True)
+        )
+        raise SampleError(
+            "every run of a pool must hold the same years, so that the latest "
+            f"years are one block for every model; the runs hold {listed}. A stated "
+            "years= resolves it"
+        )
+    kept = held[0]
+    if kept.size == 0:
+        raise SampleError("no year has a value in every run of the pool")
+    on_kept = [
+        recorded[np.isin(years, kept)]
+        for years, recorded in zip(windows, values, strict=True)
+    ]
+    return np.unique(np.concatenate(windows)), kept, on_kept, lacked, dropped
+
+
+def sample_annual_pool(
+    runs: Iterable[ModelRun],
+    *,
+    loss_model: LossModel,
+    basis_risk: BasisRisk,
+    asset_id: str,
+    rng: np.random.Generator | None = None,
+    missing: MissingYears = "raise",
+    trend: Trend = AsRecorded(),
+    scenario: str = "baseline",
+) -> OutcomeSample:
+    """Pool the model-years of several runs into one asset's sample.
+
+    `runs` holds one `ModelRun` per model, all at one location. Every
+    model-year is one row with probability `1/N`, so 3 models of `n` years give
+    `3n` rows at `1/(3n)` each. The rows are in (year, model, member) order,
+    with models and members in UTF-8 byte order, so the order of `runs` does
+    not matter. `period` is the draw number, 0 to `N - 1`. The provenance's
+    `pool` records each row's year and run, and each run's model, member,
+    pathway, lineage and series.
+
+    The steps come in this order: the window of `RecentYears`, taken from each
+    run; the missing years; the check that every run holds the same years; the
+    fit and the adjustment, one fit per run on the same years, with the same
+    reference year, the last of the pool's years; the impact on the adjusted
+    hazard; the basis-risk model. A year without a value in a run raises,
+    unless `missing="drop_year"` drops it from every run and lists it with the
+    run that lacked it. `rng` is needed only by a basis-risk model that draws:
+    `ImpactNoise` draws one factor per row, in row order. `trend` and
+    `scenario` are those of `sample_annual`.
+
+    `holdout` and `year_block_kfold` split a pool by its years, so every run
+    holds out the same latest years, and the leakage check compares (run
+    lineage, year) pairs, so a model-year cannot be on both sides, between
+    pools of different runs or between a pool and one of its runs. To hold out
+    a block under `LinearTrend`, state the design years with `fit_years=`.
+
+    A draw mixes model spread with year-to-year variability. The rows are not
+    independent years: rows of one run share that model's climate and rows of
+    one year the pathway's forcing, so the number of rows is not an effective
+    sample size.
+
+    Raises `SampleError` for fewer than two runs; runs under different
+    pathways, in different units or with different stated recipes; the same
+    model twice, whatever the member; runs that do not hold the same years; a
+    missing year (unless `missing="drop_year"`); a hazard unit the loss model's
+    impact is not calibrated for; a trend a run cannot take; and invalid
+    arguments. Raises `TypeError` for wrong types. Warns with
+    `ComonotoneIndexWarning` for `NoBasisRisk()`, as for one series.
+    """
+    sample = _pool_rows(
+        runs,
+        loss_model=loss_model,
+        basis_risk=basis_risk,
+        asset_id=asset_id,
+        rng=rng,
+        missing=missing,
+        trend=trend,
+        scenario=scenario,
+    )
+    _warn_comonotone(basis_risk, separate_index=False)
+    return sample
+
+
+def _pool_rows(
+    runs: Iterable[ModelRun],
+    *,
+    loss_model: LossModel,
+    basis_risk: BasisRisk,
+    asset_id: str,
+    rng: np.random.Generator | None,
+    missing: MissingYears,
+    trend: Trend,
+    scenario: str,
+) -> OutcomeSample:
+    """`sample_annual_pool`, without its warning: a plan rebuilds it per fold."""
+    ordered = _checked_runs(runs)
+    asset = _identifier("asset_id", asset_id)
+    _check_models(loss_model, basis_risk, asset)
+    unit = ordered[0].series.unit
+    loss_model.check_hazard_unit(unit)
+    if rng is not None:
+        rng = _require_generator(rng)
+    if missing not in get_args(MissingYears):
+        raise SampleError(
+            f"missing must be one of {get_args(MissingYears)}, got {missing!r}"
+        )
+    trend = _require_trend(trend)
+    scenario = _identifier("scenario", scenario)
+    all_years, kept, on_kept, lacked, dropped = _pool_years(ordered, trend, missing)
+    series = [
+        _Series(f"hazard of run {run.name}", unit, np.array(values))
+        for run, values in zip(ordered, on_kept, strict=True)
+    ]
+    adjusted, trend_record = trend._apply(all_years, kept, series)
+    if "fits" in trend_record:
+        trend_record["fits"] = [
+            {**fit, "role": "hazard", "model": run.model, "member": run.member}
+            for fit, run in zip(trend_record["fits"], ordered, strict=True)
+        ]
+    # One row per year and run: a column per run, read row by row.
+    hazard_values = np.column_stack(adjusted).reshape(-1)
+    count = hazard_values.shape[0]
+
+    impact = loss_model.impact_values(hazard_values)
+    rng_records = [] if rng is None else [_generator_record(rng, "basis_risk")]
+    new_index, impact, basis_summary = _apply_basis_risk(
+        basis_risk, hazard_values.copy(), hazard_values, impact, rng
+    )
+    loss = loss_model.loss_values(impact)
+
+    notes: list[str] = []
+    if dropped:
+        noun, verb = ("year", "was") if len(dropped) == 1 else ("years", "were")
+        notes.append(
+            f"{len(dropped)} {noun} without a value in a run {verb} dropped from "
+            f"every run: {_year_spans(dropped)}."
+        )
+    notes += _basis_risk_notes(basis_risk, separate_index=False)
+    lineages = [_annual_lineage(asset, run.series, None) for run in ordered]
+    licences: list[dict[str, Any]] = []
+    for run in ordered:
+        licence = _series_licence("hazard", run.series)
+        if licence not in licences:
+            licences.append(licence)
+    provenance = SampleProvenance(
+        source_kind="annual",
+        sources=tuple(
+            {
+                "role": "hazard",
+                "unit": unit,
+                "series": _thaw(run.series.provenance),
+                "model": run.model,
+                "member": run.member,
+                "pathway": run.pathway,
+            }
+            for run in ordered
+        ),
+        semantics_source="data",
+        loss_model=loss_model._document(asset),
+        basis_risk=basis_risk.to_document(),
+        rng=tuple(rng_records),
+        licences=tuple(licences),
+        details={
+            "years": [int(kept[0]), int(kept[-1])],
+            "n_years": int(kept.shape[0]),
+            "n_runs": len(ordered),
+            "missing": missing,
+            "dropped_years": dropped,
+            "index_from": "hazard",
+            "basis_risk": basis_summary,
+        },
+        notes=tuple(notes),
+        lineage=content_hash(
+            {
+                "kind": "pool",
+                "asset_id": asset,
+                "runs": [
+                    {"model": run.model, "member": run.member, "lineage": lineage}
+                    for run, lineage in zip(ordered, lineages, strict=True)
+                ],
+            }
+        ),
+        trend=trend_record,
+        pool={
+            "pathway": ordered[0].pathway,
+            "runs": [
+                {
+                    "model": run.model,
+                    "member": run.member,
+                    "pathway": run.pathway,
+                    "lineage": lineage,
+                    "series": _thaw(run.series.provenance),
+                    "dropped_years": years,
+                }
+                for run, lineage, years in zip(ordered, lineages, lacked, strict=True)
+            ],
+            "year": np.repeat(kept, len(ordered)).tolist(),
+            "run": np.tile(np.arange(len(ordered)), kept.shape[0]).tolist(),
+        },
+    )
+    return OutcomeSample(
+        asset_ids=(asset,),
+        period=np.arange(count, dtype=np.int64),
+        probability=np.full(count, 1.0 / count),
+        index=new_index,
+        loss=loss,
+        hazard=None if np.array_equal(new_index, hazard_values) else hazard_values,
+        index_unit=unit,
         loss_unit=loss_model.value_unit,
         semantics="annual",
         provenance=provenance,

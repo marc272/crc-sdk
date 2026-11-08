@@ -55,6 +55,14 @@ with probability 1/n. `trend=` states how the climate trend is treated,
 some registry impacts need in their context: the name of an asset column, or
 `H3Cell(resolution=r)` for the cell of the asset's point.
 
+**Pooled model-years** (`pool=`, per-year values only). `pool=ModelPool()` pools
+the years of several climate-model runs per asset: `source` is one table, file
+or plan whose rows carry the columns `ModelPool` names, as NEX-GDDP-CMIP6's
+batches do, or a sequence of sources, one per run, as CMIP6's plans are. Each
+asset gets one sample from `sample_annual_pool`, its rows the runs' model-years
+at `1/N` each and `period` their draw number. Each run is located on its own
+grid, and a run named by no column is named by its source plan's `explain()`.
+
 **An index read elsewhere** (`.index`, per-year values only). The cover pays on
 a series from a second source, at a station an asset column names or in the
 grid cell nearest the asset or another point, while the loss still reads the
@@ -107,7 +115,9 @@ from it, so a held-out value changes neither the fit nor the design block. A
 basis-risk model that draws starts every fold from the asset's same generator
 state, so a year's factor does not depend on the fold. `RecentYears` is not
 rebuilt: the window comes first and the split divides it. `.samples()` and
-`ParametricResult.samples` hold all the years, fitted on all of them.
+`ParametricResult.samples` hold all the years, fitted on all of them. On a pool
+each run has its own fit, on the same design years with the same reference
+year, and a split divides the pool's years, not its rows.
 
 **Scopes.** By default, `Individual()`, each asset is designed and evaluated
 on its own sample: nothing sums over the assets and no dependence between them
@@ -163,6 +173,7 @@ from typing import Any, Literal, get_args
 
 import numpy as np
 import pyarrow as pa  # type: ignore[import-untyped]
+import pyarrow.compute as pc  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 from crc_framework import (
     CallableImpact,
@@ -206,6 +217,7 @@ from crc_sdk.parametric.sample import (
     OutcomeSample,
     _arrow_table,
     _identifier,
+    _sample_years,
     _string_values,
     _thaw,
     holdout,
@@ -215,9 +227,11 @@ from crc_sdk.parametric.sources import (
     AnnualSemantics,
     AnnualSeries,
     MissingYears,
+    ModelRun,
     OutsideSupport,
     _annual_rows,
     _coordinate,
+    _pool_rows,
     _source_plan_document,
     _warn_comonotone,
     sample_curve,
@@ -241,6 +255,7 @@ __all__ = [
     "H3Cell",
     "Holdout",
     "KFold",
+    "ModelPool",
     "NearestCell",
     "ParametricPlan",
     "ParametricResult",
@@ -503,6 +518,36 @@ class H3Cell:
         return {"kind": "h3_cell", "resolution": self.resolution}
 
 
+@dataclass(frozen=True)
+class ModelPool:
+    """Pool the years of several climate-model runs, per asset.
+
+    For `for_annual_extremes(..., pool=ModelPool())`. `model`, `member` and
+    `pathway` name the columns that say whose each row of the source is, as
+    NEX-GDDP-CMIP6's batches carry them. A source without them, such as a CMIP6
+    plan, is named by its `explain()` document, where its `model`, `member` and
+    `pathway` keys state the run. Raises `ValueError` for an empty column name.
+    """
+
+    model: str = "model"
+    member: str = "member"
+    pathway: str = "scenario"
+
+    def __post_init__(self) -> None:
+        _column_name("model", self.model)
+        _column_name("member", self.member)
+        _column_name("pathway", self.pathway)
+
+    def to_document(self) -> dict[str, Any]:
+        """Return the kind and the columns that name a run."""
+        return {
+            "kind": "model_pool",
+            "model_column": self.model,
+            "member_column": self.member,
+            "pathway_column": self.pathway,
+        }
+
+
 @dataclass(frozen=True, eq=False)
 class _SeriesRead:
     """What a plan reads for each asset: its hazard or its `.index(...)` series.
@@ -532,6 +577,16 @@ class _OpenedRead:
     record: dict[str, Any]
     source: dict[str, Any]
     pathway: str | None
+
+
+@dataclass(frozen=True, eq=False)
+class _OpenedRun:
+    """One run of a pool at execution: its own rows, and whose they are."""
+
+    opened: _OpenedRead
+    model: str
+    member: str
+    pathway: str
 
 
 @dataclass(frozen=True)
@@ -642,14 +697,15 @@ class _Run:
     index_source: dict[str, Any] | None = None
     joint: OutcomeSample | None = None
     fresh_joint: OutcomeSample | None = None
+    run_records: Mapping[tuple[str, str], dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True, eq=False)
 class _AnnualAsset:
-    """What one asset's per-year samples are built from."""
+    """What one asset's per-year samples are built from: a series, or a pool's runs."""
 
     asset_id: str
-    series: AnnualSeries
+    series: AnnualSeries | tuple[ModelRun, ...]
     index_series: AnnualSeries | None
     loss_model: LossModel
     cell: int | None
@@ -667,7 +723,9 @@ class _Samples:
 
     `folds` holds each asset's sample of each fold, when each fold has a sample
     of its own. Under `Joint()`, `joint` and `fresh_joint` are the samples of
-    all the assets, and `samples` and `fresh` each asset's view of them.
+    all the assets, and `samples` and `fresh` each asset's view of them. A pool
+    read from a sequence of sources has each run's record in `run_records`,
+    by model and member.
     """
 
     portfolio: AssetPortfolio
@@ -680,6 +738,7 @@ class _Samples:
     folds: Mapping[str, tuple[OutcomeSample, ...]] | None = None
     joint: OutcomeSample | None = None
     fresh_joint: OutcomeSample | None = None
+    run_records: Mapping[tuple[str, str], dict[str, Any]] | None = None
 
 
 # -- helpers -----------------------------------------------------------------
@@ -742,6 +801,33 @@ def _source_kind(source: Any) -> Literal["table", "file", "plan"]:
         "pyarrow.Table in an annual-extremes layout, or a local Parquet file; "
         f"got {type(source).__name__}"
     )
+
+
+def _pool_source(source: Any) -> Any:
+    """A pool's `source`: a sequence becomes a tuple, each of its sources checked."""
+    if isinstance(source, Sequence) and not isinstance(source, (str, bytes)):
+        if not source:
+            raise ValueError("source must name at least one source of the pool")
+        for each in source:
+            _source_kind(each)
+        return tuple(source)
+    _source_kind(source)
+    return source
+
+
+def _run_names(table: Any, name: str) -> Any:
+    """A column that names runs, as text; `SampleError` if it cannot."""
+    column = table.column(name)
+    if pa.types.is_dictionary(column.type):
+        column = column.cast(column.type.value_type)
+    if not (pa.types.is_string(column.type) or pa.types.is_large_string(column.type)):
+        raise SampleError(f"column {name!r} must hold strings, not {column.type}")
+    if column.null_count:
+        raise SampleError(
+            f"column {name!r} has {column.null_count} null values, so it does not "
+            "name every row's run"
+        )
+    return column.cast(pa.string())
 
 
 def _assets(assets: Any) -> AssetPortfolio | Path:
@@ -1178,7 +1264,9 @@ class ParametricPlan:
     `scenario` what `for_annual_extremes(...)` states, `index_read` what
     `.index(...)` states, and `scope_list`, `dependence_model` and
     `allocation_rule` what `.scopes(...)`, `.dependence(...)` and
-    `.allocation(...)` state.
+    `.allocation(...)` state. `pool` holds what `for_annual_extremes(...)`
+    states of a pool of model-years, and `source` is then a tuple of its sources
+    when several were given.
     """
 
     source: Any
@@ -1207,6 +1295,7 @@ class ParametricPlan:
     scope_list: tuple[Individual | Joint, ...] = (Individual(),)
     dependence_model: Dependence | None = None
     allocation_rule: Allocation | None = None
+    pool: ModelPool | None = None
 
     # -- the entry points -----------------------------------------------------
 
@@ -1325,6 +1414,7 @@ class ParametricPlan:
         trend: Trend = AsRecorded(),
         scenario: str = "baseline",
         cell: str | H3Cell | None = None,
+        pool: ModelPool | None = None,
     ) -> ParametricPlan:
         """Plan covers on per-year hazard values at each asset.
 
@@ -1374,13 +1464,23 @@ class ParametricPlan:
           hashes and in the comparison's `scenario` column. It is not derived
           from the source: the `scenario` column of a CMIP6 table is its
           pathway, which the setup text states as well.
+        - `pool` (`ModelPool()`) pools the years of several model runs, per
+          asset, as `sample_annual_pool` does. `source` is then one table,
+          file or plan whose rows carry the columns it names, or a sequence
+          of sources, one per run. A run is named by those columns or, where
+          a source has none, by its plan's `explain()`. Each run is located on
+          its own grid, so the matched cell and the grid step are recorded per
+          run. `years`, `missing` and `trend` apply to every run, and every
+          run must then hold the same years. `.samples()` returns one pooled
+          sample per asset. `.index(...)` and `StationColumn` are refused.
 
         Raises `TypeError` for arguments of the wrong type, `SampleError`
         for a unit the impact is not calibrated for, a missing asset column,
         an invalid `scenario` or a `cell` for an impact that takes no
         context, and `ValueError` for other invalid arguments, among them a
-        `LinearTrend` with `fit_years`, which the plan sets per fold, and a
-        `cell` where the impact's context already holds one. A registry
+        `LinearTrend` with `fit_years`, which the plan sets per fold, a
+        `cell` where the impact's context already holds one, and `pool` with
+        `StationColumn`, since models have no stations. A registry
         impact that needs an H3 cell in its context (such as `rx1day`)
         raises `SampleError` unless `cell` states each asset's, the impact
         or `context` is a
@@ -1388,7 +1488,12 @@ class ParametricPlan:
         H3 cells (`CellColumn`) and `context` names context columns: without
         one of these, a point asset has no cell on this route.
         """
-        _source_kind(source)
+        if pool is None:
+            _source_kind(source)
+        elif not isinstance(pool, ModelPool):
+            raise TypeError(f"pool must be a ModelPool, got {type(pool).__name__}")
+        else:
+            source = _pool_source(source)
         portfolio = _assets(assets)
         unit = _identifier("unit", unit)
         if not isinstance(provenance, SourceProvenance):
@@ -1404,6 +1509,11 @@ class ParametricPlan:
             raise TypeError(
                 "location must be NearestCell() or StationColumn(name), got "
                 f"{type(location).__name__}"
+            )
+        if pool is not None and isinstance(location, StationColumn):
+            raise ValueError(
+                "pool= pools climate-model runs, and models have no stations; "
+                "locate each asset with NearestCell()"
             )
         if cell is not None:
             _check_cell(cell, impact, context)
@@ -1475,6 +1585,7 @@ class ParametricPlan:
             cell=cell,
             trend=trend,
             scenario=scenario,
+            pool=pool,
         )
 
     # -- builders ---------------------------------------------------------------
@@ -1644,6 +1755,12 @@ class ParametricPlan:
         """Why this plan cannot read its index elsewhere; `None` if it can."""
         if self._on_curves:
             return f".index(...) reads per-year values; {_CURVES_READ_AT_THE_ASSET}"
+        if self.pool is not None:
+            return (
+                ".index(...) cannot read an index for a pool of model-years: an "
+                "observed station and a free-running model share no weather, so "
+                "pairing them by year would invent a dependence"
+            )
         return None
 
     def index(
@@ -1704,8 +1821,9 @@ class ParametricPlan:
         documents. Replaces any index stated before.
 
         Raises `ValueError` on a plan on fitted curves, whose index at
-        another location would need a joint distribution of two curves, for
-        `point=` with `StationColumn` and for empty column names; `TypeError`
+        another location would need a joint distribution of two curves, on a
+        plan that pools model-years, for `point=` with `StationColumn` and
+        for empty column names; `TypeError`
         for arguments of the wrong type; and `SampleError` for a missing
         asset column, or a cover the new index does not fit.
         """
@@ -2130,9 +2248,19 @@ class ParametricPlan:
                 )
         return evaluations
 
-    def _source_description(self) -> dict[str, Any]:
+    def _source_descriptions(self) -> list[dict[str, Any]]:
+        """The hazard's sources, as far as they are known: one entry per source."""
+        if self.pool is None:
+            return [self._source_description(self.source)]
+        pooled = self.pool.to_document()
+        return [
+            {**self._source_description(source), "pool": pooled}
+            for source in self._pool_sources()
+        ]
+
+    def _source_description(self, source: Any) -> dict[str, Any]:
         if self._on_curves:
-            request: PortfolioEvaluation = self.source
+            request: PortfolioEvaluation = source
             selection = request.selection
             spec = request.impact_spec
             assert spec is not None
@@ -2153,7 +2281,7 @@ class ParametricPlan:
                 },
                 "type": type(request.dataset).__name__,
             }
-        kind = _source_kind(self.source)
+        kind = _source_kind(source)
         assert self.provenance is not None
         description: dict[str, Any] = {
             "columns": {"value": self.hazard_column, "year": self.year_column},
@@ -2162,14 +2290,14 @@ class ParametricPlan:
             "missing": self.missing,
             "provenance": self.provenance.model_dump(mode="json"),
             "role": "hazard",
-            "type": type(self.source).__name__,
+            "type": type(source).__name__,
             "unit": self.unit,
             "years": None if self.years is None else list(self.years),
         }
         if kind == "file":
-            description["path"] = os.fspath(self.source)
+            description["path"] = os.fspath(source)
         elif kind == "table":
-            description["rows"] = int(self.source.num_rows)
+            description["rows"] = int(source.num_rows)
         return description
 
     def _index_description(self, read: _SeriesRead) -> dict[str, Any]:
@@ -2231,6 +2359,8 @@ class ParametricPlan:
             )
         else:
             sample["trend"] = self.trend.to_document()
+            if self.pool is not None:
+                sample["pool"] = self.pool.to_document()
         if self.basis_risk_model is not None:
             sample["basis_risk"] = self.basis_risk_model.to_document()
         if self._holds_joint:
@@ -2346,7 +2476,7 @@ class ParametricPlan:
                 "samples": samples,
             },
             "sources": [
-                self._source_description(),
+                *self._source_descriptions(),
                 *([] if read is None else [self._index_description(read)]),
             ],
         }
@@ -2382,7 +2512,8 @@ class ParametricPlan:
         The document mirrors the metadata the plan writes
         (`EvaluationMetadata`): `setup` (the basis, the metric options, one
         sample per asset with its source, loss and basis-risk models and, on
-        per-year values, its `trend` option, and the planned evaluations with
+        per-year values, its `trend` option and any `pool` columns, and the
+        planned evaluations with
         their split, fold and pricing), `covers`, `designs` (the objectives
         and design terms), `sources`, `assets`, `licences`, `rng` (the seeds)
         and `entry`; with
@@ -2552,6 +2683,80 @@ class ParametricPlan:
             self._series_source(read),
             _stated_pathway(record.get("explain")),
         )
+
+    def _pool_sources(self) -> tuple[Any, ...]:
+        """The sources of a pool: several, or the one that holds every run."""
+        return self.source if isinstance(self.source, tuple) else (self.source,)
+
+    def _runs_of(self, opened: _OpenedRead, *, alone: bool) -> list[_OpenedRun]:
+        """The runs one opened source holds, each with its own rows."""
+        pool = self.pool
+        assert pool is not None
+        table = opened.table
+        if table.num_rows == 0:
+            raise SampleError("a source of the pool has no rows")
+        columns = {
+            key: name
+            for key, name in (
+                ("model", pool.model),
+                ("member", pool.member),
+                ("pathway", pool.pathway),
+            )
+            if name in table.column_names
+        }
+        explained = opened.record.get("explain")
+        stated: dict[str, str] = {}
+        for key in ("model", "member", "pathway"):
+            if key in columns:
+                continue
+            value = explained.get(key) if isinstance(explained, dict) else None
+            if not isinstance(value, str) or not value:
+                raise SampleError(
+                    f"a source of the pool states no {key}: it has no column "
+                    f"{getattr(pool, key)!r} and no explain() document that states "
+                    "one; a run must be named by its columns or its source plan"
+                )
+            stated[key] = value
+        if not columns:
+            return [_OpenedRun(opened, **stated)]
+        names = {key: _run_names(table, name) for key, name in columns.items()}
+        found = sorted(
+            pa.table(names).group_by(list(names)).aggregate([]).to_pylist(),
+            key=lambda row: [row[key].encode("utf-8") for key in names],
+        )
+        if alone and len(found) > 1:
+            raise SampleError(
+                f"each source of a sequence is one run, but one holds {len(found)}: "
+                f"{found}; pass them as one source, or one source per run"
+            )
+        runs: list[_OpenedRun] = []
+        for run in found:
+            mask: Any = None
+            for key, value in run.items():
+                matches = pc.equal(names[key], pa.scalar(value, pa.string()))
+                mask = matches if mask is None else pc.and_(mask, matches)
+            rows = dataclasses.replace(opened, table=table.filter(mask))
+            runs.append(_OpenedRun(rows, **stated, **run))
+        return runs
+
+    def _open_runs(self) -> list[_OpenedRun]:
+        """Read the sources of a pool once, for all the assets, and find its runs."""
+        sources = self._pool_sources()
+        runs: list[_OpenedRun] = []
+        for source in sources:
+            read = dataclasses.replace(self._hazard_read, source=source)
+            runs += self._runs_of(self._open(read), alone=len(sources) > 1)
+        recipes: set[str] = set()
+        for run in runs:
+            explained = run.opened.record.get("explain")
+            recipe = explained.get("recipe") if isinstance(explained, dict) else None
+            if isinstance(recipe, str) and recipe:
+                recipes.add(recipe)
+        if len(recipes) > 1:
+            raise SampleError(
+                f"a pool needs one recipe in every run, got {sorted(recipes)}"
+            )
+        return runs
 
     def _asset_cell(
         self, portfolio: AssetPortfolio, asset_id: str, row: Mapping[str, Any]
@@ -2750,17 +2955,29 @@ class ParametricPlan:
         rng: np.random.Generator | None,
     ) -> OutcomeSample:
         """One asset's per-year sample under `trend`, with its notes."""
-        sample = _annual_rows(
-            asset.series,
-            loss_model=asset.loss_model,
-            basis_risk=self._require_basis_risk(),
-            asset_id=asset.asset_id,
-            index=asset.index_series,
-            rng=rng,
-            missing=self.missing,
-            trend=trend,
-            scenario=self.scenario,
-        )
+        if isinstance(asset.series, AnnualSeries):
+            sample = _annual_rows(
+                asset.series,
+                loss_model=asset.loss_model,
+                basis_risk=self._require_basis_risk(),
+                asset_id=asset.asset_id,
+                index=asset.index_series,
+                rng=rng,
+                missing=self.missing,
+                trend=trend,
+                scenario=self.scenario,
+            )
+        else:
+            sample = _pool_rows(
+                asset.series,
+                loss_model=asset.loss_model,
+                basis_risk=self._require_basis_risk(),
+                asset_id=asset.asset_id,
+                rng=rng,
+                missing=self.missing,
+                trend=trend,
+                scenario=self.scenario,
+            )
         if asset.cell is not None:
             assert self.cell is not None
             sample = _noted(
@@ -2818,7 +3035,8 @@ class ParametricPlan:
         assert isinstance(trend, LinearTrend)
         refits: list[OutcomeSample] = []
         for fold, design_block, _ in self._blocks(sample, None):
-            count = len(design_block)
+            design_years = _sample_years(design_block)
+            count = design_years.shape[0]
             if count < trend.min_years:
                 raise SampleError(
                     f"asset {asset.asset_id!r}, fold {fold}: LinearTrend needs at "
@@ -2826,7 +3044,7 @@ class ParametricPlan:
                     f"block holds {count}; no fold is dropped"
                 )
             fitted = dataclasses.replace(
-                trend, fit_years=tuple(int(year) for year in design_block.period)
+                trend, fit_years=tuple(int(year) for year in design_years)
             )
             refits.append(self._annual_sample(asset, fitted, copy.deepcopy(generator)))
         return tuple(refits)
@@ -2848,7 +3066,10 @@ class ParametricPlan:
             _require_several_assets([asset_id for asset_id, _ in rows])
         # Before the source is read, which may take long or download data.
         cells = [self._asset_cell(portfolio, asset_id, row) for asset_id, row in rows]
-        hazard = self._open(self._hazard_read)
+        pool_runs = None if self.pool is None else self._open_runs()
+        hazard = (
+            self._open(self._hazard_read) if pool_runs is None else pool_runs[0].opened
+        )
         index = None if self.index_read is None else self._open(self.index_read)
         generators = self._generators(len(rows))
         per_fold = (
@@ -2860,11 +3081,25 @@ class ParametricPlan:
         locations: dict[str, AtPoint | AtStation] = {}
         refitted: dict[str, tuple[OutcomeSample, ...]] = {}
         for (asset_id, row), rng, cell in zip(rows, generators, cells, strict=True):
-            series = self._series(hazard, row, asset_id, portfolio)
+            series: AnnualSeries | tuple[ModelRun, ...]
+            if pool_runs is None:
+                series = self._series(hazard, row, asset_id, portfolio)
+            else:
+                series = tuple(
+                    ModelRun(
+                        self._series(run.opened, row, asset_id, portfolio),
+                        model=run.model,
+                        member=run.member,
+                        pathway=run.pathway,
+                    )
+                    for run in pool_runs
+                )
             index_series: AnnualSeries | None = None
             unused: list[int] = []
             location: AtPoint | AtStation | None = None
             if index is not None:
+                # .index(...) is refused on a pool, so the hazard is one series.
+                assert isinstance(series, AnnualSeries)
                 read_series = self._series(index, row, asset_id, portfolio)
                 location = _resolved_location(index.read, read_series, row)
                 locations[asset_id] = location
@@ -2895,6 +3130,11 @@ class ParametricPlan:
             locations=None if index is None else locations,
             folds=refitted if per_fold else None,
             joint=joint,
+            run_records=(
+                None
+                if pool_runs is None or not isinstance(self.source, tuple)
+                else {(run.model, run.member): run.opened.record for run in pool_runs}
+            ),
         )
 
     # -- the curve route ---------------------------------------------------------
@@ -3295,6 +3535,7 @@ class ParametricPlan:
             index_source=built.index_record,
             joint=built.joint,
             fresh_joint=built.fresh_joint,
+            run_records=built.run_records,
         )
 
     def samples(self) -> Mapping[str, OutcomeSample]:
@@ -3376,7 +3617,9 @@ class ParametricPlan:
         dataset's path, its SHA-256 and the number of matched curves); on
         per-year values `{"annual_table": {...}}` (the table's rows, columns
         and SHA-256, the source plan's `explain()` and, for a file, its path
-        and SHA-256). Each hazard source names its record by that checksum:
+        and SHA-256; a pool has one hazard source per run, and a sequence of
+        sources one such record each). Each hazard source names its record by
+        that checksum:
         `canonical_file_sha256` (the file's) or `annual_table_sha256` (the
         table's). With `.index(...)`, `source_records` also holds
         `{"index_table": {...}}`, of the same form, each source with role
@@ -3411,13 +3654,28 @@ class ParametricPlan:
         ]
         checksums = {"hazard": {f"{run.source_key}_sha256": checksum}}
         records: list[dict[str, Any]] = [{run.source_key: run.source}]
+        by_run = run.run_records
+        if by_run is not None:
+            records = [{run.source_key: record} for record in by_run.values()]
         if run.index_source is not None:
             checksums["index"] = {
                 "index_table_sha256": run.index_source["table_sha256"]
             }
             records.append({"index_table": run.index_source})
         document["sources"] = [
-            {**entry, **checksums.get(str(entry.get("role")), {})}
+            {
+                **entry,
+                **checksums.get(str(entry.get("role")), {}),
+                **(
+                    {}
+                    if by_run is None
+                    else {
+                        f"{run.source_key}_sha256": by_run[
+                            (entry["model"], entry["member"])
+                        ]["table_sha256"]
+                    }
+                ),
+            }
             for entry in document["sources"]
         ]
         document["source_records"] = [*document.get("source_records", ()), *records]

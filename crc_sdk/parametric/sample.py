@@ -7,7 +7,8 @@ modelled years (`sample_annual`), or the rows of a user table
 (`OutcomeSample.from_table`).
 
 - `period` labels the rows: the calendar year of a per-year sample, the draw
-  number of a Monte Carlo sample. It is strictly increasing.
+  number of a Monte Carlo sample or of a pool of model-years, whose rows record
+  their year, model and member. It is strictly increasing.
 - `probability` is each row's probability; it sums to 1.
 - `index` and `loss` have one row per draw and one column per asset, in
   `asset_ids` order: `(n, n_assets)`.
@@ -23,7 +24,9 @@ samples of the same years side by side. `design`, `evaluate` and `compare`
 work on one asset's sample.
 
 `holdout` and `year_block_kfold` split a sample into contiguous blocks of
-periods, so the held-out block of a per-year sample is its latest years.
+periods, so the held-out block of a per-year sample is its latest years. A
+pool of model-years is split by its distinct years, not by its rows, so every
+run holds out the same years.
 Monte Carlo draws are independent, so a fresh sample from another generator
 state is the plainer out-of-sample test.
 
@@ -377,6 +380,27 @@ def _is_monotone_function(index: FloatArray, loss: FloatArray) -> bool:
 # -- the provenance ----------------------------------------------------------
 
 
+def _check_pool(pool: Mapping[str, Any]) -> None:
+    """Raise `SampleError` unless `pool` names its runs and each row's run."""
+    if not {"pathway", "runs", "year", "run"} <= set(pool):
+        raise SampleError(
+            "pool must hold a pathway, its runs, and a year and a run per row"
+        )
+    runs, years, positions = pool["runs"], pool["year"], pool["run"]
+    if not all(
+        isinstance(run, Mapping) and {"model", "member", "lineage"} <= set(run)
+        for run in runs
+    ):
+        raise SampleError("each run of a pool needs a model, a member and a lineage")
+    if len(years) != len(positions):
+        raise SampleError(
+            f"a pool needs one year and one run per row, got {len(years)} years "
+            f"and {len(positions)} runs"
+        )
+    if any(not 0 <= position < len(runs) for position in positions):
+        raise SampleError(f"the rows of a pool name runs outside its {len(runs)} runs")
+
+
 @dataclass(frozen=True, eq=False)
 class SampleProvenance:
     """Where a sample's rows come from, and how they were made.
@@ -419,6 +443,13 @@ class SampleProvenance:
       Monte Carlo and table samples. The lineage leaves it out: a design on
       adjusted years, evaluated on the same years as recorded, shares their
       rows.
+    - `pool`: for pooled model-years (`sample_annual_pool`), who each row is:
+      `pathway`; `runs`, one document per run with its `model`, `member`,
+      `pathway`, `lineage`, the provenance of its `series` and the
+      `dropped_years` it had no value for; and `year` and `run`, one entry per
+      row, the calendar year and the run's position in `runs`. `select`,
+      `holdout` and `year_block_kfold` keep the entries of the rows they keep.
+      `None` on every other sample.
 
     Mappings and sequences are stored read-only; `to_document()` returns
     plain JSON types. Raises `SampleError` for unknown kinds or values that
@@ -441,6 +472,7 @@ class SampleProvenance:
     dependence: Mapping[str, Any] | None = None
     parts: Mapping[str, Mapping[str, Any]] | None = None
     trend: Mapping[str, Any] | None = None
+    pool: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.source_kind not in get_args(SourceKind):
@@ -468,7 +500,14 @@ class SampleProvenance:
                 raise SampleError(
                     "each rng record needs a step, a bit_generator and a state"
                 )
-        for name in ("loss_model", "basis_risk", "dependence", "parts", "trend"):
+        for name in (
+            "loss_model",
+            "basis_risk",
+            "dependence",
+            "parts",
+            "trend",
+            "pool",
+        ):
             value = getattr(self, name)
             if value is not None and not isinstance(value, Mapping):
                 raise SampleError(f"{name} must be a mapping or None")
@@ -476,6 +515,8 @@ class SampleProvenance:
             value = getattr(self, name)
             if value is not None and "kind" not in value:
                 raise SampleError(f"{name} must name its kind")
+        if self.pool is not None:
+            _check_pool(self.pool)
         if self.parts is not None and not all(
             isinstance(part, Mapping) for part in self.parts.values()
         ):
@@ -497,6 +538,7 @@ class SampleProvenance:
             "dependence",
             "parts",
             "trend",
+            "pool",
         ):
             value = getattr(self, name)
             _check_json(name, value)
@@ -532,13 +574,26 @@ class SampleProvenance:
         return np.random.Generator(bit_generator)
 
     def _selected(
-        self, *, parent: str, lineage: str, step: Mapping[str, Any]
+        self,
+        *,
+        parent: str,
+        lineage: str,
+        step: Mapping[str, Any],
+        rows: NDArray[np.bool_],
     ) -> SampleProvenance:
+        pool = self.pool
+        if pool is not None:
+            pool = {
+                **pool,
+                "year": np.asarray(pool["year"], dtype=np.int64)[rows].tolist(),
+                "run": np.asarray(pool["run"], dtype=np.int64)[rows].tolist(),
+            }
         return dataclasses.replace(
             self,
             parent=parent,
             lineage=lineage,
             selection=(*self.selection, step),
+            pool=pool,
         )
 
 
@@ -642,6 +697,12 @@ class OutcomeSample:
                 f"the provenance's parts are for {sorted(self.provenance.parts)}, "
                 f"but the sample holds {sorted(asset_ids)}"
             )
+        pool = self.provenance.pool
+        if pool is not None and len(pool["year"]) != n:
+            raise SampleError(
+                f"the provenance's pool names {len(pool['year'])} rows, but the "
+                f"sample holds {n}"
+            )
         _identifier("scenario", self.scenario)
         object.__setattr__(self, "asset_ids", asset_ids)
         object.__setattr__(self, "period", _read_only(period))
@@ -719,6 +780,7 @@ class OutcomeSample:
             parent=self.provenance.parent or self.content_hash,
             lineage=self.lineage,
             step=step,
+            rows=rows,
         )
         return OutcomeSample(
             asset_ids=self.asset_ids,
@@ -772,6 +834,7 @@ class OutcomeSample:
             selection=(*earlier, step, *own.selection),
             dependence=None,
             parts=None,
+            pool=own.pool if part is None else _part_pool(own.pool, part.pool),
         )
         return OutcomeSample(
             asset_ids=(asset_id,),
@@ -795,9 +858,11 @@ class OutcomeSample:
         units, semantics and scenario must be identical and the asset ids
         distinct. The parts' trends must share their kind, reference year and
         fit years, so the total sums years on one basis; the slopes differ per
-        asset, and the provenance's `trend` names each fit's asset. A part
-        without a separate `hazard` contributes its index when another part
-        has one.
+        asset, and the provenance's `trend` names each fit's asset. Pools must
+        hold the same (year, model, member) rows under one pathway, as draw
+        numbers alone would not line them up, and the provenance's `pool`
+        records them. A part without a separate `hazard` contributes its index
+        when another part has one.
 
         The provenance records `dependence` as `{"kind": "data"}`, the data's
         own, because the rows are the same years of the data, and holds each
@@ -811,8 +876,9 @@ class OutcomeSample:
         without stating it.
 
         Raises `SampleError` for fewer than two samples, a sample of several
-        assets, a Monte Carlo sample, a repeated asset id or any field that
-        differs, and `TypeError` for anything but an iterable of samples.
+        assets, a Monte Carlo sample, a repeated asset id, any field that
+        differs or a pool beside a sample that is not one, and `TypeError` for
+        anything but an iterable of samples.
         """
         if isinstance(samples, (str, bytes, Mapping)) or not isinstance(
             samples, Iterable
@@ -857,6 +923,8 @@ class OutcomeSample:
                 )
         _check_same_trend(parts)
         trend = _joined_trend(parts)
+        _check_same_pool(parts)
+        pool = _joined_pool(parts)
         kinds = {part.provenance.source_kind for part in parts}
         stated = {part.provenance.semantics_source for part in parts}
         documents = {part.asset_ids[0]: part.provenance.to_document() for part in parts}
@@ -906,6 +974,7 @@ class OutcomeSample:
                 for part in parts
             },
             trend=trend,
+            pool=pool,
         )
         hazard = (
             None
@@ -1412,6 +1481,153 @@ def _joined_trend(parts: Sequence[OutcomeSample]) -> dict[str, Any] | None:
     return joined
 
 
+def _pool_row_ids(pool: Mapping[str, Any]) -> list[tuple[int, str, str]]:
+    """Each row of a pool as (year, model, member)."""
+    runs = pool["runs"]
+    return [
+        (int(year), str(runs[run]["model"]), str(runs[run]["member"]))
+        for year, run in zip(pool["year"], pool["run"], strict=True)
+    ]
+
+
+def _check_same_pool(parts: Sequence[OutcomeSample]) -> None:
+    """Raise `SampleError` unless the parts of a join hold the same model-years.
+
+    Their draw numbers alone would not line them up, the reason `join` refuses
+    Monte Carlo samples.
+    """
+    first = parts[0]
+    stated = first.provenance.pool
+    for part in parts[1:]:
+        own = part.provenance.pool
+        if stated is None and own is None:
+            continue
+        if stated is None or own is None:
+            raise SampleError(
+                "join needs model-years pooled in every sample or in none, because "
+                "draw numbers alone would not line them up, but of assets "
+                f"{first.asset_ids[0]!r} and {part.asset_ids[0]!r} only one is pooled"
+            )
+        if own["pathway"] != stated["pathway"]:
+            raise SampleError(
+                f"join needs one pathway in every pool, but asset "
+                f"{part.asset_ids[0]!r} is under {own['pathway']!r} and asset "
+                f"{first.asset_ids[0]!r} under {stated['pathway']!r}"
+            )
+        if _pool_row_ids(own) != _pool_row_ids(stated):
+            raise SampleError(
+                f"join needs pools of the same (year, model, member) rows, because "
+                f"draw numbers alone would not line them up, but those of asset "
+                f"{part.asset_ids[0]!r} differ from those of asset "
+                f"{first.asset_ids[0]!r}"
+            )
+
+
+def _joined_pool(parts: Sequence[OutcomeSample]) -> dict[str, Any] | None:
+    """The rows the parts of a join hold alike, each run named across the assets.
+
+    A run's lineage is built from each asset's own, as `join` builds a sample's
+    lineage, so a plain sample of the same assets counts as one run. `parts`
+    holds each asset's own runs and series.
+    """
+    first = parts[0].provenance.pool
+    if first is None:
+        return None
+    named: list[tuple[str, dict[tuple[str, str], Mapping[str, Any]]]] = []
+    for part in parts:
+        pool = part.provenance.pool
+        assert pool is not None
+        named.append(
+            (
+                part.asset_ids[0],
+                {(run["model"], run["member"]): run for run in pool["runs"]},
+            )
+        )
+    held = sorted({int(position) for position in first["run"]})
+    runs: list[dict[str, Any]] = []
+    for position in held:
+        run = first["runs"][position]
+        key = (run["model"], run["member"])
+        runs.append(
+            {
+                "model": run["model"],
+                "member": run["member"],
+                "pathway": run.get("pathway"),
+                "lineage": content_hash(
+                    {
+                        "kind": "join",
+                        "lineages": {
+                            asset: own[key]["lineage"] for asset, own in named
+                        },
+                    }
+                ),
+                "dropped_years": sorted(
+                    {
+                        int(year)
+                        for _, own in named
+                        for year in own[key].get("dropped_years", ())
+                    }
+                ),
+            }
+        )
+    return {
+        "pathway": first["pathway"],
+        "runs": runs,
+        "year": [int(year) for year in first["year"]],
+        "run": [held.index(int(position)) for position in first["run"]],
+    }
+
+
+def _part_pool(
+    joined: Mapping[str, Any] | None, own: Mapping[str, Any] | None
+) -> dict[str, Any] | None:
+    """One asset's own pool, on the rows its joined sample holds now."""
+    if joined is None or own is None:
+        return None
+    position = {(run["model"], run["member"]): i for i, run in enumerate(own["runs"])}
+    runs = [position[(run["model"], run["member"])] for run in joined["runs"]]
+    return {
+        **_thaw(own),
+        "year": [int(year) for year in joined["year"]],
+        "run": [runs[int(run)] for run in joined["run"]],
+    }
+
+
+def _pool_entry(pool: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """A pool's record in a comparison's metadata: its runs and years.
+
+    Without the row arrays, which the sample's own metadata holds and the
+    order of its rows gives, and without each run's series, which the
+    comparison's `sources` holds.
+    """
+    if pool is None:
+        return None
+    return {
+        "pathway": pool["pathway"],
+        "rows": len(pool["year"]),
+        "runs": [
+            {key: value for key, value in run.items() if key != "series"}
+            for run in pool["runs"]
+        ],
+        "years": sorted({int(year) for year in pool["year"]}),
+    }
+
+
+def _row_years(sample: OutcomeSample) -> IntArray:
+    """Each row's year: a pool's calendar year, otherwise the row's period."""
+    pool = sample.provenance.pool
+    if pool is None:
+        return sample.period
+    years: IntArray = np.asarray(pool["year"], dtype=np.int64)
+    return years
+
+
+def _sample_years(sample: OutcomeSample) -> IntArray:
+    """The distinct years of a sample's rows, in order."""
+    years: IntArray = np.unique(_row_years(sample))
+    return years
+
+
 def _require_one_asset(sample: OutcomeSample, function: str) -> None:
     """Raise `SampleError` if `sample` holds several assets; `function` needs one."""
     count = len(sample.asset_ids)
@@ -1452,9 +1668,12 @@ def holdout(
     The design block is the first `floor(train_fraction * n + 1e-9)` periods
     in period order (the tolerance makes `0.7 * 10` give 7), the held-out
     block the rest. For per-year samples the held-out block is therefore the
-    latest years. Each block's probabilities are rescaled to sum to 1. Both
-    blocks share the sample's lineage, so evaluating a design on a block
-    that overlaps its design block raises `LeakageError`.
+    latest years. A pool of model-years is split by its `n` distinct years
+    instead of its rows, as cutting rows could cut through a year, so every
+    run holds out the same latest years. Each block's probabilities are
+    rescaled to sum to 1. Both blocks share the sample's lineage, so
+    evaluating a design on a block that overlaps its design block raises
+    `LeakageError`.
 
     Raises `SampleError` unless `train_fraction` is a number in (0, 1) that
     leaves at least one period in each block, and for an `EmpiricalCopula`
@@ -1472,14 +1691,17 @@ def holdout(
             f"train_fraction must be a number in (0, 1), got {train_fraction!r}"
         )
     fraction = float(train_fraction)
-    n = len(sample)
+    row_years = _row_years(sample)
+    blocks = np.unique(row_years)
+    n = blocks.size
     n_train = math.floor(fraction * n + _HOLDOUT_TOLERANCE)
     if not 1 <= n_train <= n - 1:
+        noun = "period" if sample.provenance.pool is None else "year"
         raise SampleError(
-            f"train_fraction {fraction} of {n} periods gives {n_train} design "
-            "periods; both blocks need at least one period"
+            f"train_fraction {fraction} of {n} {noun}s gives {n_train} design "
+            f"{noun}s; both blocks need at least one {noun}"
         )
-    design_rows = np.arange(n) < n_train
+    design_rows = np.isin(row_years, blocks[:n_train])
     step = {"kind": "holdout", "train_fraction": fraction, "fold": 0}
     return (
         sample._subset(design_rows, {**step, "block": "train"}),
@@ -1494,7 +1716,9 @@ def year_block_kfold(
 
     The periods, in order, are split into `k` contiguous blocks with
     `numpy.array_split` (the first `n % k` blocks get one period more). Fold
-    `i` holds out block `i` and designs on the others. Returns one
+    `i` holds out block `i` and designs on the others. A pool of model-years
+    is split by its `n` distinct years instead of its rows, so every run holds
+    out the same years in each fold, and the last fold the latest. Returns one
     `(design, held_out)` pair per fold, in fold order; each sample's
     probabilities are rescaled to sum to 1.
 
@@ -1504,13 +1728,14 @@ def year_block_kfold(
     """
     sample = _require_sample(sample)
     _refuse_reference_year_blocks(sample, "year_block_kfold")
-    n = len(sample)
+    row_years = _row_years(sample)
+    blocks = np.unique(row_years)
+    n = blocks.size
     if isinstance(k, bool) or not isinstance(k, (int, np.integer)) or not 2 <= k <= n:
         raise SampleError(f"k must be an integer in [2, {n}], got {k!r}")
     folds: list[tuple[OutcomeSample, OutcomeSample]] = []
-    for fold, block in enumerate(np.array_split(np.arange(n), int(k))):
-        held_out = np.zeros(n, dtype=bool)
-        held_out[block] = True
+    for fold, block in enumerate(np.array_split(blocks, int(k))):
+        held_out = np.isin(row_years, block)
         step = {"kind": "kfold", "k": int(k), "fold": fold}
         folds.append(
             (
@@ -1521,29 +1746,61 @@ def year_block_kfold(
     return tuple(folds)
 
 
+def _years_by_run(sample: OutcomeSample) -> dict[str, IntArray]:
+    """The source of a sample's rows, by lineage, with the years each holds.
+
+    A pool's rows come from its runs, and any other sample counts as one run,
+    so that a model-year is the same row in a pool and in a sample of its run.
+    """
+    pool = sample.provenance.pool
+    if pool is None:
+        return {sample.lineage: sample.period}
+    years = np.asarray(pool["year"], dtype=np.int64)
+    positions = np.asarray(pool["run"], dtype=np.int64)
+    return {
+        str(run["lineage"]): years[positions == position]
+        for position, run in enumerate(pool["runs"])
+    }
+
+
 def _check_out_of_sample(design: OutcomeSample, evaluation: OutcomeSample) -> None:
     """Raise `LeakageError` if `evaluation` shares rows with `design`.
 
     Two samples share rows when they have the same lineage (the same source,
-    or splits of one sample) and a common period. A linear trend fitted on a
-    year the evaluation sample holds, by either sample, leaks that year too.
+    or splits of one sample) and a common period. On a pool the comparison is
+    of (run lineage, year) pairs, and a plain per-year sample counts as one
+    run: a model-year cannot be on both sides, between pools of different runs
+    or between a pool and one of its runs. A linear trend fitted on a year the
+    evaluation sample holds, by either sample, leaks that year too.
     """
     design = _require_sample(design)
     evaluation = _require_sample(evaluation)
-    if design.lineage != evaluation.lineage:
+    designed = _years_by_run(design)
+    held = _years_by_run(evaluation)
+    common = designed.keys() & held.keys()
+    if not common:
         return
-    shared = np.intersect1d(design.period, evaluation.period)
-    if shared.size:
+    pooled = design.provenance.pool or evaluation.provenance.pool
+    shared = [np.intersect1d(designed[lineage], held[lineage]) for lineage in common]
+    count = sum(each.size for each in shared)
+    if count:
+        noun = "periods" if pooled is None else "model-years"
+        years = np.unique(np.concatenate(shared))
         raise LeakageError(
-            f"the evaluation sample shares {shared.size} periods with the design "
-            f"sample (e.g. {shared[:5].tolist()}) from the same source; evaluate "
+            f"the evaluation sample shares {count} {noun} with the design "
+            f"sample (e.g. {years[:5].tolist()}) from the same source; evaluate "
             "out of sample on a held-out block or on fresh draws"
         )
     for role, sample in (("design", design), ("evaluation", evaluation)):
         fitted = _trend_of(sample).get("fit_years")
         if fitted is None:
             continue
-        overlap = np.intersect1d(np.array(fitted, dtype=np.int64), evaluation.period)
+        fit_years = np.array(fitted, dtype=np.int64)
+        overlap = np.unique(
+            np.concatenate(
+                [np.intersect1d(fit_years, held[lineage]) for lineage in common]
+            )
+        )
         if overlap.size:
             raise LeakageError(
                 f"the {role} sample's linear trend was fitted on {overlap.size} "
