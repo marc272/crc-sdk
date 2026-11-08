@@ -121,7 +121,7 @@ def test_the_docs_quick_start_runs_as_written(
     per_year = _python_blocks("## Next step: per-year values")
     curve_by_hand = _python_blocks("### From a fitted curve")
     annual_by_hand = _python_blocks("### From per-year values")
-    assert [len(blocks) for blocks in (quick_start, builders, per_year)] == [2, 1, 3]
+    assert [len(blocks) for blocks in (quick_start, builders, per_year)] == [2, 1, 4]
     assert [len(blocks) for blocks in (curve_by_hand, annual_by_hand)] == [1, 2]
     monkeypatch.chdir(tmp_path)
     namespace: dict[str, Any] = {}
@@ -282,6 +282,15 @@ def test_the_docs_quick_start_runs_as_written(
         "the index series from provider example and dataset synthetic gauges"
         in setup_text(station_result.metadata)
     )
+
+    # The pool: two models of 30 years are 60 rows, and the text says what.
+    pooled_result = namespace["pooled_result"]
+    assert len(pooled_result.samples["warehouse-a"]) == 60
+    pooled_text = setup_text(pooled_result.metadata)
+    assert "Pool: 2 runs under pathway ssp245" in pooled_text
+    assert "30 years (2015 to 2044), 60 rows" in pooled_text
+    assert "the number of rows is not an effective sample size" in pooled_text
+    assert "18 pooled model-years (2036 to 2044), the held-out block" in pooled_text
 
     # The function route by hand gives each plan's samples and design.
     with warnings.catch_warnings():

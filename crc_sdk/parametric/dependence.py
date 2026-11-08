@@ -227,7 +227,8 @@ class EmpiricalCopula:
             lower = max(n_draws // m, 1) * m
             raise SampleError(
                 f"EmpiricalCopula needs n_draws to be a whole multiple of the "
-                f"reference's {m} years, got {n_draws}; the nearest valid counts "
+                f"reference's {m} {_rows_are(self.reference)}s, got {n_draws}; the "
+                "nearest valid counts "
                 f"are {lower} and {lower + m}"
             )
         held = sorted(self.reference.asset_ids)
@@ -243,14 +244,14 @@ class EmpiricalCopula:
         reference = self.reference
         m = len(reference)
         years = _sample_years(reference)
-        noun = "years" if reference.provenance.pool is None else "model-years"
+        row = _rows_are(reference)
         return _assumption(
             between,
             f"their draws are reordered to the ranks of the stated reference, "
-            f"{m} {noun} from {years[0]} to {years[-1]} "
-            f"({reference.content_hash[:19]}), {n_draws // m} draws per year. "
-            f"Inside a reference year's block the {between} are independent: "
-            f"dependence finer than one year in {m} is assumed, not observed. The "
+            f"{m} {row}s from {years[0]} to {years[-1]} "
+            f"({reference.content_hash[:19]}), {n_draws // m} draws per {row}. "
+            f"Inside a reference {row}'s block the {between} are independent: "
+            f"dependence finer than one {row} in {m} is assumed, not observed. The "
             "reference is part of this stated model, so a design and its fresh "
             "draws share it.",
         )
@@ -265,6 +266,11 @@ class EmpiricalCopula:
             values = ranked[:, reference.asset_ids.index(column)]
             order[:, j] = _rank_blocks(uniforms[:, j], values, k)
         return order
+
+
+def _rows_are(reference: OutcomeSample) -> str:
+    """What one row of a reference is."""
+    return "year" if reference.provenance.pool is None else "model-year"
 
 
 def _pooled(reference: OutcomeSample) -> dict[str, Any]:

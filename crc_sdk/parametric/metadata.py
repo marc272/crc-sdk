@@ -727,11 +727,11 @@ def _dependence(sample: Mapping[str, Any], where: str) -> str | None:
         first = _get(model, "first_year", int, place)
         last = _get(model, "last_year", int, place)
         draws = _get(model, "k", int, place)
-        noun = "years" if _get(model, "pool", Mapping, place) is None else "model-years"
+        row = "year" if _get(model, "pool", Mapping, place) is None else "model-year"
         return (
             f"EmpiricalCopula, a stated assumption: the ranks of {years} reference "
-            f"{noun}, {first} to {last} ({_short(model.get('content_hash'))})"
-            + ("" if draws is None else f", {draws} draws per year")
+            f"{row}s, {first} to {last} ({_short(model.get('content_hash'))})"
+            + ("" if draws is None else f", {draws} draws per {row}")
         )
     return f"{kind}, as stated"
 

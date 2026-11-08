@@ -1617,7 +1617,7 @@ class ModelRun:
             _identifier(name, getattr(self, name))
 
     @property
-    def name(self) -> str:
+    def _name(self) -> str:
         """The run's model and member, as an error message names it."""
         return f"{self.model} {self.member}"
 
@@ -1697,7 +1697,7 @@ def _pool_years(
         try:
             first_row = trend._first_row(len(run.series))
         except SampleError as error:
-            raise SampleError(f"run {run.name}: {error}") from error
+            raise SampleError(f"run {run._name}: {error}") from error
         windows.append(run.series.years[first_row:])
         values.append(run.series.values[first_row:])
     lacked = [
@@ -1707,7 +1707,7 @@ def _pool_years(
     dropped = sorted({year for years in lacked for year in years})
     if dropped and missing == "raise":
         listed = "; ".join(
-            f"{run.name}: {_year_spans(years)}"
+            f"{run._name}: {_year_spans(years)}"
             for run, years in zip(runs, lacked, strict=True)
             if years
         )
@@ -1723,7 +1723,7 @@ def _pool_years(
     held = [years[~np.isin(years, gone)] for years in windows]
     if any(not np.array_equal(years, held[0]) for years in held[1:]):
         listed = "; ".join(
-            f"{run.name}: {_year_spans([int(year) for year in years])}"
+            f"{run._name}: {_year_spans([int(year) for year in years])}"
             for run, years in zip(runs, held, strict=True)
         )
         raise SampleError(
@@ -1832,7 +1832,7 @@ def _pool_rows(
     scenario = _identifier("scenario", scenario)
     all_years, kept, on_kept, lacked, dropped = _pool_years(ordered, trend, missing)
     series = [
-        _Series(f"hazard of run {run.name}", unit, np.array(values))
+        _Series(f"hazard of run {run._name}", unit, np.array(values))
         for run, values in zip(ordered, on_kept, strict=True)
     ]
     adjusted, trend_record = trend._apply(all_years, kept, series)

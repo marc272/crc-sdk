@@ -386,6 +386,11 @@ def _check_pool(pool: Mapping[str, Any]) -> None:
         raise SampleError(
             "pool must hold a pathway, its runs, and a year and a run per row"
         )
+    for name in ("runs", "year", "run"):
+        if isinstance(pool[name], (str, Mapping)) or not isinstance(
+            pool[name], Sequence
+        ):
+            raise SampleError(f"pool's {name} must be a list")
     runs, years, positions = pool["runs"], pool["year"], pool["run"]
     if not all(
         isinstance(run, Mapping) and {"model", "member", "lineage"} <= set(run)
@@ -397,7 +402,12 @@ def _check_pool(pool: Mapping[str, Any]) -> None:
             f"a pool needs one year and one run per row, got {len(years)} years "
             f"and {len(positions)} runs"
         )
-    if any(not 0 <= position < len(runs) for position in positions):
+    if any(
+        isinstance(position, bool)
+        or not isinstance(position, (int, np.integer))
+        or not 0 <= position < len(runs)
+        for position in positions
+    ):
         raise SampleError(f"the rows of a pool name runs outside its {len(runs)} runs")
 
 

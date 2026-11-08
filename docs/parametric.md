@@ -156,7 +156,8 @@ and nothing more.
 ParametricPlan.for_evaluation(request, *, value_column=None, value_unit="1")
   .monte_carlo(n_draws, *, seed, assume_semantics=None, outside_support="raise")
 ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
-                                   trend=AsRecorded(), scenario="baseline", ...)
+                                   trend=AsRecorded(), scenario="baseline",
+                                   pool=None, ...)
   .index(source, *, location, unit, provenance, ...)   # optional: read elsewhere
 # then, on either plan:
   .basis_risk(model)                          # required
@@ -261,6 +262,9 @@ priced_result = priced.write_parquet("priced.parquet")
   evaluation on the rest, so a per-year sample is tested on its latest years.
 - **`KFold(k)`:** `year_block_kfold` holds out each of `k` contiguous blocks of
   periods in turn; every fold has its own designs.
+
+A pool of model-years is split by its distinct years, not its rows: see [pooled
+model-years](#pooled-model-years).
 
 With `LinearTrend`, `Holdout` and `KFold` build each asset's sample once per
 fold, fitted on that fold's design years: see [Climate
@@ -617,6 +621,141 @@ between index and loss is the data's own.
 - **Refused.** On a plan on fitted curves `.index(...)` raises `ValueError`: an
   index at another location needs a joint distribution of two curves.
 
+### Pooled model-years
+
+A single model run has few years. `pool=` pools the years of several model runs
+under one pathway into one sample per asset, on `for_annual_extremes`, and
+`sample_annual_pool` does so by hand. Every model-year is one row. Whether a
+pool suits a question is your choice, and the module says nothing about it.
+
+```python
+from crc_sdk.parametric import ModelPool
+
+# The layout of NEX-GDDP-CMIP6's annual_extremes(): one row per year and cell,
+# whose model, member and scenario columns say whose it is.
+future = np.arange(2015, 2045)
+runs = pa.concat_tables(
+    pa.table({
+        "year": np.repeat(future, 4).astype("int32"),
+        "latitude": np.tile([50.875, 50.875, 51.125, 51.125], len(future)),
+        "longitude": np.tile([6.875, 7.125, 6.875, 7.125], len(future)),
+        "value": rng.gumbel(50.0, 12.0, 4 * len(future)),       # mm/day
+        "model": [model] * (4 * len(future)),
+        "member": ["r1i1p1f1"] * (4 * len(future)),
+        "scenario": ["ssp245"] * (4 * len(future)),
+    })
+    for model in ("model-a", "model-b")
+)
+archive = SourceProvenance(provider="example", dataset="synthetic pooled rx1day",
+                           licence="CC0-1.0", attribution="Synthetic data")
+
+pooled_result = (
+    ParametricPlan.for_annual_extremes(
+        runs, assets,
+        impact=PiecewiseLinearImpact([40.0, 120.0], [0.0, 0.5]),
+        unit="mm/day", value_column="value_eur", value_unit="EUR",
+        provenance=archive, seed=42,
+        pool=ModelPool(),                 # the columns that name a run
+        scenario="ssp245, two models",    # your name for the rows
+    )
+    .basis_risk(ImpactNoise(0.3, upper=1.0))
+    .covers(step, linear)
+    .objective(ExpectedUncovered(), budget=Budget(ratio=0.8))
+    .split(Holdout(0.7))                  # design on 2015-2035, test on 2036-2044
+    .metrics(MetricOptions(betas=(0.9,), return_periods=(10,)))
+    .write_parquet("pooled-comparison.parquet")
+)
+print(setup_text(pooled_result.metadata))
+```
+
+**The rows.** 3 models of `n` years give `3n` rows at `1/(3n)` each, in (year,
+model, member) order, with models and members in UTF-8 byte order. `period` is
+the draw number, `0` to `N − 1`, and `source_kind` stays `"annual"`. Each row's
+identity is in `provenance.pool`: one document per run in `runs` (`model`,
+`member`, `pathway`, `lineage`, `series` and the `dropped_years` it had no value
+for), and one entry per row in `year` and `run`. `select`, `holdout` and
+`year_block_kfold` keep the entries of the rows they keep.
+
+**What a pool is not.** A draw mixes model spread with year-to-year variability.
+The rows are not independent years: rows of one run share that model's climate
+and rows of one year the pathway's forcing, so the number of rows is not an
+effective sample size. Every number from a pool has these two statements next to
+it, in the `Pool` line of `setup_text`.
+
+**One pathway, one weight per model.** These raise `SampleError`: runs under
+different pathways (`historical` is one, so a pool can't span NEX-GDDP-CMIP6's
+historical and SSP experiments); different units; different recipes, where the
+runs state one; the same model twice, whatever the member, so every model has
+the same weight; fewer than two runs. A table with several models at one
+location still raises without `pool=`.
+
+**The same years.** After `years=`, the window of `RecentYears` and `missing=`,
+every run must hold the same years, or `SampleError` lists each run's years; a
+stated `years=` resolves it. With `missing="drop_year"`, a year without a value
+in any run is dropped from every run and listed with the run that lacked it.
+
+**Splits** work on the pool's distinct years, not on its rows. `Holdout` puts
+the first `floor(train_fraction · n)` of the `n` years in the design block and
+`KFold(k)` divides the `n` years, so `k` is at most `n`. Every run holds out the
+same years: the latest ones under `Holdout`, and one block per fold under
+`KFold`, the last fold holding out the latest. `FreshDraws` raises `TypeError`,
+as on every per-year plan.
+
+**Leakage.** The check compares (run lineage, year) pairs instead of periods,
+and a plain per-year sample counts as one run. So a model-year can't be on both
+sides, between pools of different runs or between a pool and one of its runs.
+
+**Trend and basis risk.** Each run has its own fit, on the same design years
+with the same reference year, the last of the pool's years. `RecentYears(n)`
+takes the last `n` years of each run. `NoBasisRisk()` warns with
+`ComonotoneIndexWarning`, as for one series: pooling puts no difference between
+index and loss. `ImpactNoise` draws one factor per row, in row order, from the
+asset's generator.
+
+**The source.** With `pool=`, `source` is one table, file or plan whose rows
+carry the columns `ModelPool(model="model", member="member",
+pathway="scenario")` names, as NEX-GDDP-CMIP6's batches do, or a sequence of
+sources, one per run, as CMIP6's plans are (one model each). A source without
+those columns is named by its plan's `explain(format="json")` (`model`, `member`,
+`pathway`), and a source that states neither raises `SampleError`. Each run is
+located on its own grid, so the matched cell and the grid step are recorded per
+run. `provenance` states the archive's licence and attribution once; each run's
+own columns are recorded with it. `.samples()` returns one pooled sample per
+asset. `cell=` is allowed, as the cell belongs to the asset, not to a run.
+
+**Under `Joint()`** the assets' pools are joined by `OutcomeSample.join`, which
+needs the same (year, model, member) rows under one pathway, because draw
+numbers alone would not line them up. The dependence is the data's own, the rows
+being the same model-years. With `LinearTrend` and a split the plan joins per
+fold.
+
+**Refused.** `.index(...)` raises `ValueError` on a pool: an observed station
+and a free-running model share no weather, so pairing them by year would invent
+a dependence. `pool=` with `StationColumn` raises `ValueError`, as models have no
+stations.
+
+**By hand**, the run's series and its names go in a `ModelRun`:
+
+```text
+ModelRun(series, *, model, member, pathway)
+sample_annual_pool(runs, *, loss_model, basis_risk, asset_id, rng=None,
+                   missing="raise", trend=AsRecorded(), scenario="baseline")
+```
+
+To hold out a block under `LinearTrend`, state the design years with
+`LinearTrend(fit_years=...)`, as for one series.
+
+**In the metadata and the text.** Each `setup.samples` entry holds `pool`, with
+the runs and their `years` and `rows` but without the row arrays, which are in
+the sample's own metadata (`crc.parametric.sample`); it is null on every other
+sample, and a document without the key reads as null. `sources` has one hazard
+entry per run. A sequence of sources has one `annual_table` record each in
+`source_records`, and each entry names its own by `annual_table_sha256`. Before
+execution, `plan.explain(format="json")` states the pool's columns in
+`setup.samples` and in each entry of `sources`. A `scenario=` label is the name
+of the rows: without one, rows under `ssp245` are labelled `"baseline"`, and the
+`Source` line states the pathway.
+
 ## The function route
 
 The plan's steps are functions you can chain by hand, for a table, a curve or
@@ -897,6 +1036,7 @@ sample of several ([joint design](#joint-design-over-several-assets)), and
 | A fitted curve | `sample_curve(curve, *, metadata, n_draws, rng, loss_model, basis_risk, asset_id)` | a simulated year | `1/n` |
 | Fitted curves of several assets | `sample_curves(curves, *, dependence, metadata, n_draws, rngs, loss_models, basis_risk)` | a simulated year | `1/n` |
 | Per-year values | `sample_annual(AnnualSeries, *, loss_model, basis_risk, asset_id, index=None, trend=AsRecorded(), scenario="baseline")` | an observed or modelled year | `1/n` |
+| Pooled model-years | `sample_annual_pool(runs, *, loss_model, basis_risk, asset_id, trend=AsRecorded(), scenario="baseline")` | one run's year | `1/N` |
 | A user table | `OutcomeSample.from_table(table, *, period, asset_id, index, loss, semantics="annual", ...)` | a table row | its `probability` column, or `1/n` |
 
 ```python
@@ -991,8 +1131,10 @@ draws come first, then the basis-risk model.
 **Splits.** `holdout(sample, train_fraction=0.7)` designs on the first
 `floor(train_fraction · n)` periods and holds out the rest, so a per-year
 sample is tested on its latest years. `year_block_kfold(sample, k)` holds out
-each of `k` contiguous blocks in turn. Monte Carlo draws are independent, so a
-fresh sample from another generator is the plainer out-of-sample test.
+each of `k` contiguous blocks in turn. On a [pool of
+model-years](#pooled-model-years), `n` is its number of distinct years. Monte
+Carlo draws are independent, so a fresh sample from another generator is the
+plainer out-of-sample test.
 
 **Provenance.** `sample.provenance` (`SampleProvenance`) records the source
 (dataset metadata with licence, attribution, version and checksum; the series
@@ -1001,8 +1143,8 @@ stated them, the loss model (impact type, name, `definition_hash`, value
 column and unit, not the value itself), the basis-risk model, the generator's
 state before each random step (`provenance.generator()` rebuilds it), what was
 counted (draws outside the support, atom draws, dropped years), a per-year
-sample's treatment of the trend (`provenance.trend`) and notes for the setup
-text. `sample.content_hash` is `sha256:` plus the SHA-256 of the
+sample's treatment of the trend (`provenance.trend`), a pool's rows
+(`provenance.pool`) and notes for the setup text. `sample.content_hash` is `sha256:` plus the SHA-256 of the
 canonical long table with its units, semantics and scenario.
 `sample.to_table()` returns that long table, with the metadata under the
 Parquet key `crc.parametric.sample`, and `OutcomeSample.from_written_table(table)`
@@ -1056,7 +1198,10 @@ probabilities, holding exactly the curves' assets, for example
 `SampleError`, as it has no dependence of its own to lend. Ranks are read from
 its `hazard`, or from its `index` when it has no separate hazard. Only the ranks
 are used, so its unit may differ from the curves'. A larger reference value
-takes a larger draw; negate a reference that moves the other way.
+takes a larger draw; negate a reference that moves the other way. A reference
+may be a [pool of model-years](#pooled-model-years): `m` is then its number of
+rows, each model-year taking a block of its own, and `first_year` and
+`last_year` in its record are the pool's calendar years.
 
 - `n_draws` must be a whole multiple `k·m` of the reference's years. Any other
   count raises `SampleError` and names the two nearest valid counts.
@@ -1183,7 +1328,8 @@ draws; the fold for k-fold, which must match the sample's own split).
   own; for a cover given as is, pass `design_sample=` with the sample its
   terms were chosen on. Without one it raises `SampleError`. A design sample
   that shares a period with the evaluation sample from the same source raises
-  `LeakageError`. So does a linear trend of either sample fitted on a year the
+  `LeakageError`; on a [pool](#pooled-model-years), a (run, year) pair
+  does. So does a linear trend of either sample fitted on a year the
   evaluation sample holds from the same source; the error names `fit_years`.
   A trend or a `scenario` label does not make one source's rows another's.
 - In sample, a known design sample must be the evaluation sample itself.
@@ -1595,6 +1741,9 @@ them.
 - **Several scenarios at once.** A per-year plan names one `scenario` for its
   rows, a sample on fitted curves is `"baseline"`, and a plan on fitted curves
   samples one hazard, horizon and pathway per asset.
+- **Several members of one model in a pool.** A model appears once, whatever
+  its member. **An index read elsewhere on a pool**, even from the same run at
+  another cell, is refused.
 - **Several events within a year.** One draw is one year.
 - **Remote requests in the plan.** `for_evaluation` takes a request on a local
   canonical file; materialize a remote source first (its `materialize(path)`
