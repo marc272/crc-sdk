@@ -456,7 +456,7 @@ class H3Cell:
         return {"kind": "h3_cell", "resolution": self.resolution}
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class _SeriesRead:
     """What a plan reads for each asset: its hazard or its `.index(...)` series.
 
@@ -1531,7 +1531,9 @@ class ParametricPlan:
           source's own grid, accepted as for the hazard. `NearestCell` reads
           at the asset's own location by default; `point=PointColumns(longitude,
           latitude)` names asset columns holding another point, such as a
-          reference site. Only the matched cell is recorded.
+          reference site. Only the matched cell is recorded, not the point,
+          so an index grid finer than the hazard's records an asset's place
+          to within its own cell.
         - `unit` is the index series' unit. It is checked against a `unit`
           column of the table and the source plan's `explain()`, and not
           against the impact, because the loss does not read it. A cover's
