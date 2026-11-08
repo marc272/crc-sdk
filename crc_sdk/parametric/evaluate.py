@@ -933,6 +933,7 @@ def _sample_entry(sample: OutcomeSample, roles: set[str]) -> dict[str, Any]:
         "semantics": sample.semantics,
         "semantics_source": provenance["semantics_source"],
         "source_kind": provenance["source_kind"],
+        "trend": provenance["trend"],
     }
 
 

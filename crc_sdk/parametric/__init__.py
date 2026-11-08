@@ -11,7 +11,9 @@ Covers are designed and evaluated on an `OutcomeSample`, one row per year
 with an index value and a loss: `sample_curve` draws simulated years from a
 fitted curve, `sample_annual` reads the years of an `AnnualSeries`, and
 `OutcomeSample.from_table` takes a user table. `LossModel` turns the hazard
-into a loss and a `BasisRisk` model states how index and loss differ.
+into a loss and a `BasisRisk` model states how index and loss differ. On
+per-year samples, `AsRecorded`, `RecentYears` and `LinearTrend` state how the
+climate trend is treated.
 
 `design` chooses a template's free parameters on an outcome sample for an
 objective (`MSE`, `ExpectedUncovered`, `WeightedCVaR` or a `UserObjective`)
@@ -111,9 +113,11 @@ from crc_sdk.parametric.sources import (
     sample_curve,
     sample_curves,
 )
+from crc_sdk.parametric.trend import AsRecorded, LinearTrend, RecentYears
 
 __all__ = [
     "AnnualSeries",
+    "AsRecorded",
     "AtAsset",
     "AtCell",
     "AtPoint",
@@ -150,6 +154,7 @@ __all__ = [
     "LinearConstraints",
     "LinearInAmounts",
     "LinearPayout",
+    "LinearTrend",
     "LossModel",
     "MSE",
     "MetricOptions",
@@ -163,6 +168,7 @@ __all__ = [
     "PiecewiseLinearPayout",
     "ProbabilitySemanticsError",
     "PurePremium",
+    "RecentYears",
     "SampleError",
     "SampleProvenance",
     "SolverUnavailableError",

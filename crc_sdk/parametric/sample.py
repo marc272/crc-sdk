@@ -411,6 +411,14 @@ class SampleProvenance:
       one-asset sample.
     - `parts`: for a sample of several assets, each asset's own provenance
       document, by asset id. `None` on a one-asset sample.
+    - `trend`: how a per-year sample treats the climate trend:
+      `{"kind": "as_recorded"}`; `{"kind": "recent_years", "n": n, "years":
+      [first, last]}`; or `{"kind": "linear_trend", "method": "ols_additive",
+      "reference_year": t0, "min_years": m, "fit_years": [...], "fits": [...]}`,
+      with one `{"role", "slope", "intercept", "unit"}` per series. `None` on
+      Monte Carlo and table samples. The lineage leaves it out: a design on
+      adjusted years, evaluated on the same years as recorded, shares their
+      rows.
 
     Mappings and sequences are stored read-only; `to_document()` returns
     plain JSON types. Raises `SampleError` for unknown kinds or values that
@@ -432,6 +440,7 @@ class SampleProvenance:
     selection: tuple[Mapping[str, Any], ...] = ()
     dependence: Mapping[str, Any] | None = None
     parts: Mapping[str, Mapping[str, Any]] | None = None
+    trend: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.source_kind not in get_args(SourceKind):
@@ -459,12 +468,14 @@ class SampleProvenance:
                 raise SampleError(
                     "each rng record needs a step, a bit_generator and a state"
                 )
-        for name in ("loss_model", "basis_risk", "dependence", "parts"):
+        for name in ("loss_model", "basis_risk", "dependence", "parts", "trend"):
             value = getattr(self, name)
             if value is not None and not isinstance(value, Mapping):
                 raise SampleError(f"{name} must be a mapping or None")
-        if self.dependence is not None and "kind" not in self.dependence:
-            raise SampleError("dependence must name its kind")
+        for name in ("dependence", "trend"):
+            value = getattr(self, name)
+            if value is not None and "kind" not in value:
+                raise SampleError(f"{name} must name its kind")
         if self.parts is not None and not all(
             isinstance(part, Mapping) for part in self.parts.values()
         ):
@@ -485,6 +496,7 @@ class SampleProvenance:
             "selection",
             "dependence",
             "parts",
+            "trend",
         ):
             value = getattr(self, name)
             _check_json(name, value)
@@ -781,8 +793,11 @@ class OutcomeSample:
 
         The columns are in the order of `samples`. The periods, probabilities,
         units, semantics and scenario must be identical and the asset ids
-        distinct. A part without a separate `hazard` contributes its index
-        when another part has one.
+        distinct. The parts' trends must share their kind, reference year and
+        fit years, so the total sums years on one basis; the slopes differ per
+        asset, and the provenance's `trend` names each fit's asset. A part
+        without a separate `hazard` contributes its index when another part
+        has one.
 
         The provenance records `dependence` as `{"kind": "data"}`, the data's
         own, because the rows are the same years of the data, and holds each
@@ -840,6 +855,8 @@ class OutcomeSample:
                 raise SampleError(
                     f"join needs one {name} in every sample, got {sorted(values)}"
                 )
+        _check_same_trend(parts)
+        trend = _joined_trend(parts)
         kinds = {part.provenance.source_kind for part in parts}
         stated = {part.provenance.semantics_source for part in parts}
         documents = {part.asset_ids[0]: part.provenance.to_document() for part in parts}
@@ -888,6 +905,7 @@ class OutcomeSample:
                 }
                 for part in parts
             },
+            trend=trend,
         )
         hazard = (
             None
@@ -1349,6 +1367,51 @@ def _require_sample(sample: Any) -> OutcomeSample:
     return sample
 
 
+def _trend_of(sample: OutcomeSample) -> Mapping[str, Any]:
+    """A sample's trend record; none recorded means the years as they are."""
+    return sample.provenance.trend or {"kind": "as_recorded"}
+
+
+def _check_same_trend(parts: Sequence[OutcomeSample]) -> None:
+    """Raise `SampleError` unless the parts of a join treat the trend alike."""
+    first = parts[0]
+    stated = _trend_of(first)
+    for part in parts[1:]:
+        own = _trend_of(part)
+        for key, name in (
+            ("kind", "kind"),
+            ("reference_year", "reference year"),
+            ("fit_years", "fit years"),
+        ):
+            if own.get(key) != stated.get(key):
+                raise SampleError(
+                    f"join needs one basis for the trend in every sample, so that "
+                    f"the total sums years on one basis, but the trend's {name} of "
+                    f"asset {part.asset_ids[0]!r} is {own.get(key)!r} and of asset "
+                    f"{first.asset_ids[0]!r} is {stated.get(key)!r}"
+                )
+
+
+def _joined_trend(parts: Sequence[OutcomeSample]) -> dict[str, Any] | None:
+    """What the parts of a join state alike, with each part's fits named."""
+    trends = [part.provenance.trend for part in parts]
+    stated = [trend for trend in trends if trend is not None]
+    if not stated:
+        return None
+    joined = {
+        key: _thaw(value)
+        for key, value in stated[0].items()
+        if key != "fits" and all(other.get(key) == value for other in stated)
+    }
+    if "fits" in stated[0]:
+        joined["fits"] = [
+            {**_thaw(fit), "asset_id": part.asset_ids[0]}
+            for part in parts
+            for fit in _trend_of(part)["fits"]
+        ]
+    return joined
+
+
 def _require_one_asset(sample: OutcomeSample, function: str) -> None:
     """Raise `SampleError` if `sample` holds several assets; `function` needs one."""
     count = len(sample.asset_ids)
@@ -1462,7 +1525,8 @@ def _check_out_of_sample(design: OutcomeSample, evaluation: OutcomeSample) -> No
     """Raise `LeakageError` if `evaluation` shares rows with `design`.
 
     Two samples share rows when they have the same lineage (the same source,
-    or splits of one sample) and a common period.
+    or splits of one sample) and a common period. A linear trend fitted on a
+    year the evaluation sample holds, by either sample, leaks that year too.
     """
     design = _require_sample(design)
     evaluation = _require_sample(evaluation)
@@ -1475,3 +1539,15 @@ def _check_out_of_sample(design: OutcomeSample, evaluation: OutcomeSample) -> No
             f"sample (e.g. {shared[:5].tolist()}) from the same source; evaluate "
             "out of sample on a held-out block or on fresh draws"
         )
+    for role, sample in (("design", design), ("evaluation", evaluation)):
+        fitted = _trend_of(sample).get("fit_years")
+        if fitted is None:
+            continue
+        overlap = np.intersect1d(np.array(fitted, dtype=np.int64), evaluation.period)
+        if overlap.size:
+            raise LeakageError(
+                f"the {role} sample's linear trend was fitted on {overlap.size} "
+                f"years the evaluation sample holds (e.g. {overlap[:5].tolist()}) "
+                "from the same source; state the design years with "
+                "LinearTrend(fit_years=...), or let a plan fit the trend per fold"
+            )

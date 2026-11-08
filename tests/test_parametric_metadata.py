@@ -496,8 +496,11 @@ def test_setup_text_of_per_year_samples() -> None:
         'and pathway not recorded; the index series "station B", with provider, '
         "dataset, horizon and pathway not recorded."
     ]
+    assert lines["Trend"] == [
+        "Trend: the years are used as recorded; no trend is removed."
+    ]
     notes = lines["Sample notes"][0]
-    assert "no trend is removed" in notes
+    assert "no trend is removed" not in notes
     assert "1 year without a value was dropped: 2001." in notes
     assert "The index is read from another series than the loss." in notes
 

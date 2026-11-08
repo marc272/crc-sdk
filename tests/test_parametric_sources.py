@@ -849,7 +849,8 @@ def test_years_become_the_rows() -> None:
     assert provenance.probability_semantics is None
     assert provenance.rng == ()
     assert provenance.details["years"] == (2000, 2003)
-    assert "no trend is removed" in provenance.notes[0]
+    assert provenance.trend == {"kind": "as_recorded"}
+    assert not any("trend" in note for note in provenance.notes)
 
 
 def test_missing_years_raise_or_are_dropped_and_listed() -> None:

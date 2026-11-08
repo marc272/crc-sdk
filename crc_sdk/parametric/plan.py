@@ -46,9 +46,10 @@ inside one grid cell), or the station an asset column names
 `provenance` (a `SourceProvenance`) the source's licence, attribution and
 version: annual-extremes tables carry no licence of their own. Each asset
 gets one `OutcomeSample` from `sample_annual`: its years are the rows, each
-with probability 1/n, and no trend is removed. `cell=` gives point assets the
-H3 cell that some registry impacts need in their context: the name of an
-asset column, or `H3Cell(resolution=r)` for the cell of the asset's point.
+with probability 1/n. `trend=` states how the climate trend is treated,
+`scenario=` names the rows, and `cell=` gives point assets the H3 cell that
+some registry impacts need in their context: the name of an asset column, or
+`H3Cell(resolution=r)` for the cell of the asset's point.
 
 **An index read elsewhere** (`.index`, per-year values only). The cover pays on
 a series from a second source, at a station an asset column names or in the
@@ -95,6 +96,15 @@ draws). Resolved covers are evaluated on the same blocks, with the design
 block as their design sample, so their terms are taken as chosen without
 the held-out data.
 
+**The climate trend under a split.** `LinearTrend` is fitted on the design
+years only: with `Holdout` or `KFold` the plan builds each asset's sample once
+per fold, fitted on that fold's design years, and takes the fold's two blocks
+from it, so a held-out value changes neither the fit nor the design block. A
+basis-risk model that draws starts every fold from the asset's same generator
+state, so a year's factor does not depend on the fold. `RecentYears` is not
+rebuilt: the window comes first and the split divides it. `.samples()` and
+`ParametricResult.samples` hold all the years, fitted on all of them.
+
 **Output.** `write_parquet(path)` writes one comparison table, as `compare`
 builds it, through a temporary sibling and `os.replace`. Its metadata under
 `crc.parametric.evaluation` (`EvaluationMetadata`) holds the setup of every
@@ -112,6 +122,7 @@ and the designs.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import json
@@ -172,11 +183,13 @@ from crc_sdk.parametric.sources import (
     AnnualSeries,
     MissingYears,
     OutsideSupport,
+    _annual_rows,
     _coordinate,
     _source_plan_document,
-    sample_annual,
+    _warn_comonotone,
     sample_curve,
 )
+from crc_sdk.parametric.trend import AsRecorded, LinearTrend, Trend, _require_trend
 from crc_sdk.types import SourceProvenance
 from crc_sdk.workflows.distributions import CURVE_COLUMNS
 from crc_sdk.workflows.portfolio import (
@@ -547,7 +560,8 @@ class ParametricResult:
     - `table`: the comparison table as written, with its metadata;
     - `metadata`: its `EvaluationMetadata`, under `crc.parametric.evaluation`;
     - `samples`: one `OutcomeSample` per asset, in asset order (all years
-      or draws, before any split);
+      or draws, before any split; with `LinearTrend` and a holdout or k-fold,
+      fitted on all the years, while the rows come from one sample per fold);
     - `designs`: every `DesignResult`, in asset, fold, cover and objective
       order;
     - `fresh_samples`: with `FreshDraws`, one `OutcomeSample` per asset, in
@@ -582,8 +596,28 @@ class _Run:
 
 
 @dataclass(frozen=True, eq=False)
+class _AnnualAsset:
+    """What one asset's per-year samples are built from."""
+
+    asset_id: str
+    series: AnnualSeries
+    index_series: AnnualSeries | None
+    loss_model: LossModel
+    cell: int | None
+    location: AtPoint | AtStation | None
+    unused: list[int]
+
+
+_Block = tuple[int, OutcomeSample, OutcomeSample | None]
+"""A fold, its design block, and its evaluation block if it has one."""
+
+
+@dataclass(frozen=True, eq=False)
 class _Samples:
-    """What execution builds before any design: the samples and the source."""
+    """What execution builds before any design: the samples and the source.
+
+    `folds` holds each asset's blocks when each fold has a sample of its own.
+    """
 
     portfolio: AssetPortfolio
     samples: dict[str, OutcomeSample]
@@ -592,6 +626,7 @@ class _Samples:
     record: dict[str, Any]
     index_record: dict[str, Any] | None = None
     locations: Mapping[str, AtPoint | AtStation] | None = None
+    folds: Mapping[str, tuple[_Block, ...]] | None = None
 
 
 # -- helpers -----------------------------------------------------------------
@@ -1064,8 +1099,8 @@ class ParametricPlan:
     `entry` names the entry point. On the curve route `source` is the
     request, `unit` and `provenance` are `None` (the dataset's metadata
     states them at execution) and `draws` holds what `monte_carlo` states.
-    `pricing_rule` holds what `.pricing(...)` states, `cell` what
-    `for_annual_extremes(..., cell=...)` states, and `index_read` what
+    `pricing_rule` holds what `.pricing(...)` states, `cell`, `trend` and
+    `scenario` what `for_annual_extremes(...)` states, and `index_read` what
     `.index(...)` states.
     """
 
@@ -1090,6 +1125,8 @@ class ParametricPlan:
     pricing_rule: Pricing | None = None
     cell: str | H3Cell | None = None
     index_read: _SeriesRead | None = None
+    trend: Trend = field(default_factory=AsRecorded)
+    scenario: str = "baseline"
 
     # -- the entry points -----------------------------------------------------
 
@@ -1205,6 +1242,8 @@ class ParametricPlan:
         years: Sequence[int] | None = None,
         missing: MissingYears = "raise",
         seed: int | None = None,
+        trend: Trend = AsRecorded(),
+        scenario: str = "baseline",
         cell: str | H3Cell | None = None,
     ) -> ParametricPlan:
         """Plan covers on per-year hazard values at each asset.
@@ -1244,14 +1283,27 @@ class ParametricPlan:
           is still located by `location`. Each sample records the cell, not
           the point. `H3Cell` needs a point, so it cannot serve assets
           located by `CellColumn`.
+        - `trend` states how the climate trend is treated: `AsRecorded()`,
+          the default, `RecentYears(n)` or `LinearTrend(reference_year=None,
+          min_years=10)` (`crc_sdk.parametric.trend`). `years` comes first
+          and `RecentYears` takes the last n of them. With `.index(...)`, the
+          hazard and the index each have their own fit, on the same years
+          with the same reference year. Under a split, `LinearTrend` is
+          fitted per fold: the module docstring says how.
+        - `scenario` is your name for the rows, in the samples' tables and
+          hashes and in the comparison's `scenario` column. It is not derived
+          from the source: the `scenario` column of a CMIP6 table is its
+          pathway, which the setup text states as well.
 
         Raises `TypeError` for arguments of the wrong type, `SampleError`
-        for a unit the impact is not calibrated for, a missing asset column
-        or a `cell` for an impact that takes no context, and `ValueError`
-        for other invalid arguments, among them a `cell` where the impact's
-        context already holds one. A registry impact that needs an H3 cell
-        in its context (such as `rx1day`) raises `SampleError` unless
-        `cell` states each asset's, the impact or `context` is a
+        for a unit the impact is not calibrated for, a missing asset column,
+        an invalid `scenario` or a `cell` for an impact that takes no
+        context, and `ValueError` for other invalid arguments, among them a
+        `LinearTrend` with `fit_years`, which the plan sets per fold, and a
+        `cell` where the impact's context already holds one. A registry
+        impact that needs an H3 cell in its context (such as `rx1day`)
+        raises `SampleError` unless `cell` states each asset's, the impact
+        or `context` is a
         `TransformContext` with a cell, or the assets are located by their
         H3 cells (`CellColumn`) and `context` names context columns: without
         one of these, a point asset has no cell on this route.
@@ -1321,6 +1373,13 @@ class ParametricPlan:
             or int(seed) < 0
         ):
             raise ValueError(f"seed must be a non-negative integer, got {seed!r}")
+        trend = _require_trend(trend)
+        if isinstance(trend, LinearTrend) and trend.fit_years is not None:
+            raise ValueError(
+                "LinearTrend(fit_years=...) states the fit years of one sample; a "
+                "plan sets them per fold, so leave them out"
+            )
+        scenario = _identifier("scenario", scenario)
         return cls(
             source=source,
             assets=portfolio,
@@ -1334,6 +1393,8 @@ class ParametricPlan:
             missing=missing,
             seed=None if seed is None else int(seed),
             cell=cell,
+            trend=trend,
+            scenario=scenario,
         )
 
     # -- builders ---------------------------------------------------------------
@@ -1714,7 +1775,8 @@ class ParametricPlan:
         Every design block gets in-sample rows and every held-out block (or
         the fresh draws) out-of-sample rows. `FreshDraws` needs a plan on
         fitted curves; `Holdout` and `KFold` split per-year samples by year
-        and Monte Carlo samples by draw. Raises `TypeError` for another rule
+        and Monte Carlo samples by draw; a `LinearTrend` is then fitted per
+        fold, on the design years only. Raises `TypeError` for another rule
         or fresh draws on per-year values, and `ValueError` for fresh draws
         with the plan's seed.
         """
@@ -1892,7 +1954,7 @@ class ParametricPlan:
             "loss_model": self.loss_model.to_document(),
             "loss_unit": self.loss_model.value_unit,
             "notes": notes,
-            "scenario": "baseline",
+            "scenario": self.scenario,
             "semantics": "annual",
             "semantics_source": "data",
             "source_kind": "annual",
@@ -1908,6 +1970,8 @@ class ParametricPlan:
                     "source_kind": "monte_carlo",
                 }
             )
+        else:
+            sample["trend"] = self.trend.to_document()
         if self.basis_risk_model is not None:
             sample["basis_risk"] = self.basis_risk_model.to_document()
         return sample
@@ -2046,10 +2110,11 @@ class ParametricPlan:
 
         The document mirrors the metadata the plan writes
         (`EvaluationMetadata`): `setup` (the basis, the metric options, one
-        sample per asset with its source, loss and basis-risk models, and
-        the planned evaluations with their split, fold and pricing),
-        `covers`, `designs` (the objectives and design terms), `sources`,
-        `assets`, `licences`, `rng` (the seeds) and `entry`; with
+        sample per asset with its source, loss and basis-risk models and, on
+        per-year values, its `trend` option, and the planned evaluations with
+        their split, fold and pricing), `covers`, `designs` (the objectives
+        and design terms), `sources`, `assets`, `licences`, `rng` (the seeds)
+        and `entry`; with
         `.index(...)`, `sources` has an entry with role `"index"` that states
         the location rule, and `covers` holds the covers as stated; a plan on
         fitted curves adds `monte_carlo` (the draws, the semantics stated by
@@ -2397,8 +2462,74 @@ class ParametricPlan:
             for fold, (train, test) in enumerate(year_block_kfold(sample, rule.k))
         ]
 
-    def _build_samples(self, *, fresh: bool = False) -> _Samples:
-        """The samples of every asset; with `fresh`, also their fresh draws."""
+    def _annual_sample(
+        self,
+        asset: _AnnualAsset,
+        trend: Trend,
+        rng: np.random.Generator | None,
+    ) -> OutcomeSample:
+        """One asset's per-year sample under `trend`, with its notes."""
+        sample = _annual_rows(
+            asset.series,
+            loss_model=asset.loss_model,
+            basis_risk=self._require_basis_risk(),
+            asset_id=asset.asset_id,
+            index=asset.index_series,
+            rng=rng,
+            missing=self.missing,
+            trend=trend,
+            scenario=self.scenario,
+        )
+        if asset.cell is not None:
+            assert self.cell is not None
+            sample = _noted(
+                sample,
+                f"The impact reads H3 cell {asset.cell:x} for asset "
+                f"{asset.asset_id}: {_cell_origin(self.cell)}.",
+            )
+        if self.index_read is not None:
+            assert asset.location is not None
+            sample = _index_recorded(
+                sample, self.index_read, asset.location, asset.unused
+            )
+        return sample
+
+    def _refitted_blocks(
+        self,
+        asset: _AnnualAsset,
+        sample: OutcomeSample,
+        generator: np.random.Generator | None,
+    ) -> tuple[_Block, ...]:
+        """Each fold's two blocks, from a sample fitted on its design years.
+
+        The fit years are the years the split puts in the design block of
+        `sample`, so the two cannot disagree. Every fold starts from the
+        asset's same generator state, in `generator`.
+        """
+        trend = self.trend
+        assert isinstance(trend, LinearTrend)
+        blocks: list[_Block] = []
+        for fold, design_block, _ in self._blocks(sample, None):
+            count = len(design_block)
+            if count < trend.min_years:
+                raise SampleError(
+                    f"asset {asset.asset_id!r}, fold {fold}: LinearTrend needs at "
+                    f"least {trend.min_years} fit years (min_years), and the design "
+                    f"block holds {count}; no fold is dropped"
+                )
+            fitted = dataclasses.replace(
+                trend, fit_years=tuple(int(year) for year in design_block.period)
+            )
+            refitted = self._annual_sample(asset, fitted, copy.deepcopy(generator))
+            blocks.append(self._blocks(refitted, None)[fold])
+        return tuple(blocks)
+
+    def _build_samples(self, *, fresh: bool = False, folds: bool = False) -> _Samples:
+        """The samples of every asset; with `fresh`, also their fresh draws.
+
+        With `folds`, also each fold's blocks, where a linear trend is fitted
+        per fold.
+        """
         if self._on_curves:
             return self._curve_samples(fresh=fresh)
         basis_risk = self._require_basis_risk()
@@ -2409,42 +2540,39 @@ class ParametricPlan:
         hazard = self._open(self._hazard_read)
         index = None if self.index_read is None else self._open(self.index_read)
         generators = self._generators(len(rows))
+        per_fold = (
+            folds
+            and isinstance(self.trend, LinearTrend)
+            and isinstance(self.split_rule, (Holdout, KFold))
+        )
         samples: dict[str, OutcomeSample] = {}
         locations: dict[str, AtPoint | AtStation] = {}
+        refitted: dict[str, tuple[_Block, ...]] = {}
         for (asset_id, row), rng, cell in zip(rows, generators, cells, strict=True):
             series = self._series(hazard, row, asset_id, portfolio)
             index_series: AnnualSeries | None = None
             unused: list[int] = []
+            location: AtPoint | AtStation | None = None
             if index is not None:
                 read_series = self._series(index, row, asset_id, portfolio)
-                locations[asset_id] = _resolved_location(index.read, read_series, row)
+                location = _resolved_location(index.read, read_series, row)
+                locations[asset_id] = location
                 index_series, unused = _on_years(read_series, series.years)
             loss_model = (
                 self.loss_model.for_asset(portfolio, asset_id)
                 if cell is None
                 else self._cell_loss_model(portfolio, asset_id, row, cell)
             )
-            sample = sample_annual(
-                series,
-                loss_model=loss_model,
-                basis_risk=basis_risk,
-                asset_id=asset_id,
-                index=index_series,
-                rng=rng,
-                missing=self.missing,
+            asset = _AnnualAsset(
+                asset_id, series, index_series, loss_model, cell, location, unused
             )
-            if cell is not None:
-                assert self.cell is not None
-                sample = _noted(
-                    sample,
-                    f"The impact reads H3 cell {cell:x} for asset {asset_id}: "
-                    f"{_cell_origin(self.cell)}.",
+            first_state = copy.deepcopy(rng)
+            samples[asset_id] = self._annual_sample(asset, self.trend, rng)
+            _warn_comonotone(basis_risk, separate_index=index is not None)
+            if per_fold:
+                refitted[asset_id] = self._refitted_blocks(
+                    asset, samples[asset_id], first_state
                 )
-            if index is not None:
-                sample = _index_recorded(
-                    sample, index.read, locations[asset_id], unused
-                )
-            samples[asset_id] = sample
         return _Samples(
             portfolio,
             samples,
@@ -2453,6 +2581,7 @@ class ParametricPlan:
             hazard.record,
             index_record=None if index is None else index.record,
             locations=None if index is None else locations,
+            folds=refitted if per_fold else None,
         )
 
     # -- the curve route ---------------------------------------------------------
@@ -2629,7 +2758,7 @@ class ParametricPlan:
                 f"covers {names} have free parameters; design them with "
                 ".objective(...), or resolve them with Cover.with_values"
             )
-        built = self._build_samples(fresh=evaluate)
+        built = self._build_samples(fresh=evaluate, folds=True)
         portfolio, samples = built.portfolio, built.samples
         asset_ids = list(samples)
         covers = self._covers_for(asset_ids, built.locations)
@@ -2638,7 +2767,12 @@ class ParametricPlan:
         tables: list[Any] = []
         for asset_id in asset_ids:
             fresh = None if built.fresh is None else built.fresh[asset_id]
-            for fold, train, test in self._blocks(samples[asset_id], fresh):
+            blocks = (
+                self._blocks(samples[asset_id], fresh)
+                if built.folds is None
+                else built.folds[asset_id]
+            )
+            for fold, train, test in blocks:
                 items: list[Cover | DesignResult] = []
                 for cover in covers[asset_id]:
                     if not cover.free_parameters():
@@ -2704,13 +2838,15 @@ class ParametricPlan:
 
         Reads the source and the assets. Each sample holds all of the
         asset's draws or years, before any split (fresh draws are drawn by
-        `write_parquet()` only, which returns them in `fresh_samples`).
+        `write_parquet()` only, which returns them in `fresh_samples`), so a
+        `LinearTrend` here is fitted on all the years, and its record says so.
         Raises `ValueError` without a basis-risk model or, on fitted curves,
         without `monte_carlo`; `SampleError` for an asset that cannot be
         located (an H3 cell that straddles grid cells included), a curve that
         cannot be sampled (`sample_curve`), several curves for one asset, a
         cover whose index unit is not the dataset's, or a series with a
-        missing year, an index year included (unless `missing="drop_year"`);
+        missing year, an index year included (unless `missing="drop_year"`),
+        or a trend the series cannot take;
         `ProbabilitySemanticsError` for curves whose semantics are not those
         of one year; and `ImportError` without the `geometry` extra for
         assets located by their H3 cells on per-year values, or for
@@ -2763,7 +2899,8 @@ class ParametricPlan:
         `fresh_samples` when the split is `FreshDraws`. Raises `ValueError`
         without covers, a basis-risk model, or an objective for templates;
         `SampleError` for a cover that names another location than the index
-        is read at; and as `samples`, `design` and `compare` raise.
+        is read at, or a fold with fewer design years than `LinearTrend`'s
+        `min_years`; and as `samples`, `design` and `compare` raise.
         """
         run = self._run(evaluate=True)
         merged = EvaluationMetadata.merge(

@@ -154,7 +154,8 @@ and nothing more.
 ```text
 ParametricPlan.for_evaluation(request, *, value_column=None, value_unit="1")
   .monte_carlo(n_draws, *, seed, assume_semantics=None, outside_support="raise")
-ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance, ...)
+ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
+                                   trend=AsRecorded(), scenario="baseline", ...)
   .index(source, *, location, unit, provenance, ...)   # optional: read elsewhere
 # then, on either plan:
   .basis_risk(model)                          # required
@@ -253,6 +254,10 @@ priced_result = priced.write_parquet("priced.parquet")
 - **`KFold(k)`:** `year_block_kfold` holds out each of `k` contiguous blocks of
   periods in turn; every fold has its own designs.
 
+With `LinearTrend`, `Holdout` and `KFold` build each asset's sample once per
+fold, fitted on that fold's design years: see [Climate
+trends](#climate-trends).
+
 Every design block gets in-sample rows and every held-out block, or the fresh
 draws, out-of-sample rows (`split`, `fold`). Resolved covers are evaluated on
 the same blocks, with the design block as their design sample: their terms are
@@ -310,7 +315,8 @@ The `ParametricResult` holds what the rows are evaluated on: `samples`, one
 sample per asset with all its draws or years, and, with `FreshDraws`,
 `fresh_samples`, one sample per asset of the fresh draws, whose
 `content_hash` is the `sample_hash` of the out-of-sample rows (`None` without
-fresh draws).
+fresh draws). With `LinearTrend` and a holdout or k-fold split, `samples` are
+fitted on all the years, and the rows come from one sample per fold.
 
 ## Next step: per-year values
 
@@ -318,7 +324,8 @@ The same plan runs on per-year values: `ParametricPlan.for_annual_extremes`
 reads the years of an annual-extremes table (ERA5, CMIP6, NEX-GDDP-CMIP6, a
 station, NOAA water levels) at each asset. Each row is a recorded or modelled
 year with probability `1/n`, so no curve and no probability semantics are
-assumed, and no trend is removed. Here the quick start's covers and asset are
+assumed, and by default the years are used as recorded ([Climate
+trends](#climate-trends)). Here the quick start's covers and asset are
 designed on 28 years of a synthetic table and compared on the 12 years held
 out:
 
@@ -409,7 +416,101 @@ The builders, splits, seeding and outputs are those above.
   Each sample's provenance and the setup text record the cell, not the point.
 - **`years`** states the years every series must cover (by default the years
   the table holds); a year without a value raises, unless `missing="drop_year"`
-  drops it and lists it. No trend is removed.
+  drops it and lists it.
+
+### Climate trends
+
+The years of a record carry the climate's trend over them, so using them as
+they are is a choice like any other, and the plan states it. `trend=` takes one
+of three options, on `for_annual_extremes` and on `sample_annual`. Which one
+suits a hazard is your choice, and the module says nothing about it.
+
+| Option | What it does | What the sample records in `provenance.trend` |
+| --- | --- | --- |
+| `AsRecorded()`, the default | Uses the years as they are | `{"kind": "as_recorded"}` |
+| `RecentYears(n)` | Keeps the last `n` entries of the series' years. No value changes | `n` and the window's first and last year |
+| `LinearTrend(reference_year=None, *, min_years=10)` | Removes an additive linear trend in the mean, by ordinary least squares on the year | `method` (`"ols_additive"`), `reference_year`, `min_years`, `fit_years`, and in `fits` one `role`, `slope`, `intercept` and `unit` per series |
+
+```python
+from crc_sdk.parametric import LinearTrend
+
+trended_result = (
+    ParametricPlan.for_annual_extremes(
+        annual, assets,
+        impact=PiecewiseLinearImpact([40.0, 120.0], [0.0, 0.5]),
+        unit="mm/day", value_column="value_eur", value_unit="EUR",
+        provenance=provenance, seed=42,
+        trend=LinearTrend(),                  # fitted per fold, on the design years
+        scenario="1981-2020, moved to 2020",  # your name for the rows
+    )
+    .basis_risk(ImpactNoise(0.3, upper=1.0))
+    .covers(step, linear)
+    .objective(ExpectedUncovered(), budget=Budget(ratio=0.8))
+    .split(Holdout(0.7))
+    .metrics(MetricOptions(betas=(0.9,), return_periods=(10,)))
+    .write_parquet("trended-comparison.parquet")
+)
+print(setup_text(trended_result.metadata))
+```
+
+**`RecentYears(n)`** comes after `years=` and before `missing=`: a gap before
+the window does not matter, and a gap inside it is a missing year. An `n` above
+the series' length raises `SampleError`. The window comes first and a split
+divides it, so the held-out block is the latest years inside the window.
+
+**`LinearTrend`** fits `x_t = a + b·(t − t₀) + e_t` on the fit years, with `t`
+the calendar year and `t₀` the reference year, and replaces every year's value
+by `x_t − b·(t − t₀)`. So `a`, the recorded intercept, is the fitted value at
+the reference year, and the adjusted fit years have mean `a`. The spread around
+the line is not touched, so a change in the variance or the tail stays in the
+data.
+
+- **The reference year** is by default the last entry of the series' years,
+  whether or not it has a value and whichever block it falls in, so it is the
+  same in every fold. A stated year may lie outside the record.
+- **One fit per series.** Each asset's hazard series has its own fit. With
+  `.index(...)` the index series has its own, on the same years with the same
+  reference year.
+- **Too few years.** Fewer than `min_years` fit years raise `SampleError`,
+  which names the count and, on a plan, the fold; no fold is dropped. The
+  default of 10 is a floor against a slope that is nearly all noise, not a
+  statement that ten years are enough. `min_years` below 3, which would leave
+  no residual, raises at construction.
+- **No clipping.** A non-finite result, or a value that was non-negative as
+  recorded and is negative after the adjustment, raises `SampleError`. A value
+  that is negative as recorded (a temperature) may stay negative.
+- **Under a split**, the fit sees the design years only. With `Holdout` or
+  `KFold`, the plan builds each asset's sample once per fold, fitted on the
+  years the split puts in that fold's design block, and takes the fold's two
+  blocks from it: the held-out years are adjusted with the design years' slope,
+  and a changed held-out value changes neither the fit nor any row of the
+  design block. A basis-risk model that draws starts every fold from the
+  asset's same generator state, so a year's factor does not depend on the fold.
+  `.samples()` and `ParametricResult.samples` hold all the years before any
+  split, so their fit uses all the years, and their record says so.
+- **`fit_years`** is for one sample built by hand ([from per-year
+  values](#from-per-year-values)). On a plan it raises `ValueError`, because the
+  plan sets it per fold.
+
+**The order** is `years=`; the window of `RecentYears`; `missing=`; the fit and
+the adjustment of the hazard and of the index; the impact on the adjusted
+hazard; the basis-risk model. A trend draws no random numbers. The sample's
+`index` and `hazard` hold the adjusted values.
+
+**In the metadata and the text.** `setup_text` writes one `Trend` line for
+every per-year sample, the default included: the option and, for `LinearTrend`,
+the fit years, each series' slope with its unit, its intercept and the
+reference year. In a comparison's metadata each `setup.samples` entry holds the
+record under `trend`, null on Monte Carlo and table samples, and a document
+without the key reads as the years as recorded. Before execution,
+`plan.explain(format="json")` states the option in each `setup.samples` entry.
+
+**`scenario=`** names the rows: it sets `sample.scenario`, so it reaches
+`to_table`, `content_hash` and the comparison's `scenario` column. It is yours,
+and is not derived from the source. The `scenario` column of a CMIP6 table is
+its pathway, another thing, and the setup text states both, so state a label
+whenever you use a pathway: without one, rows under `ssp245` are labelled
+`"baseline"`. The leakage check sees through a relabelling.
 
 ### An index read elsewhere
 
@@ -571,6 +672,25 @@ station instead, and `sample_annual(..., index=other_series)` reads the index
 at another cell, station or hazard than the loss, as the plan's
 [`.index(...)`](#an-index-read-elsewhere) does.
 
+`trend=` and `scenario=` are those of the plan ([Climate
+trends](#climate-trends)). By hand, a `LinearTrend` is fitted on every kept
+year unless `fit_years=` states others, so to hold out a block, state the
+design years:
+
+```python
+from crc_sdk.parametric import LinearTrend
+
+fitted = sample_annual(series, loss_model=loss_model,
+                       basis_risk=ImpactNoise(0.3, upper=1.0),
+                       asset_id="warehouse-a", rng=np.random.default_rng(7),
+                       trend=LinearTrend(fit_years=series.years[:28]))
+design_years, held_out = holdout(fitted, train_fraction=0.7)
+```
+
+`holdout(sample_annual(..., trend=LinearTrend()))`, fitted on all the years, is
+refused at evaluation with `LeakageError`, which names `fit_years`: the fit saw
+the held-out years.
+
 ## Reporting numbers
 
 - Report out-of-sample rows (`split == "out_of_sample"`): held-out years, or
@@ -590,10 +710,10 @@ Every number in a comparison rests on a setup: the asset, the basis, the
 split, the samples' source and basis-risk model, the pricing and, for a design,
 its objective and constraints. `setup_text(result.metadata)` states that setup
 in plain text, one statement per line (`Level`, `Split`, `Seeds`, `Sample`,
-`Source`, `Sample notes`, `Pricing`, `Design`, `Metrics`), for a notebook or a
-report to print next to the numbers. The text reads only the metadata, so the
-same metadata always gives the same text, and statements that every split or
-sample shares are written once.
+`Source`, `Trend`, `Sample notes`, `Pricing`, `Design`, `Metrics`), for a
+notebook or a report to print next to the numbers. The text reads only the
+metadata, so the same metadata always gives the same text, and statements that
+every split or sample shares are written once.
 
 - `Seeds` states the plan's seed, which every evaluation's `details` holds
   under `"plan_seed"`, and the fresh draws' seed, which every fresh-draw
@@ -604,6 +724,9 @@ sample shares are written once.
   and pathway of its canonical row; for per-year values, the provider and
   dataset of the series. A field that a record does not hold is stated as not
   recorded, never guessed.
+- `Trend` states how a per-year sample treats the climate trend ([Climate
+  trends](#climate-trends)). Samples that treat it alike share a line, and
+  lines that differ name their assets.
 - `Sample notes` writes a note that counts draws once, with each sample's own
   counts. In the quick start, the draws beyond the curve's fitted support
   read "2527 of 5000 draws in the design sample and 2464 of 5000 in the fresh
@@ -758,7 +881,7 @@ draws several assets under a dependence you state. `design`, `evaluate` and
 | --- | --- | --- | --- |
 | A fitted curve | `sample_curve(curve, *, metadata, n_draws, rng, loss_model, basis_risk, asset_id)` | a simulated year | `1/n` |
 | Fitted curves of several assets | `sample_curves(curves, *, dependence, metadata, n_draws, rngs, loss_models, basis_risk)` | a simulated year | `1/n` |
-| Per-year values | `sample_annual(AnnualSeries, *, loss_model, basis_risk, asset_id, index=None)` | an observed or modelled year | `1/n` |
+| Per-year values | `sample_annual(AnnualSeries, *, loss_model, basis_risk, asset_id, index=None, trend=AsRecorded(), scenario="baseline")` | an observed or modelled year | `1/n` |
 | A user table | `OutcomeSample.from_table(table, *, period, asset_id, index, loss, semantics="annual", ...)` | a table row | its `probability` column, or `1/n` |
 
 ```python
@@ -800,7 +923,8 @@ station with `where={"station": ...}`), and `AnnualSeries.nearest_cell(table,
 *, longitude, latitude, unit, source=None)` the grid cell whose centre lies
 within half a grid step of a point. A year without a value raises in
 `sample_annual`, unless `missing="drop_year"`, which lists the dropped years.
-No trend is removed.
+`trend=` states how the climate trend is treated, by default as recorded
+([Climate trends](#climate-trends)).
 
 `source` describes the table in the series' provenance: a name, a
 `SourceProvenance`, a mapping such as a plan's `explain(format="json")`, or
@@ -861,8 +985,9 @@ and its matched cell or station; or the table's name), the semantics and who
 stated them, the loss model (impact type, name, `definition_hash`, value
 column and unit, not the value itself), the basis-risk model, the generator's
 state before each random step (`provenance.generator()` rebuilds it), what was
-counted (draws outside the support, atom draws, dropped years) and notes for
-the setup text. `sample.content_hash` is `sha256:` plus the SHA-256 of the
+counted (draws outside the support, atom draws, dropped years), a per-year
+sample's treatment of the trend (`provenance.trend`) and notes for the setup
+text. `sample.content_hash` is `sha256:` plus the SHA-256 of the
 canonical long table with its units, semantics and scenario.
 `sample.to_table()` returns that long table, with the metadata under the
 Parquet key `crc.parametric.sample`, and `OutcomeSample.from_written_table(table)`
@@ -1040,7 +1165,9 @@ draws; the fold for k-fold, which must match the sample's own split).
   own; for a cover given as is, pass `design_sample=` with the sample its
   terms were chosen on. Without one it raises `SampleError`. A design sample
   that shares a period with the evaluation sample from the same source raises
-  `LeakageError`.
+  `LeakageError`. So does a linear trend of either sample fitted on a year the
+  evaluation sample holds from the same source; the error names `fit_years`.
+  A trend or a `scenario` label does not make one source's rows another's.
 - In sample, a known design sample must be the evaluation sample itself.
 - The metadata records how the split was made: `holdout` (with the train
   fraction), `kfold` (with k), `fresh_draws` (Monte Carlo samples from
@@ -1268,9 +1395,9 @@ years or fresh draws, are the ones to report.
   there are no designs for a goal over several assets, and a plan builds one
   sample per asset, so it assumes no dependence between them.
 - **Several hazards in one index.** An index is one hazard at one location.
-- **Several scenarios at once.** Every sample is `"baseline"`, and a plan on
-  fitted curves samples one hazard, horizon and pathway per asset; the
-  comparison's `scenario` column is there for later.
+- **Several scenarios at once.** A per-year plan names one `scenario` for its
+  rows, a sample on fitted curves is `"baseline"`, and a plan on fitted curves
+  samples one hazard, horizon and pathway per asset.
 - **Several events within a year.** One draw is one year.
 - **Remote requests in the plan.** `for_evaluation` takes a request on a local
   canonical file; materialize a remote source first (its `materialize(path)`
@@ -1279,5 +1406,4 @@ years or fresh draws, are the ones to report.
   the index at each asset: an index elsewhere needs a joint distribution of two
   curves, which the curves do not give. On per-year values,
   [`.index(...)`](#an-index-read-elsewhere) reads it elsewhere.
-- **Pooled k-fold metrics, bootstrap intervals, trend removal.** Each fold has
-  its own rows, and years are used as recorded.
+- **Pooled k-fold metrics, bootstrap intervals.** Each fold has its own rows.
