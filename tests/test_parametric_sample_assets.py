@@ -210,6 +210,14 @@ def test_invalid_samples_of_several_assets_raise(
         _three(**overrides)
 
 
+@pytest.mark.parametrize("source_kind", ["monte_carlo", "annual", "table"])
+def test_a_sample_of_several_assets_must_state_its_dependence(
+    source_kind: str,
+) -> None:
+    with pytest.raises(SampleError, match="must state where the dependence"):
+        _three(provenance=_provenance(source_kind=source_kind))
+
+
 @pytest.mark.parametrize(
     "fields",
     [
@@ -319,6 +327,31 @@ def test_a_sample_of_three_assets_round_trips_its_table_and_hash(
             np.testing.assert_array_equal(getattr(read, name), getattr(sample, name))
         assert read.provenance.to_document() == sample.provenance.to_document()
         assert (read.hazard is None) is (not with_hazard)
+
+
+@pytest.mark.parametrize(
+    "dependence",
+    [{"kind": "data"}, {"kind": "independent"}],
+    ids=["the data's own", "a model"],
+)
+def test_a_written_table_of_several_assets_round_trips_its_dependence(
+    dependence: dict[str, Any], tmp_path: Path
+) -> None:
+    sample = _three(provenance=_provenance(dependence=dependence))
+    path = tmp_path / "three.parquet"
+    pq.write_table(sample.to_table(), path)
+    read = OutcomeSample.from_written_table(pq.read_table(path))
+    assert read.provenance.to_document()["dependence"] == dependence
+
+
+def test_a_written_table_of_several_assets_without_a_dependence_is_refused() -> None:
+    table = _three().to_table()
+    key = SAMPLE_METADATA_KEY.encode()
+    written = json.loads(table.schema.metadata[key])
+    written["provenance"]["dependence"] = None
+    edited = table.replace_schema_metadata({key: json.dumps(written)})
+    with pytest.raises(SampleError, match="must state where the dependence"):
+        OutcomeSample.from_written_table(edited)
 
 
 def test_the_hash_does_not_depend_on_the_order_of_the_columns() -> None:
@@ -611,7 +644,7 @@ def test_a_table_of_several_assets_round_trips() -> None:
     read = OutcomeSample.from_written_table(sample.to_table())
     assert read.content_hash == sample.content_hash
     assert read.asset("a").lineage == sample.lineage
-    assert read.provenance.dependence == {"kind": "data"}
+    assert read.provenance.to_document()["dependence"] == {"kind": "data"}
 
 
 def test_a_table_s_asset_keeps_the_table_s_lineage_and_sources() -> None:

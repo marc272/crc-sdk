@@ -16,7 +16,8 @@ modelled years (`sample_annual`), or the rows of a user table
 - `provenance` (`SampleProvenance`) records the source, the semantics, the
   loss model, the basis-risk model and the generator state.
 
-A sample holds one asset or more, with distinct ids. `OutcomeSample.asset`
+A sample holds one asset or more, with distinct ids, and a sample of several
+states where the dependence between them comes from. `OutcomeSample.asset`
 takes one asset's sample out of it, and `OutcomeSample.join` puts one-asset
 samples of the same years side by side. `design`, `evaluate` and `compare`
 work on one asset's sample.
@@ -405,8 +406,9 @@ class SampleProvenance:
     - `parent` and `selection`: for a sample split or selected from another,
       the content hash of the sample it came from and the steps taken.
     - `dependence`: for a sample of several assets, where the dependence
-      between them comes from. `{"kind": "data"}` is the data's own: the rows
-      are the same years of the data. `None` on a one-asset sample.
+      between them comes from; such a sample must state it. `{"kind": "data"}`
+      is the data's own: the rows are the same years of the data. `None` on a
+      one-asset sample.
     - `parts`: for a sample of several assets, each asset's own provenance
       document, by asset id. `None` on a one-asset sample.
 
@@ -545,8 +547,10 @@ class OutcomeSample:
     `loss_unit` name the units; the loss unit must equal a cover's payout
     unit for designs and evaluations. `semantics` is `"annual"`.
 
-    A sample holds one asset or more, with distinct ids. `asset` takes one
-    asset's sample out of it and `join` puts one-asset samples side by side.
+    A sample holds one asset or more, with distinct ids. A sample of several
+    must state where the dependence between them comes from, in its
+    provenance's `dependence`: it is never assumed. `asset` takes one asset's
+    sample out of it and `join` puts one-asset samples side by side.
     The arrays are read-only copies. Samples compare by identity; compare
     `content_hash` for equal contents.
 
@@ -612,6 +616,12 @@ class OutcomeSample:
         ):
             raise SampleError(
                 "a one-asset sample has no dependence between assets and no parts"
+            )
+        if len(asset_ids) > 1 and self.provenance.dependence is None:
+            raise SampleError(
+                f"a sample of {len(asset_ids)} assets must state where the dependence "
+                "between them comes from: set the provenance's dependence, for "
+                'example {"kind": "data"} for the same years of the data'
             )
         if self.provenance.parts is not None and set(self.provenance.parts) != set(
             asset_ids
@@ -1191,7 +1201,10 @@ class OutcomeSample:
             loss_unit=loss_unit,
             semantics=semantics,
             provenance=SampleProvenance(
-                source_kind="table", sources=(), semantics_source="caller"
+                source_kind="table",
+                sources=(),
+                semantics_source="caller",
+                dependence=None if n_assets == 1 else {"kind": "data"},
             ),
         )
         table_hash = bare.content_hash
