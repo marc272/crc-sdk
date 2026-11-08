@@ -528,6 +528,7 @@ def test_an_empirical_copula_takes_fresh_draws(dataset: Path) -> None:
     assert result.fresh_joint_sample is not None
     assert result.fresh_joint_sample.provenance.dependence is not None
     assert result.fresh_joint_sample.provenance.dependence["k"] == 3
+    assert "EmpiricalCopula, a stated assumption" in setup_text(result.metadata)
 
 
 def test_an_empirical_copula_checks_the_draw_counts_before_reading(
