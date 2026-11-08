@@ -1,8 +1,9 @@
 # Parity fixtures for `crc_sdk.parametric`
 
 The cases in `cases/` are golden fixtures for the metrics
-(`tests/test_parametric_parity.py`) and the designs
-(`tests/test_parametric_design.py`) of `crc_sdk.parametric`. Each case is one
+(`tests/test_parametric_parity.py`), the designs
+(`tests/test_parametric_design.py`) and the joint designs
+(`tests/test_parametric_joint.py`) of `crc_sdk.parametric`. Each case is one
 JSON document: an outcome sample, a cover, a pricing and the values the module
 must reproduce. The tests read them with plain numpy; nothing imports the code
 that generated them.
@@ -20,7 +21,7 @@ the copies stay byte-identical. A case's `generator.commit` names the commit
 of the code that generated it, which can be older than the commit it was copied
 at.
 
-The 60 cases copied (about 640 kB):
+The 76 cases copied (about 998 kB):
 
 - 20 evaluation cases of fixed covers (`*-fixed-*`): 16 whose expected values
   are closed forms, computed in exact rational arithmetic, and 4 step covers
@@ -52,7 +53,15 @@ The 60 cases copied (about 640 kB):
   whose expected values are a closed form
   (`linear-upper-grid-wcvar-b0_9-pure-individual-handmade`), and two
   piecewise-linear designs
-  (`piecewise-linear-upper-{mse-pure,wcvar-b0_9-coc}-individual-handmade`).
+  (`piecewise-linear-upper-{mse-pure,wcvar-b0_9-coc}-individual-handmade`);
+- 16 joint design cases
+  (`step-{mse,eu,wcvar-b0_9,wcvar-b0_99}-{pure,coc}-joint-{synthetic,thesis}`):
+  step covers on three assets with fixed breakpoints, designed by the
+  reference implementation for one objective and one budget, 0.8 times the
+  expected loss, on the sums over the assets of the loss and of the payout of
+  each draw. A case's `cover` is the list of templates in `asset_ids` order,
+  and its `expected.parameters` and `expected.unidentified` are keyed by asset
+  id.
 
 Every case carries the fields `metric_options` and `expected.profile`.
 `metric_options` is null, for the default metric options, except in the two
@@ -78,9 +87,16 @@ evaluated on its `evaluation_sample` with the design premium:
   design years; with the design sample's lineage they would raise
   `LeakageError`.
 
+The joint design test reads every case of `kind` `"design"` and `scope`
+`"joint"` in `cases/`. It designs one cover per asset with `design_joint` and
+judges the objective value, the parameters by the case's `compare_parameters`,
+the premium and `unique`. A non-unique case's premium is that of the templates
+resolved with `expected.parameters`, priced on the total payout. The cases'
+`expected.metrics` aren't read yet: they are the metrics of the total, and
+`evaluate` doesn't take a joint design yet.
+
 Further cases are picked up the same way once they are copied here. Every
-case of one asset in the source is copied. The source's 16 joint cases
-(`*-joint-*`) are for the joint designs of a later phase and are not copied.
+case in the source is copied.
 
 ## Licence
 
@@ -92,15 +108,15 @@ or `-fresh`, or `-options`):
 - **`synthetic`, `synthetic52` and `handmade`: CC0-1.0**
   ([public domain dedication](https://creativecommons.org/publicdomain/zero/1.0/)).
   These are the cases whose ids end in `-synthetic` or `-synthetic-holdout`
-  (18 cases), in `-synthetic52`, `-synthetic52-kfold5-fold<i>`,
+  (26 cases), in `-synthetic52`, `-synthetic52-kfold5-fold<i>`,
   `-synthetic52-fresh` or `-synthetic52-options` (13) and in `-handmade` or
   `-handmade-options` (15). They hold no third-party data: draws of a seeded synthetic generator, the fresh draws of the
   `-fresh` cases included, and values chosen by hand.
 - **`thesis`: CC-BY-4.0**
   ([Creative Commons Attribution 4.0](https://creativecommons.org/licenses/by/4.0/)).
-  These are the cases whose ids end in `-thesis` or `-thesis-holdout` (14
-  cases: `step-fixed-*-thesis`, `step-*-individual-thesis` and
-  `step-*-thesis-holdout`). Their draws are taken from the source
+  These are the cases whose ids end in `-thesis` or `-thesis-holdout` (22
+  cases: `step-fixed-*-thesis`, `step-*-individual-thesis`,
+  `step-*-joint-thesis` and `step-*-thesis-holdout`). Their draws are taken from the source
   repository's parity fixture `parity/tests/data/thesis_eventset/`, which is
   derived from the IRIS event set. A copy of them keeps this attribution:
   - the draws: Marc Prinzing, parametric-insurance-design,
