@@ -42,6 +42,7 @@ from crc_sdk.parametric import (
     StepPayout,
     compare,
     design,
+    design_joint,
     evaluate,
     holdout,
     sample_annual,
@@ -580,6 +581,39 @@ def test_a_held_out_block_of_a_join_fitted_on_all_years_is_refused() -> None:
             split="out_of_sample",
             design_sample=train.asset("a"),
         )
+
+
+def _joint_templates() -> list[Cover]:
+    return [
+        Cover(
+            INDEX,
+            StepPayout([60.0, 90.0, 120.0], [Free(), Free(), Free()]),
+            payout_unit="EUR",
+            asset_id=asset,
+            label="step",
+        )
+        for asset in ("a", "b")
+    ]
+
+
+def test_a_joint_comparison_states_each_part_s_fit() -> None:
+    fit = LinearTrend(fit_years=YEARS[:28])
+    joined = OutcomeSample.join([_part("a", fit, seed=1), _part("b", fit, seed=2)])
+    train, test = holdout(joined, 0.7)
+    designed = design_joint(_joint_templates(), train, MSE())
+    table = compare([designed], test, split="out_of_sample")
+    line = _text_lines(setup_text(EvaluationMetadata.from_table(table)), "Trend")
+    assert len(line) == 1
+    assert "fitted on 28 years (1981 to 2008), reference year 2020" in line[0]
+    assert "hazard of a slope" in line[0] and "hazard of b slope" in line[0]
+
+
+def test_a_joint_design_fitted_on_all_years_is_refused_out_of_sample() -> None:
+    parts = [_part("a", LinearTrend(), seed=1), _part("b", LinearTrend(), seed=2)]
+    train, test = holdout(OutcomeSample.join(parts), 0.7)
+    designed = design_joint(_joint_templates(), train, MSE())
+    with pytest.raises(LeakageError, match="fit_years"):
+        compare([designed], test, split="out_of_sample")
 
 
 def test_join_of_recent_years_keeps_what_the_parts_state_alike() -> None:
