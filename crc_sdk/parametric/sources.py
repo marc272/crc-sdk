@@ -22,6 +22,12 @@ tabulated curve cannot be evaluated outside its knots, so by default its
 sample raises; `outside_support="extrapolate"` uses crc-framework's own
 extrapolation and `"clamp"` the nearest knot, and the choice is recorded.
 
+**Several assets from curves** (`sample_curves`). Curves say nothing about how
+assets move together, so a stated dependence model (`Independent`,
+`Comonotonic` or `EmpiricalCopula`) is required, and has no default. Each asset
+is drawn exactly as `sample_curve` draws it, from its own generator; the model
+then only puts that asset's rows in another order.
+
 **Per-year values** (`AnnualSeries`, `sample_annual`). The years of an
 `annual_extremes()` table (ERA5, CMIP6, NEX-GDDP-CMIP6, stations) become the
 rows; nothing is assumed about probabilities, and no trend is removed. A
@@ -66,6 +72,12 @@ from pydantic import BaseModel
 
 from crc_sdk.parametric._canonical import content_hash
 from crc_sdk.parametric.basis_risk import BasisRisk, ImpactNoise, NoBasisRisk
+from crc_sdk.parametric.dependence import (
+    Comonotonic,
+    Dependence,
+    EmpiricalCopula,
+    Independent,
+)
 from crc_sdk.parametric.errors import (
     ComonotoneIndexWarning,
     ProbabilitySemanticsError,
@@ -77,6 +89,7 @@ from crc_sdk.parametric.sample import (
     OutcomeSample,
     SampleProvenance,
     _arrow_table,
+    _asset_note,
     _check_json,
     _column,
     _freeze,
@@ -103,6 +116,7 @@ __all__ = [
     "OutsideSupport",
     "sample_annual",
     "sample_curve",
+    "sample_curves",
 ]
 
 FloatArray = NDArray[np.float64]
@@ -625,6 +639,228 @@ def sample_curve(
         )
     _warn_comonotone(basis_risk, separate_index=False)
     return sample
+
+
+# -- several assets from curves ------------------------------------------------
+
+
+def _by_asset(name: str, value: Any, assets: tuple[str, ...]) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError(
+            f"{name} must be a mapping by asset id, got {type(value).__name__}"
+        )
+    if set(value) != set(assets):
+        raise SampleError(
+            f"{name} must name the assets of curves, {sorted(assets)}; "
+            f"got {sorted(value)}"
+        )
+    return value
+
+
+def _one_unit(name: str, units: Mapping[str, str]) -> str:
+    if len(set(units.values())) > 1:
+        raise SampleError(
+            f"sample_curves needs one {name} for every asset, got {dict(units)}"
+        )
+    return next(iter(units.values()))
+
+
+def sample_curves(
+    curves: Mapping[str, Any],
+    *,
+    dependence: Dependence,
+    metadata: Mapping[str, HazardDatasetMetadata],
+    n_draws: int,
+    rngs: Mapping[str, np.random.Generator],
+    loss_models: Mapping[str, LossModel],
+    basis_risk: BasisRisk,
+    assume_semantics: AnnualSemantics | None = None,
+    outside_support: OutsideSupport = "raise",
+    details: Mapping[str, Any] | None = None,
+) -> OutcomeSample:
+    """Draw simulated years for several assets under a stated dependence.
+
+    `curves`, `metadata`, `rngs` and `loss_models` are mappings by asset id;
+    the order of `curves` sets `asset_ids`. `dependence` is required: curves
+    say nothing about how assets move together, so the dependence is an
+    assumption the caller states with `Independent()`, `Comonotonic()` or
+    `EmpiricalCopula(reference)`. `basis_risk` is one model for every asset;
+    `details` is added to every asset's provenance; the other arguments are
+    those of `sample_curve`.
+
+    Each asset is drawn by `sample_curve` with its own generator: the uniforms
+    first, then the basis-risk model. The dependence model then puts that
+    asset's rows in another order, by the ranks of the uniforms; a row's
+    hazard, index and loss stay together, no value changes and no further
+    random number is used. So each column holds the rows of `sample_curve`
+    with the same generator, and under `Independent()` in the same order.
+    `period` is the row number, 0 to `n_draws - 1`.
+
+    The provenance's `dependence` holds the model's document: for an
+    `EmpiricalCopula`, the reference's content hash, sources, licences, first
+    and last year, `m` and `k`. `parts` holds each asset's own provenance,
+    whose `selection` records a reordering, and `notes` state the model and
+    call it an assumption. The lineage is built from the assets' lineages and
+    not from the model, as the same generators give the same draws under every
+    model: a design and an evaluation need different generators, whichever
+    models they state.
+
+    Raises `SampleError` for fewer than two assets, mappings that name other
+    assets, two assets with the same generator state, assets in different
+    units, an `n_draws` or a reference the model cannot use (all before any
+    draw) and for what `sample_curve` raises for; `TypeError` for a missing or
+    unknown dependence model and wrong types. Warns as `sample_curve` does, for
+    each asset.
+    """
+    if not isinstance(curves, Mapping):
+        raise TypeError(
+            f"curves must be a mapping by asset id, got {type(curves).__name__}"
+        )
+    assets = tuple(_identifier("asset id", asset) for asset in curves)
+    if len(assets) < 2:
+        raise SampleError(
+            f"sample_curves needs two assets or more, got {list(assets)}; "
+            "use sample_curve for one"
+        )
+    if not isinstance(dependence, (Independent, Comonotonic, EmpiricalCopula)):
+        raise TypeError(
+            "dependence must be stated, as Independent(), Comonotonic() or "
+            "EmpiricalCopula(reference): curves say nothing about how assets move "
+            f"together, so there is no default; got {type(dependence).__name__}"
+        )
+    metadata = _by_asset("metadata", metadata, assets)
+    rngs = _by_asset("rngs", rngs, assets)
+    loss_models = _by_asset("loss_models", loss_models, assets)
+    n = _draw_count(n_draws)
+    for asset in assets:
+        if not isinstance(metadata[asset], HazardDatasetMetadata):
+            raise TypeError(
+                "metadata must hold HazardDatasetMetadata, got "
+                f"{type(metadata[asset]).__name__} for asset {asset!r}"
+            )
+        _require_generator(rngs[asset])
+        _check_models(loss_models[asset], basis_risk, asset)
+    index_unit = _one_unit(
+        "index unit", {asset: metadata[asset].value_unit for asset in assets}
+    )
+    loss_unit = _one_unit(
+        "loss unit", {asset: loss_models[asset].value_unit for asset in assets}
+    )
+    # Equal states would give equal draws, whatever the model says of them.
+    states = {
+        asset: _generator_record(rngs[asset], "hazard")["state"] for asset in assets
+    }
+    if len(set(states.values())) < len(assets):
+        raise SampleError(
+            "rngs must give each asset its own generator state: two assets with "
+            "the same state would draw the same uniforms"
+        )
+    # Before any draw, so a refused call leaves the generators untouched.
+    document = dependence.record(n, assets)
+
+    parts = {
+        asset: sample_curve(
+            curves[asset],
+            metadata=metadata[asset],
+            n_draws=n,
+            rng=rngs[asset],
+            loss_model=loss_models[asset],
+            basis_risk=basis_risk,
+            asset_id=asset,
+            assume_semantics=assume_semantics,
+            outside_support=outside_support,
+            details=details,
+        )
+        for asset in assets
+    }
+    # Each part recorded the state its uniforms came from, so these are them.
+    uniforms = np.column_stack(
+        [parts[asset].provenance.generator(0).random(n) for asset in assets]
+    )
+    order = dependence.reorder(uniforms, assets)
+
+    def reordered(values: Mapping[str, FloatArray]) -> FloatArray:
+        return np.column_stack(
+            [values[asset][order[:, j], 0] for j, asset in enumerate(assets)]
+        )
+
+    documents = {asset: parts[asset].provenance.to_document() for asset in assets}
+    licences: list[dict[str, Any]] = []
+    for licence in [
+        *(entry for own in documents.values() for entry in own["licences"]),
+        *({**entry, "role": "dependence"} for entry in document.get("licences", ())),
+    ]:
+        if licence not in licences:
+            licences.append(licence)
+    declared = sorted({own["probability_semantics"] for own in documents.values()})
+    stated = {own["semantics_source"] for own in documents.values()}
+    in_draw_order = np.arange(n, dtype=np.int64)
+    provenance = SampleProvenance(
+        source_kind="monte_carlo",
+        sources=tuple(
+            {**source, "asset_id": asset}
+            for asset, own in documents.items()
+            for source in own["sources"]
+        ),
+        # Assets that differ here are stated side by side because the caller says.
+        semantics_source=stated.pop() if len(stated) == 1 else "caller",
+        probability_semantics=", ".join(declared),
+        basis_risk=basis_risk.to_document(),
+        rng=tuple(
+            {**record, "asset_id": asset}
+            for asset, own in documents.items()
+            for record in own["rng"]
+        ),
+        licences=tuple(licences),
+        details={"draws": n, "periods": [0, n - 1]},
+        notes=(
+            dependence.statement(n, "assets"),
+            *(
+                _asset_note(asset, note)
+                for asset, own in documents.items()
+                for note in own["notes"]
+            ),
+        ),
+        lineage=content_hash(
+            {
+                "kind": "monte_carlo",
+                "lineages": {asset: parts[asset].lineage for asset in assets},
+            }
+        ),
+        dependence=document,
+        parts={
+            asset: {
+                **documents[asset],
+                "lineage": parts[asset].lineage,
+                "selection": (
+                    []
+                    if np.array_equal(order[:, j], in_draw_order)
+                    else [{"kind": "reorder", "dependence": document["kind"]}]
+                ),
+            }
+            for j, asset in enumerate(assets)
+        },
+    )
+    hazards = {
+        asset: part.index if part.hazard is None else part.hazard
+        for asset, part in parts.items()
+    }
+    return OutcomeSample(
+        asset_ids=assets,
+        period=in_draw_order,
+        probability=np.full(n, 1.0 / n),
+        index=reordered({asset: part.index for asset, part in parts.items()}),
+        loss=reordered({asset: part.loss for asset, part in parts.items()}),
+        hazard=(
+            None
+            if all(part.hazard is None for part in parts.values())
+            else reordered(hazards)
+        ),
+        index_unit=index_unit,
+        loss_unit=loss_unit,
+        semantics="annual",
+        provenance=provenance,
+    )
 
 
 # -- per-year values -----------------------------------------------------------

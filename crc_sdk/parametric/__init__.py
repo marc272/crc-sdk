@@ -35,6 +35,7 @@ plan reads its source and assets only at its execution points (`samples`,
 from crc_sdk.parametric.basis_risk import BasisRisk, ImpactNoise, NoBasisRisk
 from crc_sdk.parametric.constraints import Budget, Limit
 from crc_sdk.parametric.cover import Cover
+from crc_sdk.parametric.dependence import Comonotonic, EmpiricalCopula, Independent
 from crc_sdk.parametric.design import DesignOptions, DesignResult, design
 from crc_sdk.parametric.errors import (
     ComonotoneIndexWarning,
@@ -96,7 +97,12 @@ from crc_sdk.parametric.sample import (
     holdout,
     year_block_kfold,
 )
-from crc_sdk.parametric.sources import AnnualSeries, sample_annual, sample_curve
+from crc_sdk.parametric.sources import (
+    AnnualSeries,
+    sample_annual,
+    sample_curve,
+    sample_curves,
+)
 
 __all__ = [
     "AnnualSeries",
@@ -108,12 +114,14 @@ __all__ = [
     "BinaryPayout",
     "Budget",
     "ComonotoneIndexWarning",
+    "Comonotonic",
     "CostOfCapitalLoad",
     "Cover",
     "CoverDefinitionError",
     "DesignError",
     "DesignOptions",
     "DesignResult",
+    "EmpiricalCopula",
     "EvaluationError",
     "EvaluationMetadata",
     "ExpectedUncovered",
@@ -122,6 +130,7 @@ __all__ = [
     "H3Cell",
     "Holdout",
     "ImpactNoise",
+    "Independent",
     "IndexDefinition",
     "InfeasibleDesignError",
     "KFold",
@@ -160,6 +169,7 @@ __all__ = [
     "register_payout",
     "sample_annual",
     "sample_curve",
+    "sample_curves",
     "setup_text",
     "to_long",
     "write_comparison",
