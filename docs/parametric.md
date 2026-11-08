@@ -750,12 +750,14 @@ several assets; `sample.asset(asset_id)` takes one asset's sample back out, and
 keeps its lineage. A sample of several assets states where the dependence
 between them comes from: for `join` and `from_table` it is the data's own, the
 same years of the data. `join` refuses Monte Carlo samples, because independent
-draws line up by draw number only. `design`, `evaluate` and `compare` take one
-asset's sample and raise `SampleError` on a sample of several.
+draws line up by draw number only: [`sample_curves`](#several-assets-from-fitted-curves)
+draws several assets under a dependence you state. `design`, `evaluate` and
+`compare` take one asset's sample and raise `SampleError` on a sample of several.
 
 | Source | Function | One draw is | Probability |
 | --- | --- | --- | --- |
 | A fitted curve | `sample_curve(curve, *, metadata, n_draws, rng, loss_model, basis_risk, asset_id)` | a simulated year | `1/n` |
+| Fitted curves of several assets | `sample_curves(curves, *, dependence, metadata, n_draws, rngs, loss_models, basis_risk)` | a simulated year | `1/n` |
 | Per-year values | `sample_annual(AnnualSeries, *, loss_model, basis_risk, asset_id, index=None)` | an observed or modelled year | `1/n` |
 | A user table | `OutcomeSample.from_table(table, *, period, asset_id, index, loss, semantics="annual", ...)` | a table row | its `probability` column, or `1/n` |
 
@@ -867,6 +869,83 @@ Parquet key `crc.parametric.sample`, and `OutcomeSample.from_written_table(table
 reads it back, in memory or from `pyarrow.parquet.read_table`, with its
 provenance and lineage; a table whose rows no longer match the recorded
 content hash raises `SampleError`.
+
+### Several assets from fitted curves
+
+A fitted curve describes one place and says nothing about how two places move
+together. So a sample of several assets from curves needs a dependence that you
+state: `sample_curves` takes it as a required argument with no default, and the
+sample records it as an assumption.
+
+```python
+import numpy as np
+from crc_sdk.parametric import Comonotonic, ImpactNoise, sample_curves
+
+assets = ("warehouse-a", "warehouse-b")
+children = np.random.SeedSequence(42).spawn(len(assets))
+sample = sample_curves(
+    {"warehouse-a": row_a, "warehouse-b": row_b},   # the order sets asset_ids
+    dependence=Comonotonic(),
+    metadata={asset: metadata for asset in assets},
+    n_draws=10_000,
+    rngs={a: np.random.default_rng(c) for a, c in zip(assets, children)},
+    loss_models={asset: loss_model for asset in assets},
+    basis_risk=ImpactNoise(0.3, upper=1.0),         # one model for every asset
+)
+```
+
+`curves`, `metadata`, `rngs` and `loss_models` are mappings by asset id. Each
+asset is drawn exactly as `sample_curve` draws it from that asset's generator:
+the uniforms first, then the basis-risk model. Each model only reorders: a row's
+hazard, index and loss stay together, no value changes and no further random
+number is used. So an asset's rows are the same under every model, and each
+model says which assets' draws share a row. Ranks are those of the uniforms, so
+a hurdle curve's atom adds no ties. `period` is the row number, 0 to
+`n_draws - 1`.
+
+| Model | What shares a row | What it assumes |
+| --- | --- | --- |
+| `Independent()` | every asset's draws, in draw order | the assets are independent |
+| `Comonotonic()` | every asset's draw of rank r; the first asset stays in draw order | the assets' uniforms have rank correlation 1 |
+| `EmpiricalCopula(reference)` | for each reference year, the block of each asset's draws at that year's rank there | the reference's ranks at block level, and independence between the assets inside a block |
+
+**`EmpiricalCopula(reference)`** takes the ranks of a stated per-year sample.
+`reference` is an `OutcomeSample` of `m` observed or modelled years with equal
+probabilities, holding exactly the curves' assets, for example
+`OutcomeSample.join` of `sample_annual` samples; a Monte Carlo sample raises
+`SampleError`, as it has no dependence of its own to lend. Ranks are read from
+its `hazard`, or from its `index` when it has no separate hazard. Only the ranks
+are used, so its unit may differ from the curves'. A larger reference value
+takes a larger draw; negate a reference that moves the other way.
+
+- `n_draws` must be a whole multiple `k·m` of the reference's years. Any other
+  count raises `SampleError` and names the two nearest valid counts.
+- Each asset's draws, sorted by their uniforms, make `m` consecutive blocks of
+  `k`. A reference year of rank r at that asset takes block r, and inside a
+  block the draws keep the order in which they were drawn. The rows are in
+  reference-year order: the first `k` rows are the first reference year.
+- With `k = 1` the sample's ranks are the reference's. With `k > 1` the block of
+  every row's draw equals the reference's rank of that row's year.
+- Years with equal values at one asset pool their blocks, dealt in draw order,
+  `k` each, in year order, so a tie adds no dependence between assets.
+- Inside a block the reference says nothing, so the assets are independent
+  there. Dependence finer than one year in `m` is assumed, not observed.
+- The rows come in reference-year blocks, so the out-of-sample test is a fresh
+  sample: call `sample_curves` again with new generators and the same reference.
+  The reference is part of the stated model, so the two samples share it.
+
+**The record.** `sample.provenance.dependence` holds the model's document:
+`{"kind": "independent"}`, `{"kind": "comonotonic"}`, or for `EmpiricalCopula`
+the reference's `content_hash`, `sources`, `licences`, `first_year`, `last_year`,
+`m` and `k`. The reference's licences are listed in `provenance.licences` too.
+`provenance.notes` start with a sentence that names the model and calls the
+dependence an assumption. `sample.asset(asset_id)` gives one asset's sample,
+with its own provenance; a reordering is a step of its `selection`.
+
+The dependence model is what you assume about the assets, and the module does
+not choose it. The same generators give the same draws under every model, so
+the lineage doesn't depend on the model: evaluating out of sample needs other
+generators, whichever models the two samples state.
 
 ## Evaluate and compare covers
 
