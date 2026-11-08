@@ -599,16 +599,9 @@ def _docs_text() -> str:
 
 
 def test_the_docs_state_the_loss_model_as_it_is_called() -> None:
-    parameters = inspect.signature(LossModel).parameters.values()
-    stated = ", ".join(
-        "*, " + p.name + "=" + repr(p.default).replace("'", '"')
-        if p.kind is p.KEYWORD_ONLY and p.name == "value_column"
-        else p.name + "=" + repr(p.default).replace("'", '"')
-        if p.kind is p.KEYWORD_ONLY
-        else p.name
-        for p in parameters
-    )
-    assert f"`LossModel({stated})`" in _docs_text()
+    impact, *keywords = inspect.signature(LossModel).parameters.values()
+    named = [f"{p.name}={p.default!r}".replace("'", '"') for p in keywords]
+    assert f"`LossModel({impact.name}, *, {', '.join(named)})`" in _docs_text()
 
 
 @pytest.mark.parametrize(

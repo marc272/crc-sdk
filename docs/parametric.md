@@ -886,7 +886,9 @@ every split or sample shares are written once.
   asset's matched cell as the centre's (latitude, longitude). There is one line
   per role (hazard, index), way and grid step. Above five assets the line
   counts the assets and cells and gives the range of the centres. The asset's
-  point and its distance to the cell are not recorded, so they are not stated.
+  point and its distance to the cell are not recorded, so they are not stated;
+  a report that prints the line shows each asset's grid cell, as the result
+  file does.
 - `Trend` states how a per-year sample treats the climate trend ([Climate
   trends](#climate-trends)). Samples that treat it alike share a line, and
   lines that differ name their assets. Above five assets, as under `Joint()`,
