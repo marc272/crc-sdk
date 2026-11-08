@@ -347,9 +347,13 @@ class DesignResult:
 
 @dataclass(frozen=True, eq=False)
 class _Context:
-    """The design problem in payout units, with its scale."""
+    """The design problem in payout units, with its scale.
 
-    asset_id: str
+    `asset_id` is `None` when the problem is on several assets' total; its
+    `index` then has one column per asset.
+    """
+
+    asset_id: str | None
     index: FloatArray
     loss: FloatArray
     probability: FloatArray
@@ -379,8 +383,11 @@ class _Context:
         status: str | None = None,
         solver_message: str | None = None,
     ) -> DesignError:
+        subject = (
+            "the joint design" if self.asset_id is None else f"asset {self.asset_id!r}"
+        )
         return kind(
-            f"asset {self.asset_id!r}: {message}",
+            f"{subject}: {message}",
             asset_id=self.asset_id,
             status=status,
             solver_message=solver_message,
@@ -416,6 +423,30 @@ class _Amounts:
     zeroed: tuple[str, ...]
     unique: bool | None
     ranges: dict[str, tuple[float, float]] | None
+
+
+@dataclass(frozen=True, eq=False)
+class _Block:
+    """The amounts of a design, as columns: one cover's, or several side by side."""
+
+    names: tuple[str, ...]
+    basis: FloatArray
+    constraints: LinearConstraints
+    free: NDArray[np.bool_]
+
+
+@dataclass(frozen=True, eq=False)
+class _SolvedBlock:
+    """A block's amounts after the solve, the repair and the fill rule."""
+
+    amounts: FloatArray
+    programme: _solver.Programme
+    solution: _solver.Solution
+    route: Literal["lp", "qp"]
+    ranging: bool
+    identified: NDArray[np.bool_]
+    unidentified: NDArray[np.bool_]
+    zeroed: NDArray[np.bool_]
 
 
 class _Builder:
@@ -805,6 +836,15 @@ def _objective_value(context: _Context, payout: FloatArray) -> float:
     return context.objective.value(context.loss, payout, context.probability)
 
 
+def _over_budget(context: _Context, premium: float) -> str | None:
+    """Describe a premium above the budget, or `None` if it is within it."""
+    if context.bound is not None and premium - context.bound > context.slack(
+        context.bound
+    ):
+        return f"the premium {premium:.10g} exceeds the budget {context.bound:.10g}"
+    return None
+
+
 def _verify(
     context: _Context,
     cover: Cover,
@@ -843,12 +883,9 @@ def _verify(
             if (activity - constraints.b_ub > slack).any():
                 problems.append("the amounts break a linear constraint of the payout")
     premium = _premium(context, payout)
-    if context.bound is not None and premium - context.bound > context.slack(
-        context.bound
-    ):
-        problems.append(
-            f"the premium {premium:.10g} exceeds the budget {context.bound:.10g}"
-        )
+    over_budget = _over_budget(context, premium)
+    if over_budget is not None:
+        problems.append(over_budget)
     if context.limit is not None:
         largest = float(payout.max(initial=0.0))
         if largest - context.limit > context.slack(context.limit):
@@ -875,18 +912,8 @@ def _amount_values(
     }
 
 
-def _design_amounts(
-    candidate: Cover,
-    context: _Context,
-    solves: _Solves,
-    *,
-    report: bool,
-) -> _Amounts:
-    """Solve the amounts of a cover whose thresholds are resolved.
-
-    With `report`, compute the uniqueness report (ranges on the LP route,
-    when asked for; the eigenvalue rule on the QP route).
-    """
+def _read_block(candidate: Cover, context: _Context) -> _Block:
+    """Read a cover's basis and constraints; raise `DesignError` if unusable."""
     payout = cast(LinearInAmounts, candidate.payout)
     names = tuple(payout.amount_names())
     basis = np.asarray(payout.basis(context.index), dtype=np.float64)
@@ -921,6 +948,22 @@ def _design_amounts(
         )
     parameters = payout.parameters()
     free = np.array([isinstance(parameters[name], Free) for name in names])
+    return _Block(names, basis, constraints, free)
+
+
+def _solve_block(
+    block: _Block, context: _Context, solves: _Solves, *, report: bool
+) -> _SolvedBlock:
+    """Solve a block's amounts and apply the repair, the zeroing and the fill rule.
+
+    With `report`, an LP keeps its basis for the ranges, when asked for.
+    """
+    names, basis, constraints, free = (
+        block.names,
+        block.basis,
+        block.constraints,
+        block.free,
+    )
     if (
         isinstance(context.objective, ExpectedUncovered | WeightedCVaR)
         and context.bound is None
@@ -936,72 +979,134 @@ def _design_amounts(
     ranging = report and route == "lp" and context.options.ranges
     solution = _solve(programme, route, context, solves, keep_basis=ranging)
     assert solution.values is not None and solution.objective is not None
-    k = len(names)
     edges, other = _order_edges(constraints)
-    amounts = _repair(solution.values[:k] * context.scale, constraints, edges)
+    amounts = _repair(solution.values[: len(names)] * context.scale, constraints, edges)
     small = (
         free
         & (constraints.lower <= 0.0)
         & (np.abs(amounts) <= ZERO_AMOUNT * context.scale)
     )
-    zeroed = tuple(
-        name
-        for name, flag, value in zip(names, small, amounts, strict=True)
-        if flag and value != 0.0
-    )
+    zeroed = small & (amounts != 0.0)
     amounts = _repair(np.where(small, 0.0, amounts), constraints, edges)
     identified = np.any(basis != 0.0, axis=0)
     unidentified = free & ~identified
     amounts = _fill(
         amounts, unidentified, constraints, edges, other, context, solves, names
     )
+    return _SolvedBlock(
+        amounts=amounts,
+        programme=programme,
+        solution=solution,
+        route=route,
+        ranging=ranging,
+        identified=identified,
+        unidentified=unidentified,
+        zeroed=zeroed,
+    )
+
+
+def _resolve_amounts(
+    candidate: Cover, names: Sequence[str], amounts: FloatArray, context: _Context
+) -> tuple[Cover, dict[str, float]]:
+    """Put solved amounts into a cover; raise `DesignError` if they don't fit."""
     values = _amount_values(candidate, names, amounts)
     try:
-        cover = candidate.with_values(values)
+        return candidate.with_values(values), values
     except CoverDefinitionError as error:
         raise context.error(
             DesignError, f"the solved amounts do not make a valid cover: {error}"
         ) from error
-    _, value, _ = _verify(context, cover, amounts, basis, constraints)
+
+
+def _check_objective(value: float, solved: _SolvedBlock, context: _Context) -> None:
+    """Raise `DesignError` if numpy's objective differs from the solver's."""
+    assert solved.solution.objective is not None
     scaled = context.scaled(value)
-    if abs(scaled - solution.objective) > context.options.feasibility_tolerance * max(
-        1.0, abs(scaled)
-    ):
+    if abs(
+        scaled - solved.solution.objective
+    ) > context.options.feasibility_tolerance * max(1.0, abs(scaled)):
         raise context.error(
             DesignError,
             f"the objective recomputed in numpy ({scaled:.12g}, scaled) differs "
-            f"from the solver's ({solution.objective:.12g})",
+            f"from the solver's ({solved.solution.objective:.12g})",
             status="inconsistent_objective",
         )
-    unique: bool | None = None
-    ranges: dict[str, tuple[float, float]] | None = None
-    ranged = [j for j in range(k) if free[j] and identified[j]]
-    if report and route == "qp":
-        if ranged:
-            gram = basis[:, ranged].T @ (
-                basis[:, ranged] * context.probability[:, None]
-            )
-            eigen = np.linalg.eigvalsh(gram)
-            unique = bool(eigen.min() > MSE_EIGEN_TOLERANCE * eigen.max())
-        else:
-            unique = True
-    elif ranging:
-        wide, unique = _ranges(programme, solution, ranged, context, solves)
-        ranges = {
-            names[j]: (low * context.scale + 0.0, high * context.scale + 0.0)
+
+
+def _uniqueness(
+    block: _Block,
+    solved: _SolvedBlock,
+    context: _Context,
+    solves: _Solves,
+    *,
+    report: bool,
+) -> tuple[bool | None, dict[int, tuple[float, float]] | None]:
+    """The uniqueness report: whether the optimum is unique, and the ranges.
+
+    On the QP route `unique` comes from the eigenvalue rule; on the LP route,
+    when ranges are asked for, from the ranges, returned by column in payout
+    units. Without `report`, or on the LP route without ranges, both are
+    `None`.
+    """
+    ranged = [
+        j for j in range(len(block.names)) if block.free[j] and solved.identified[j]
+    ]
+    if report and solved.route == "qp":
+        if not ranged:
+            return True, None
+        gram = block.basis[:, ranged].T @ (
+            block.basis[:, ranged] * context.probability[:, None]
+        )
+        eigen = np.linalg.eigvalsh(gram)
+        return bool(eigen.min() > MSE_EIGEN_TOLERANCE * eigen.max()), None
+    if solved.ranging:
+        wide, unique = _ranges(
+            solved.programme, solved.solution, ranged, context, solves
+        )
+        return unique, {
+            j: (low * context.scale + 0.0, high * context.scale + 0.0)
             for j, (low, high) in wide.items()
         }
+    return None, None
+
+
+def _masked_names(names: Sequence[str], mask: NDArray[np.bool_]) -> tuple[str, ...]:
+    return tuple(name for name, flag in zip(names, mask, strict=True) if flag)
+
+
+def _design_amounts(
+    candidate: Cover,
+    context: _Context,
+    solves: _Solves,
+    *,
+    report: bool,
+) -> _Amounts:
+    """Solve the amounts of a cover whose thresholds are resolved.
+
+    With `report`, compute the uniqueness report (ranges on the LP route,
+    when asked for; the eigenvalue rule on the QP route).
+    """
+    block = _read_block(candidate, context)
+    solved = _solve_block(block, context, solves, report=report)
+    cover, values = _resolve_amounts(candidate, block.names, solved.amounts, context)
+    _, value, _ = _verify(
+        context, cover, solved.amounts, block.basis, block.constraints
+    )
+    _check_objective(value, solved, context)
+    unique, by_column = _uniqueness(block, solved, context, solves, report=report)
     return _Amounts(
         cover=cover,
         values=values,
         objective_value=value,
-        route=route,
-        unidentified=tuple(
-            name for name, flag in zip(names, unidentified, strict=True) if flag
-        ),
-        zeroed=zeroed,
+        route=solved.route,
+        unidentified=_masked_names(block.names, solved.unidentified),
+        zeroed=_masked_names(block.names, solved.zeroed),
         unique=unique,
-        ranges=ranges,
+        ranges=(
+            None
+            if by_column is None
+            else {block.names[j]: bounds for j, bounds in by_column.items()}
+        ),
     )
 
 
@@ -1157,8 +1262,21 @@ def _check_inputs(
     limit: Any,
     options: Any,
 ) -> None:
+    if not isinstance(template, Cover):
+        raise TypeError(f"template must be a Cover, got {type(template).__name__}")
+    _check_terms(sample, objective, pricing, budget, limit, options)
+
+
+def _check_terms(
+    sample: Any,
+    objective: Any,
+    pricing: Any,
+    budget: Any,
+    limit: Any,
+    options: Any,
+) -> None:
+    """Check the arguments a design takes besides its template or templates."""
     checks: tuple[tuple[str, Any, Any, str], ...] = (
-        ("template", template, Cover, "a Cover"),
         ("sample", sample, OutcomeSample, "an OutcomeSample"),
         (
             "objective",
@@ -1189,6 +1307,16 @@ def _check_template(template: Cover, sample: OutcomeSample) -> None:
             "the template has no free parameters: there is nothing to design; "
             "evaluate the cover with evaluate()"
         )
+    _check_units(template, sample)
+    asset = sample.asset_ids[0]
+    if template.asset_id is not None and template.asset_id != asset:
+        raise SampleError(
+            f"the cover is written for asset {template.asset_id!r}, but the "
+            f"sample holds asset {asset!r}"
+        )
+
+
+def _check_units(template: Cover, sample: OutcomeSample) -> None:
     if template.payout_unit != sample.loss_unit:
         raise SampleError(
             f"the cover pays in {template.payout_unit!r}, but the sample's loss "
@@ -1198,12 +1326,6 @@ def _check_template(template: Cover, sample: OutcomeSample) -> None:
         raise SampleError(
             f"the cover's index is in {template.index.unit!r}, but the sample's "
             f"index is in {sample.index_unit!r}"
-        )
-    asset = sample.asset_ids[0]
-    if template.asset_id is not None and template.asset_id != asset:
-        raise SampleError(
-            f"the cover is written for asset {template.asset_id!r}, but the "
-            f"sample holds asset {asset!r}"
         )
 
 

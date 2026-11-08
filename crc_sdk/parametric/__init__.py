@@ -16,7 +16,9 @@ into a loss and a `BasisRisk` model states how index and loss differ.
 `design` chooses a template's free parameters on an outcome sample for an
 objective (`MSE`, `ExpectedUncovered`, `WeightedCVaR` or a `UserObjective`)
 under a `Budget` and a `Limit`; its LP and QP routes need the optional extra
-`crc-sdk[parametric]`. `evaluate` and `compare` assess covers and designs.
+`crc-sdk[parametric]`. `design_joint` designs one cover per asset of a
+sample of several assets, for one objective and one budget on the asset
+owner's total. `evaluate` and `compare` assess covers and designs.
 
 `ParametricPlan` chains these steps as a lazy plan, to a written
 comparison: `ParametricPlan.for_evaluation(request)` from the fitted hazard
@@ -58,6 +60,12 @@ from crc_sdk.parametric.index import (
     AtPoint,
     AtStation,
     IndexDefinition,
+)
+from crc_sdk.parametric.joint import (
+    Individual,
+    Joint,
+    JointDesignResult,
+    design_joint,
 )
 from crc_sdk.parametric.loss import LossModel
 from crc_sdk.parametric.metadata import EvaluationMetadata, setup_text
@@ -123,7 +131,10 @@ __all__ = [
     "Holdout",
     "ImpactNoise",
     "IndexDefinition",
+    "Individual",
     "InfeasibleDesignError",
+    "Joint",
+    "JointDesignResult",
     "KFold",
     "LeakageError",
     "Limit",
@@ -155,6 +166,7 @@ __all__ = [
     "WeightedCVaR",
     "compare",
     "design",
+    "design_joint",
     "evaluate",
     "holdout",
     "register_payout",
