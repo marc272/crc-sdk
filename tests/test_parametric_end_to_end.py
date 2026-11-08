@@ -119,7 +119,7 @@ def test_the_docs_quick_start_runs_as_written(
     per_year = _python_blocks("## Next step: per-year values")
     curve_by_hand = _python_blocks("### From a fitted curve")
     annual_by_hand = _python_blocks("### From per-year values")
-    assert [len(blocks) for blocks in (quick_start, builders, per_year)] == [2, 1, 1]
+    assert [len(blocks) for blocks in (quick_start, builders, per_year)] == [2, 1, 2]
     assert [len(blocks) for blocks in (curve_by_hand, annual_by_hand)] == [1, 1]
     monkeypatch.chdir(tmp_path)
     namespace: dict[str, Any] = {}
@@ -250,6 +250,20 @@ def test_the_docs_quick_start_runs_as_written(
         if e["split"] == "out_of_sample"
     ]
     assert held[0]["details"] == {"train_fraction": 0.7, "plan_seed": 42}
+
+    # The index read elsewhere: the covers pay on the station's series.
+    station_result = namespace["station_result"]
+    assert station_result.row_count == 4
+    station_sample = station_result.samples["warehouse-a"]
+    assert station_sample.provenance.details["index_from"] == "series"
+    assert {
+        entry.document["index"]["location"]["station_id"]
+        for entry in station_result.metadata.covers
+    } == {"ST-1"}
+    assert (
+        "the index series from provider example and dataset synthetic gauges"
+        in setup_text(station_result.metadata)
+    )
 
     # The function route by hand gives each plan's samples and design.
     with warnings.catch_warnings():

@@ -155,6 +155,7 @@ and nothing more.
 ParametricPlan.for_evaluation(request, *, value_column=None, value_unit="1")
   .monte_carlo(n_draws, *, seed, assume_semantics=None, outside_support="raise")
 ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance, ...)
+  .index(source, *, location, unit, provenance, ...)   # optional: read elsewhere
 # then, on either plan:
   .basis_risk(model)                          # required
   .covers(*covers)                            # resolved covers and templates
@@ -211,7 +212,7 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance, 
 | --- | --- |
 | `.monte_carlo(n_draws, *, seed, ...)` | Fitted curves only, and required there: the simulated years per asset, the plan's seed, the semantics the caller states for a dataset that declares none, and `outside_support` |
 | `.basis_risk(model)` | How index and loss differ: `NoBasisRisk()` (warns with `ComonotoneIndexWarning`), `ImpactNoise(sigma, upper=...)` or a `BasisRisk` of your own. Required: no model is assumed |
-| `.covers(*covers)` | The covers to compare. A template is designed; a resolved cover is evaluated as it is. A cover written for no asset applies to every asset, as a copy written for that asset; one written for an asset applies to it only. Each cover pays in the loss unit, on an index read at the asset (`AtAsset()`), in the hazard's unit |
+| `.covers(*covers)` | The covers to compare. A template is designed; a resolved cover is evaluated as it is. A cover written for no asset applies to every asset, as a copy written for that asset; one written for an asset applies to it only. Each cover pays in the loss unit, on an index read at the asset (`AtAsset()`), in the hazard's unit, or as [`.index(...)`](#an-index-read-elsewhere) states |
 | `.objective(*objectives, pricing, budget, limit, options)` | Designs every template under each objective, with `design`'s terms. `pricing` is the plan's pricing, below |
 | `.pricing(pricing)` | The plan's pricing, `PurePremium()` or `CostOfCapitalLoad(rate, q)`, for a plan of resolved covers that has no `.objective(...)` |
 | `.split(rule)` | `FreshDraws(n_draws, seed=...)` (fitted curves), `Holdout(train_fraction)` or `KFold(k)`, below |
@@ -410,6 +411,98 @@ The builders, splits, seeding and outputs are those above.
   the table holds); a year without a value raises, unless `missing="drop_year"`
   drops it and lists it. No trend is removed.
 
+### An index read elsewhere
+
+The covers can pay on a series read elsewhere than the loss, such as a station
+or a grid cell that is not the asset's own. `.index(...)` states that series;
+the loss still reads the hazard of `for_annual_extremes`. It is for plans on
+per-year values:
+
+```python
+from crc_sdk.parametric import NoBasisRisk, StationColumn
+
+# The layout of a station plan's annual_extremes(): one row per year and station.
+stations = pa.table({
+    "station": ["ST-1"] * len(years),
+    "year": years.astype("int32"),
+    "value": rng.gumbel(45.0, 11.0, len(years)),       # mm/day
+})
+gauges = SourceProvenance(provider="example", dataset="synthetic gauges",
+                          licence="CC0-1.0", attribution="Synthetic data")
+
+station_plan = (
+    ParametricPlan.for_annual_extremes(
+        annual, assets.append_column("station_id", pa.array(["ST-1"])),
+        impact=PiecewiseLinearImpact([40.0, 120.0], [0.0, 0.5]),
+        unit="mm/day", value_column="value_eur", value_unit="EUR",
+        provenance=provenance, seed=42,
+    )
+    .index(stations, location=StationColumn("station_id"), unit="mm/day",
+           provenance=gauges)
+    .basis_risk(NoBasisRisk())                 # required, as on every plan
+    .covers(step, linear)
+    .objective(ExpectedUncovered(), budget=Budget(ratio=0.8))
+    .split(Holdout(0.7))
+    .metrics(MetricOptions(betas=(0.9,), return_periods=(10,)))
+)
+station_result = station_plan.write_parquet("station-comparison.parquet")
+```
+
+```text
+.index(source, *, location, unit, provenance, point=None, year_column="year",
+       index_column="value")
+```
+
+Each asset's sample is that of `sample_annual(hazard, index=series, ...)` built
+by hand ([from per-year values](#from-per-year-values)), so the dependence
+between index and loss is the data's own.
+
+- **`source`** takes what `for_annual_extremes` takes, and is read once per
+  execution. `year_column` and `index_column` name its columns.
+- **`location`** is required. `StationColumn(name)` reads the station an asset
+  column names. `NearestCell(...)` reads the nearest cell of the index
+  source's own grid, under the rule above: at the asset's location by default,
+  or, with `point=PointColumns(longitude, latitude)`, at the point that those
+  asset columns hold, such as a reference site. Only the matched cell is
+  recorded, not the point, so an index grid finer than the hazard's records an
+  asset's place to within its own cell. `point=` with `StationColumn` raises
+  `ValueError`.
+- **`unit`** is the index series' unit. It is checked against a `unit` column
+  of the table and against the source plan's `explain()`, and not against the
+  impact, because the loss does not read it.
+- **`provenance`** states the index source's licence, attribution and version,
+  as for the hazard.
+- **The years.** The index is read on exactly the hazard's years. A hazard year
+  that the index lacks or holds as null is a missing year under the plan's one
+  `missing=`: it raises and is listed or, with `missing="drop_year"`, it is
+  dropped from the sample and listed in `dropped_years`. An index year the
+  hazard does not have is not used, and `unused_index_years` lists it.
+- **The covers.** At execution, a cover stated with `AtAsset()` is bound to each
+  asset's resolved location, as the plan already binds it to the asset:
+  `AtStation(<the asset's station id>)`, or `AtPoint(<the matched cell's
+  centre>)` with its longitude wrapped to [−180, 180]. So the location is in the
+  cover's document, its `definition_hash`, the `cover_hash` column and the
+  `design_id`, and the asset's own point is not. A cover that already names a
+  location must name that one: another kind of location raises `SampleError`
+  at `.covers(...)`, and another station or point at execution.
+- **Units and order.** `.covers(...)` checks a cover's index unit against
+  `.index`'s `unit`, not the hazard's, so state `.index(...)` first when the
+  two differ or when a cover names a location. Stated after `.covers(...)`, it
+  checks the covers again and raises on a mismatch.
+- **Basis risk.** `.basis_risk(model)` stays required. `NoBasisRisk()` does not
+  warn with a separate index series, as in `sample_annual`, and `ImpactNoise`
+  may be added on top.
+- **What is recorded.** `explain()` shows the covers as stated and the location
+  rule, in the `sources` entry with role `"index"`. In the written metadata,
+  `covers` holds the bound documents; `sources` has an entry with role
+  `"index"`, the series with its matched cell or station; `source_records` has
+  an `{"index_table": ...}` record of the form of `annual_table`, which each
+  index entry names by `index_table_sha256`; and `licences` holds the index
+  source's terms. Each sample's notes, and so the setup text, state where its
+  index is read.
+- **Refused.** On a plan on fitted curves `.index(...)` raises `ValueError`: an
+  index at another location needs a joint distribution of two curves.
+
 ## The function route
 
 The plan's steps are functions you can chain by hand, for a table, a curve or
@@ -475,7 +568,8 @@ write_comparison(table, "by-hand-annual.parquet")   # atomic
 
 `AnnualSeries.from_table(table, where={"station": ...}, unit=...)` reads a
 station instead, and `sample_annual(..., index=other_series)` reads the index
-at another cell, station or hazard than the loss.
+at another cell, station or hazard than the loss, as the plan's
+[`.index(...)`](#an-index-read-elsewhere) does.
 
 ## Reporting numbers
 
@@ -1100,9 +1194,9 @@ years or fresh draws, are the ones to report.
 - **Remote requests in the plan.** `for_evaluation` takes a request on a local
   canonical file; materialize a remote source first (its `materialize(path)`
   returns the `HazardDataset`).
-- **An index read elsewhere in the plan.** The plan reads the index at each
-  asset. On per-year values, `sample_annual(..., index=series)` reads it at
-  another cell, station or hazard; on fitted curves, an index elsewhere needs
-  a joint distribution of two curves, which the curves do not give.
+- **An index read elsewhere on fitted curves.** A plan on fitted curves reads
+  the index at each asset: an index elsewhere needs a joint distribution of two
+  curves, which the curves do not give. On per-year values,
+  [`.index(...)`](#an-index-read-elsewhere) reads it elsewhere.
 - **Pooled k-fold metrics, bootstrap intervals, trend removal.** Each fold has
   its own rows, and years are used as recorded.

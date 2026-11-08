@@ -8,6 +8,7 @@ points:
 ParametricPlan.for_evaluation(request, value_column=, value_unit=)   # fitted curves
   .monte_carlo(n_draws, seed=)          # required there: simulated years
 ParametricPlan.for_annual_extremes(source, assets, impact=, unit=, provenance=)
+  .index(source, location=, unit=, provenance=)   # optional: read elsewhere
 # then, on either plan:
   .basis_risk(model)                    # required: how index and loss differ
   .covers(*covers)                      # resolved covers and templates
@@ -48,6 +49,15 @@ gets one `OutcomeSample` from `sample_annual`: its years are the rows, each
 with probability 1/n, and no trend is removed. `cell=` gives point assets the
 H3 cell that some registry impacts need in their context: the name of an
 asset column, or `H3Cell(resolution=r)` for the cell of the asset's point.
+
+**An index read elsewhere** (`.index`, per-year values only). The cover pays on
+a series from a second source, at a station an asset column names or in the
+grid cell nearest the asset or another point, while the loss still reads the
+hazard. Each asset's sample is that of `sample_annual(hazard, index=series)`.
+The index is read on exactly the hazard's years, under the plan's one
+`missing=`. A cover stated with `AtAsset()` is bound at execution to each
+asset's resolved `AtStation` or `AtPoint` (the cell centre, never the asset's
+own point), so the location is in its document and its hashes.
 
 On both routes the loss is `impact(hazard) × value`, with the value from an
 asset column or 1 (the damage ratio), and the basis-risk model is required:
@@ -91,7 +101,8 @@ builds it, through a temporary sibling and `os.replace`. Its metadata under
 number: the samples with their source, loss and basis-risk models, the
 splits, the pricing, the designs and the covers, plus the source's record
 once, in `source_records` (the canonical file's path and SHA-256, or the
-annual table's checksum and the source plan's `explain()`), the licences,
+annual table's checksum and the source plan's `explain()`, and the index
+table's likewise), the licences,
 the generator states, and the plan's seed in every evaluation's `details`
 (`"plan_seed"`, with `"fresh_draws_seed"` on fresh-draw rows). Asset values
 are never written; the metadata holds a SHA-256 of the (asset id, value)
@@ -124,6 +135,7 @@ from crc_framework import (
     impact_registry_manifest,
 )
 from crc_framework import ImpactExpression as FrameworkImpactExpression
+from numpy.typing import NDArray
 
 from crc_sdk.impacts.calibration import units_equivalent
 from crc_sdk.impacts.expression import ImpactExpression
@@ -134,7 +146,7 @@ from crc_sdk.parametric.cover import Cover
 from crc_sdk.parametric.design import DesignOptions, DesignResult, design
 from crc_sdk.parametric.errors import ProbabilitySemanticsError, SampleError
 from crc_sdk.parametric.evaluate import compare, write_comparison
-from crc_sdk.parametric.index import AtAsset
+from crc_sdk.parametric.index import AtAsset, AtPoint, AtStation, IndexDefinition
 from crc_sdk.parametric.loss import LossModel
 from crc_sdk.parametric.metadata import EVALUATION_METADATA_KEY, EvaluationMetadata
 from crc_sdk.parametric.metrics import MetricOptions
@@ -188,6 +200,10 @@ __all__ = [
     "StationColumn",
 ]
 
+_CURVES_READ_AT_THE_ASSET = (
+    "an index read elsewhere than a fitted curve's asset needs a joint "
+    "distribution of two curves, which the curves do not give"
+)
 _EXECUTION = (
     "the source is read, the samples are built and the covers are designed and "
     "evaluated only at samples(), designs() and write_parquet()"
@@ -440,6 +456,37 @@ class H3Cell:
         return {"kind": "h3_cell", "resolution": self.resolution}
 
 
+@dataclass(frozen=True, eq=False)
+class _SeriesRead:
+    """What a plan reads for each asset: its hazard or its `.index(...)` series.
+
+    `years` are the years the plan states for the hazard. The index takes the
+    hazard's years at execution, so its `years` are `None`, and `point` names
+    the asset columns of another point for `NearestCell` to read at.
+    """
+
+    role: Literal["hazard", "index"]
+    source: Any
+    location: NearestCell | StationColumn
+    unit: str
+    provenance: SourceProvenance
+    year_column: str
+    value_column: str
+    years: tuple[int, ...] | None = None
+    point: PointColumns | None = None
+
+
+@dataclass(frozen=True, eq=False)
+class _OpenedRead:
+    """A `_SeriesRead` at execution: its table and what is recorded of it."""
+
+    read: _SeriesRead
+    table: Any
+    record: dict[str, Any]
+    source: dict[str, Any]
+    pathway: str | None
+
+
 @dataclass(frozen=True)
 class _DesignSpec:
     """What `.objective(...)` states: the objectives and the design terms.
@@ -531,6 +578,7 @@ class _Run:
     source: dict[str, Any]
     id_column: str
     values_sha256: str | None
+    index_source: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -542,6 +590,8 @@ class _Samples:
     fresh: dict[str, OutcomeSample] | None
     record_key: str
     record: dict[str, Any]
+    index_record: dict[str, Any] | None = None
+    locations: Mapping[str, AtPoint | AtStation] | None = None
 
 
 # -- helpers -----------------------------------------------------------------
@@ -689,13 +739,149 @@ def _objective_tag(objective: Objective) -> str:
     return str(objective.to_document()["kind"])
 
 
-def _bound(cover: Cover, asset_id: str, label: str | None = None) -> Cover:
-    """`cover` written for `asset_id`, with `label` if given."""
+def _index_origin(read: _SeriesRead) -> str:
+    """Where `.index(...)` takes an asset's index series from, in words."""
+    if isinstance(read.location, StationColumn):
+        return f"the station the asset column {read.location.name} names"
+    if read.point is None:
+        return "the grid cell of the index source nearest the asset"
+    return (
+        "the grid cell of the index source nearest the point in the asset "
+        f"columns {read.point.longitude} and {read.point.latitude}"
+    )
+
+
+def _wrapped_longitude(longitude: float) -> float:
+    """`longitude` within [-180, 180], as `AtPoint` takes it; a grid may run to 360."""
+    if -180.0 <= longitude <= 180.0:
+        return longitude
+    return (longitude + 180.0) % 360.0 - 180.0
+
+
+def _resolved_location(
+    read: _SeriesRead, series: AnnualSeries, row: Mapping[str, Any]
+) -> AtPoint | AtStation:
+    """Where an asset's index series was read: its station, or the cell centre.
+
+    The matched cell's centre, as the series records it, and not the point it
+    was matched from: the asset's own point stays out of the cover's document.
+    """
+    if isinstance(read.location, StationColumn):
+        return AtStation(str(row[read.location.name]))
+    cell = series.provenance["cell"]
+    return AtPoint(
+        _wrapped_longitude(float(cell["longitude"])), float(cell["latitude"])
+    )
+
+
+def _on_years(
+    series: AnnualSeries, years: NDArray[np.int64]
+) -> tuple[AnnualSeries, list[int]]:
+    """`series` on exactly `years`, and the years with a value that it left out.
+
+    A year of `years` that `series` does not hold has no value, so that the
+    plan's `missing=` decides what becomes of it, as for a null year.
+    """
+    values = np.full(years.shape[0], np.nan)
+    _, on_years, in_series = np.intersect1d(
+        years, series.years, assume_unique=True, return_indices=True
+    )
+    values[on_years] = series.values[in_series]
+    held = series.years[~np.isnan(series.values)]
+    unused = [int(year) for year in np.setdiff1d(held, years)]
+    return AnnualSeries(years, values, series.unit, _thaw(series.provenance)), unused
+
+
+def _index_recorded(
+    sample: OutcomeSample,
+    read: _SeriesRead,
+    location: AtPoint | AtStation,
+    unused: Sequence[int],
+) -> OutcomeSample:
+    """`sample` with the index years not used and where the index was read."""
+    asset_id = sample.asset_ids[0]
+    place = (
+        f"station {location.station_id}"
+        if isinstance(location, AtStation)
+        else (
+            f"the grid cell centred at latitude {location.latitude:g}, "
+            f"longitude {location.longitude:g}"
+        )
+    )
+    notes = [
+        f"The index of asset {asset_id} is read at {place}: {_index_origin(read)}."
+    ]
+    if unused:
+        noun, verb = ("year", "is") if len(unused) == 1 else ("years", "are")
+        notes.append(
+            f"{len(unused)} index {noun} outside the hazard's years {verb} not "
+            f"used: {', '.join(str(year) for year in unused[:10])}"
+            f"{', ...' if len(unused) > 10 else ''}."
+        )
+    provenance = dataclasses.replace(
+        sample.provenance,
+        details={
+            **_thaw(sample.provenance.details),
+            "unused_index_years": list(unused),
+        },
+        notes=(*sample.provenance.notes, *notes),
+    )
+    return dataclasses.replace(sample, provenance=provenance)
+
+
+def _same_location(first: Any, second: Any) -> bool:
+    """Whether two stated locations name one station, or one point on the globe."""
+    if isinstance(first, AtStation) and isinstance(second, AtStation):
+        return first.station_id == second.station_id
+    if isinstance(first, AtPoint) and isinstance(second, AtPoint):
+        d_lon = (first.longitude - second.longitude + 180.0) % 360.0 - 180.0
+        return math.isclose(
+            first.latitude, second.latitude, abs_tol=1e-9
+        ) and math.isclose(d_lon, 0.0, abs_tol=1e-9)
+    return False
+
+
+def _index_at(
+    cover: Cover, asset_id: str, location: AtPoint | AtStation
+) -> IndexDefinition:
+    """`cover`'s index, for an asset whose index series is read at `location`.
+
+    A cover stated with `AtAsset()` is bound to it; one that already names a
+    location keeps its own, which must be that one.
+    """
+    index = cover.index
+    if isinstance(index.location, AtAsset):
+        return IndexDefinition(
+            index.hazard_name,
+            index.unit,
+            tail=index.tail,
+            location=location,
+            aggregation=index.aggregation,
+            source=index.source,
+        )
+    if _same_location(index.location, location):
+        return index
+    raise SampleError(
+        f"cover {cover.label or cover.definition_hash!r} names the location "
+        f"{index.location!r}, but the plan reads the index of asset {asset_id!r} "
+        f"at {location!r}; name that one, or state AtAsset()"
+    )
+
+
+def _bound(
+    cover: Cover,
+    asset_id: str,
+    label: str | None = None,
+    *,
+    location: AtPoint | AtStation | None = None,
+) -> Cover:
+    """`cover` written for `asset_id`, with `label` and `location` if given."""
     name = cover.label if label is None else label
-    if cover.asset_id == asset_id and name == cover.label:
+    index = cover.index if location is None else _index_at(cover, asset_id, location)
+    if cover.asset_id == asset_id and name == cover.label and index is cover.index:
         return cover
     return Cover(
-        cover.index,
+        index,
         cover.payout,
         payout_unit=cover.payout_unit,
         asset_id=asset_id,
@@ -869,17 +1055,18 @@ class ParametricPlan:
 
     Start one with `ParametricPlan.for_evaluation(request)` (fitted curves)
     or `ParametricPlan.for_annual_extremes(...)` (per-year values); the
-    builders (`monte_carlo`, `basis_risk`, `covers`, `objective`, `pricing`,
-    `split`, `metrics`) return new plans, and neither they nor `explain()`
-    do any I/O. The execution points `samples()`, `designs()` and
+    builders (`monte_carlo`, `index`, `basis_risk`, `covers`, `objective`,
+    `pricing`, `split`, `metrics`) return new plans, and neither they nor
+    `explain()` do any I/O. The execution points `samples()`, `designs()` and
     `write_parquet(path)` read the source and the assets. The module
     docstring describes both routes.
 
     `entry` names the entry point. On the curve route `source` is the
     request, `unit` and `provenance` are `None` (the dataset's metadata
     states them at execution) and `draws` holds what `monte_carlo` states.
-    `pricing_rule` holds what `.pricing(...)` states, and `cell` what
-    `for_annual_extremes(..., cell=...)` states.
+    `pricing_rule` holds what `.pricing(...)` states, `cell` what
+    `for_annual_extremes(..., cell=...)` states, and `index_read` what
+    `.index(...)` states.
     """
 
     source: Any
@@ -902,6 +1089,7 @@ class ParametricPlan:
     draws: _MonteCarlo | None = None
     pricing_rule: Pricing | None = None
     cell: str | H3Cell | None = None
+    index_read: _SeriesRead | None = None
 
     # -- the entry points -----------------------------------------------------
 
@@ -1220,7 +1408,8 @@ class ParametricPlan:
         """State the basis-risk model every sample is built with.
 
         `NoBasisRisk()` (the index is the hazard at the asset; samples warn
-        with `ComonotoneIndexWarning`), `ImpactNoise(sigma, upper=...)` or a
+        with `ComonotoneIndexWarning`, except with `.index(...)`, where the
+        index is another series), `ImpactNoise(sigma, upper=...)` or a
         user model that implements `BasisRisk`. Required before execution.
         Raises `TypeError` for another type, and `ValueError` for
         `ImpactNoise` on a plan on per-year values without a seed (on fitted
@@ -1246,7 +1435,11 @@ class ParametricPlan:
         is. Each cover pays in the loss unit on an index read at the asset
         (`AtAsset()`), in the table's unit on per-year values; on fitted
         curves the index unit is checked against the dataset's `value_unit`
-        at execution. Replaces any covers set before.
+        at execution. With `.index(...)`, stated first, the index unit is
+        checked against its `unit`, and a cover may also name the location
+        that the index is read at (`AtStation` or `AtPoint`, the kind that
+        `.index`'s `location` resolves to), which is checked at execution.
+        Replaces any covers set before.
 
         Raises `TypeError` for a non-cover, `SampleError` for a cover in
         other units or on an index read elsewhere, and `ValueError` for no
@@ -1258,24 +1451,7 @@ class ParametricPlan:
         for cover in covers:
             if not isinstance(cover, Cover):
                 raise TypeError(f"expected a Cover, got {type(cover).__name__}")
-            if cover.payout_unit != self.loss_model.value_unit:
-                raise SampleError(
-                    f"cover {cover.label or cover.definition_hash!r} pays in "
-                    f"{cover.payout_unit!r}, but the loss is in "
-                    f"{self.loss_model.value_unit!r}"
-                )
-            if self.unit is not None and cover.index.unit != self.unit:
-                raise SampleError(
-                    f"cover {cover.label or cover.definition_hash!r} pays on an "
-                    f"index in {cover.index.unit!r}, but the table's values are "
-                    f"in {self.unit!r}"
-                )
-            if not isinstance(cover.index.location, AtAsset):
-                raise SampleError(
-                    "the plan reads the index at each asset (AtAsset()); for an "
-                    "index read elsewhere, build the samples with "
-                    "sample_annual(..., index=series)"
-                )
+            self._check_cover(cover)
             key = (cover.definition_hash, cover.asset_id)
             if key in seen:
                 raise ValueError(
@@ -1284,6 +1460,166 @@ class ParametricPlan:
                 )
             seen.add(key)
         return dataclasses.replace(self, cover_list=tuple(covers))
+
+    def _check_cover(self, cover: Cover) -> None:
+        """Check a cover against the loss unit and the index the plan reads."""
+        name = cover.label or cover.definition_hash
+        if cover.payout_unit != self.loss_model.value_unit:
+            raise SampleError(
+                f"cover {name!r} pays in {cover.payout_unit!r}, but the loss is in "
+                f"{self.loss_model.value_unit!r}"
+            )
+        read = self.index_read
+        unit = self.unit if read is None else read.unit
+        if unit is not None and cover.index.unit != unit:
+            values = "table's" if read is None else "index series'"
+            raise SampleError(
+                f"cover {name!r} pays on an index in {cover.index.unit!r}, but the "
+                f"{values} values are in {unit!r}"
+            )
+        location = cover.index.location
+        if isinstance(location, AtAsset):
+            return
+        if read is None:
+            raise SampleError(
+                "this plan reads the index at each asset (AtAsset()); "
+                + (
+                    _CURVES_READ_AT_THE_ASSET
+                    if self._on_curves
+                    else "to read it elsewhere, state where with .index(source, "
+                    "location=..., unit=..., provenance=...) before .covers(...)"
+                )
+            )
+        expected = AtStation if isinstance(read.location, StationColumn) else AtPoint
+        if not isinstance(location, expected):
+            raise SampleError(
+                f"cover {name!r} names the location {location!r}, but .index(...) "
+                f"resolves each asset's to an {expected.__name__}; name that one, "
+                "or state AtAsset()"
+            )
+
+    def _index_refusal(self) -> str | None:
+        """Why this plan cannot read its index elsewhere; `None` if it can."""
+        if self._on_curves:
+            return f".index(...) reads per-year values; {_CURVES_READ_AT_THE_ASSET}"
+        return None
+
+    def index(
+        self,
+        source: Any,
+        *,
+        location: NearestCell | StationColumn,
+        unit: str,
+        provenance: SourceProvenance,
+        point: PointColumns | None = None,
+        year_column: str = "year",
+        index_column: str = "value",
+    ) -> ParametricPlan:
+        """Read the index elsewhere: the series each cover pays on.
+
+        For plans on per-year values. The covers pay on a series read from
+        `source` at `location`; the loss still reads the hazard of
+        `for_annual_extremes`. Each asset's sample is that of
+        `sample_annual(hazard, index=series, ...)`, so `NoBasisRisk()` does
+        not warn, and `.basis_risk(...)` is required all the same.
+
+        - `source` takes what `for_annual_extremes` takes: a plan with an
+          `annual_extremes()` execution point, an Arrow table or a local
+          Parquet file; it is read only at an execution point.
+        - `location` is required: `StationColumn(name)`, the station an asset
+          column names, or `NearestCell(...)`, the nearest cell of the index
+          source's own grid, accepted as for the hazard. `NearestCell` reads
+          at the asset's own location by default; `point=PointColumns(longitude,
+          latitude)` names asset columns holding another point, such as a
+          reference site. Only the matched cell is recorded, not the point,
+          so an index grid finer than the hazard's records an asset's place
+          to within its own cell.
+        - `unit` is the index series' unit. It is checked against a `unit`
+          column of the table and the source plan's `explain()`, and not
+          against the impact, because the loss does not read it. A cover's
+          index unit is checked against it, so state `.index(...)` before
+          `.covers(...)` when the two units differ or a cover names a
+          location; stated after, it checks the covers again.
+        - `provenance` states the index source's licence, attribution and
+          version, as for the hazard. `year_column` and `index_column` name
+          the table's year and value columns.
+
+        **The years.** The index is read on exactly the hazard's years. A
+        hazard year the index lacks or holds as null is a missing year,
+        under the plan's one `missing=`: it raises and is listed, or with
+        `missing="drop_year"` it is dropped from the sample and listed in
+        `dropped_years`. An index year the hazard does not have is not used,
+        and `unused_index_years` lists it.
+
+        **The covers.** At execution, a cover stated with `AtAsset()` is
+        bound to each asset's resolved location: `AtStation` with the asset's
+        station id, or `AtPoint` at the matched cell's centre, its longitude
+        wrapped to [-180, 180]. The location is thus in its document and in
+        `definition_hash` and `design_id`, and the asset's own point is not.
+        A cover that already names a location must name that one, or
+        execution raises `SampleError`. `explain()` shows the covers as
+        stated and the location rule; the written metadata holds the bound
+        documents. Replaces any index stated before.
+
+        Raises `ValueError` on a plan on fitted curves, whose index at
+        another location would need a joint distribution of two curves, for
+        `point=` with `StationColumn` and for empty column names; `TypeError`
+        for arguments of the wrong type; and `SampleError` for a missing
+        asset column, or a cover the new index does not fit.
+        """
+        refusal = self._index_refusal()
+        if refusal is not None:
+            raise ValueError(refusal)
+        _source_kind(source)
+        if not isinstance(location, (NearestCell, StationColumn)):
+            raise TypeError(
+                "location must be NearestCell() or StationColumn(name), got "
+                f"{type(location).__name__}"
+            )
+        if point is not None:
+            if not isinstance(point, PointColumns):
+                raise TypeError(
+                    "point must be PointColumns(longitude, latitude) naming asset "
+                    f"columns, got {type(point).__name__}"
+                )
+            if isinstance(location, StationColumn):
+                raise ValueError(
+                    "point= says where NearestCell reads; StationColumn reads "
+                    "the station the asset column names"
+                )
+            _column_name("point.longitude", point.longitude)
+            _column_name("point.latitude", point.latitude)
+        if not isinstance(provenance, SourceProvenance):
+            raise TypeError(
+                "provenance must be a SourceProvenance stating the index source's "
+                f"licence and attribution, got {type(provenance).__name__}"
+            )
+        _column_name("year_column", year_column)
+        _column_name("index_column", index_column)
+        columns = _table_columns(self.assets)
+        if columns is not None:
+            needed = (
+                [location.name]
+                if isinstance(location, StationColumn)
+                else ([] if point is None else [point.longitude, point.latitude])
+            )
+            absent = [name for name in needed if name not in columns]
+            if absent:
+                raise SampleError(f"the asset table has no columns {absent}")
+        read = _SeriesRead(
+            role="index",
+            source=source,
+            location=location,
+            unit=_identifier("unit", unit),
+            provenance=provenance,
+            year_column=year_column,
+            value_column=index_column,
+            point=point,
+        )
+        plan = dataclasses.replace(self, index_read=read)
+        for cover in self.cover_list:
+            plan._check_cover(cover)
+        return plan
 
     def objective(
         self,
@@ -1504,6 +1840,7 @@ class ParametricPlan:
             "location": self.location.to_document(),
             "missing": self.missing,
             "provenance": self.provenance.model_dump(mode="json"),
+            "role": "hazard",
             "type": type(self.source).__name__,
             "unit": self.unit,
             "years": None if self.years is None else list(self.years),
@@ -1514,19 +1851,47 @@ class ParametricPlan:
             description["rows"] = int(self.source.num_rows)
         return description
 
+    def _index_description(self, read: _SeriesRead) -> dict[str, Any]:
+        """`.index(...)`'s source, in the form of a written `sources` entry."""
+        kind = _source_kind(read.source)
+        description: dict[str, Any] = {
+            "columns": {"value": read.value_column, "year": read.year_column},
+            "location": read.location.to_document(),
+            "point": (
+                None
+                if read.point is None
+                else {
+                    "latitude_column": read.point.latitude,
+                    "longitude_column": read.point.longitude,
+                }
+            ),
+            "role": "index",
+            "series": {"source": read.provenance.model_dump(mode="json")},
+            "source_kind": kind,
+            "type": type(read.source).__name__,
+            "unit": read.unit,
+        }
+        if kind == "file":
+            description["path"] = os.fspath(read.source)
+        elif kind == "table":
+            description["rows"] = int(read.source.num_rows)
+        return description
+
     def _sample_description(self) -> dict[str, Any]:
         """One asset's sample, as far as it is known before execution."""
+        read = self.index_read
+        notes: list[str] = []
+        if self.cell is not None:
+            notes.append(
+                f"The impact reads each asset's H3 cell: {_cell_origin(self.cell)}."
+            )
+        if read is not None:
+            notes.append(f"The index is read elsewhere: {_index_origin(read)}.")
         sample: dict[str, Any] = {
-            "index_unit": self.unit,
+            "index_unit": self.unit if read is None else read.unit,
             "loss_model": self.loss_model.to_document(),
             "loss_unit": self.loss_model.value_unit,
-            "notes": (
-                []
-                if self.cell is None
-                else [
-                    f"The impact reads each asset's H3 cell: {_cell_origin(self.cell)}."
-                ]
-            ),
+            "notes": notes,
             "scenario": "baseline",
             "semantics": "annual",
             "semantics_source": "data",
@@ -1610,6 +1975,16 @@ class ParametricPlan:
                 }
             ]
         )
+        read = self.index_read
+        if licences is not None and read is not None:
+            licences.append(
+                {
+                    "attribution": read.provenance.attribution,
+                    "licence": read.provenance.licence,
+                    "role": "index",
+                    "source": read.provenance.dataset,
+                }
+            )
         document: dict[str, Any] = {
             "assets": {
                 "count": None if ids is None else len(ids),
@@ -1640,7 +2015,10 @@ class ParametricPlan:
                 "metric_options": self.metric_options.to_document(),
                 "samples": samples,
             },
-            "sources": [self._source_description()],
+            "sources": [
+                self._source_description(),
+                *([] if read is None else [self._index_description(read)]),
+            ],
         }
         if isinstance(self.cell, H3Cell):
             document["assets"]["cell"] = self.cell.to_document()
@@ -1671,7 +2049,9 @@ class ParametricPlan:
         sample per asset with its source, loss and basis-risk models, and
         the planned evaluations with their split, fold and pricing),
         `covers`, `designs` (the objectives and design terms), `sources`,
-        `assets`, `licences`, `rng` (the seeds) and `entry`; a plan on
+        `assets`, `licences`, `rng` (the seeds) and `entry`; with
+        `.index(...)`, `sources` has an entry with role `"index"` that states
+        the location rule, and `covers` holds the covers as stated; a plan on
         fitted curves adds `monte_carlo` (the draws, the semantics stated by
         the caller, `outside_support` and the fresh draws), and a plan with
         `cell=` adds what it states to `assets` as `cell`. Its `setup` has
@@ -1683,7 +2063,8 @@ class ParametricPlan:
         curves, the checksums, the hashes of the samples and designs and, on
         fitted curves, the dataset's metadata (its units, semantics and
         licence, so `licences` is `None` here); with `cell=`, the cells are
-        known only there too. `format="json"` returns a
+        known only there too, and with `.index(...)` the bound covers.
+        `format="json"` returns a
         dict, `"text"` its JSON text.
         """
         document = self._explain_document()
@@ -1715,10 +2096,19 @@ class ParametricPlan:
     # -- execution --------------------------------------------------------------
 
     @property
-    def _annual_unit(self) -> str:
-        """The unit of the annual table's values (per-year route only)."""
-        assert self.unit is not None
-        return self.unit
+    def _hazard_read(self) -> _SeriesRead:
+        """Where each asset's hazard series is read (per-year route only)."""
+        assert self.unit is not None and self.provenance is not None
+        return _SeriesRead(
+            role="hazard",
+            source=self.source,
+            location=self.location,
+            unit=self.unit,
+            provenance=self.provenance,
+            year_column=self.year_column,
+            value_column=self.hazard_column,
+            years=self.years,
+        )
 
     def _require_basis_risk(self) -> BasisRisk:
         if self.basis_risk_model is None:
@@ -1761,50 +2151,61 @@ class ParametricPlan:
             raise SampleError(f"assets {repeated[:10]} appear more than once")
         return list(zip(ids, table.to_pylist(), strict=True))
 
-    def _read_source(self) -> tuple[Any, dict[str, Any]]:
-        """Read the annual table; return it with its record for the metadata."""
-        kind = _source_kind(self.source)
-        record: dict[str, Any] = {"kind": kind, "type": type(self.source).__name__}
+    def _read_source(self, read: _SeriesRead) -> tuple[Any, dict[str, Any]]:
+        """Read one annual table; return it with its record for the metadata."""
+        source = read.source
+        name = "annual" if read.role == "hazard" else "index"
+        kind = _source_kind(source)
+        record: dict[str, Any] = {"kind": kind, "type": type(source).__name__}
         if kind == "table":
-            table = _arrow_table(self.source, "the annual table")
+            table = _arrow_table(source, f"the {name} table")
         elif kind == "file":
-            path = Path(self.source)
+            path = Path(source)
             table = pq.read_table(path)
             record["path"] = os.fspath(path)
             record["file_sha256"] = _file_sha256(path)
         else:
+            who = "source" if read.role == "hazard" else "index source"
             table = _arrow_table(
-                self.source.annual_extremes(), "the source's annual_extremes()"
+                source.annual_extremes(), f"the {who}'s annual_extremes()"
             )
             explained = (
-                _json_safe(_source_plan_document(self.source))
-                if callable(getattr(self.source, "explain", None))
+                _json_safe(_source_plan_document(source))
+                if callable(getattr(source, "explain", None))
                 else None
             )
             record["explain"] = explained
             stated = explained.get("unit") if isinstance(explained, dict) else None
-            if isinstance(stated, str) and not units_equivalent(
-                stated, self._annual_unit
-            ):
+            if isinstance(stated, str) and not units_equivalent(stated, read.unit):
                 raise SampleError(
-                    f"the source's values are in {stated!r}, but the plan states "
-                    f"unit={self.unit!r}"
+                    f"the {who}'s values are in {stated!r}, but the plan states "
+                    f"unit={read.unit!r}"
                 )
         record["columns"] = list(table.column_names)
         record["rows"] = int(table.num_rows)
         record["table_sha256"] = _table_sha256(table)
         return table, record
 
-    def _series_source(self) -> dict[str, Any]:
+    def _series_source(self, read: _SeriesRead) -> dict[str, Any]:
         """The series' `source`: what identifies the data, stable across runs."""
-        assert self.provenance is not None
-        document: dict[str, Any] = self.provenance.model_dump(mode="json")
-        kind = _source_kind(self.source)
+        document: dict[str, Any] = read.provenance.model_dump(mode="json")
+        kind = _source_kind(read.source)
         if kind == "plan":
-            document["source_type"] = type(self.source).__name__
+            document["source_type"] = type(read.source).__name__
         elif kind == "file":
-            document["file_sha256"] = _file_sha256(Path(self.source))
+            document["file_sha256"] = _file_sha256(Path(read.source))
         return document
+
+    def _open(self, read: _SeriesRead) -> _OpenedRead:
+        """Read a source once, for all the assets' series."""
+        table, record = self._read_source(read)
+        return _OpenedRead(
+            read,
+            table,
+            record,
+            self._series_source(read),
+            _stated_pathway(record.get("explain")),
+        )
 
     def _asset_cell(
         self, portfolio: AssetPortfolio, asset_id: str, row: Mapping[str, Any]
@@ -1831,15 +2232,34 @@ class ParametricPlan:
 
     def _series(
         self,
-        table: Any,
+        opened: _OpenedRead,
         row: Mapping[str, Any],
         asset_id: str,
         portfolio: AssetPortfolio,
-        source: Mapping[str, Any],
     ) -> AnnualSeries:
-        location = self.location
+        """One asset's series of an opened source, as read at its location."""
+        series = self._located_series(opened, row, asset_id, portfolio)
+        if opened.pathway is None:
+            return series
+        # Beside the caller's source: the plan does not rewrite it.
+        return AnnualSeries(
+            series.years,
+            series.values,
+            series.unit,
+            {**_thaw(series.provenance), "pathway": opened.pathway},
+        )
+
+    def _located_series(
+        self,
+        opened: _OpenedRead,
+        row: Mapping[str, Any],
+        asset_id: str,
+        portfolio: AssetPortfolio,
+    ) -> AnnualSeries:
+        read, table, source = opened.read, opened.table, opened.source
+        location = read.location
         if isinstance(location, NearestCell):
-            located = portfolio.location
+            located = portfolio.location if read.point is None else read.point
             vertices: tuple[tuple[float, float], ...] | None = None
             if isinstance(located, PointColumns):
                 longitude = row.get(located.longitude)
@@ -1861,13 +2281,13 @@ class ParametricPlan:
                 table,
                 longitude=longitude,
                 latitude=latitude,
-                unit=self._annual_unit,
-                year=self.year_column,
-                value=self.hazard_column,
+                unit=read.unit,
+                year=read.year_column,
+                value=read.value_column,
                 longitude_column=location.longitude,
                 latitude_column=location.latitude,
                 spacing=location.spacing,
-                years=self.years,
+                years=read.years,
                 source=source,
             )
             if vertices is None:
@@ -1900,11 +2320,11 @@ class ParametricPlan:
             )
         return AnnualSeries.from_table(
             table,
-            year=self.year_column,
-            value=self.hazard_column,
+            year=read.year_column,
+            value=read.value_column,
             where={location.table_column: station},
-            unit=self._annual_unit,
-            years=self.years,
+            unit=read.unit,
+            years=read.years,
             source=source,
         )
 
@@ -1914,7 +2334,12 @@ class ParametricPlan:
         children = np.random.SeedSequence(self.seed).spawn(count)
         return [np.random.default_rng(child) for child in children]
 
-    def _covers_for(self, asset_ids: Sequence[str]) -> dict[str, list[Cover]]:
+    def _covers_for(
+        self,
+        asset_ids: Sequence[str],
+        locations: Mapping[str, AtPoint | AtStation] | None = None,
+    ) -> dict[str, list[Cover]]:
+        """Each asset's covers, written for it and bound to its index location."""
         known = set(asset_ids)
         unknown = sorted(
             {
@@ -1930,8 +2355,9 @@ class ParametricPlan:
             )
         covers: dict[str, list[Cover]] = {}
         for asset_id in asset_ids:
+            location = None if locations is None else locations[asset_id]
             chosen = [
-                _bound(cover, asset_id)
+                _bound(cover, asset_id, location=location)
                 for cover in self.cover_list
                 if cover.asset_id in (None, asset_id)
             ]
@@ -1944,8 +2370,13 @@ class ParametricPlan:
             repeated = sorted({h for h in hashes if hashes.count(h) > 1})
             if repeated:
                 raise ValueError(
-                    f"cover {repeated[0]} applies to asset {asset_id!r} twice: once "
-                    "written for no asset and once for this one"
+                    f"cover {repeated[0]} applies to asset {asset_id!r} twice: "
+                    + (
+                        "once written for no asset and once for this one"
+                        if locations is None
+                        else "two covers have the same terms once bound to this "
+                        "asset and the location of its index"
+                    )
                 )
             covers[asset_id] = chosen
         return covers
@@ -1975,21 +2406,19 @@ class ParametricPlan:
         rows = self._asset_rows(portfolio)
         # Before the source is read, which may take long or download data.
         cells = [self._asset_cell(portfolio, asset_id, row) for asset_id, row in rows]
-        table, record = self._read_source()
-        source = self._series_source()
-        pathway = _stated_pathway(record.get("explain"))
+        hazard = self._open(self._hazard_read)
+        index = None if self.index_read is None else self._open(self.index_read)
         generators = self._generators(len(rows))
         samples: dict[str, OutcomeSample] = {}
+        locations: dict[str, AtPoint | AtStation] = {}
         for (asset_id, row), rng, cell in zip(rows, generators, cells, strict=True):
-            series = self._series(table, row, asset_id, portfolio, source)
-            if pathway is not None:
-                # Beside the caller's source: the plan does not rewrite it.
-                series = AnnualSeries(
-                    series.years,
-                    series.values,
-                    series.unit,
-                    {**_thaw(series.provenance), "pathway": pathway},
-                )
+            series = self._series(hazard, row, asset_id, portfolio)
+            index_series: AnnualSeries | None = None
+            unused: list[int] = []
+            if index is not None:
+                read_series = self._series(index, row, asset_id, portfolio)
+                locations[asset_id] = _resolved_location(index.read, read_series, row)
+                index_series, unused = _on_years(read_series, series.years)
             loss_model = (
                 self.loss_model.for_asset(portfolio, asset_id)
                 if cell is None
@@ -2000,6 +2429,7 @@ class ParametricPlan:
                 loss_model=loss_model,
                 basis_risk=basis_risk,
                 asset_id=asset_id,
+                index=index_series,
                 rng=rng,
                 missing=self.missing,
             )
@@ -2010,8 +2440,20 @@ class ParametricPlan:
                     f"The impact reads H3 cell {cell:x} for asset {asset_id}: "
                     f"{_cell_origin(self.cell)}.",
                 )
+            if index is not None:
+                sample = _index_recorded(
+                    sample, index.read, locations[asset_id], unused
+                )
             samples[asset_id] = sample
-        return _Samples(portfolio, samples, None, "annual_table", record)
+        return _Samples(
+            portfolio,
+            samples,
+            None,
+            "annual_table",
+            hazard.record,
+            index_record=None if index is None else index.record,
+            locations=None if index is None else locations,
+        )
 
     # -- the curve route ---------------------------------------------------------
 
@@ -2190,7 +2632,7 @@ class ParametricPlan:
         built = self._build_samples(fresh=evaluate)
         portfolio, samples = built.portfolio, built.samples
         asset_ids = list(samples)
-        covers = self._covers_for(asset_ids)
+        covers = self._covers_for(asset_ids, built.locations)
         pricing = self._pricing()
         designs: list[DesignResult] = []
         tables: list[Any] = []
@@ -2254,6 +2696,7 @@ class ParametricPlan:
             source=built.record,
             id_column=portfolio.id_column,
             values_sha256=self._values_sha256(portfolio, asset_ids),
+            index_source=built.index_record,
         )
 
     def samples(self) -> Mapping[str, OutcomeSample]:
@@ -2267,7 +2710,7 @@ class ParametricPlan:
         located (an H3 cell that straddles grid cells included), a curve that
         cannot be sampled (`sample_curve`), several curves for one asset, a
         cover whose index unit is not the dataset's, or a series with a
-        missing year (unless `missing="drop_year"`);
+        missing year, an index year included (unless `missing="drop_year"`);
         `ProbabilitySemanticsError` for curves whose semantics are not those
         of one year; and `ImportError` without the `geometry` extra for
         assets located by their H3 cells on per-year values, or for
@@ -2307,7 +2750,11 @@ class ParametricPlan:
         and SHA-256, the source plan's `explain()` and, for a file, its path
         and SHA-256). Each hazard source names its record by that checksum:
         `canonical_file_sha256` (the file's) or `annual_table_sha256` (the
-        table's). It adds the plan's seed to every evaluation's `details`
+        table's). With `.index(...)`, `source_records` also holds
+        `{"index_table": {...}}`, of the same form, each source with role
+        `"index"` names it by `index_table_sha256`, `licences` holds the
+        index source's terms and `covers` the bound documents. It adds the
+        plan's seed to every evaluation's `details`
         (`"plan_seed"`) and the fresh draws' seed to every fresh-draw
         evaluation's (`"fresh_draws_seed"`), and the asset id column and a
         SHA-256 of the (asset id, value) pairs to `assets`.
@@ -2315,7 +2762,8 @@ class ParametricPlan:
         Returns a `ParametricResult`, with the fresh draws in
         `fresh_samples` when the split is `FreshDraws`. Raises `ValueError`
         without covers, a basis-risk model, or an objective for templates;
-        and as `samples`, `design` and `compare` raise.
+        `SampleError` for a cover that names another location than the index
+        is read at; and as `samples`, `design` and `compare` raise.
         """
         run = self._run(evaluate=True)
         merged = EvaluationMetadata.merge(
@@ -2325,16 +2773,18 @@ class ParametricPlan:
         checksum = run.source[
             "file_sha256" if run.source_key == "canonical_file" else "table_sha256"
         ]
+        checksums = {"hazard": {f"{run.source_key}_sha256": checksum}}
+        records: list[dict[str, Any]] = [{run.source_key: run.source}]
+        if run.index_source is not None:
+            checksums["index"] = {
+                "index_table_sha256": run.index_source["table_sha256"]
+            }
+            records.append({"index_table": run.index_source})
         document["sources"] = [
-            {**entry, f"{run.source_key}_sha256": checksum}
-            if entry.get("role") == "hazard"
-            else entry
+            {**entry, **checksums.get(str(entry.get("role")), {})}
             for entry in document["sources"]
         ]
-        document["source_records"] = [
-            *document.get("source_records", ()),
-            {run.source_key: run.source},
-        ]
+        document["source_records"] = [*document.get("source_records", ()), *records]
         seeded = self._seed_details()
         rule = self.split_rule
         fresh = {"fresh_draws_seed": rule.seed} if isinstance(rule, FreshDraws) else {}
