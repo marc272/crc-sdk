@@ -591,6 +591,77 @@ GRID = pa.table(
 )
 
 
+class _SourcePlan:
+    """A source plan: `explain()` answers, and fetching its data raises."""
+
+    def __init__(self, document: Any) -> None:
+        self.document = document
+
+    def annual_extremes(self, **_: Any) -> Any:
+        raise AssertionError("a source's annual_extremes() must not be called")
+
+    def explain(self, *, format: str = "text") -> Any:
+        assert format == "json"
+        return self.document
+
+
+def test_a_source_plan_is_read_through_its_explain_document_only() -> None:
+    document = {
+        "recipe": "rx1day",
+        "store": "arco-0p25",
+        "store_url": "gs://bucket/era5.zarr",
+        "grid_degrees": 0.25,
+        "area": (-1.0, -1.0, 1.0, 1.0),
+        "cache": {"directory": None},
+    }
+    series = AnnualSeries.nearest_cell(
+        GRID, longitude=7.0, latitude=50.0, unit="mm/day", source=_SourcePlan(document)
+    )
+    source = series.provenance["source"]
+    assert source["provider"] == "era5"
+    assert source["dataset"] == "arco-0p25 rx1day"
+    # The whole document is recorded, in plain JSON.
+    assert source["store_url"] == "gs://bucket/era5.zarr"
+    assert list(source["area"]) == [-1.0, -1.0, 1.0, 1.0]
+    from_document = AnnualSeries.nearest_cell(
+        GRID, longitude=7.0, latitude=50.0, unit="mm/day", source=document
+    )
+    assert from_document.provenance["source"] == source
+
+
+def test_a_source_plans_names_need_the_documents_own_text() -> None:
+    # A document with no marks, or with no name to give, implies nothing.
+    for document in (
+        {"recipe": "rx1day", "store": "arco-0p25"},
+        {"store_url": "gs://x", "grid_degrees": 0.25, "store": 1, "recipe": "rx1day"},
+        {"archive": "aws", "catalogue": "x", "pathway": "ssp245", "recipe": "rx1day"},
+    ):
+        series = AnnualSeries.from_table(
+            STATIONS, where={"station": "S1"}, unit="mm/day", source=document
+        )
+        assert "provider" not in series.provenance["source"]
+        assert "dataset" not in series.provenance["source"]
+
+
+def test_a_source_plan_must_explain_itself_as_a_document() -> None:
+    with pytest.raises(SampleError, match="must return a mapping, got str"):
+        AnnualSeries.from_table(
+            STATIONS,
+            where={"station": "S1"},
+            unit="mm/day",
+            source=_SourcePlan("Recipe: rx1day"),
+        )
+
+    class NoExplain:
+        def annual_extremes(self) -> Any:
+            raise AssertionError("a source's annual_extremes() must not be called")
+
+    with pytest.raises(TypeError, match="a plan with explain\\(\\), got NoExplain"):
+        AnnualSeries.from_table(
+            STATIONS, where={"station": "S1"}, unit="mm/day", source=NoExplain()
+        )
+
+
 def test_from_table_selects_a_station_and_marks_null_years_missing() -> None:
     series = AnnualSeries.from_table(
         STATIONS, where={"station": "S1"}, unit="mm/day", source="ghcnh-rx1day"

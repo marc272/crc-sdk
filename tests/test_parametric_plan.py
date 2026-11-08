@@ -315,6 +315,28 @@ def test_setup_text_states_the_plan_before_execution() -> None:
     ]
 
 
+def test_the_callers_provenance_names_a_plans_source_not_the_source_plan() -> None:
+    class CMIP6Shaped(_SourcePlan):
+        def explain(self, *, format: str = "text") -> Any:
+            return {
+                **super().explain(format=format),
+                "archive": "aws",
+                "catalogue": "https://example.org/pangeo-cmip6.csv",
+                "pathway": "ssp245",
+                "model": "M",
+                "member": "r1i1p1f1",
+            }
+
+    sample = (
+        _plan(CMIP6Shaped(_annual()), _assets("warehouse-a"))
+        .basis_risk(NoBasisRisk())
+        .samples()["warehouse-a"]
+    )
+    source = sample.provenance.sources[0]["series"]["source"]
+    assert (source["provider"], source["dataset"]) == ("example", "synthetic rx1day")
+    assert "pathway" not in source
+
+
 def test_explain_without_a_split_lists_in_sample_rows_only() -> None:
     document: Any = _plan().basis_risk(NoBasisRisk()).explain(format="json")
     assert [(e["split"], e["fold"]) for e in document["setup"]["evaluations"]] == [
