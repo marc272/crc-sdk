@@ -47,7 +47,9 @@ from crc_sdk.types import (
     HazardDatasetMetadata,
     SourceProvenance,
 )
-from crc_sdk.workflows import ReturnPeriodExtrapolationWarning
+from crc_sdk.workflows import HazardDataset, ReturnPeriodExtrapolationWarning
+from crc_sdk.workflows._remote import file_checksum, write_manifest
+from crc_sdk.workflows.cmip6 import CATALOGUE_CACHE
 from crc_sdk.workflows.noaa_water_levels import NOAAExtremeWaterLevelPlan
 
 UNTYPED_CURVE: Any = sample_curve  # for calls with deliberately invalid arguments
@@ -1237,6 +1239,47 @@ def test_a_lineage_does_not_move_with_the_cache_state(
             _check_out_of_sample(before, after)
 
 
+def test_a_real_cmip6_plans_lineage_is_the_same_after_a_fetch(tmp_path: Path) -> None:
+    pytest.importorskip("zarr")
+    pytest.importorskip("h5netcdf")
+    directory = tmp_path / "cmip6"
+    dataset = HazardDataset.cmip6("rx1day", model="M", scenario="ssp245")
+    plan = dataset.for_area((-1.0, -1.0, 1.0, 1.0)).years(2015, 2016)
+    plan = plan.cache(directory).canonicalize()
+    before = _per_year(_read_station(plan))
+    assert plan.explain(format="json")["resolved_dataset"] is None
+
+    # As a fetch leaves it: the years' files, their manifest and the catalogue.
+    (directory / CATALOGUE_CACHE).parent.mkdir(parents=True)
+    (directory / CATALOGUE_CACHE).write_bytes(b"a local copy of the catalogue")
+    entries = {}
+    for year in (2015, 2016):
+        path = directory / f"{year}.nc"
+        path.write_bytes(b"a year's extremes")
+        entries[plan._key("one.dataset", year)] = {
+            "year": year,
+            "dataset_id": "one.dataset",
+            "resolved_version": "v1",
+            "model": "M",
+            "scenario": "ssp245",
+            "member": "r1i1p1f1",
+            "local": path.name,
+            "checksum": file_checksum(path),
+            "calendar": "noleap",
+            "licence": "CC-BY-4.0",
+        }
+    write_manifest(directory, {"entries": entries})
+    fetched = plan.explain(format="json")
+    assert fetched["resolved_dataset"] == "one.dataset"
+    assert fetched["catalogue"] == str(directory / CATALOGUE_CACHE)
+    assert fetched["cache"]["years_cached"] == [2015, 2016]
+
+    after = _per_year(_read_station(plan))
+    assert after.lineage == before.lineage
+    with pytest.raises(LeakageError, match="shares 5 periods"):
+        _check_out_of_sample(before, after)
+
+
 @READS
 @pytest.mark.parametrize(
     ("document", "key", "value"),
@@ -1336,9 +1379,18 @@ def test_a_nearest_cell_series_records_the_cell_not_the_distance() -> None:
     # Both points read the cell's rows: the leakage check links them...
     with pytest.raises(LeakageError, match="shares 5 periods"):
         _check_out_of_sample(_per_year(first), _per_year(second))
-    # ...and so it does when the grid step is inferred for one and stated for the other.
-    stated = _read_cell("s", spacing=(0.25, 0.25))
+    # ...and so does a grid step stated instead of inferred, or an H3 cell's
+    # centre standing in for the point: the rows are the same cell's.
+    stated = _read_cell("s", spacing=(0.5, 0.5))
+    assert stated.provenance["spacing_degrees"]["latitude"] == 0.5
     assert _per_year(stated).lineage == _per_year(_read_cell("s")).lineage
+    by_h3 = AnnualSeries(
+        first.years,
+        first.values,
+        first.unit,
+        {**first.provenance, "asset_location": "h3_cell"},
+    )
+    assert _per_year(by_h3).lineage == _per_year(first).lineage
 
 
 def test_an_era5_series_records_the_terms_crc_sdk_holds_for_era5() -> None:
@@ -1356,6 +1408,11 @@ def test_an_era5_series_records_the_terms_crc_sdk_holds_for_era5() -> None:
     own = {**ERA5_DOCUMENT, "licence": "theirs", "attribution": "their text"}
     recorded = _read_station(own).provenance["source"]
     assert (recorded["licence"], recorded["attribution"]) == ("theirs", "their text")
+    # Terms say nothing about which rows these are.
+    assert (
+        _per_year(_read_station(own)).lineage
+        == _per_year(_read_station(ERA5_DOCUMENT)).lineage
+    )
     assert _read_station(CMIP6_DOCUMENT).provenance["source"]["licence"] is None
     assert "attribution" not in _read_station(CMIP6_DOCUMENT).provenance["source"]
     assert _read_station(_fetched(CMIP6_DOCUMENT)).provenance["source"]["licence"] == (
