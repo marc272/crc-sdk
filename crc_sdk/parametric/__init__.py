@@ -26,8 +26,9 @@ owner's total. `evaluate` and `compare` assess covers and designs.
 comparison: `ParametricPlan.for_evaluation(request)` from the fitted hazard
 curves of a `PortfolioEvaluation` (with `.monte_carlo(...)` and, for the
 out-of-sample test, `FreshDraws`), or `ParametricPlan.for_annual_extremes(...)`
-from an annual-extremes source and assets. Its builders and `explain()` do no
-I/O.
+from an annual-extremes source and assets. By default each asset is designed on
+its own; `.scopes(Joint())` designs them together. Its builders and `explain()`
+do no I/O.
 
 The functions work on numpy arrays and Arrow tables in memory and do no I/O,
 except `write_comparison`, which writes one Parquet file atomically. The

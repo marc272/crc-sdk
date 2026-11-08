@@ -16,8 +16,12 @@ ParametricPlan.for_annual_extremes(source, assets, impact=, unit=, provenance=)
   .pricing(PurePremium() | CostOfCapitalLoad(rate, q))     # optional
   .split(FreshDraws(n, seed=) | Holdout(0.7) | KFold(5))   # optional
   .metrics(MetricOptions(...))          # optional: levels and thresholds
+  .scopes(Individual() | Joint())       # optional: asset by asset, or on the total
+  .dependence(Comonotonic() | ...)      # with Joint() on curves: required
+  .allocation("value" | "loss")         # optional: per-asset rows of a joint design
   .explain()                            # the setup, no I/O
   .samples()                            # execution: one sample per asset
+  .joint_sample()                       # execution: Joint() only
   .designs()                            # execution: the designed covers
   .write_parquet("comparison.parquet")  # execution: written atomically
 ```
@@ -105,6 +109,28 @@ state, so a year's factor does not depend on the fold. `RecentYears` is not
 rebuilt: the window comes first and the split divides it. `.samples()` and
 `ParametricResult.samples` hold all the years, fitted on all of them.
 
+**Scopes.** By default, `Individual()`, each asset is designed and evaluated
+on its own sample: nothing sums over the assets and no dependence between them
+is imposed. `Joint()` needs at least two assets and designs each template once
+per objective with `design_joint`, as one objective and one budget on the
+owner's total, on one sample of all the assets:
+
+- on fitted curves, `sample_curves` under the model that `.dependence(...)`
+  must state, with the plan's generators, one per asset;
+- on per-year values, `OutcomeSample.join` of the assets' samples, whose
+  dependence is the data's own, so `.dependence(...)` raises there. With
+  `LinearTrend` and a holdout or k-fold the assets' samples are joined per fold,
+  each fitted on that fold's design years.
+
+Under `Joint()` a cover must be written for no asset, because each cover applies
+to every asset; different terms per asset go through `design_joint`. A resolved
+cover is evaluated as a set, one contract per asset. `.samples()` returns each
+asset's view of the sample and `.joint_sample()` the sample itself. `.scopes`
+may hold both scopes: each asset is then also designed on its own view, and the
+`scope` column keeps the rows of each scope apart. `.allocation(rule)` adds a
+joint design's per-asset rows, with the values the plan's loss model read.
+`docs/parametric.md` describes the rows.
+
 **Output.** `write_parquet(path)` writes one comparison table, as `compare`
 builds it, through a temporary sibling and `os.replace`. Its metadata under
 `crc.parametric.evaluation` (`EvaluationMetadata`) holds the setup of every
@@ -117,7 +143,7 @@ the generator states, and the plan's seed in every evaluation's `details`
 (`"plan_seed"`, with `"fresh_draws_seed"` on fresh-draw rows). Asset values
 are never written; the metadata holds a SHA-256 of the (asset id, value)
 pairs. The returned `ParametricResult` holds the samples, the fresh draws
-and the designs.
+and the designs and, under `Joint()`, the sample of all the assets.
 """
 
 from __future__ import annotations
@@ -154,10 +180,17 @@ from crc_sdk.parametric._canonical import content_hash
 from crc_sdk.parametric.basis_risk import BasisRisk, ImpactNoise
 from crc_sdk.parametric.constraints import Budget, Limit
 from crc_sdk.parametric.cover import Cover
+from crc_sdk.parametric.dependence import (
+    Comonotonic,
+    Dependence,
+    EmpiricalCopula,
+    Independent,
+)
 from crc_sdk.parametric.design import DesignOptions, DesignResult, design
 from crc_sdk.parametric.errors import ProbabilitySemanticsError, SampleError
-from crc_sdk.parametric.evaluate import compare, write_comparison
+from crc_sdk.parametric.evaluate import Allocation, Split, compare, write_comparison
 from crc_sdk.parametric.index import AtAsset, AtPoint, AtStation, IndexDefinition
+from crc_sdk.parametric.joint import Individual, Joint, JointDesignResult, design_joint
 from crc_sdk.parametric.loss import LossModel
 from crc_sdk.parametric.metadata import EVALUATION_METADATA_KEY, EvaluationMetadata
 from crc_sdk.parametric.metrics import MetricOptions
@@ -188,6 +221,7 @@ from crc_sdk.parametric.sources import (
     _source_plan_document,
     _warn_comonotone,
     sample_curve,
+    sample_curves,
 )
 from crc_sdk.parametric.trend import AsRecorded, LinearTrend, Trend, _require_trend
 from crc_sdk.types import SourceProvenance
@@ -561,20 +595,33 @@ class ParametricResult:
     - `metadata`: its `EvaluationMetadata`, under `crc.parametric.evaluation`;
     - `samples`: one `OutcomeSample` per asset, in asset order (all years
       or draws, before any split; with `LinearTrend` and a holdout or k-fold,
-      fitted on all the years, while the rows come from one sample per fold);
+      fitted on all the years, while the rows come from one sample per fold).
+      Under `Joint()`, each asset's view of `joint_sample`;
     - `designs`: every `DesignResult`, in asset, fold, cover and objective
-      order;
+      order. Under `Joint()`, every `JointDesignResult`, in fold, cover and
+      objective order, each followed by its template's per-asset
+      `DesignResult`s when the plan also holds `Individual()`;
     - `fresh_samples`: with `FreshDraws`, one `OutcomeSample` per asset, in
       asset order: the fresh draws the out-of-sample rows are evaluated on.
-      `None` without fresh draws.
+      `None` without fresh draws. Under `Joint()`, each asset's view of
+      `fresh_joint_sample`;
+    - `joint_sample`: under `Joint()`, the sample of all the assets, with all
+      its years or draws, before any split; otherwise `None`;
+    - `fresh_joint_sample`: under `Joint()` with `FreshDraws`, the fresh draws
+      of all the assets, whose `content_hash` is the `sample_hash` of the
+      out-of-sample rows; otherwise `None`.
     """
 
     output: Path
     table: Any
     metadata: EvaluationMetadata
     samples: Mapping[str, OutcomeSample]
-    designs: tuple[DesignResult, ...]
+    # `DesignResult`, or `JointDesignResult` under `Joint()`: it depends on the
+    # plan's scopes, so existing callers of a plan of one scope keep their types.
+    designs: tuple[Any, ...]
     fresh_samples: Mapping[str, OutcomeSample] | None = None
+    joint_sample: OutcomeSample | None = None
+    fresh_joint_sample: OutcomeSample | None = None
 
     @property
     def row_count(self) -> int:
@@ -586,13 +633,15 @@ class ParametricResult:
 class _Run:
     samples: Mapping[str, OutcomeSample]
     fresh: Mapping[str, OutcomeSample] | None
-    designs: tuple[DesignResult, ...]
+    designs: tuple[Any, ...]
     tables: tuple[Any, ...]
     source_key: str
     source: dict[str, Any]
     id_column: str
     values_sha256: str | None
     index_source: dict[str, Any] | None = None
+    joint: OutcomeSample | None = None
+    fresh_joint: OutcomeSample | None = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -616,7 +665,9 @@ _Block = tuple[int, OutcomeSample, OutcomeSample | None]
 class _Samples:
     """What execution builds before any design: the samples and the source.
 
-    `folds` holds each asset's blocks when each fold has a sample of its own.
+    `folds` holds each asset's sample of each fold, when each fold has a sample
+    of its own. Under `Joint()`, `joint` and `fresh_joint` are the samples of
+    all the assets, and `samples` and `fresh` each asset's view of them.
     """
 
     portfolio: AssetPortfolio
@@ -626,10 +677,29 @@ class _Samples:
     record: dict[str, Any]
     index_record: dict[str, Any] | None = None
     locations: Mapping[str, AtPoint | AtStation] | None = None
-    folds: Mapping[str, tuple[_Block, ...]] | None = None
+    folds: Mapping[str, tuple[OutcomeSample, ...]] | None = None
+    joint: OutcomeSample | None = None
+    fresh_joint: OutcomeSample | None = None
 
 
 # -- helpers -----------------------------------------------------------------
+
+
+def _require_several_assets(asset_ids: Sequence[str]) -> None:
+    if len(asset_ids) < 2:
+        raise ValueError(
+            "Joint() designs several assets together, but the plan holds "
+            f"{list(asset_ids)}; use Individual() for one asset"
+        )
+
+
+def _copula_split_error(rule: Holdout | KFold) -> SampleError:
+    return SampleError(
+        f"{type(rule).__name__} cannot split a sample under EmpiricalCopula: its "
+        "rows come in reference-year blocks, so a block of rows is a set of "
+        "reference years; test it out of sample with .split(FreshDraws(n_draws, "
+        "seed=...)), whose n_draws must be a multiple of the reference's years"
+    )
 
 
 def _json_safe(value: Any) -> Any:
@@ -764,6 +834,11 @@ def _noted(sample: OutcomeSample, note: str) -> OutcomeSample:
 
 def _listed(values: Sequence[Any] | None) -> list[Any] | None:
     return None if values is None else list(values)
+
+
+def _views(joint: OutcomeSample) -> dict[str, OutcomeSample]:
+    """Each asset's own sample of a sample of several assets, in asset order."""
+    return {asset_id: joint.asset(asset_id) for asset_id in joint.asset_ids}
 
 
 def _objective_tag(objective: Objective) -> str:
@@ -1091,17 +1166,19 @@ class ParametricPlan:
     Start one with `ParametricPlan.for_evaluation(request)` (fitted curves)
     or `ParametricPlan.for_annual_extremes(...)` (per-year values); the
     builders (`monte_carlo`, `index`, `basis_risk`, `covers`, `objective`,
-    `pricing`, `split`, `metrics`) return new plans, and neither they nor
-    `explain()` do any I/O. The execution points `samples()`, `designs()` and
-    `write_parquet(path)` read the source and the assets. The module
-    docstring describes both routes.
+    `pricing`, `split`, `metrics`, `scopes`, `dependence`, `allocation`) return
+    new plans, and neither they nor `explain()` do any I/O. The execution
+    points `samples()`, `joint_sample()`, `designs()` and `write_parquet(path)`
+    read the source and the assets. The module docstring describes both routes.
 
     `entry` names the entry point. On the curve route `source` is the
     request, `unit` and `provenance` are `None` (the dataset's metadata
     states them at execution) and `draws` holds what `monte_carlo` states.
     `pricing_rule` holds what `.pricing(...)` states, `cell`, `trend` and
-    `scenario` what `for_annual_extremes(...)` states, and `index_read` what
-    `.index(...)` states.
+    `scenario` what `for_annual_extremes(...)` states, `index_read` what
+    `.index(...)` states, and `scope_list`, `dependence_model` and
+    `allocation_rule` what `.scopes(...)`, `.dependence(...)` and
+    `.allocation(...)` state.
     """
 
     source: Any
@@ -1127,6 +1204,9 @@ class ParametricPlan:
     index_read: _SeriesRead | None = None
     trend: Trend = field(default_factory=AsRecorded)
     scenario: str = "baseline"
+    scope_list: tuple[Individual | Joint, ...] = (Individual(),)
+    dependence_model: Dependence | None = None
+    allocation_rule: Allocation | None = None
 
     # -- the entry points -----------------------------------------------------
 
@@ -1500,7 +1580,8 @@ class ParametricPlan:
         checked against its `unit`, and a cover may also name the location
         that the index is read at (`AtStation` or `AtPoint`, the kind that
         `.index`'s `location` resolves to), which is checked at execution.
-        Replaces any covers set before.
+        Under `Joint()` a cover must be written for no asset, as it applies to
+        every asset. Replaces any covers set before.
 
         Raises `TypeError` for a non-cover, `SampleError` for a cover in
         other units or on an index read elsewhere, and `ValueError` for no
@@ -1777,8 +1858,9 @@ class ParametricPlan:
         fitted curves; `Holdout` and `KFold` split per-year samples by year
         and Monte Carlo samples by draw; a `LinearTrend` is then fitted per
         fold, on the design years only. Raises `TypeError` for another rule
-        or fresh draws on per-year values, and `ValueError` for fresh draws
-        with the plan's seed.
+        or fresh draws on per-year values, `ValueError` for fresh draws with
+        the plan's seed, and `SampleError` for `Holdout` or `KFold` with
+        `.dependence(EmpiricalCopula(...))`, which only fresh draws can test.
         """
         if not isinstance(rule, (Holdout, KFold, FreshDraws)):
             raise TypeError(
@@ -1796,6 +1878,8 @@ class ParametricPlan:
                     f"seed {rule.seed} is also the plan's seed; fresh draws need "
                     "another seed, or they repeat the design draws"
                 )
+        elif isinstance(self.dependence_model, EmpiricalCopula):
+            raise _copula_split_error(rule)
         return dataclasses.replace(self, split_rule=rule)
 
     def metrics(self, options: MetricOptions) -> ParametricPlan:
@@ -1808,6 +1892,178 @@ class ParametricPlan:
                 f"options must be MetricOptions, got {type(options).__name__}"
             )
         return dataclasses.replace(self, metric_options=options)
+
+    def scopes(self, *scopes: Individual | Joint) -> ParametricPlan:
+        """State how the assets are designed: `Individual()` and/or `Joint()`.
+
+        `Individual()`, the default, designs and evaluates each asset on its
+        own sample. `Joint()` designs each template once per objective for one
+        objective and one budget on the asset owner's total (`design_joint`),
+        one cover per asset, on one sample of all the assets, and every
+        evaluation gets a row at the level of that total. A plan may hold both:
+        the `scope` column keeps the rows of each scope apart.
+
+        `Joint()` needs at least two assets; on fitted curves it also needs
+        `.dependence(...)`, and each cover must be written for no asset, as it
+        applies to every asset. Those are checked by `explain()` and at every
+        execution point, since builders may come in any order. Replaces any
+        scopes stated before.
+
+        Raises `TypeError` for another type, and `ValueError` for no scope, a
+        scope given twice, or `Joint()` on fewer than two assets (when the
+        asset table is in memory; otherwise at execution).
+        """
+        if not scopes:
+            raise ValueError("scopes needs at least one scope")
+        for scope in scopes:
+            if not isinstance(scope, (Individual, Joint)):
+                raise TypeError(
+                    "scopes must be Individual() or Joint(), got "
+                    f"{type(scope).__name__}"
+                )
+        kinds = [scope.to_document()["kind"] for scope in scopes]
+        repeated = sorted({kind for kind in kinds if kinds.count(kind) > 1})
+        if repeated:
+            raise ValueError(f"scope {repeated[0]!r} is given twice")
+        plan = dataclasses.replace(self, scope_list=tuple(scopes))
+        ids = self._known_asset_ids()
+        if ids is not None and plan._holds_joint:
+            _require_several_assets(ids)
+        return plan
+
+    def dependence(self, model: Dependence) -> ParametricPlan:
+        """State the dependence between the assets' curve draws, under `Joint()`.
+
+        For plans on fitted curves, where it is required with `Joint()`: a
+        fitted curve says nothing about how two places move together, so
+        `Independent()`, `Comonotonic()` or `EmpiricalCopula(reference)` is an
+        assumption the plan states, in its metadata and its setup text. The
+        draws are those of `sample_curves`, with the plan's generators. Without
+        `Joint()` nothing puts the assets side by side, so `explain()` and every
+        execution point raise. Replaces any dependence stated before.
+
+        Raises `ValueError` on a plan on per-year values, whose dependence is
+        the data's own: the rows are the same years of the data. Raises
+        `TypeError` for another type, and `SampleError` for
+        `EmpiricalCopula(...)` under `Holdout` or `KFold`.
+        """
+        if not self._on_curves:
+            raise ValueError(
+                "a plan on per-year values takes no dependence model: its "
+                "dependence is the data's own, the rows being the same years of "
+                "the data"
+            )
+        if not isinstance(model, (Independent, Comonotonic, EmpiricalCopula)):
+            raise TypeError(
+                "model must be Independent(), Comonotonic() or "
+                f"EmpiricalCopula(reference), got {type(model).__name__}"
+            )
+        rule = self.split_rule
+        if isinstance(model, EmpiricalCopula) and isinstance(rule, (Holdout, KFold)):
+            raise _copula_split_error(rule)
+        return dataclasses.replace(self, dependence_model=model)
+
+    def allocation(self, rule: Allocation) -> ParametricPlan:
+        """Add a joint design's per-asset rows, under `rule`: `"value"` or `"loss"`.
+
+        By default a joint design has no per-asset rows, because the split of
+        the total payout across the assets is the solver's choice. A rule is an
+        accounting statement about that total payout, not the payout of an
+        asset's cover: `"value"` shares each draw's total payout in proportion
+        to the assets' values and `"loss"` in proportion to their losses in
+        that draw. The rows have `level` `"asset_by_value"` or
+        `"asset_by_loss"` and no premium or net-loss columns. The values are
+        those the plan's loss model reads (the asset column `value_column`, or
+        1 for a damage ratio); only their hash is written. It applies to joint
+        designs only, so `explain()` and every execution point raise without
+        `Joint()`. Replaces any allocation stated before.
+
+        Raises `ValueError` for another rule.
+        """
+        if rule not in get_args(Allocation):
+            raise ValueError(
+                f"rule must be one of {get_args(Allocation)}, got {rule!r}"
+            )
+        return dataclasses.replace(self, allocation_rule=rule)
+
+    # -- scopes -----------------------------------------------------------------
+
+    @property
+    def _holds_joint(self) -> bool:
+        return any(isinstance(scope, Joint) for scope in self.scope_list)
+
+    @property
+    def _holds_individual(self) -> bool:
+        return any(isinstance(scope, Individual) for scope in self.scope_list)
+
+    def _check_scopes(self) -> None:
+        """Check what no single builder can, as the builders come in any order."""
+        model = self.dependence_model
+        if not self._holds_joint:
+            if model is not None:
+                raise ValueError(
+                    ".dependence(...) says how the assets are put side by side, "
+                    "and only Joint() does that; state .scopes(Joint())"
+                )
+            if self.allocation_rule is not None:
+                raise ValueError(
+                    ".allocation(...) shares out a joint design's total payout; "
+                    "state .scopes(Joint())"
+                )
+            return
+        if model is None and self._on_curves:
+            raise ValueError(
+                "Joint() on fitted curves needs a stated dependence between the "
+                "assets, because a fitted curve says nothing about how two places "
+                "move together: state .dependence(Independent()), "
+                ".dependence(Comonotonic()) or .dependence(EmpiricalCopula(reference))"
+            )
+        for cover in self.cover_list:
+            if cover.asset_id is not None:
+                raise ValueError(
+                    f"cover {cover.label or cover.definition_hash!r} is written for "
+                    f"asset {cover.asset_id!r}, but under Joint() each cover applies "
+                    "to every asset; write it for no asset, or give different terms "
+                    "per asset to design_joint"
+                )
+        if isinstance(model, EmpiricalCopula):
+            ids = self._known_asset_ids()
+            columns = model.reference.asset_ids if ids is None else tuple(ids)
+            if self.draws is not None:
+                model.record(self.draws.n_draws, columns)
+            if isinstance(self.split_rule, FreshDraws):
+                model.record(self.split_rule.n_draws, columns)
+
+    def _dependence_document(self) -> dict[str, Any]:
+        """Where the dependence under `Joint()` comes from, as far as it is known."""
+        model = self.dependence_model
+        if model is None:
+            return {"kind": "data"}
+        if self.draws is None:
+            return model.to_document()
+        ids = self._known_asset_ids()
+        columns: tuple[str, ...] = () if ids is None else tuple(ids)
+        if isinstance(model, EmpiricalCopula) and ids is None:
+            columns = model.reference.asset_ids
+        return model.record(self.draws.n_draws, columns)
+
+    def _planned_rows(self) -> dict[str, Any]:
+        """The levels, scopes and allocation of the rows under `Joint()`."""
+        designed = any(cover.free_parameters() for cover in self.cover_list)
+        fixed = any(not cover.free_parameters() for cover in self.cover_list)
+        individual = fixed or (designed and self._holds_individual)
+        joint = designed or not self.cover_list
+        rule = self.allocation_rule
+        levels = [
+            *(["asset"] if individual else []),
+            "total",
+            *([f"asset_by_{rule}"] if joint and rule is not None else []),
+        ]
+        scopes = [
+            *(["individual"] if individual else []),
+            *(["joint"] if joint else []),
+        ]
+        return {"level": levels, "scope": scopes, "allocation": rule}
 
     # -- explain ----------------------------------------------------------------
 
@@ -1848,10 +2104,12 @@ class ParametricPlan:
             details = {"fresh_draws_seed": rule.seed}
         else:
             folds, method, details = rule.k, "kfold", {"k": rule.k}
+        rows = self._planned_rows() if self._holds_joint else {}
         evaluations: list[dict[str, Any]] = []
         for fold in range(folds):
             evaluations.append(
                 {
+                    **rows,
                     "details": self._seed_details(),
                     "fold": fold,
                     "method": "in_sample",
@@ -1862,6 +2120,7 @@ class ParametricPlan:
             if method is not None:
                 evaluations.append(
                     {
+                        **rows,
                         "details": {**details, **self._seed_details()},
                         "fold": fold,
                         "method": method,
@@ -1974,6 +2233,12 @@ class ParametricPlan:
             sample["trend"] = self.trend.to_document()
         if self.basis_risk_model is not None:
             sample["basis_risk"] = self.basis_risk_model.to_document()
+        if self._holds_joint:
+            sample["dependence"] = self._dependence_document()
+            if self.dependence_model is not None and self.draws is not None:
+                notes.append(
+                    self.dependence_model.statement(self.draws.n_draws, "assets")
+                )
         return sample
 
     def _rng_description(self) -> dict[str, Any]:
@@ -1998,11 +2263,12 @@ class ParametricPlan:
     def _explain_document(self) -> dict[str, Any]:
         ids = self._known_asset_ids()
         sample = self._sample_description()
-        samples = (
-            [{**sample, "asset_ids": []}]
-            if ids is None
-            else [{**sample, "asset_ids": [asset_id]} for asset_id in ids]
-        )
+        if ids is None:
+            samples = [{**sample, "asset_ids": []}]
+        elif self._holds_joint:
+            samples = [{**sample, "asset_ids": ids}]
+        else:
+            samples = [{**sample, "asset_ids": [asset_id]} for asset_id in ids]
         spec = self.design_spec
         designs = None
         if spec is not None:
@@ -2084,6 +2350,11 @@ class ParametricPlan:
                 *([] if read is None else [self._index_description(read)]),
             ],
         }
+        if self._holds_joint:
+            model = self.dependence_model
+            document["scopes"] = [scope.to_document() for scope in self.scope_list]
+            document["dependence"] = None if model is None else model.to_document()
+            document["allocation"] = self.allocation_rule
         if isinstance(self.cell, H3Cell):
             document["assets"]["cell"] = self.cell.to_document()
         elif self.cell is not None:
@@ -2129,9 +2400,19 @@ class ParametricPlan:
         fitted curves, the dataset's metadata (its units, semantics and
         licence, so `licences` is `None` here); with `cell=`, the cells are
         known only there too, and with `.index(...)` the bound covers.
-        `format="json"` returns a
+        A plan that holds `Joint()` adds `scopes`, `dependence` (`None` on
+        per-year values, whose dependence is the data's own) and `allocation`;
+        `setup.samples` then has one sample of all the assets, and each planned
+        evaluation its `level`, `scope` and `allocation`. `format="json"` returns a
         dict, `"text"` its JSON text.
+
+        Raises `ValueError` for `Joint()` on fitted curves without
+        `.dependence(...)`, for a dependence or an allocation without
+        `Joint()`, and for a cover written for one asset under `Joint()`;
+        `SampleError` for a draw count or assets that `EmpiricalCopula`'s
+        reference does not fit.
         """
+        self._check_scopes()
         document = self._explain_document()
         if format == "json":
             return document
@@ -2494,13 +2775,40 @@ class ParametricPlan:
             )
         return sample
 
-    def _refitted_blocks(
+    def _fold_blocks(self, samples: Sequence[OutcomeSample]) -> list[_Block]:
+        """Each fold's two blocks, each from that fold's own sample."""
+        return [self._blocks(sample, None)[fold] for fold, sample in enumerate(samples)]
+
+    def _asset_blocks(self, built: _Samples, asset_id: str) -> list[_Block]:
+        """The blocks one asset is designed and evaluated on, on its own."""
+        if built.folds is not None:
+            return self._fold_blocks(built.folds[asset_id])
+        fresh = None if built.fresh is None else built.fresh[asset_id]
+        return self._blocks(built.samples[asset_id], fresh)
+
+    def _joint_blocks(self, built: _Samples) -> list[_Block]:
+        """The blocks the assets are designed and evaluated on together.
+
+        With a sample per fold, the assets' samples are joined fold by fold, so
+        a split step is recorded on each joined sample and every asset's trend
+        is fitted on that fold's design years.
+        """
+        joint = built.joint
+        assert joint is not None
+        if built.folds is None:
+            return self._blocks(joint, built.fresh_joint)
+        parts = (built.folds[asset_id] for asset_id in joint.asset_ids)
+        return self._fold_blocks(
+            [OutcomeSample.join(fold) for fold in zip(*parts, strict=True)]
+        )
+
+    def _refitted_samples(
         self,
         asset: _AnnualAsset,
         sample: OutcomeSample,
         generator: np.random.Generator | None,
-    ) -> tuple[_Block, ...]:
-        """Each fold's two blocks, from a sample fitted on its design years.
+    ) -> tuple[OutcomeSample, ...]:
+        """One sample per fold of all the years, fitted on that fold's design years.
 
         The fit years are the years the split puts in the design block of
         `sample`, so the two cannot disagree. Every fold starts from the
@@ -2508,7 +2816,7 @@ class ParametricPlan:
         """
         trend = self.trend
         assert isinstance(trend, LinearTrend)
-        blocks: list[_Block] = []
+        refits: list[OutcomeSample] = []
         for fold, design_block, _ in self._blocks(sample, None):
             count = len(design_block)
             if count < trend.min_years:
@@ -2520,21 +2828,24 @@ class ParametricPlan:
             fitted = dataclasses.replace(
                 trend, fit_years=tuple(int(year) for year in design_block.period)
             )
-            refitted = self._annual_sample(asset, fitted, copy.deepcopy(generator))
-            blocks.append(self._blocks(refitted, None)[fold])
-        return tuple(blocks)
+            refits.append(self._annual_sample(asset, fitted, copy.deepcopy(generator)))
+        return tuple(refits)
 
     def _build_samples(self, *, fresh: bool = False, folds: bool = False) -> _Samples:
         """The samples of every asset; with `fresh`, also their fresh draws.
 
-        With `folds`, also each fold's blocks, where a linear trend is fitted
-        per fold.
+        With `folds`, also each asset's sample per fold, where a linear trend
+        is fitted per fold. Under `Joint()`, also the sample of all the assets,
+        and `samples` holds each asset's view of it.
         """
+        self._check_scopes()
         if self._on_curves:
             return self._curve_samples(fresh=fresh)
         basis_risk = self._require_basis_risk()
         portfolio = self._portfolio()
         rows = self._asset_rows(portfolio)
+        if self._holds_joint:
+            _require_several_assets([asset_id for asset_id, _ in rows])
         # Before the source is read, which may take long or download data.
         cells = [self._asset_cell(portfolio, asset_id, row) for asset_id, row in rows]
         hazard = self._open(self._hazard_read)
@@ -2547,7 +2858,7 @@ class ParametricPlan:
         )
         samples: dict[str, OutcomeSample] = {}
         locations: dict[str, AtPoint | AtStation] = {}
-        refitted: dict[str, tuple[_Block, ...]] = {}
+        refitted: dict[str, tuple[OutcomeSample, ...]] = {}
         for (asset_id, row), rng, cell in zip(rows, generators, cells, strict=True):
             series = self._series(hazard, row, asset_id, portfolio)
             index_series: AnnualSeries | None = None
@@ -2570,18 +2881,20 @@ class ParametricPlan:
             samples[asset_id] = self._annual_sample(asset, self.trend, rng)
             _warn_comonotone(basis_risk, separate_index=index is not None)
             if per_fold:
-                refitted[asset_id] = self._refitted_blocks(
+                refitted[asset_id] = self._refitted_samples(
                     asset, samples[asset_id], first_state
                 )
+        joint = OutcomeSample.join(samples.values()) if self._holds_joint else None
         return _Samples(
             portfolio,
-            samples,
+            samples if joint is None else _views(joint),
             None,
             "annual_table",
             hazard.record,
             index_record=None if index is None else index.record,
             locations=None if index is None else locations,
             folds=refitted if per_fold else None,
+            joint=joint,
         )
 
     # -- the curve route ---------------------------------------------------------
@@ -2648,6 +2961,8 @@ class ParametricPlan:
         request: PortfolioEvaluation = self.source
         portfolio = self._portfolio()
         rows = self._asset_rows(portfolio)
+        if self._holds_joint:
+            _require_several_assets([asset_id for asset_id, _ in rows])
         metadata = request.dataset.metadata()
         for cover in self.cover_list:
             if cover.index.unit != metadata.value_unit:
@@ -2673,43 +2988,88 @@ class ParametricPlan:
                 for child in np.random.SeedSequence(fresh_seed).spawn(len(rows))
             ]
         )
-        samples: dict[str, OutcomeSample] = {}
-        fresh_samples: dict[str, OutcomeSample] = {}
-        for (asset_id, row), rng, fresh_rng in zip(
-            rows, generators, fresh_generators, strict=True
-        ):
-            curve = matched[asset_id]
-            loss_model = self._cell_loss_model(
-                portfolio, asset_id, row, curve.get("cell_index")
+        asset_ids = [asset_id for asset_id, _ in rows]
+        loss_models = {
+            asset_id: self._cell_loss_model(
+                portfolio, asset_id, row, matched[asset_id].get("cell_index")
             )
-            canonical = {
+            for asset_id, row in rows
+        }
+        canonical = {
+            asset_id: {
                 name: curve[name] for name in _CURVE_ROW_COLUMNS if name in curve
             }
-            details = {
-                "file_sha256": file_sha256,
-                "spatial_match": curve["spatial_match"],
-            }
+            for asset_id, curve in matched.items()
+        }
 
-            def draw(
-                count: int, generator: np.random.Generator | None
-            ) -> OutcomeSample:
+        def draw_joint(
+            count: int, drawn: Sequence[np.random.Generator | None]
+        ) -> OutcomeSample:
+            rngs: dict[str, np.random.Generator] = {}
+            for asset_id, generator in zip(asset_ids, drawn, strict=True):
                 assert generator is not None
-                return sample_curve(
-                    canonical,
-                    metadata=metadata,
-                    n_draws=count,
-                    rng=generator,
-                    loss_model=loss_model,
-                    basis_risk=basis_risk,
-                    asset_id=asset_id,
-                    assume_semantics=draws.assume_semantics,
-                    outside_support=draws.outside_support,
-                    details=details,
-                )
+                rngs[asset_id] = generator
+            assert self.dependence_model is not None
+            return sample_curves(
+                canonical,
+                dependence=self.dependence_model,
+                metadata=dict.fromkeys(asset_ids, metadata),
+                n_draws=count,
+                rngs=rngs,
+                loss_models=loss_models,
+                basis_risk=basis_risk,
+                assume_semantics=draws.assume_semantics,
+                outside_support=draws.outside_support,
+                # One document for every asset, so each match is named by its asset.
+                details={
+                    "file_sha256": file_sha256,
+                    "spatial_match_by_asset": {
+                        asset_id: matched[asset_id]["spatial_match"]
+                        for asset_id in asset_ids
+                    },
+                },
+            )
 
-            samples[asset_id] = draw(draws.n_draws, rng)
+        def draw(
+            asset_id: str, count: int, generator: np.random.Generator | None
+        ) -> OutcomeSample:
+            assert generator is not None
+            return sample_curve(
+                canonical[asset_id],
+                metadata=metadata,
+                n_draws=count,
+                rng=generator,
+                loss_model=loss_models[asset_id],
+                basis_risk=basis_risk,
+                asset_id=asset_id,
+                assume_semantics=draws.assume_semantics,
+                outside_support=draws.outside_support,
+                details={
+                    "file_sha256": file_sha256,
+                    "spatial_match": matched[asset_id]["spatial_match"],
+                },
+            )
+
+        samples: dict[str, OutcomeSample]
+        fresh_samples: dict[str, OutcomeSample] = {}
+        joint: OutcomeSample | None = None
+        fresh_joint: OutcomeSample | None = None
+        if self._holds_joint:
+            joint = draw_joint(draws.n_draws, generators)
+            samples = _views(joint)
             if isinstance(rule, FreshDraws):
-                fresh_samples[asset_id] = draw(rule.n_draws, fresh_rng)
+                fresh_joint = draw_joint(rule.n_draws, fresh_generators)
+                fresh_samples = _views(fresh_joint)
+        else:
+            samples = {
+                asset_id: draw(asset_id, draws.n_draws, rng)
+                for asset_id, rng in zip(asset_ids, generators, strict=True)
+            }
+            if isinstance(rule, FreshDraws):
+                fresh_samples = {
+                    asset_id: draw(asset_id, rule.n_draws, rng)
+                    for asset_id, rng in zip(asset_ids, fresh_generators, strict=True)
+                }
         record = {
             "curves": int(curves.num_rows),
             "file_sha256": file_sha256,
@@ -2722,6 +3082,8 @@ class ParametricPlan:
             fresh_samples if isinstance(rule, FreshDraws) else None,
             "canonical_file",
             record,
+            joint=joint,
+            fresh_joint=fresh_joint,
         )
 
     def _values_sha256(
@@ -2745,6 +3107,130 @@ class ParametricPlan:
         )
         return content_hash({"asset_values": pairs, "value_column": column})
 
+    def _asset_values(
+        self, portfolio: AssetPortfolio, asset_ids: Sequence[str]
+    ) -> dict[str, float]:
+        """Each asset's value, as the plan's loss model reads it; 1 for a ratio."""
+        values: dict[str, float] = {}
+        for asset_id in asset_ids:
+            read = self.loss_model.for_asset(portfolio, asset_id)._value
+            values[asset_id] = 1.0 if read is None else read
+        return values
+
+    def _block_tables(
+        self,
+        entries: Sequence[Any],
+        block: _Block,
+        *,
+        values: Mapping[str, float] | None = None,
+    ) -> list[Any]:
+        """The rows of one block: on the design block, and on any held-out one."""
+        fold, train, test = block
+        evaluated: list[tuple[Split, OutcomeSample]] = [("in_sample", train)]
+        if test is not None:
+            evaluated.append(("out_of_sample", test))
+        return [
+            compare(
+                entries,
+                sample,
+                split=split,
+                fold=fold,
+                pricing=self._pricing(),
+                options=self.metric_options,
+                design_sample=train,
+                allocation=self.allocation_rule,
+                values=values,
+            )
+            for split, sample in evaluated
+        ]
+
+    def _individual_design(
+        self,
+        cover: Cover,
+        asset_id: str,
+        train: OutcomeSample,
+        objective: Objective,
+        label: str,
+    ) -> DesignResult:
+        """One template's design on one asset's design block, labelled `label`."""
+        spec = self.design_spec
+        assert spec is not None
+        result = design(
+            cover,
+            train,
+            objective,
+            pricing=self._pricing(),
+            budget=spec.budget,
+            limit=spec.limit,
+            options=spec.options,
+        )
+        return dataclasses.replace(result, cover=_bound(result.cover, asset_id, label))
+
+    def _joint_design(
+        self,
+        templates: Mapping[str, Cover],
+        train: OutcomeSample,
+        objective: Objective,
+        label: str,
+    ) -> JointDesignResult:
+        """One template's design on the owner's total, its covers labelled `label`."""
+        spec = self.design_spec
+        assert spec is not None
+        result = design_joint(
+            [templates[asset_id] for asset_id in train.asset_ids],
+            train,
+            objective,
+            pricing=self._pricing(),
+            budget=spec.budget,
+            limit=spec.limit,
+            options=spec.options,
+        )
+        return dataclasses.replace(
+            result,
+            covers={
+                asset_id: _bound(cover, asset_id, label)
+                for asset_id, cover in result.covers.items()
+            },
+        )
+
+    def _joint_entries(
+        self, train: OutcomeSample, covers: Mapping[str, Sequence[Cover]]
+    ) -> tuple[list[Any], list[Any]]:
+        """The entries to compare on one block of the joint sample, and the designs.
+
+        A resolved cover is one contract per asset. A template is designed under
+        each objective on the owner's total and, if the plan holds
+        `Individual()` too, on each asset's own view of the block.
+        """
+        assets = train.asset_ids
+        entries: list[Any] = []
+        designs: list[Any] = []
+        for position, stated in enumerate(self.cover_list):
+            own = {asset_id: covers[asset_id][position] for asset_id in assets}
+            if not stated.free_parameters():
+                entries.append(own)
+                continue
+            assert self.design_spec is not None
+            for objective in self.design_spec.objectives:
+                label = _design_label(stated, objective)
+                joint = self._joint_design(own, train, objective, label)
+                designs.append(joint)
+                entries.append(joint)
+                if self._holds_individual:
+                    each = {
+                        asset_id: self._individual_design(
+                            own[asset_id],
+                            asset_id,
+                            train.asset(asset_id),
+                            objective,
+                            label,
+                        )
+                        for asset_id in assets
+                    }
+                    designs += each.values()
+                    entries.append(each)
+        return entries, designs
+
     def _run(self, *, evaluate: bool) -> _Run:
         if not self.cover_list:
             raise ValueError("the plan has no covers; set them with .covers(...)")
@@ -2762,65 +3248,41 @@ class ParametricPlan:
         portfolio, samples = built.portfolio, built.samples
         asset_ids = list(samples)
         covers = self._covers_for(asset_ids, built.locations)
-        pricing = self._pricing()
-        designs: list[DesignResult] = []
+        designs: list[Any] = []
         tables: list[Any] = []
-        for asset_id in asset_ids:
-            fresh = None if built.fresh is None else built.fresh[asset_id]
-            blocks = (
-                self._blocks(samples[asset_id], fresh)
-                if built.folds is None
-                else built.folds[asset_id]
+        if built.joint is not None:
+            values = (
+                None
+                if self.allocation_rule is None
+                else self._asset_values(portfolio, asset_ids)
             )
-            for fold, train, test in blocks:
-                items: list[Cover | DesignResult] = []
-                for cover in covers[asset_id]:
-                    if not cover.free_parameters():
-                        items.append(cover)
-                        continue
-                    assert spec is not None
-                    for objective in spec.objectives:
-                        result = design(
-                            cover,
-                            train,
-                            objective,
-                            pricing=pricing,
-                            budget=spec.budget,
-                            limit=spec.limit,
-                            options=spec.options,
-                        )
-                        labelled = _bound(
-                            result.cover, asset_id, _design_label(cover, objective)
-                        )
-                        result = dataclasses.replace(result, cover=labelled)
-                        designs.append(result)
-                        items.append(result)
-                if not evaluate:
-                    continue
-                options = self.metric_options
-                tables.append(
-                    compare(
-                        items,
-                        train,
-                        split="in_sample",
-                        fold=fold,
-                        pricing=pricing,
-                        options=options,
-                        design_sample=train,
-                    )
-                )
-                if test is not None:
-                    tables.append(
-                        compare(
-                            items,
-                            test,
-                            split="out_of_sample",
-                            fold=fold,
-                            pricing=pricing,
-                            options=options,
-                            design_sample=train,
-                        )
-                    )
+            for block in self._joint_blocks(built):
+                entries, made = self._joint_entries(block[1], covers)
+                designs += made
+                if evaluate:
+                    tables += self._block_tables(entries, block, values=values)
+        else:
+            for asset_id in asset_ids:
+                for block in self._asset_blocks(built, asset_id):
+                    train = block[1]
+                    items: list[Any] = []
+                    for cover in covers[asset_id]:
+                        if not cover.free_parameters():
+                            items.append(cover)
+                            continue
+                        assert spec is not None
+                        for objective in spec.objectives:
+                            result = self._individual_design(
+                                cover,
+                                asset_id,
+                                train,
+                                objective,
+                                _design_label(cover, objective),
+                            )
+                            designs.append(result)
+                            items.append(result)
+                    if evaluate:
+                        tables += self._block_tables(items, block)
         return _Run(
             samples=MappingProxyType(samples),
             fresh=None if built.fresh is None else MappingProxyType(built.fresh),
@@ -2831,6 +3293,8 @@ class ParametricPlan:
             id_column=portfolio.id_column,
             values_sha256=self._values_sha256(portfolio, asset_ids),
             index_source=built.index_record,
+            joint=built.joint,
+            fresh_joint=built.fresh_joint,
         )
 
     def samples(self) -> Mapping[str, OutcomeSample]:
@@ -2840,8 +3304,10 @@ class ParametricPlan:
         asset's draws or years, before any split (fresh draws are drawn by
         `write_parquet()` only, which returns them in `fresh_samples`), so a
         `LinearTrend` here is fitted on all the years, and its record says so.
+        Under `Joint()`, each is that asset's view of `joint_sample()`.
         Raises `ValueError` without a basis-risk model or, on fitted curves,
-        without `monte_carlo`; `SampleError` for an asset that cannot be
+        without `monte_carlo`, and as `explain()` does for the scopes;
+        `SampleError` for an asset that cannot be
         located (an H3 cell that straddles grid cells included), a curve that
         cannot be sampled (`sample_curve`), several curves for one asset, a
         cover whose index unit is not the dataset's, or a series with a
@@ -2855,14 +3321,40 @@ class ParametricPlan:
         """
         return MappingProxyType(self._build_samples().samples)
 
-    def designs(self) -> tuple[DesignResult, ...]:
+    def joint_sample(self) -> OutcomeSample:
+        """Execution: the sample of all the assets, side by side, under `Joint()`.
+
+        Reads the source and the assets. On fitted curves it is what
+        `sample_curves` draws under the plan's `.dependence(...)`, and on
+        per-year values `OutcomeSample.join` of each asset's sample. It holds
+        all the draws or years, before any split, so a `LinearTrend` here is
+        fitted on all the years, like `.samples()`, while the rows of a holdout
+        or k-fold come from one sample per fold.
+
+        Raises `ValueError` for a plan that does not hold `Joint()`, and as
+        `samples` does; `SampleError` when the assets' years differ, as
+        `OutcomeSample.join` raises, which a stated `years=` resolves.
+        """
+        if not self._holds_joint:
+            raise ValueError(
+                "joint_sample() puts the assets side by side under Joint(); state "
+                ".scopes(Joint())"
+            )
+        joint = self._build_samples().joint
+        assert joint is not None
+        return joint
+
+    def designs(self) -> tuple[Any, ...]:
         """Execution: design every template, in asset, fold, cover, objective order.
 
         Each template is designed on each design block (the whole sample
         without a split or with fresh draws; the design block of a holdout;
-        each fold's design block) under each objective. Raises `ValueError`
+        each fold's design block) under each objective. Under `Joint()` the
+        designs are `JointDesignResult`s, in fold, cover and objective order,
+        each followed by that template's `DesignResult`s, in asset order, when
+        the plan also holds `Individual()`. Raises `ValueError`
         without covers, an objective or a basis-risk model, the design errors
-        of `design`, and `SolverUnavailableError` without
+        of `design` and `design_joint`, and `SolverUnavailableError` without
         `crc-sdk[parametric]` on the LP and QP routes.
         """
         if self.design_spec is None:
@@ -2894,6 +3386,13 @@ class ParametricPlan:
         (`"plan_seed"`) and the fresh draws' seed to every fresh-draw
         evaluation's (`"fresh_draws_seed"`), and the asset id column and a
         SHA-256 of the (asset id, value) pairs to `assets`.
+
+        Under `Joint()` the rows are one `"total"` row per joint design and
+        block (`scope="joint"`) and, under `.allocation(...)`, one allocated
+        row per asset; a resolved cover has one `"asset"` row per asset and a
+        `"total"` row (`scope="individual"`), and so does a template's
+        per-asset design if the plan also holds `Individual()`. Only the rows
+        of a plan that holds `Joint()` include a `"total"` row.
 
         Returns a `ParametricResult`, with the fresh draws in
         `fresh_samples` when the split is `FreshDraws`. Raises `ValueError`
@@ -2939,7 +3438,9 @@ class ParametricPlan:
         document["assets"] = {
             "count": len(run.samples),
             "id_column": run.id_column,
-            "values_sha256": run.values_sha256,
+            # Without a value column, an allocation's values are the plan's 1s.
+            "values_sha256": run.values_sha256
+            or document["assets"].get("values_sha256"),
         }
         metadata = EvaluationMetadata.model_validate(document)
         table = pa.concat_tables(run.tables)
@@ -2961,4 +3462,6 @@ class ParametricPlan:
             samples=run.samples,
             designs=run.designs,
             fresh_samples=run.fresh,
+            joint_sample=run.joint,
+            fresh_joint_sample=run.fresh_joint,
         )
