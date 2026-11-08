@@ -758,7 +758,6 @@ def test_nearest_cell_accepts_a_centre_within_half_a_step() -> None:
     )
     assert series.provenance["cell"] == {"latitude": 50.0, "longitude": 7.0}
     assert series.provenance["spacing_degrees"] == {"latitude": 0.25, "longitude": 0.25}
-    assert 10.0 < series.provenance["distance_km"] < 15.0
     assert "6.9" not in str(series.provenance)  # the asset's point is not recorded
     assert series.values.tolist() == [1.0, 11.0, 21.0, 31.0, 41.0]
 
@@ -1379,8 +1378,8 @@ def test_two_points_in_one_grid_cell_share_a_lineage() -> None:
         )
         for x, y in ((6.9, 50.1), (7.05, 49.95))
     )
-    assert first.provenance["cell"] == second.provenance["cell"]
-    assert first.provenance["distance_km"] != second.provenance["distance_km"]
+    # Nothing recorded says which of the two points a series was read for.
+    assert first.provenance == second.provenance
     # Both points read the cell's rows, so the leakage check links them.
     design, evaluation = _per_year(first), _per_year(second)
     assert design.lineage == evaluation.lineage

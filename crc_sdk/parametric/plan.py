@@ -337,8 +337,7 @@ class NearestCell:
       its centre. An H3 cell that straddles two grid cells does not say
       which cell's series is the asset's, so the plan raises `SampleError`
       at execution; give such an asset a point instead. The series records
-      `"asset_location": "h3_cell"`, and its `distance_km` is measured from
-      the H3 cell's centre. This needs the `geometry` extra
+      `"asset_location": "h3_cell"`. This needs the `geometry` extra
       (`crc-sdk[geometry]`).
     """
 
