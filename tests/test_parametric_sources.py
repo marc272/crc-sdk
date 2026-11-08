@@ -993,7 +993,7 @@ def test_windows_of_one_named_series_share_a_lineage() -> None:
         )
 
     design, evaluation = window(2000, 2002, "ghcnh"), window(2002, 2004, "ghcnh")
-    with pytest.raises(Exception, match="shares 1 periods"):
+    with pytest.raises(Exception, match="shares 1 period with"):
         _check_out_of_sample(design, evaluation)
     # Without a source the identity is the data, so these are not linked...
     _check_out_of_sample(window(2000, 2002, None), window(2002, 2004, None))
@@ -1316,7 +1316,7 @@ def test_windows_of_one_source_plan_share_a_lineage() -> None:
         document = {**ERA5_DOCUMENT, "years": (first, last)}
         return _per_year(_read_station(document, years=range(first, last + 1)))
 
-    with pytest.raises(LeakageError, match="shares 1 periods"):
+    with pytest.raises(LeakageError, match="shares 1 period with"):
         _check_out_of_sample(window(2000, 2002), window(2002, 2004))
     _check_out_of_sample(window(2000, 2002), window(2003, 2004))
 

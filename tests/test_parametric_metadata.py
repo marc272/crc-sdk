@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -1689,6 +1690,409 @@ def test_setup_text_names_the_sources_of_an_explain_document(
     if record.get("kind") == "canonical_dataset":
         expected += "; their provider and dataset are not known yet"
     assert line == f"Source: {expected}."
+
+
+# -- planned designs -----------------------------------------------------------
+
+TEMPLATE = "sha256:" + "a" * 64
+OTHER_TEMPLATE = "sha256:" + "b" * 64
+PLANNED_DESIGNS: dict[str, Any] = {
+    "budget": {"ratio": 0.8},
+    "limit": {"amount": 1e6},
+    "objectives": [
+        {"kind": "mse"},
+        {"alpha": 0.9, "beta": 0.95, "kind": "weighted_cvar"},
+    ],
+    "options": {"fill": "lowest"},
+    "pricing": {"kind": "cost_of_capital", "q": 0.99, "rate": 0.1},
+    "templates": [TEMPLATE],
+}
+PLANNED_COVERS: list[dict[str, Any]] = [{"hash": TEMPLATE, "label": "step"}]
+PLANNED_DOCUMENT: dict[str, Any] = {
+    "covers": PLANNED_COVERS,
+    "designs": PLANNED_DESIGNS,
+    "setup": PLANNED_SETUP,
+    "sources": [CANONICAL],
+}
+COST_OF_CAPITAL = (
+    "pricing: a cost-of-capital load, P = (1 - 0.1) E[payout] + 0.1 CVaR_0.99(payout)"
+)
+NOT_KNOWN = "design premium, route and non-uniqueness report: not known yet."
+
+
+def _planned_lines(document: Mapping[str, Any]) -> list[str]:
+    lines = setup_text(document).splitlines()
+    return [line for line in lines if line.startswith("Design")]
+
+
+def test_setup_text_states_one_line_per_planned_objective() -> None:
+    assert _planned_lines(PLANNED_DOCUMENT) == [
+        f"Design step, planned: objective: MSE, E[(L - payout)^2]; {COST_OF_CAPITAL}; "
+        "budget: premium at most 0.8 x E[L] of the design sample; limit: 1,000,000 "
+        f"EUR; {NOT_KNOWN}",
+        "Design step, planned: objective: weighted CVaR, alpha CVaR_beta(U) + (1 - "
+        f"alpha) E[U] with alpha 0.9 and beta 0.95; {COST_OF_CAPITAL}; budget: premium "
+        f"at most 0.8 x E[L] of the design sample; limit: 1,000,000 EUR; {NOT_KNOWN}",
+    ]
+    # They come where a comparison's Design lines do, before the Metrics line.
+    lines = setup_text(PLANNED_DOCUMENT).splitlines()
+    assert [line.split(" ")[0] for line in lines[-3:]] == [
+        "Design",
+        "Design",
+        "Metrics:",
+    ]
+
+
+def test_setup_text_states_a_planned_joint_design_on_the_total() -> None:
+    document = {
+        **PLANNED_DOCUMENT,
+        "designs": {
+            **PLANNED_DESIGNS,
+            "budget": {"amount": 5e5},
+            "objectives": PLANNED_DESIGNS["objectives"][:1],
+        },
+        "scopes": [{"kind": "joint"}],
+        "setup": {
+            **PLANNED_SETUP,
+            "samples": [{**PLANNED_SETUP["samples"][0], "asset_ids": ["a", "b"]}],
+        },
+    }
+    assert _planned_lines(document) == [
+        "Design step, planned: scope: joint, one objective, one budget and one premium "
+        "on the total of a and b, with one cover per asset; objective: MSE, E[(L - "
+        f"payout)^2]; {COST_OF_CAPITAL}; budget: premium at most 500,000 EUR on the "
+        f"total; limit: 1,000,000 EUR on each cover; {NOT_KNOWN}"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("covers", "templates", "name"),
+    [
+        pytest.param(
+            [{"hash": TEMPLATE, "label": None}],
+            [TEMPLATE],
+            "a" * 12,
+            id="an unlabelled template by its hash",
+        ),
+        pytest.param(
+            [
+                {"hash": TEMPLATE, "label": "step"},
+                {"hash": OTHER_TEMPLATE, "label": "x"},
+            ],
+            [TEMPLATE, OTHER_TEMPLATE],
+            "step and x",
+            id="two templates",
+        ),
+        pytest.param(
+            [
+                {"hash": TEMPLATE, "label": "step"},
+                {"hash": OTHER_TEMPLATE, "label": "step"},
+            ],
+            [TEMPLATE, OTHER_TEMPLATE],
+            "step",
+            id="one label per asset's template",
+        ),
+    ],
+)
+def test_setup_text_names_the_templates_of_a_planned_design(
+    covers: list[dict[str, Any]], templates: list[str], name: str
+) -> None:
+    document = {
+        **PLANNED_DOCUMENT,
+        "covers": covers,
+        "designs": {
+            **PLANNED_DESIGNS,
+            "objectives": PLANNED_DESIGNS["objectives"][:1],
+            "templates": templates,
+        },
+    }
+    assert _planned_lines(document)[0].startswith(f"Design {name}, planned: ")
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        pytest.param({"setup": PLANNED_SETUP}, id="no designs key"),
+        pytest.param({**PLANNED_DOCUMENT, "designs": None}, id="no objective"),
+        pytest.param(
+            {**PLANNED_DOCUMENT, "designs": {**PLANNED_DESIGNS, "templates": []}},
+            id="no template",
+        ),
+    ],
+)
+def test_setup_text_has_no_planned_design_without_one(
+    document: dict[str, Any],
+) -> None:
+    assert _planned_lines(document) == []
+
+
+@pytest.mark.parametrize(
+    ("update", "wrong"),
+    [
+        ({"designs": "mse"}, r"document\.designs has the wrong type"),
+        ({"covers": "step"}, r"document\.covers must be a list"),
+        ({"scopes": ["joint"]}, r"document\.scopes must be a list of objects"),
+        (
+            {"designs": {**PLANNED_DESIGNS, "objectives": ["mse"]}},
+            r"designs\.objectives must be a list of objects",
+        ),
+        (
+            {"designs": {**PLANNED_DESIGNS, "templates": "step"}},
+            r"designs\.templates must be a list",
+        ),
+        (
+            {"designs": {**PLANNED_DESIGNS, "budget": 0.8}},
+            r"designs\.budget has the wrong type",
+        ),
+    ],
+)
+def test_setup_text_rejects_malformed_planned_designs(
+    update: dict[str, Any], wrong: str
+) -> None:
+    with pytest.raises(EvaluationError, match=wrong):
+        setup_text({**PLANNED_DOCUMENT, **update})
+
+
+# -- the canonical file ---------------------------------------------------------
+
+CANONICAL_DIGEST = "ab" * 32
+CANONICAL_FILE: dict[str, Any] = {
+    "curves": 1,
+    "file_sha256": f"sha256:{CANONICAL_DIGEST}",
+    "kind": "canonical_dataset",
+    "path": "data/rx1day.parquet",
+}
+
+
+def _curve_document(*records: dict[str, Any], **entry: Any) -> dict[str, Any]:
+    """A comparison on one curve, its source with `entry` and these records."""
+    document: dict[str, Any] = json.loads(
+        _metadata(evaluate(LINEAR, _draws(1), split="in_sample")).to_json()
+    )
+    document["sources"] = [{**document["sources"][0], **entry}]
+    document["source_records"] = list(records)
+    return document
+
+
+@pytest.mark.filterwarnings(
+    "ignore::crc_sdk.workflows.ReturnPeriodExtrapolationWarning",
+    "ignore::crc_sdk.parametric.ComonotoneIndexWarning",
+)
+@pytest.mark.parametrize(
+    ("records", "entry", "file"),
+    [
+        pytest.param(
+            [{"canonical_file": CANONICAL_FILE}],
+            {"canonical_file_sha256": f"sha256:{CANONICAL_DIGEST}"},
+            f", read from the canonical dataset data/rx1day.parquet, SHA-256 "
+            f"{CANONICAL_DIGEST}",
+            id="the path and the checksum",
+        ),
+        pytest.param(
+            [{"annual_table": {"table_sha256": "sha256:0"}}],
+            {"canonical_file_sha256": f"sha256:{CANONICAL_DIGEST}"},
+            f", read from a canonical dataset, its path not recorded, SHA-256 "
+            f"{CANONICAL_DIGEST}",
+            id="a checksum without a record",
+        ),
+        pytest.param([{"canonical_file": CANONICAL_FILE}], {}, "", id="no checksum"),
+    ],
+)
+def test_setup_text_names_a_curves_canonical_file(
+    records: list[dict[str, Any]], entry: dict[str, Any], file: str
+) -> None:
+    line = _lines(setup_text(_curve_document(*records, **entry)))["Source"]
+    assert line == [f"{CURVE_SOURCE[:-1]}{file}."]
+
+
+@pytest.mark.filterwarnings(
+    "ignore::crc_sdk.workflows.ReturnPeriodExtrapolationWarning",
+    "ignore::crc_sdk.parametric.ComonotoneIndexWarning",
+)
+@pytest.mark.parametrize(
+    ("records", "wrong"),
+    [
+        ([{"canonical_file": "x"}], r"source_records\[0\]\.canonical_file has"),
+        (
+            [{"canonical_file": {**CANONICAL_FILE, "file_sha256": ["x"]}}],
+            r"canonical_file\.file_sha256 has the wrong type",
+        ),
+        (
+            [{"canonical_file": {**CANONICAL_FILE, "path": ["x"]}}],
+            r"canonical_file\.path has the wrong type",
+        ),
+    ],
+)
+def test_setup_text_rejects_malformed_canonical_files(
+    records: list[dict[str, Any]], wrong: str
+) -> None:
+    document = _curve_document(
+        *records, canonical_file_sha256=f"sha256:{CANONICAL_DIGEST}"
+    )
+    with pytest.raises(EvaluationError, match=wrong):
+        setup_text(document)
+
+
+# -- where the series were matched ----------------------------------------------
+
+
+def _located(
+    asset: str | None,
+    latitude: float = 50.875,
+    longitude: float = 6.875,
+    *,
+    role: str = "hazard",
+    step: float = 0.25,
+    **fields: Any,
+) -> dict[str, Any]:
+    """A `sources` entry of a series read at the nearest grid cell."""
+    series = {
+        "cell": {"latitude": latitude, "longitude": longitude},
+        "kind": "nearest_cell",
+        "spacing_degrees": {"latitude": step, "longitude": step},
+        **{key: value for key, value in fields.items() if key == "asset_location"},
+    }
+    entry = {key: value for key, value in fields.items() if key != "asset_location"}
+    if asset is not None:
+        entry["asset_id"] = asset
+    return {"role": role, "series": series, **entry}
+
+
+def _location_lines(*sources: dict[str, Any]) -> list[str]:
+    document = json.loads(
+        _metadata(evaluate(LINEAR, _sample(), split="in_sample")).to_json()
+    )
+    return [
+        line
+        for line in setup_text({**document, "sources": list(sources)}).splitlines()
+        if line.startswith("Location")
+    ]
+
+
+POINT = "located by a point, in the nearest grid cell (grid step 0.25 by 0.25 degrees)"
+H3_CELL = (
+    "located by the asset's H3 cell, in the grid cell that holds it (grid step 0.25 "
+    "by 0.25 degrees)"
+)
+AS_PAIRS = "the cell centres as (latitude, longitude)"
+
+
+def test_setup_text_states_where_each_series_was_matched() -> None:
+    assert _location_lines(_located("a"), _located("b", 51.125, 7.125)) == [
+        f"Location: hazard series, {POINT}: a at (50.875, 6.875) and b at "
+        f"(51.125, 7.125), {AS_PAIRS}."
+    ]
+
+
+def test_setup_text_keeps_a_matched_cells_digits() -> None:
+    line = _location_lines(_located("a", -33.9375, 179.9375, step=0.0625))[0]
+    assert "(-33.9375, 179.9375)" in line and "0.0625 by 0.0625 degrees" in line
+
+
+def test_setup_text_states_each_way_of_locating_a_series_on_a_line() -> None:
+    assert _location_lines(
+        _located("a"),
+        _located("b", asset_location="h3_cell"),
+        _located("a", 50.75, 6.75, role="index", step=0.5),
+    ) == [
+        f"Location: hazard series, {POINT}: a at (50.875, 6.875), {AS_PAIRS}.",
+        f"Location: hazard series, {H3_CELL}: b at (50.875, 6.875), {AS_PAIRS}.",
+        "Location: index series, located by a point, in the nearest grid cell (grid "
+        f"step 0.5 by 0.5 degrees): a at (50.75, 6.75), {AS_PAIRS}.",
+    ]
+
+
+def test_setup_text_says_a_location_it_does_not_know_as_recorded() -> None:
+    line = _location_lines(_located("a", asset_location="centroid"))[0]
+    assert "located by centroid, in a matched grid cell (grid step" in line
+
+
+def test_setup_text_states_a_series_location_once_per_asset_and_cell() -> None:
+    # The blocks of one split and the runs of a pool on one grid repeat it.
+    same = [
+        _located("a", sample_hash="x", model="M1", member="r1"),
+        _located("a", sample_hash="y", model="M1", member="r1"),
+        _located("a", sample_hash="x", model="M2", member="r1"),
+    ]
+    assert _location_lines(*same) == [
+        f"Location: hazard series, {POINT}: a at (50.875, 6.875), {AS_PAIRS}."
+    ]
+
+
+def test_setup_text_names_the_runs_of_an_asset_on_several_cells() -> None:
+    assert _location_lines(
+        _located("a", model="M1", member="r1"),
+        _located("a", 50.75, 6.75, model="M2", member="r1"),
+        _located("a", 50.75, 6.75, model="M3", member="r2"),
+        _located("b", 51.125, 7.125, model="M1", member="r1"),
+    ) == [
+        f"Location: hazard series, {POINT}: a of M1 r1 at (50.875, 6.875), a of M2 r1 "
+        f"and M3 r2 at (50.75, 6.75) and b at (51.125, 7.125), {AS_PAIRS}."
+    ]
+
+
+def test_setup_text_finds_a_series_asset_through_its_sample() -> None:
+    document = json.loads(
+        _metadata(evaluate(LINEAR, _sample(), split="in_sample")).to_json()
+    )
+    sample = document["setup"]["samples"][0]
+    source = _located(None, sample_hash=sample["sample_hash"])
+    lines = setup_text({**document, "sources": [source]}).splitlines()
+    assert [line for line in lines if line.startswith("Location")] == [
+        f"Location: hazard series, {POINT}: {sample['asset_ids'][0]} at "
+        f"(50.875, 6.875), {AS_PAIRS}."
+    ]
+    # A series without an asset or a sample of one asset is said to be so.
+    assert " an asset not stated at " in _location_lines(_located(None))[0]
+
+
+def _many_cells(count: int) -> list[dict[str, Any]]:
+    return [_located(f"site-{k}", 50.125 + 0.25 * (k % 3), 6.875) for k in range(count)]
+
+
+def test_setup_text_counts_the_assets_and_cells_above_five() -> None:
+    named = _location_lines(*_many_cells(5))[0]
+    assert "site-4 at (50.375, 6.875)" in named
+    assert _location_lines(*_many_cells(6)) == [
+        f"Location: hazard series, {POINT}: 6 assets in 3 cells, with centres at "
+        "latitudes 50.125 to 50.625 and longitudes 6.875."
+    ]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param({"role": "hazard", "series": {"kind": "table"}}, id="a filter"),
+        pytest.param({"role": "hazard", "series": {"source": "x"}}, id="no kind"),
+        pytest.param({"role": "hazard", "kind": "curve"}, id="a curve"),
+        pytest.param({"role": "table", "name": "losses"}, id="a table"),
+    ],
+)
+def test_setup_text_has_no_location_without_a_matched_cell(
+    source: dict[str, Any],
+) -> None:
+    assert _location_lines(source) == []
+
+
+@pytest.mark.parametrize(
+    ("change", "wrong"),
+    [
+        ({"cell": "x"}, r"series\.cell has the wrong type"),
+        ({"cell": {"latitude": 1.0}}, r"series\.cell\.longitude must be a number"),
+        (
+            {"spacing_degrees": {"latitude": "x", "longitude": 1.0}},
+            r"spacing_degrees\.latitude must be a number",
+        ),
+        ({"asset_location": 1}, r"series\.asset_location has the wrong type"),
+    ],
+)
+def test_setup_text_rejects_malformed_locations(
+    change: dict[str, Any], wrong: str
+) -> None:
+    source = _located("a")
+    source["series"] = {**source["series"], **change}
+    with pytest.raises(EvaluationError, match=wrong):
+        _location_lines(source)
 
 
 @pytest.mark.parametrize(

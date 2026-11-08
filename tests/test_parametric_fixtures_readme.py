@@ -200,3 +200,15 @@ def test_the_origin_section_counts_the_cases(cases: dict[str, dict[str, Any]]) -
     )
     others = sum(stated.values()) - sum(expected.values())
     assert others == in_sample_designs, (others, in_sample_designs, ORIGIN_HINT)
+
+
+def test_the_readme_names_every_test_that_reads_the_cases() -> None:
+    tests = Path(__file__).parent
+    readers = [
+        path.name
+        for path in sorted(tests.glob("test_*.py"))
+        if '"cases"' in path.read_text(encoding="utf-8")
+    ]
+    assert "test_parametric_plan_parity.py" in readers
+    text = README.read_text(encoding="utf-8")
+    assert [name for name in readers if f"`tests/{name}`" not in text] == []

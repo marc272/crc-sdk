@@ -12,6 +12,7 @@ from typing import Any, Literal
 import h3  # type: ignore[import-untyped]
 import numpy as np
 import pyarrow as pa  # type: ignore[import-untyped]
+import pyarrow.compute as pc  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 import pytest
 from crc_framework import PiecewiseLinearImpact, TransformContext
@@ -35,6 +36,7 @@ from crc_sdk.parametric import (
     ImpactNoise,
     IndexDefinition,
     KFold,
+    Limit,
     LinearPayout,
     LossModel,
     MetricOptions,
@@ -309,15 +311,140 @@ def test_setup_text_states_the_plan_before_execution() -> None:
     source = f"Source: {SERIES}, read from a table of {rows} rows."
     lines = text.splitlines()
     after = max(i for i, line in enumerate(lines) if line.startswith("Sample"))
+    design = (
+        "Design step, planned: objective: MSE, E[(L - payout)^2]; pricing: the pure "
+        "premium, P = E[payout]; budget: premium at most 1 x E[L] of the design "
+        "sample; no limit; design premium, route and non-uniqueness report: not "
+        "known yet."
+    )
     assert setup_text(document).splitlines() == [
         *lines[: after + 1],
         source,
-        *lines[after + 1 :],
+        *lines[after + 1 : -1],
+        design,
+        lines[-1],
     ]
     planned: Any = _plan(_SourcePlan(_annual())).explain(format="json")
     assert _lines(setup_text(planned))["Source"] == [
         f"Source: {SERIES}, read from a source plan _SourcePlan."
     ]
+
+
+def test_setup_text_states_one_design_per_planned_objective() -> None:
+    plan = (
+        _plan()
+        .basis_risk(NoBasisRisk())
+        .covers(
+            _step(),
+            Cover(
+                INDEX,
+                StepPayout([70.0, 90.0], [Free(), Free()]),
+                payout_unit="EUR",
+                label="other",
+            ),
+            _linear(),
+        )
+        .objective(
+            MSE(),
+            WeightedCVaR(alpha=0.9, beta=0.95),
+            budget=Budget(amount=2e5),
+            limit=Limit(1e6),
+        )
+        .metrics(OPTIONS)
+    )
+    document: Any = plan.explain(format="json")
+    lines = _lines(setup_text(document))["Design step and other, planned"]
+    terms = (
+        "pricing: the pure premium, P = E[payout]; budget: premium at most 200,000 "
+        "EUR; limit: 1,000,000 EUR; design premium, route and non-uniqueness report: "
+        "not known yet."
+    )
+    assert lines == [
+        "Design step and other, planned: objective: MSE, E[(L - payout)^2]; " + terms,
+        "Design step and other, planned: objective: weighted CVaR, alpha CVaR_beta(U) "
+        "+ (1 - alpha) E[U] with alpha 0.9 and beta 0.95; " + terms,
+    ]
+    # A setup alone holds no design terms.
+    alone = _lines(setup_text(document["setup"]))
+    assert not any(label.startswith("Design") for label in alone)
+
+
+def test_setup_text_states_no_design_without_templates() -> None:
+    plan = (
+        _plan()
+        .basis_risk(NoBasisRisk())
+        .covers(_linear())
+        .objective(MSE())
+        .metrics(OPTIONS)
+    )
+    document: Any = plan.explain(format="json")
+    assert document["designs"]["templates"] == []
+    assert not any(k.startswith("Design") for k in _lines(setup_text(document)))
+
+
+def test_setup_text_states_how_a_point_found_each_asset(tmp_path: Path) -> None:
+    result = (
+        _plan()
+        .basis_risk(NoBasisRisk())
+        .covers(_linear())
+        .split(Holdout(0.7))
+        .metrics(OPTIONS)
+        .write_parquet(tmp_path / "comparison.parquet")
+    )
+    # Every block and evaluation of an asset reads one cell: one line says so.
+    assert _lines(setup_text(result.metadata))["Location"] == [
+        "Location: hazard series, located by a point, in the nearest grid cell (grid "
+        "step 0.25 by 0.25 degrees): warehouse-a at (50.875, 6.875) and depot-b at "
+        "(51.125, 7.125), the cell centres as (latitude, longitude)."
+    ]
+    # A selection of rows states its own assets' cells only.
+    rows = result.table.filter(pc.equal(result.table.column("asset_id"), "depot-b"))
+    assert _lines(setup_text(rows))["Location"] == [
+        "Location: hazard series, located by a point, in the nearest grid cell (grid "
+        "step 0.25 by 0.25 degrees): depot-b at (51.125, 7.125), the cell centres as "
+        "(latitude, longitude)."
+    ]
+    # Neither the asset's own point nor a distance is stated.
+    line = _lines(setup_text(result.metadata))["Location"][0]
+    assert "50.94" not in line and "6.96" not in line and "km" not in line
+    # Before execution only the rule is known, and it is in `sources`.
+    planned: Any = _plan().basis_risk(NoBasisRisk()).explain(format="json")
+    assert "Location" not in _lines(setup_text(planned))
+
+
+def test_setup_text_states_an_asset_located_by_its_h3_cell(tmp_path: Path) -> None:
+    cell = point_to_cell(6.96, 50.94, 7)
+    result = (
+        _plan(assets=_cell_assets(cell))
+        .basis_risk(NoBasisRisk())
+        .covers(_linear())
+        .metrics(OPTIONS)
+        .write_parquet(tmp_path / "comparison.parquet")
+    )
+    assert _lines(setup_text(result.metadata))["Location"] == [
+        "Location: hazard series, located by the asset's H3 cell, in the grid cell "
+        "that holds it (grid step 0.25 by 0.25 degrees): warehouse-a at (50.875, "
+        "6.875), the cell centres as (latitude, longitude)."
+    ]
+
+
+def test_setup_text_states_no_location_for_a_station(tmp_path: Path) -> None:
+    stations = pa.table(
+        {
+            "year": pa.array(YEARS, pa.int32()),
+            "station": ["S1"] * len(YEARS),
+            "value": np.random.default_rng(5).gumbel(60.0, 12.0, len(YEARS)),
+        }
+    )
+    assets = _assets("warehouse-a").append_column("station_id", pa.array(["S1"]))
+    result = (
+        _plan(stations, assets, location=StationColumn("station_id"))
+        .basis_risk(NoBasisRisk())
+        .covers(_linear())
+        .metrics(OPTIONS)
+        .write_parquet(tmp_path / "comparison.parquet")
+    )
+    assert "Location" not in _lines(setup_text(result.metadata))
 
 
 def test_the_callers_provenance_names_a_plans_source_not_the_source_plan() -> None:

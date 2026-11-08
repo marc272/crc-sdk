@@ -675,7 +675,9 @@ the draw number, `0` to `N − 1`, and `source_kind` stays `"annual"`. Each row'
 identity is in `provenance.pool`: one document per run in `runs` (`model`,
 `member`, `pathway`, `lineage`, `series` and the `dropped_years` it had no value
 for), and one entry per row in `year` and `run`. `select`, `holdout` and
-`year_block_kfold` keep the entries of the rows they keep.
+`year_block_kfold` keep the entries of the rows they keep. In a comparison's
+metadata, `setup.samples[i].periods` therefore holds draw numbers, the first
+and the last, and the calendar years are in `setup.samples[i].pool.years`.
 
 **What a pool is not.** A draw mixes model spread with year-to-year variability.
 The rows are not independent years: rows of one run share that model's climate
@@ -863,8 +865,8 @@ Every number in a comparison rests on a setup: the asset, the basis, the
 split, the samples' source and basis-risk model, the pricing and, for a design,
 its objective and constraints. `setup_text(result.metadata)` states that setup
 in plain text, one statement per line (`Level`, `Split`, `Seeds`, `Sample`,
-`Source`, `Trend`, `Sample notes`, `Pricing`, `Design`, `Metrics`), for a
-notebook or a report to print next to the numbers. The text reads only the
+`Source`, `Location`, `Trend`, `Sample notes`, `Pricing`, `Design`, `Metrics`),
+for a notebook or a report to print next to the numbers. The text reads only the
 metadata, so the same metadata always gives the same text, and statements that
 every split or sample shares are written once.
 
@@ -876,10 +878,21 @@ every split or sample shares are written once.
   hazard, the provider and dataset of its dataset's metadata, and the horizon
   and pathway of its canonical row; for per-year values, the provider and
   dataset of the series. A field that a record does not hold is stated as not
-  recorded, never guessed.
+  recorded, never guessed. A curve that a plan read also names the canonical
+  dataset's path and SHA-256, which `source_records` holds under
+  `canonical_file`.
+- `Location` states how a per-year series read at the nearest grid cell found
+  its asset: by a point or by the asset's H3 cell, the grid step, and each
+  asset's matched cell as the centre's (latitude, longitude). There is one line
+  per role (hazard, index), way and grid step. Above five assets the line
+  counts the assets and cells and gives the range of the centres. The asset's
+  point and its distance to the cell are not recorded, so they are not stated.
 - `Trend` states how a per-year sample treats the climate trend ([Climate
   trends](#climate-trends)). Samples that treat it alike share a line, and
-  lines that differ name their assets.
+  lines that differ name their assets. Above five assets, as under `Joint()`,
+  where a `LinearTrend` has one fit per asset and run, the line gives the range
+  of the slopes and of the intercepts, and counts the assets; the sample's
+  `trend` record holds each series' fit.
 - `Sample notes` writes a note that counts draws once, with each sample's own
   counts. In the quick start, the draws beyond the curve's fitted support
   read "2527 of 5000 draws in the design sample and 2464 of 5000 in the fresh
@@ -911,18 +924,23 @@ text of its metadata.
   `EvaluationMetadata.merge`.
 
 Before execution, `setup_text(plan.explain(format="json"))` gives the same
-lines without the design records, and says what only execution knows (the
-years of each block, the leakage check, the dataset's own metadata) is not
-known yet. Its `Source` line names what the plan states: on fitted curves the
-canonical dataset's path and the hazards, horizons and pathways selected
-("Source: the hazard curves of the canonical dataset rx1day.parquet, for
+lines, and says what only execution knows (the years of each block, the leakage
+check, the dataset's own metadata) is not known yet. In place of the design
+records it has one `Design` line per objective and scope the plan states: the
+templates, the objective, the pricing, the budget and the limit, and under
+`Joint()` the scope and the assets of the total, with the design premium, the
+route and the non-uniqueness report not known yet. Without templates nothing is
+designed, so there is no such line. Its `Source` line names what the plan
+states: on fitted curves the canonical dataset's path and the hazards, horizons
+and pathways selected ("Source: the hazard curves of the canonical dataset rx1day.parquet, for
 hazard rx1day, horizon 2050 and pathway ssp245; their provider and dataset are
 not known yet." in the quick start), and on per-year values the provider and
 dataset of the plan's `provenance` and the file, table or source plan the
-values are read from. `setup_text(plan.explain(format="json")["setup"])`, or
-`setup_text(metadata.setup)`, gives the setup alone, without a `Source` line.
-Out-of-sample rows' `Split` line says how the split was made and that the
-leakage check passed.
+values are read from. It has no `Location` line, as only execution matches the
+cells. `setup_text(plan.explain(format="json")["setup"])`, or
+`setup_text(metadata.setup)`, gives the setup alone, without `Source` or
+`Design` lines. Out-of-sample rows' `Split` line says how the split was made and
+that the leakage check passed.
 
 ## Define a cover and evaluate its payouts
 
@@ -1100,15 +1118,20 @@ table's `retrieved_at` column is left out too.
 
 A nearest-cell series records the cell's centre and the grid step, not the
 point itself: it says which grid cell holds the asset, not where in the cell it
-lies.
+lies. A result file can say more of an asset's place: `cell=H3Cell(r)` records
+the asset's H3 cell, so the caller's resolution sets how much is disclosed; a
+source plan's `explain()` records its `area` whole; and `.index(...,
+location=NearestCell(...))` on a grid finer than or offset from the hazard's
+narrows the place further, because a contract names where its index is read.
 
 **Loss model.** `LossModel(impact, *, value_column=None, value=None,
-value_unit="1", context=None)` computes `impact(hazard) × value`. `impact` is
-an `ImpactExpression`, a framework `ImpactFunction` (such as
+value_unit="1", context=None, name=None)` computes `impact(hazard) × value`.
+`impact` is an `ImpactExpression`, a framework `ImpactFunction` (such as
 `PiecewiseLinearImpact` or a registry impact) or a vectorised callable, as
-`PortfolioEvaluation.impact(...)` takes. Without a value the loss is the
-damage ratio. A value column, and `ImpactContextColumns` for registry impacts,
-are read from the asset's row with `loss_model.for_asset(assets, asset_id)`; a
+`PortfolioEvaluation.impact(...)` takes, and `name` labels it in the provenance.
+Without a value the loss is the damage ratio. A value column, and
+`ImpactContextColumns` for registry impacts, are read from the asset's row with
+`loss_model.for_asset(assets, asset_id)`; a
 missing or repeated asset raises. An `ImpactExpression` declares the hazard
 unit it is calibrated for (`loss_model.exposure_unit`). Before drawing,
 `sample_curve` and `sample_annual` check the curve's `value_unit` or the hazard

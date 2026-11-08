@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -717,6 +718,13 @@ def test_pools_of_different_runs_that_share_one_run_raise() -> None:
     assert one.lineage != other.lineage
     with pytest.raises(LeakageError, match="shares 30 model-years"):
         evaluate(LINEAR, other, split="out_of_sample", design_sample=one)
+
+
+def test_one_shared_model_year_is_named_in_the_singular() -> None:
+    first = _pool([_run("A", years=YEARS[:6]), _run("B", years=YEARS[:6])])
+    second = _pool([_run("A", years=YEARS[5:11]), _run("C", years=YEARS[5:11])])
+    with pytest.raises(LeakageError, match="shares 1 model-year with"):
+        evaluate(LINEAR, second, split="out_of_sample", design_sample=first)
 
 
 def test_pools_of_other_runs_are_no_leak() -> None:
@@ -1478,6 +1486,78 @@ def test_joint_with_a_trend_and_a_split_joins_per_fold(tmp_path: Path) -> None:
             assert len(entry["trend"]["fits"]) == 4
             assert {fit["asset_id"] for fit in entry["trend"]["fits"]} == {"a", "b"}
     assert _document(result.joint_sample)["year"][-1] == 2044
+
+
+def test_a_pool_records_draw_numbers_as_periods_and_calendar_years_in_pool(
+    tmp_path: Path,
+) -> None:
+    result = _resolved(_planned()).write_parquet(tmp_path / "p.parquet")
+    sample = next(s for s in result.metadata.setup.samples if s["asset_ids"] == ["a"])
+    # Two runs of 30 years: 60 rows, numbered from 0.
+    assert sample["periods"] == [0, 59]
+    assert sample["pool"]["years"] == [int(year) for year in YEARS]
+
+
+def _seven_sites() -> Any:
+    sites = {f"s{k}": (6.875, 50.125 + 0.25 * k) for k in range(7)}
+    return pa.table(
+        {
+            "asset_id": list(sites),
+            "longitude": [point[0] + 0.01 for point in sites.values()],
+            "latitude": [point[1] + 0.01 for point in sites.values()],
+            "value_eur": [2e6 for _ in sites],
+        }
+    )
+
+
+def _seven_cells() -> Any:
+    return tuple((50.125 + 0.25 * k, 6.875) for k in range(7))
+
+
+def test_joint_above_five_assets_summarises_the_trend_and_the_location(
+    tmp_path: Path,
+) -> None:
+    plan = (
+        _planned(
+            _table_of(cells=_seven_cells()),
+            assets=_seven_sites(),
+            trend=LinearTrend(),
+            location=NearestCell(spacing=(0.25, 0.25)),
+        )
+        .basis_risk(ImpactNoise(0.3, upper=1.0))
+        .covers(LINEAR)
+        .split(Holdout(0.75))
+        .scopes(Joint())
+        .metrics(OPTIONS)
+    )
+    result = plan.write_parquet(tmp_path / "p.parquet")
+    text = setup_text(result.metadata)
+    trend = _lines(text, "Trend")
+    assert len(trend) == 1
+    assert " of s0" not in trend[0] and "GFDL-ESM4" not in trend[0]
+    assert re.search(
+        r"where each intercept is the fitted value: hazard slope -?[\d.]+ to -?[\d.]+ "
+        r"mm/day per year and intercept [\d.]+ to [\d.]+ mm/day, over 14 series of 7 "
+        r"assets; the sample's trend record holds each series' fit\.$",
+        trend[0],
+    )
+    assert _lines(text, "Location") == [
+        "Location: hazard series, located by a point, in the nearest grid cell (grid "
+        "step 0.25 by 0.25 degrees): 7 assets in 7 cells, with centres at latitudes "
+        "50.125 to 51.625 and longitudes 6.875."
+    ]
+    # The record keeps every series' fit.
+    entry = next(s for s in result.metadata.setup.samples if len(s["asset_ids"]) == 7)
+    assert len(entry["trend"]["fits"]) == 14
+
+
+def test_a_pool_read_at_the_same_cell_names_each_asset_once(tmp_path: Path) -> None:
+    result = _resolved(_planned()).write_parquet(tmp_path / "p.parquet")
+    assert _lines(setup_text(result.metadata), "Location") == [
+        "Location: hazard series, located by a point, in the nearest grid cell (grid "
+        "step 0.25 by 0.25 degrees): a at (50.875, 6.875) and b at (51.125, 7.125), "
+        "the cell centres as (latitude, longitude)."
+    ]
 
 
 def test_individual_and_joint_together_on_a_pool(tmp_path: Path) -> None:

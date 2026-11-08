@@ -850,6 +850,78 @@ def test_samples_that_differ_are_named_by_asset() -> None:
     assert [line.split(":")[0] for line in lines] == ["Trend of a", "Trend of b"]
 
 
+def _fitted_setup(*fits_by_sample: Any) -> dict[str, Any]:
+    """A setup of per-year samples, one for each list of (asset, slope) pairs."""
+    samples = [
+        {
+            "sample_hash": f"sha256:{i}",
+            "roles": ["evaluation"],
+            "source_kind": "annual",
+            "asset_ids": sorted({asset for asset, _ in fits}),
+            "trend": {
+                "kind": "linear_trend",
+                "fit_years": [2000 + i, 2001 + i],
+                "reference_year": 2010,
+                "fits": [
+                    {
+                        "role": "hazard",
+                        "asset_id": asset,
+                        "slope": slope,
+                        "intercept": 50.0 + slope,
+                        "unit": "mm/day",
+                    }
+                    for asset, slope in fits
+                ],
+            },
+        }
+        for i, fits in enumerate(fits_by_sample)
+    ]
+    return {
+        "basis": "annual",
+        "metric_options": {},
+        "samples": samples,
+        "evaluations": [],
+    }
+
+
+def _sites(count: int) -> list[tuple[str, float]]:
+    return [(f"site-{k}", 0.1 * k) for k in range(count)]
+
+
+def test_the_trend_line_names_each_fit_up_to_five_assets() -> None:
+    line = _text_lines(setup_text(_fitted_setup(_sites(5))), "Trend")[0]
+    assert "hazard of site-0 slope 0 mm/day per year, intercept 50 mm/day" in line
+    assert "hazard of site-4 slope 0.4 mm/day per year" in line
+    assert "over 5 series" not in line
+
+
+def test_the_trend_line_gives_the_ranges_above_five_assets() -> None:
+    line = _text_lines(setup_text(_fitted_setup(_sites(6))), "Trend")[0]
+    assert "site-" not in line
+    assert line.endswith(
+        "where each intercept is the fitted value: hazard slope 0 to 0.5 mm/day per "
+        "year and intercept 50 to 50.5 mm/day, over 6 series of 6 assets; the "
+        "sample's trend record holds each series' fit."
+    )
+
+
+def test_the_trend_lines_count_their_assets_above_five() -> None:
+    lines = _text_lines(setup_text(_fitted_setup(_sites(6), _sites(6)[:2])), "Trend")
+    assert [line.split(":")[0] for line in lines] == [
+        "Trend of 6 assets",
+        "Trend of site-0 and site-1",
+    ]
+
+
+def test_the_trend_ranges_are_by_role_and_unit() -> None:
+    setup = _fitted_setup(_sites(6))
+    fits = setup["samples"][0]["trend"]["fits"]
+    fits += [{**fit, "role": "index", "unit": "m", "slope": 2.0} for fit in fits]
+    line = _text_lines(setup_text(setup), "Trend")[0]
+    assert "hazard slope 0 to 0.5 mm/day per year" in line
+    assert "index slope 2 m per year and intercept 50 to 50.5 m, over 6 series" in line
+
+
 def test_a_joined_sample_states_each_part_s_fit() -> None:
     a, b = _part("a", LinearTrend(), seed=1), _part("b", LinearTrend(), seed=2)
     joined = OutcomeSample.join([a, b])

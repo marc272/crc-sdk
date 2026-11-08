@@ -1794,7 +1794,8 @@ def _check_out_of_sample(design: OutcomeSample, evaluation: OutcomeSample) -> No
     shared = [np.intersect1d(designed[lineage], held[lineage]) for lineage in common]
     count = sum(each.size for each in shared)
     if count:
-        noun = "periods" if pooled is None else "model-years"
+        noun = "period" if pooled is None else "model-year"
+        noun += "" if count == 1 else "s"
         years = np.unique(np.concatenate(shared))
         raise LeakageError(
             f"the evaluation sample shares {count} {noun} with the design "
