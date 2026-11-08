@@ -20,6 +20,7 @@ from crc_sdk.geometry import point_to_cell
 from crc_sdk.impacts import ImpactCalibration, ImpactExpression
 from crc_sdk.parametric import (
     MSE,
+    AtStation,
     Budget,
     ComonotoneIndexWarning,
     Cover,
@@ -38,6 +39,7 @@ from crc_sdk.parametric import (
     ParametricPlan,
     ProbabilitySemanticsError,
     SampleError,
+    StationColumn,
     StepPayout,
     WeightedCVaR,
     compare,
@@ -634,6 +636,28 @@ def test_a_cover_on_another_unit_is_refused_at_execution(dataset: Path) -> None:
 
 
 # -- builders and explain -------------------------------------------------------
+
+
+def test_an_index_read_elsewhere_is_refused_on_curves(dataset: Path) -> None:
+    plan = _plan(dataset).monte_carlo(100, seed=42)
+    stations = pa.table(
+        {"station": ["S1"], "year": pa.array([2000], pa.int32()), "value": [1.0]}
+    )
+    provenance = SourceProvenance(
+        provider="example", dataset="gauges", licence="CC0-1.0", attribution="Synthetic"
+    )
+    with pytest.raises(ValueError, match="joint distribution of two curves"):
+        plan.index(
+            stations,
+            location=StationColumn("station_id"),
+            unit="mm/day",
+            provenance=provenance,
+        )
+    elsewhere = IndexDefinition(
+        "rx1day", "mm/day", location=AtStation("S1"), aggregation="annual_maximum"
+    )
+    with pytest.raises(SampleError, match="joint distribution of two curves"):
+        plan.covers(Cover(elsewhere, LinearPayout(60.0, 120.0, 1.0), payout_unit="EUR"))
 
 
 def test_builders_and_explain_do_no_io(tmp_path: Path) -> None:
