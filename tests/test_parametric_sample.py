@@ -100,8 +100,8 @@ def test_arrays_are_read_only_copies_with_an_asset_axis() -> None:
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"asset_ids": ("a", "b")}, "exactly one asset"),
-        ({"asset_ids": ()}, "exactly one asset"),
+        ({"asset_ids": ("a", "b")}, r"index must have shape \(10, 2\)"),
+        ({"asset_ids": ()}, "one asset or more"),
         ({"asset_ids": (" a",)}, "asset id"),
         ({"asset_ids": "a"}, "sequence"),
         ({"period": np.arange(10.0)}, "integers"),
@@ -482,12 +482,12 @@ def test_written_tables_that_were_changed_are_rejected(
         OutcomeSample.from_written_table(table)
 
 
-def test_a_written_table_of_two_assets_is_refused_until_phase_two() -> None:
+def test_a_written_table_of_two_assets_must_state_their_dependence() -> None:
     table = _sample(n=4).to_table()
     two = pa.concat_tables([table, table]).sort_by([("period", "ascending")])
     two = _with_column(two, "asset_id", pa.array(["a", "b"] * 4))
     two = _with_column(two, "probability", pa.array([0.25] * 8))
-    with pytest.raises(SampleError, match="exactly one asset"):
+    with pytest.raises(SampleError, match="must state where the dependence"):
         OutcomeSample.from_written_table(_rewritten(two, asset_ids=["b", "a"]))
 
 
@@ -734,7 +734,7 @@ def test_a_table_read_from_parquet(tmp_path: Path) -> None:
         (_table(loss=[1.0, None, 2.0, 3.0]), "null"),
         (_table(year=[2000.0, 2001.0, 2002.0, 2003.0]), "integers"),
         (_table(year=[2000, 2001, 2001, 2003]), "more than once"),
-        (_table(asset=["a1", "a2", "a1", "a1"]), "exactly one asset"),
+        (_table(asset=["a1", "a2", "a1", "a1"]), "has no row for periods"),
         (_table(loss=[1.0, -2.0, 2.0, 3.0]), "non-negative"),
         (_table(rain=[1.0, float("inf"), 2.0, 3.0]), "finite"),
         (_table(rain=["x", "y", "z", "w"]), "numeric"),

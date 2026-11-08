@@ -66,7 +66,11 @@ from crc_sdk.parametric.metadata import (
 )
 from crc_sdk.parametric.metrics import MetricOptions, metric_columns, metric_values
 from crc_sdk.parametric.pricing import CostOfCapitalLoad, Pricing, PurePremium
-from crc_sdk.parametric.sample import OutcomeSample, _check_out_of_sample
+from crc_sdk.parametric.sample import (
+    OutcomeSample,
+    _check_out_of_sample,
+    _require_one_asset,
+)
 
 __all__ = [
     "DesignedCover",
@@ -563,6 +567,9 @@ def _table(
     checked_premium = _premium(premium)
     checked_options = _options(options)
     given = None if design_sample is None else _sample(design_sample, "design_sample")
+    for each in (sample, given):
+        if each is not None:
+            _require_one_asset(each, "evaluate and compare")
     design_samples: dict[str, OutcomeSample] = {}
     for item in items:
         _check_cover(item.cover, sample)
@@ -650,7 +657,8 @@ def evaluate(
     Its schema metadata holds the `EvaluationMetadata` under
     `crc.parametric.evaluation`.
 
-    Raises `UnresolvedParameterError` for a template, `SampleError` if the
+    Raises `UnresolvedParameterError` for a template, `SampleError` if a sample
+    holds several assets (take one with `sample.asset(asset_id)`), the
     cover's units or asset differ from the sample's or a design sample is
     missing or wrong, `LeakageError` for a shared period, `EvaluationError`
     (a `ValueError`) for invalid arguments, such as an unknown split, a

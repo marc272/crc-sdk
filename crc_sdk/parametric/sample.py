@@ -9,12 +9,18 @@ modelled years (`sample_annual`), or the rows of a user table
 - `period` labels the rows: the calendar year of a per-year sample, the draw
   number of a Monte Carlo sample. It is strictly increasing.
 - `probability` is each row's probability; it sums to 1.
-- `index` and `loss` have one row per draw and one column per asset. A
-  sample holds exactly one asset for now, so they are `(n, 1)`.
+- `index` and `loss` have one row per draw and one column per asset, in
+  `asset_ids` order: `(n, n_assets)`.
 - `hazard` is the value the loss model read, kept when it differs from the
   index (a basis-risk model or a separate index series); otherwise `None`.
 - `provenance` (`SampleProvenance`) records the source, the semantics, the
   loss model, the basis-risk model and the generator state.
+
+A sample holds one asset or more, with distinct ids, and a sample of several
+states where the dependence between them comes from. `OutcomeSample.asset`
+takes one asset's sample out of it, and `OutcomeSample.join` puts one-asset
+samples of the same years side by side. `design`, `evaluate` and `compare`
+work on one asset's sample.
 
 `holdout` and `year_block_kfold` split a sample into contiguous blocks of
 periods, so the held-out block of a per-year sample is its latest years.
@@ -91,6 +97,11 @@ COMONOTONE_MESSAGE = (
     "loss is a function of the index, so a cover can track the loss almost "
     "exactly. State a basis-risk model (ImpactNoise, or an index series read "
     "elsewhere than the loss) to measure basis risk"
+)
+
+_TABLE_COMONOTONE_NOTE = (
+    "The table's loss is a monotone function of its index: index and loss are "
+    "comonotone."
 )
 
 
@@ -302,6 +313,11 @@ def _matrix(name: str, value: Any, n: int, n_assets: int) -> FloatArray:
     return array
 
 
+def _asset_note(asset: str, note: str) -> str:
+    """One asset's note, in the notes of a sample of several assets."""
+    return f"Asset {asset}: {note}"
+
+
 def _read_only(array: NDArray[Any]) -> NDArray[Any]:
     array.setflags(write=False)
     return array
@@ -389,6 +405,12 @@ class SampleProvenance:
       raises `LeakageError`.
     - `parent` and `selection`: for a sample split or selected from another,
       the content hash of the sample it came from and the steps taken.
+    - `dependence`: for a sample of several assets, where the dependence
+      between them comes from; such a sample must state it. `{"kind": "data"}`
+      is the data's own: the rows are the same years of the data. `None` on a
+      one-asset sample.
+    - `parts`: for a sample of several assets, each asset's own provenance
+      document, by asset id. `None` on a one-asset sample.
 
     Mappings and sequences are stored read-only; `to_document()` returns
     plain JSON types. Raises `SampleError` for unknown kinds or values that
@@ -408,6 +430,8 @@ class SampleProvenance:
     lineage: str | None = None
     parent: str | None = None
     selection: tuple[Mapping[str, Any], ...] = ()
+    dependence: Mapping[str, Any] | None = None
+    parts: Mapping[str, Mapping[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         if self.source_kind not in get_args(SourceKind):
@@ -435,10 +459,16 @@ class SampleProvenance:
                 raise SampleError(
                     "each rng record needs a step, a bit_generator and a state"
                 )
-        for name in ("loss_model", "basis_risk"):
+        for name in ("loss_model", "basis_risk", "dependence", "parts"):
             value = getattr(self, name)
             if value is not None and not isinstance(value, Mapping):
                 raise SampleError(f"{name} must be a mapping or None")
+        if self.dependence is not None and "kind" not in self.dependence:
+            raise SampleError("dependence must name its kind")
+        if self.parts is not None and not all(
+            isinstance(part, Mapping) for part in self.parts.values()
+        ):
+            raise SampleError("parts must map each asset id to a provenance document")
         if not isinstance(self.details, Mapping):
             raise SampleError("details must be a mapping")
         if isinstance(self.notes, str) or not all(
@@ -453,6 +483,8 @@ class SampleProvenance:
             "licences",
             "details",
             "selection",
+            "dependence",
+            "parts",
         ):
             value = getattr(self, name)
             _check_json(name, value)
@@ -515,7 +547,10 @@ class OutcomeSample:
     `loss_unit` name the units; the loss unit must equal a cover's payout
     unit for designs and evaluations. `semantics` is `"annual"`.
 
-    A sample holds exactly one asset for now; a second raises `SampleError`.
+    A sample holds one asset or more, with distinct ids. A sample of several
+    must state where the dependence between them comes from, in its
+    provenance's `dependence`: it is never assumed. `asset` takes one asset's
+    sample out of it and `join` puts one-asset samples side by side.
     The arrays are read-only copies. Samples compare by identity; compare
     `content_hash` for equal contents.
 
@@ -539,11 +574,10 @@ class OutcomeSample:
         if isinstance(ids, str) or not isinstance(ids, Sequence):
             raise SampleError("asset_ids must be a sequence of asset ids")
         asset_ids = tuple(_identifier("asset id", value) for value in ids)
-        if len(asset_ids) != 1:
-            raise SampleError(
-                f"a sample holds exactly one asset, got {len(asset_ids)}; build "
-                "one sample per asset"
-            )
+        if not asset_ids:
+            raise SampleError("a sample holds one asset or more, got none")
+        if len(set(asset_ids)) != len(asset_ids):
+            raise SampleError(f"asset ids must be distinct, got {list(asset_ids)}")
         period = _periods(self.period)
         n = period.shape[0]
         probability = _float_array("probability", self.probability)
@@ -577,6 +611,25 @@ class OutcomeSample:
             )
         if not isinstance(self.provenance, SampleProvenance):
             raise SampleError("provenance must be a SampleProvenance")
+        if len(asset_ids) == 1 and not (
+            self.provenance.dependence is None and self.provenance.parts is None
+        ):
+            raise SampleError(
+                "a one-asset sample has no dependence between assets and no parts"
+            )
+        if len(asset_ids) > 1 and self.provenance.dependence is None:
+            raise SampleError(
+                f"a sample of {len(asset_ids)} assets must state where the dependence "
+                "between them comes from: set the provenance's dependence, for "
+                'example {"kind": "data"} for the same years of the data'
+            )
+        if self.provenance.parts is not None and set(self.provenance.parts) != set(
+            asset_ids
+        ):
+            raise SampleError(
+                f"the provenance's parts are for {sorted(self.provenance.parts)}, "
+                f"but the sample holds {sorted(asset_ids)}"
+            )
         _identifier("scenario", self.scenario)
         object.__setattr__(self, "asset_ids", asset_ids)
         object.__setattr__(self, "period", _read_only(period))
@@ -667,6 +720,194 @@ class OutcomeSample:
             semantics=self.semantics,
             provenance=provenance,
             scenario=self.scenario,
+        )
+
+    def asset(self, asset_id: str) -> OutcomeSample:
+        """Return one asset's sample: the same periods and probabilities.
+
+        The provenance is the asset's own, from the provenance's `parts`
+        when it has them, and `selection` records the step after the steps
+        of that asset's own sample. The lineage is kept, so a leakage check
+        still sees the source: of a joined sample it is the part's, otherwise
+        this sample's. A hazard equal to the asset's index is dropped, as on
+        any sample, so a part of a join comes back with its content hash.
+
+        A one-asset sample returns itself. Raises `SampleError` for an asset
+        the sample does not hold.
+        """
+        if asset_id not in self.asset_ids:
+            raise SampleError(
+                f"the sample holds no asset {asset_id!r}; it holds "
+                f"{list(self.asset_ids)}"
+            )
+        if len(self.asset_ids) == 1:
+            return self
+        column = self.asset_ids.index(asset_id)
+        index = self.index[:, column]
+        hazard = None if self.hazard is None else self.hazard[:, column]
+        if hazard is not None and np.array_equal(hazard, index):
+            hazard = None
+        own = self.provenance
+        part = None if own.parts is None else _written_provenance(own.parts[asset_id])
+        earlier = () if part is None else part.selection
+        # Taking an asset commutes with a split, and a split stays the last
+        # step: the setup text reads the block from the last one.
+        step = {"kind": "asset", "asset_id": asset_id}
+        provenance = dataclasses.replace(
+            own if part is None else part,
+            parent=own.parent or self.content_hash,
+            lineage=(None if part is None else part.lineage) or self.lineage,
+            selection=(*earlier, step, *own.selection),
+            dependence=None,
+            parts=None,
+        )
+        return OutcomeSample(
+            asset_ids=(asset_id,),
+            period=self.period,
+            probability=self.probability,
+            index=index,
+            loss=self.loss[:, column],
+            hazard=hazard,
+            index_unit=self.index_unit,
+            loss_unit=self.loss_unit,
+            semantics=self.semantics,
+            provenance=provenance,
+            scenario=self.scenario,
+        )
+
+    @classmethod
+    def join(cls, samples: Iterable[OutcomeSample]) -> OutcomeSample:
+        """Put one-asset samples of the same years side by side.
+
+        The columns are in the order of `samples`. The periods, probabilities,
+        units, semantics and scenario must be identical and the asset ids
+        distinct. A part without a separate `hazard` contributes its index
+        when another part has one.
+
+        The provenance records `dependence` as `{"kind": "data"}`, the data's
+        own, because the rows are the same years of the data, and holds each
+        part's provenance in `parts`. Its sources, licences, generator records
+        and notes are the parts', each source, record and note naming its
+        asset. Its lineage is new, built from the parts' lineages. The loss
+        and basis-risk models are per asset, so they are in `parts` only.
+
+        Monte Carlo samples are refused: independently drawn curve samples
+        line up by draw number only, so joining them would impose independence
+        without stating it.
+
+        Raises `SampleError` for fewer than two samples, a sample of several
+        assets, a Monte Carlo sample, a repeated asset id or any field that
+        differs, and `TypeError` for anything but an iterable of samples.
+        """
+        if isinstance(samples, (str, bytes, Mapping)) or not isinstance(
+            samples, Iterable
+        ):
+            raise TypeError(
+                "samples must be an iterable of OutcomeSample, got "
+                f"{type(samples).__name__}"
+            )
+        parts = tuple(_require_sample(part) for part in samples)
+        if len(parts) < 2:
+            raise SampleError(f"join needs two samples or more, got {len(parts)}")
+        for part in parts:
+            if len(part.asset_ids) != 1:
+                raise SampleError(
+                    "join takes one-asset samples, but one holds "
+                    f"{len(part.asset_ids)} assets; take each with asset() first"
+                )
+            if part.provenance.source_kind == "monte_carlo":
+                raise SampleError(
+                    f"join refuses the Monte Carlo sample of asset "
+                    f"{part.asset_ids[0]!r}: independently drawn curve samples line "
+                    "up by draw number only, so joining them would impose "
+                    "independence without stating it; use sample_curves, which "
+                    "states the dependence"
+                )
+        ids = [part.asset_ids[0] for part in parts]
+        if len(set(ids)) != len(ids):
+            raise SampleError(f"join needs distinct asset ids, got {ids}")
+        first = parts[0]
+        for name in ("period", "probability"):
+            for part in parts[1:]:
+                if not np.array_equal(getattr(part, name), getattr(first, name)):
+                    raise SampleError(
+                        f"join needs identical {name} columns, but asset "
+                        f"{part.asset_ids[0]!r} differs from asset {ids[0]!r}"
+                    )
+        for name in ("index_unit", "loss_unit", "semantics", "scenario"):
+            values = {getattr(part, name) for part in parts}
+            if len(values) > 1:
+                raise SampleError(
+                    f"join needs one {name} in every sample, got {sorted(values)}"
+                )
+        kinds = {part.provenance.source_kind for part in parts}
+        stated = {part.provenance.semantics_source for part in parts}
+        documents = {part.asset_ids[0]: part.provenance.to_document() for part in parts}
+        licences: list[dict[str, Any]] = []
+        for document in documents.values():
+            for licence in document["licences"]:
+                if licence not in licences:
+                    licences.append(licence)
+        # Parts of different kinds line up because the caller says they do.
+        provenance = SampleProvenance(
+            source_kind=first.provenance.source_kind if len(kinds) == 1 else "table",
+            sources=tuple(
+                {**source, "asset_id": asset}
+                for asset, document in documents.items()
+                for source in document["sources"]
+            ),
+            semantics_source=(
+                first.provenance.semantics_source if len(stated) == 1 else "caller"
+            ),
+            rng=tuple(
+                {**record, "asset_id": asset}
+                for asset, document in documents.items()
+                for record in document["rng"]
+            ),
+            licences=tuple(licences),
+            details={
+                "draws": len(first),
+                "periods": [int(first.period[0]), int(first.period[-1])],
+            },
+            notes=tuple(
+                _asset_note(asset, note)
+                for asset, document in documents.items()
+                for note in document["notes"]
+            ),
+            lineage=content_hash(
+                {
+                    "kind": "join",
+                    "lineages": {part.asset_ids[0]: part.lineage for part in parts},
+                }
+            ),
+            dependence={"kind": "data"},
+            parts={
+                part.asset_ids[0]: {
+                    **documents[part.asset_ids[0]],
+                    "lineage": part.lineage,
+                }
+                for part in parts
+            },
+        )
+        hazard = (
+            None
+            if all(part.hazard is None for part in parts)
+            else np.hstack(
+                [part.index if part.hazard is None else part.hazard for part in parts]
+            )
+        )
+        return cls(
+            asset_ids=tuple(ids),
+            period=first.period,
+            probability=first.probability,
+            index=np.hstack([part.index for part in parts]),
+            loss=np.hstack([part.loss for part in parts]),
+            hazard=hazard,
+            index_unit=first.index_unit,
+            loss_unit=first.loss_unit,
+            semantics=first.semantics,
+            provenance=provenance,
+            scenario=first.scenario,
         )
 
     def to_table(self) -> Any:
@@ -872,14 +1113,17 @@ class OutcomeSample:
         provenance: a string, a `SourceProvenance` (with its licence) or a
         mapping.
 
-        Rows are sorted by period. Every (period, asset) pair must appear
-        once, and the table must hold exactly one asset. The table carries
-        its own basis risk; if its loss is a monotone function of its index,
-        this warns with `ComonotoneIndexWarning`.
+        Rows are sorted by period, and `asset_ids` by asset id. Every
+        (period, asset) pair must appear exactly once. A probability column
+        must agree between the assets of a period. A table of several assets
+        records `dependence` as `{"kind": "data"}`, the data's own: its rows
+        are what the caller states. The table carries its own basis risk; if
+        an asset's loss is a monotone function of its index, this warns with
+        `ComonotoneIndexWarning`.
 
         Raises `SampleError` for a missing column, nulls, non-integer
-        periods, repeated periods, several assets, or invalid values, and
-        `TypeError` for a file path or a non-table.
+        periods, repeated or missing (period, asset) pairs, or invalid
+        values, and `TypeError` for a file path or a non-table.
         """
         if semantics != "annual":
             raise SampleError(
@@ -905,54 +1149,80 @@ class OutcomeSample:
         if not ids:
             raise SampleError("the sample table has no rows")
         distinct = sorted(set(ids))
-        if len(distinct) != 1:
-            raise SampleError(
-                f"a sample holds exactly one asset, but the table holds "
-                f"{len(distinct)} ({', '.join(distinct[:5])}"
-                f"{', ...' if len(distinct) > 5 else ''}); filter it to one asset"
-            )
-        order = np.argsort(periods, kind="stable")
-        periods = periods[order]
-        repeated = np.unique(periods[1:][np.diff(periods) == 0])
-        if repeated.size:
-            raise SampleError(
-                f"periods {repeated[:10].tolist()} appear more than once for "
-                f"asset {distinct[0]!r}"
-            )
-        n = periods.shape[0]
-        index_values = index_values[order]
-        loss_values = loss_values[order]
+        n_assets = len(distinct)
+        position = {asset: j for j, asset in enumerate(distinct)}
+        columns = np.array([position[value] for value in ids], dtype=np.int64)
+        all_periods, rows = np.unique(periods, return_inverse=True)
+        n = all_periods.shape[0]
+        counts = np.zeros((n, n_assets), dtype=np.int64)
+        np.add.at(counts, (rows, columns), 1)
+        for j, asset in enumerate(distinct):
+            repeated = all_periods[counts[:, j] > 1]
+            if repeated.size:
+                raise SampleError(
+                    f"periods {repeated[:10].tolist()} appear more than once for "
+                    f"asset {asset!r}"
+                )
+            missing = all_periods[counts[:, j] == 0]
+            if missing.size:
+                raise SampleError(
+                    f"asset {asset!r} has no row for periods "
+                    f"{missing[:10].tolist()}; every (period, asset) pair must "
+                    "appear in the table"
+                )
+
+        def wide(values: FloatArray) -> FloatArray:
+            array = np.empty((n, n_assets), dtype=np.float64)
+            array[rows, columns] = values
+            return array
+
+        index_wide = wide(index_values)
+        loss_wide = wide(loss_values)
+        hazard_wide = None if hazard_values is None else wide(hazard_values)
         if probability_values is None:
-            probability_values = np.full(n, 1.0 / n)
+            per_period = np.full(n, 1.0 / n)
         else:
-            probability_values = probability_values[order]
-        if hazard_values is not None:
-            hazard_values = hazard_values[order]
+            probabilities = wide(probability_values)
+            if n_assets > 1 and not (probabilities == probabilities[:, :1]).all():
+                raise SampleError(
+                    f"column {probability!r} differs between the assets of a period"
+                )
+            per_period = probabilities[:, 0]
         source_document = _source_document(source)
         # Validate every field first; the provenance needs the content hash.
         bare = cls(
-            asset_ids=(distinct[0],),
-            period=periods,
-            probability=probability_values,
-            index=index_values,
-            loss=loss_values,
-            hazard=hazard_values,
+            asset_ids=tuple(distinct),
+            period=all_periods,
+            probability=per_period,
+            index=index_wide,
+            loss=loss_wide,
+            hazard=hazard_wide,
             index_unit=index_unit,
             loss_unit=loss_unit,
             semantics=semantics,
             provenance=SampleProvenance(
-                source_kind="table", sources=(), semantics_source="caller"
+                source_kind="table",
+                sources=(),
+                semantics_source="caller",
+                dependence=None if n_assets == 1 else {"kind": "data"},
             ),
         )
         table_hash = bare.content_hash
-        notes: list[str] = []
-        if _is_monotone_function(index_values, loss_values):
-            warnings.warn(COMONOTONE_MESSAGE, ComonotoneIndexWarning, stacklevel=2)
-            notes.append(
-                "The table's loss is a monotone function of its index: index "
-                "and loss are comonotone."
+        comonotone = [
+            asset
+            for j, asset in enumerate(distinct)
+            if _is_monotone_function(index_wide[:, j], loss_wide[:, j])
+        ]
+        if comonotone:
+            where = "" if n_assets == 1 else f" (assets {', '.join(comonotone)})"
+            warnings.warn(
+                COMONOTONE_MESSAGE + where, ComonotoneIndexWarning, stacklevel=2
             )
-        identity: dict[str, Any] = {"kind": "table", "asset_id": distinct[0]}
+        identity: dict[str, Any] = (
+            {"kind": "table", "asset_id": distinct[0]}
+            if n_assets == 1
+            else {"kind": "table", "asset_ids": distinct}
+        )
         if source_document:
             identity["source"] = source_document
         else:
@@ -981,9 +1251,24 @@ class OutcomeSample:
                 "periods": [int(periods[0]), int(periods[-1])],
                 "probability": "uniform" if probability is None else "column",
             },
-            notes=tuple(notes),
+            notes=(
+                (_TABLE_COMONOTONE_NOTE,)
+                if comonotone and n_assets == 1
+                else tuple(_asset_note(a, _TABLE_COMONOTONE_NOTE) for a in comonotone)
+            ),
             lineage=content_hash(identity),
         )
+        if n_assets > 1:
+            parts = {
+                asset: dataclasses.replace(
+                    provenance,
+                    notes=(_TABLE_COMONOTONE_NOTE,) if asset in comonotone else (),
+                ).to_document()
+                for asset in distinct
+            }
+            provenance = dataclasses.replace(
+                provenance, dependence={"kind": "data"}, parts=parts
+            )
         return dataclasses.replace(bare, provenance=provenance)
 
 
@@ -1062,6 +1347,18 @@ def _require_sample(sample: Any) -> OutcomeSample:
     if not isinstance(sample, OutcomeSample):
         raise TypeError(f"expected an OutcomeSample, got {type(sample).__name__}")
     return sample
+
+
+def _require_one_asset(sample: OutcomeSample, function: str) -> None:
+    """Raise `SampleError` if `sample` holds several assets; `function` needs one."""
+    count = len(sample.asset_ids)
+    if count > 1:
+        shown = ", ".join(sample.asset_ids[:5]) + (", ..." if count > 5 else "")
+        raise SampleError(
+            f"{function} takes one asset's sample, but this one holds {count} assets "
+            f"({shown}): take one with sample.asset(asset_id), or use design_joint "
+            "for one design over several assets"
+        )
 
 
 def holdout(

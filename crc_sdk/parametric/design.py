@@ -111,7 +111,7 @@ from crc_sdk.parametric.objectives import (
 from crc_sdk.parametric.parameters import Free, _DefinitionModel
 from crc_sdk.parametric.payouts import LinearConstraints, LinearInAmounts
 from crc_sdk.parametric.pricing import CostOfCapitalLoad, Pricing, PurePremium
-from crc_sdk.parametric.sample import OutcomeSample
+from crc_sdk.parametric.sample import OutcomeSample, _require_one_asset
 
 __all__ = [
     "DESIGN_SEMANTICS_VERSION",
@@ -1252,11 +1252,13 @@ def design(
     `SolverUnavailableError` without the `parametric` extra on the LP and QP
     routes; `InfeasibleDesignError` when no payout meets the constraints;
     `UnboundedDesignError` for an unbounded objective; `DesignError` for any
-    other failed solve or check; `SampleError` when the template's units or
+    other failed solve or check; `SampleError` when the sample holds several
+    assets (take one with `sample.asset(asset_id)`) or the template's units or
     asset differ from the sample's; `ValueError` for a template without free
     parameters; and `TypeError` for arguments of the wrong type.
     """
     _check_inputs(template, sample, objective, pricing, budget, limit, options)
+    _require_one_asset(sample, "design")
     _check_template(template, sample)
     loss = np.array(sample.loss[:, 0], dtype=np.float64)
     index = np.array(sample.index[:, 0], dtype=np.float64)
