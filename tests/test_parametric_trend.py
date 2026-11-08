@@ -51,6 +51,7 @@ from crc_sdk.parametric import (
     year_block_kfold,
 )
 from crc_sdk.parametric.metadata import EVALUATION_METADATA_KEY
+from crc_sdk.parametric.sample import SAMPLE_METADATA_KEY
 from crc_sdk.types import HazardDatasetMetadata, SourceProvenance
 
 pytestmark = pytest.mark.filterwarnings(
@@ -509,6 +510,8 @@ def test_monte_carlo_and_table_samples_record_no_trend() -> None:
         asset_id="site-a",
     )
     assert drawn.provenance.trend is None
+    written = evaluate(LINEAR, drawn, split="in_sample")
+    assert EvaluationMetadata.from_table(written).setup.samples[0]["trend"] is None
     table = OutcomeSample.from_table(
         pa.table(
             {
@@ -527,6 +530,8 @@ def test_monte_carlo_and_table_samples_record_no_trend() -> None:
         loss_unit="EUR",
     )
     assert table.provenance.trend is None
+    written = evaluate(LINEAR, table, split="in_sample")
+    assert EvaluationMetadata.from_table(written).setup.samples[0]["trend"] is None
 
 
 # -- join ----------------------------------------------------------------------
@@ -569,6 +574,7 @@ def test_join_shares_the_basis_and_names_each_part_s_fit() -> None:
     assert [fit["asset_id"] for fit in trend["fits"]] == ["a", "b"]
     assert joined.asset("a").provenance.trend == a.provenance.trend
     assert joined.asset("b").provenance.trend == b.provenance.trend
+    assert "trend" not in joined.provenance.details
 
 
 def test_a_held_out_block_of_a_join_fitted_on_all_years_is_refused() -> None:
@@ -740,19 +746,79 @@ def test_a_linear_trend_states_each_series() -> None:
     assert "index slope 0.2 m per year, intercept 27.8 m" in line
 
 
-def test_a_table_without_a_trend_record_reads_as_recorded() -> None:
-    metadata = EvaluationMetadata.from_table(
-        evaluate(LINEAR, _annual(_noisy(), trend=LinearTrend()), split="in_sample")
-    )
-    document = json.loads(metadata.to_json())
+AS_RECORDED_LINE = "Trend: the years are used as recorded; no trend is removed."
+
+
+def test_each_setup_sample_holds_the_record_under_trend() -> None:
+    sample = _annual(_noisy(), trend=LinearTrend())
+    table = evaluate(LINEAR, sample, split="in_sample")
+    entry = EvaluationMetadata.from_table(table).setup.samples[0]
+    assert entry["trend"] == sample.provenance.to_document()["trend"]
+    assert entry["trend"]["kind"] == "linear_trend"
+    assert "trend" not in entry["details"]
+    assert "trend" not in sample.provenance.details
+
+
+def _written_before_the_key(table: Any, tmp_path: Path) -> Any:
+    """`table` as written before a setup sample had `trend`, read from its file."""
+    key = EVALUATION_METADATA_KEY.encode()
+    document = json.loads(table.schema.metadata[key])
     for sample in document["setup"]["samples"]:
-        del sample["details"]["trend"]
-    assert _text_lines(setup_text(document), "Trend") == [
-        "Trend: the years are used as recorded; no trend is removed."
-    ]
+        del sample["trend"]
+    older = table.replace_schema_metadata(
+        {**table.schema.metadata, key: json.dumps(document).encode()}
+    )
+    path = tmp_path / "older.parquet"
+    pq.write_table(older, path)
+    return pq.read_table(path)
 
 
-def test_a_trend_key_of_the_setup_is_read_first() -> None:
+def test_a_comparison_written_before_the_key_reads_as_null(tmp_path: Path) -> None:
+    table = evaluate(LINEAR, _annual(_noisy()), split="in_sample")
+    older = _written_before_the_key(table, tmp_path)
+    metadata = EvaluationMetadata.from_table(older)
+    assert "trend" not in metadata.setup.samples[0]
+    assert metadata.setup.samples[0].get("trend") is None
+    assert _text_lines(setup_text(metadata), "Trend") == [AS_RECORDED_LINE]
+    assert _text_lines(setup_text(older), "Trend") == [AS_RECORDED_LINE]
+    document = json.loads(metadata.to_json())
+    assert _text_lines(setup_text(document), "Trend") == [AS_RECORDED_LINE]
+    assert _text_lines(setup_text(document["setup"]), "Trend") == [AS_RECORDED_LINE]
+
+
+def test_a_sample_table_written_before_the_field_reads_as_null() -> None:
+    table = _annual(_noisy()).to_table()
+    key = SAMPLE_METADATA_KEY.encode()
+    document = json.loads(table.schema.metadata[key])
+    del document["provenance"]["trend"]
+    read = OutcomeSample.from_written_table(
+        table.replace_schema_metadata({key: json.dumps(document).encode()})
+    )
+    assert read.provenance.trend is None
+    written = evaluate(LINEAR, read, split="in_sample")
+    metadata = EvaluationMetadata.from_table(written)
+    assert metadata.setup.samples[0]["trend"] is None
+    assert _text_lines(setup_text(metadata), "Trend") == [AS_RECORDED_LINE]
+
+
+def test_a_record_in_details_is_not_read() -> None:
+    setup = {
+        "basis": "annual",
+        "metric_options": {},
+        "samples": [
+            {
+                "sample_hash": "x",
+                "roles": [],
+                "source_kind": "annual",
+                "details": {"trend": {"kind": "recent_years", "n": 7}},
+            }
+        ],
+        "evaluations": [],
+    }
+    assert _text_lines(setup_text(setup), "Trend") == [AS_RECORDED_LINE]
+
+
+def test_the_setup_text_reads_the_trend_key() -> None:
     metadata = EvaluationMetadata.from_table(
         evaluate(LINEAR, _annual(_noisy()), split="in_sample")
     )
@@ -796,7 +862,7 @@ def test_a_joined_sample_states_each_part_s_fit() -> None:
                 "sample_hash": "x",
                 "roles": ["evaluation"],
                 "source_kind": "annual",
-                "details": document["details"],
+                "trend": document["trend"],
             }
         ],
         "evaluations": [],
@@ -1026,7 +1092,7 @@ def test_a_holdout_fits_on_the_design_years_only(tmp_path: Path) -> None:
     table = result.table
     assert set(table.column("split").to_pylist()) == {"in_sample", "out_of_sample"}
     samples = result.metadata.setup.samples
-    fit = [entry["details"]["trend"]["fit_years"] for entry in samples]
+    fit = [entry["trend"]["fit_years"] for entry in samples]
     assert all(years == YEARS[:28].tolist() for years in fit)
     held_out = [entry for entry in samples if "design" not in entry["roles"]]
     assert all(entry["periods"] == [2009, 2020] for entry in held_out)
@@ -1062,13 +1128,13 @@ def test_kfold_fits_each_fold_on_its_own_design_years(tmp_path: Path) -> None:
     plan = _designed(_plan(trend=LinearTrend())).split(KFold(4))
     result = plan.write_parquet(tmp_path / "out.parquet")
     designs = [e for e in result.metadata.setup.samples if "design" in e["roles"]]
-    fits = {tuple(e["details"]["trend"]["fit_years"]) for e in designs}
+    fits = {tuple(e["trend"]["fit_years"]) for e in designs}
     blocks = np.array_split(YEARS, 4)
     expected = {
         tuple(int(year) for year in YEARS if year not in block) for block in blocks
     }
     assert fits == expected
-    reference = {e["details"]["trend"]["reference_year"] for e in designs}
+    reference = {e["trend"]["reference_year"] for e in designs}
     assert reference == {2020}
 
 
@@ -1237,7 +1303,7 @@ def test_the_plan_fits_hazard_and_index_separately(tmp_path: Path) -> None:
         tmp_path / "out.parquet"
     )
     for entry in written.metadata.setup.samples:
-        assert [f["role"] for f in entry["details"]["trend"]["fits"]] == [
+        assert [f["role"] for f in entry["trend"]["fits"]] == [
             "hazard",
             "index",
         ]

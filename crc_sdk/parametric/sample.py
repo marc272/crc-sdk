@@ -885,7 +885,6 @@ class OutcomeSample:
             details={
                 "draws": len(first),
                 "periods": [int(first.period[0]), int(first.period[-1])],
-                **({} if trend is None else {"trend": trend}),
             },
             notes=tuple(
                 _asset_note(asset, note)

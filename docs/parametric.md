@@ -501,9 +501,9 @@ hazard; the basis-risk model. A trend draws no random numbers. The sample's
 every per-year sample, the default included: the option and, for `LinearTrend`,
 the fit years, each series' slope with its unit, its intercept and the
 reference year. In a comparison's metadata each `setup.samples` entry holds the
-record in its `details`, under `trend`, and a document without one reads as the
-years as recorded. Before execution, `plan.explain(format="json")` states the
-option in each `setup.samples` entry.
+record under `trend`, null on Monte Carlo and table samples, and a document
+without the key reads as the years as recorded. Before execution,
+`plan.explain(format="json")` states the option in each `setup.samples` entry.
 
 **`scenario=`** names the rows: it sets `sample.scenario`, so it reaches
 `to_table`, `content_hash` and the comparison's `scenario` column. It is yours,

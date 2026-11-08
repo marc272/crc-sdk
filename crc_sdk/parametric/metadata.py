@@ -11,7 +11,8 @@ with sorted keys. It holds:
 - `setup`, the setup a published number needs next to it: the basis (one
   draw is one year), the metric options, every sample (source kind, draws
   and periods, semantics and who stated them, the basis-risk and loss
-  models, units, lineage and split steps, the dependence between its assets)
+  models, units, lineage and split steps, the dependence between its assets
+  and its trend record)
   and every evaluation (sample, split, fold, how the split was made, the
   design samples checked for leakage, the pricing, the levels and scopes of
   its rows and the allocation rule);
@@ -35,7 +36,8 @@ with sorted keys. It holds:
 A document or table without the `scope` column, or without an evaluation's
 `level`, `scope` and `allocation` or a sample's `dependence`, reads as rows of
 single assets: `level` `["asset"]`, `scope` `["individual"]`, no allocation and
-no dependence.
+no dependence. A sample without `trend` has none recorded, which on per-year
+values reads as the years as recorded.
 
 The module claims no licence of its own for a comparison: it is derived data
 under its inputs' terms, which `licences` lists.
@@ -812,20 +814,16 @@ def _trend_text(record: Mapping[str, Any], where: str) -> str:
 def _trend_lines(samples: Sequence[Mapping[str, Any]]) -> list[str]:
     """One line for each way the per-year samples treat the trend.
 
-    Every per-year sample has one. Its record is under `trend` or, in what
-    `compare` writes, in its `details`; a document with neither reads as the
-    years as recorded. Samples that treat the trend alike share a line; lines
-    that differ name their assets.
+    Every per-year sample has one. Its record is under `trend`; a null or
+    absent one reads as the years as recorded. Samples that treat the trend
+    alike share a line; lines that differ name their assets.
     """
     stated: dict[str, list[str]] = {}
     for i, sample in enumerate(samples):
         where = f"setup.samples[{i}]"
         if _get(sample, "source_kind", str, where) != "annual":
             continue
-        details = _get(sample, "details", Mapping, where) or {}
-        record = _get(sample, "trend", Mapping, where) or _get(
-            details, "trend", Mapping, f"{where}.details"
-        )
+        record = _get(sample, "trend", Mapping, where)
         text = _trend_text(record or {"kind": "as_recorded"}, f"{where}.trend")
         stated.setdefault(text, []).extend(
             str(asset) for asset in _list(sample, "asset_ids", where)

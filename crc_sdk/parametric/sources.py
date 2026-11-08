@@ -1539,7 +1539,6 @@ def _annual_rows(
             "dropped_years": dropped,
             "index_from": "series" if index is not None else "hazard",
             "basis_risk": basis_summary,
-            "trend": trend_record,
         },
         notes=tuple(notes),
         lineage=content_hash(
