@@ -375,9 +375,8 @@ The builders, splits, seeding and outputs are those above.
   cell nearest the H3 cell's centre is accepted only if the whole H3 cell lies
   within it. An H3 cell that straddles two grid cells does not say which
   series is the asset's, so it raises `SampleError`; give that asset a point.
-  Such a series records `"asset_location": "h3_cell"`, and its `distance_km`
-  is measured from the H3 cell's centre. `StationColumn("station_id")` reads
-  per-station tables: the asset column names each asset's station, matched
+  Such a series records `"asset_location": "h3_cell"`.
+  `StationColumn("station_id")` reads per-station tables: the asset column names each asset's station, matched
   against the table's `station` column (`table_column="station_id"` for NOAA
   water levels). An asset that cannot be located raises; none is dropped.
 - **`unit`** is the unit of the table's values. It is checked against the
@@ -388,7 +387,9 @@ The builders, splits, seeding and outputs are those above.
   plan that also materializes curves, `HazardDataset.local(path).provenance()`
   of its canonical file). It identifies the series of every sample, so give
   one source the same provenance each time: the leakage checks then link its
-  blocks.
+  blocks. A pathway that a source plan's `explain()` states, as a CMIP6 plan's
+  does, is recorded beside it at execution, and the setup text states it;
+  before execution the plan does not read its source, so the text cannot.
 - **The loss model** is `LossModel(impact, value_column=..., value_unit=...,
   context=...)`: loss = `impact(hazard) × value`, the value from an asset
   column, or 1 with `value_unit="1"` (the damage ratio). A registry impact
@@ -688,11 +689,34 @@ describes one year's value:
   `"clamp"` is stated.
 
 **Per-year values.** `AnnualSeries.from_table(table, *, year, value, where,
-unit)` reads one location of an `annual_extremes()` table (a station with
-`where={"station": ...}`), and `AnnualSeries.nearest_cell(table, *, longitude,
-latitude, unit)` the grid cell whose centre lies within half a grid step of a
-point. A year without a value raises in `sample_annual`, unless
-`missing="drop_year"`, which lists the dropped years. No trend is removed.
+unit, source=None)` reads one location of an `annual_extremes()` table (a
+station with `where={"station": ...}`), and `AnnualSeries.nearest_cell(table,
+*, longitude, latitude, unit, source=None)` the grid cell whose centre lies
+within half a grid step of a point. A year without a value raises in
+`sample_annual`, unless `missing="drop_year"`, which lists the dropped years.
+No trend is removed.
+
+`source` describes the table in the series' provenance: a name, a
+`SourceProvenance`, a mapping such as a plan's `explain(format="json")`, or
+the source plan itself, of which only `explain()` is called, so no data is
+fetched. An ERA5 or CMIP6 plan's document names no provider or dataset, so
+they are named from what it states; an ERA5 document states no terms either,
+so the series records crc-sdk's `ERA5_LICENCE` and `ERA5_ATTRIBUTION`, without
+the year of retrieval that fitted curves add, which `explain()` does not know.
+A mapping's own names and terms win.
+
+The leakage checks link two series through their source. What a source plan's
+document says of its cache and its run is left out of that link, and so are
+the years it asks for and, where the series' cell or filter names its rows,
+the area: each fetch and each window of one source is linked, and two series
+that share rows and a source raise. A `source` of your own is kept whole. A
+table's `retrieved_at` column is left out too.
+
+A nearest-cell series records the cell's centre and the grid step, and neither
+the point nor its distance from the centre: the distance, with the centre,
+would narrow the point to a ring, and two series on different grids to at most
+two places. The step already bounds it, since a cell is accepted only within
+half a step of the point.
 
 **Loss model.** `LossModel(impact, *, value_column=None, value=None,
 value_unit="1", context=None)` computes `impact(hazard) × value`. `impact` is

@@ -659,13 +659,17 @@ def _series_pathway(
 ) -> str | None:
     """A per-year series' pathway: its source's, else its rows' one scenario.
 
-    A CMIP6 plan's `explain()` document states `pathway`. A table of CMIP6
-    runs, such as NEX-GDDP-CMIP6's `annual_extremes()`, has `model`, `member`
-    and `scenario` columns instead, and the `scenario` of the series' rows is
-    the pathway when they hold one. A table with only a `scenario` column
-    states no pathway: there the word need not mean one.
+    A CMIP6 plan's `explain()` document states `pathway`; on the plan route
+    the source is the caller's, and the plan's pathway is recorded beside it,
+    on the series. A table of CMIP6 runs, such as NEX-GDDP-CMIP6's
+    `annual_extremes()`, has `model`, `member` and `scenario` columns
+    instead, and the `scenario` of the series' rows is the pathway when they
+    hold one. A table with only a `scenario` column states no pathway: there
+    the word need not mean one.
     """
-    stated = _recorded(document, "pathway", where)
+    stated = _recorded(document, "pathway", where) or _recorded(
+        series, "pathway", f"{where}.series"
+    )
     if stated is not None:
         return stated
     columns = _get(series, "table_columns", Mapping, f"{where}.series") or {}

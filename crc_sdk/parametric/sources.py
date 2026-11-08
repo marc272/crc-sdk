@@ -44,6 +44,7 @@ step, so a sample can be rebuilt exactly.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import math
 import warnings
 from collections.abc import Mapping, Sequence
@@ -87,6 +88,7 @@ from crc_sdk.parametric.sample import (
     _source_document,
     _thaw,
 )
+from crc_sdk.providers.era5 import ERA5_ATTRIBUTION, ERA5_LICENCE
 from crc_sdk.types import CurveParameters, HazardDatasetMetadata
 from crc_sdk.workflows.distributions import (
     ReturnPeriodExtrapolationWarning,
@@ -141,15 +143,47 @@ _TABLE_PROVENANCE_COLUMNS = (
     "version",
 )
 _MAX_RECORDED_VALUES = 20
-_SOURCE_PLANS = (
-    ("era5", ("store_url", "grid_degrees"), ("store", "recipe")),
-    ("cmip6", ("archive", "catalogue", "pathway"), ("model", "member", "recipe")),
+_SOURCE_PLANS: tuple[
+    tuple[str, tuple[str, ...], tuple[str, ...], Mapping[str, str]], ...
+] = (
+    (
+        "era5",
+        ("store_url", "grid_degrees"),
+        ("store", "recipe"),
+        {"licence": ERA5_LICENCE, "attribution": ERA5_ATTRIBUTION},
+    ),
+    ("cmip6", ("archive", "catalogue", "pathway"), ("model", "member", "recipe"), {}),
 )
 """How the `explain()` documents of ERA5 and CMIP6 plans are read.
 
 For each: the provider, as the plan records it on its fitted curves; the keys
-that mark its document; and the keys whose values name the dataset.
+that mark its document; the keys whose values name the dataset; and the terms
+crc-sdk holds for the data, when the document does not state them. ERA5's are
+those of its fitted curves, without the year of retrieval that their
+attribution adds, as `explain()` does not know it.
 """
+_PLAN_STATE = frozenset(
+    {
+        # The cache, and what a fetch reads into it.
+        "attribution",
+        "cache",
+        "cache_dir",
+        "calendar",
+        "catalogue",
+        "licence",
+        "mode",
+        "resolved_dataset",
+        # How the plan runs.
+        "execution",
+        # The years asked for: each row states its own year.
+        "years",
+    }
+)
+"""The keys of a source plan's `explain()` document left out of a lineage."""
+_PLAN_PLACE = frozenset({"area", "areas", "station_selection", "stations"})
+"""The places a plan asks for, left out where the series' cell or filter names one."""
+_ROW_SEARCH = ("asset_location", "spacing_degrees")
+"""What a series records of how it found its rows, which are the same either way."""
 
 
 # -- shared checks ------------------------------------------------------------
@@ -633,34 +667,49 @@ def _recorded_columns(rows: Any) -> dict[str, Any]:
     return recorded
 
 
-def _source_plan_names(document: Mapping[str, Any]) -> dict[str, str]:
-    """The provider and dataset that an ERA5 or CMIP6 `explain()` document implies.
+def _source_plan_facts(document: Mapping[str, Any]) -> dict[str, str]:
+    """What an ERA5 or CMIP6 `explain()` document implies but does not state.
 
-    These plans' documents state what was asked for, not who holds it. Any
-    other document implies nothing.
+    These plans' documents state what was asked for, not who holds it: the
+    provider and the dataset, and for ERA5 the terms of its data. Any other
+    document implies nothing.
     """
-    for provider, marks, names in _SOURCE_PLANS:
+    for provider, marks, names, terms in _SOURCE_PLANS:
         parts = [
             part for part in map(document.get, names) if isinstance(part, str) and part
         ]
         if len(parts) == len(names) and all(mark in document for mark in marks):
-            return {"provider": provider, "dataset": " ".join(parts)}
+            return {"provider": provider, "dataset": " ".join(parts), **terms}
     return {}
+
+
+def _source_plan_document(plan: Any) -> Any:
+    """A source plan's `explain()` document, with `format="json"` where it takes one.
+
+    Plans such as NOAA's water levels take no `format`: their `explain()`
+    returns the document itself.
+    """
+    parameters = inspect.signature(plan.explain).parameters.values()
+    takes_format = any(
+        parameter.name == "format" or parameter.kind is parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    return plan.explain(format="json") if takes_format else plan.explain()
 
 
 def _series_source_document(source: Any) -> dict[str, Any]:
     """Return a per-year series' `source` as a plain JSON document.
 
     As `_source_document`, and `source` may be a source plan too: then its
-    `explain(format="json")` is the document, and nothing else of the plan is
-    called, so no data is fetched. The provider and dataset of an ERA5 or
-    CMIP6 document are added, unless the document states its own.
+    `explain()` is the document, and nothing else of the plan is called, so
+    no data is fetched. What an ERA5 or CMIP6 document implies is added,
+    unless the document states its own.
     """
     if callable(getattr(source, "explain", None)):
-        source = source.explain(format="json")
+        source = _source_plan_document(source)
         if not isinstance(source, Mapping):
             raise SampleError(
-                "a source plan's explain(format='json') must return a mapping, "
+                "a source plan's explain() must return a mapping, "
                 f"got {type(source).__name__}"
             )
     elif source is not None and not isinstance(source, (str, Mapping, BaseModel)):
@@ -669,7 +718,7 @@ def _series_source_document(source: Any) -> dict[str, Any]:
             f"explain(), got {type(source).__name__}"
         )
     document = _source_document(source)
-    return {**_source_plan_names(document), **document}
+    return {**_source_plan_facts(document), **document}
 
 
 @dataclass(frozen=True, eq=False)
@@ -791,11 +840,18 @@ class AnnualSeries:
         `source` describes the table for the provenance: a name, a
         `SourceProvenance`, a mapping such as the plan's
         `explain(format="json")`, or the source plan itself, of which only
-        `explain(format="json")` is called. An ERA5 or CMIP6 plan's document
-        states no provider or dataset, so they are named from what it does
-        state; a mapping's own `provider` and `dataset` win. Columns such as
+        `explain()` is called. An ERA5 or CMIP6 plan's document states no
+        provider or dataset, so they are named from what it does state, and
+        ERA5's states no terms, so crc-sdk's `ERA5_LICENCE` and
+        `ERA5_ATTRIBUTION` are recorded; a mapping's own `provider`,
+        `dataset`, `licence` and `attribution` win. Columns such as
         `attribution`, `archive_licence`, `source_url` or `station` are
         recorded too. If the table has a `unit` column, it must equal `unit`.
+
+        What a source plan's document says of its cache, its run and the
+        years it asks for is left out of a sample's lineage, as is the time a
+        table's `retrieved_at` column records, so one source links across
+        fetches and windows. A `source` of the caller's own is kept whole.
 
         `table` is an in-memory Arrow table, record batches (for example
         NEX-GDDP-CMIP6's `annual_extremes()` iterator) or any table Arrow
@@ -867,8 +923,9 @@ class AnnualSeries:
         and in longitude; otherwise this raises. `spacing` is the grid step
         `(latitude, longitude)` in degrees; by default the smallest step
         between the table's distinct latitudes and longitudes. Longitudes are
-        compared modulo 360. The cell centre, the distance in km and the
-        step are recorded, not the point itself. By default the series must
+        compared modulo 360. The cell centre and the step are recorded,
+        neither the point nor its distance from the centre, which with the
+        centre would narrow the point to a ring. By default the series must
         cover every year the table holds: a year the cell lacks is missing.
         `years`, `source` and the other arguments are as in `from_table`.
 
@@ -937,7 +994,6 @@ class AnnualSeries:
                 "longitude": longitude_column,
             },
             "cell": {"latitude": cell_lat, "longitude": cell_lon},
-            "distance_km": float(distance[best[0]]),
             "spacing_degrees": {"latitude": step_lat, "longitude": step_lon},
         }
         return cls._from_rows(
@@ -1005,9 +1061,42 @@ def _great_circle_km(
     return distance
 
 
+def _source_identity(source: Any, *, located: bool) -> Any:
+    """`source` as far as it names the data, in a stable form.
+
+    Only a source plan's `explain()` document is cut down, one with a record
+    of its cache: `_PLAN_STATE` goes, and `_PLAN_PLACE` too when the series is
+    `located`. A caller's own source is kept whole.
+    """
+    if not isinstance(source, Mapping) or not {"cache", "cache_dir"} & source.keys():
+        return source
+    left_out = _PLAN_STATE | _PLAN_PLACE if located else _PLAN_STATE
+    return {key: value for key, value in source.items() if key not in left_out}
+
+
 def _series_identity(series: AnnualSeries) -> dict[str, Any]:
-    """What identifies a series' source: its provenance, else its data."""
-    identity: dict[str, Any] = {"unit": series.unit, **_thaw(series.provenance)}
+    """What identifies a series' source: its provenance, else its data.
+
+    A lineage must not depend on when the data was fetched or how its rows
+    were found, or the leakage checks would miss rows two series share. A
+    series is `located` when its cell or its filter says which rows it reads.
+    """
+    identity: dict[str, Any] = {
+        "unit": series.unit,
+        **{
+            key: value
+            for key, value in _thaw(series.provenance).items()
+            if key not in _ROW_SEARCH
+        },
+    }
+    if "source" in identity:
+        located = "cell" in identity or identity.get("where") is not None
+        identity["source"] = _source_identity(identity["source"], located=located)
+    recorded = identity.get("table_columns")
+    if isinstance(recorded, Mapping):
+        identity["table_columns"] = {
+            name: values for name, values in recorded.items() if name != "retrieved_at"
+        }
     if not identity.get("source"):
         digest = hashlib.sha256(
             series.years.astype("<i8").tobytes() + series.values.astype("<f8").tobytes()

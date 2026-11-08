@@ -1218,6 +1218,30 @@ def test_setup_text_keeps_the_callers_own_names_for_a_per_year_source() -> None:
     ]
 
 
+@pytest.mark.filterwarnings("ignore::crc_sdk.parametric.ComonotoneIndexWarning")
+def test_setup_text_reads_a_pathway_recorded_beside_the_source() -> None:
+    years, values = [2000, 2001, 2002], [50.0, 70.0, 100.0]
+    stated = {"provider": "lab", "dataset": "our cmip6"}
+
+    def series(source: dict[str, str], **provenance: Any) -> AnnualSeries:
+        return AnnualSeries(
+            np.array(years),
+            np.array(values),
+            "mm/day",
+            {"source": source, **provenance},
+        )
+
+    assert _source_line(series(stated, pathway="ssp585")) == [
+        "Source: the hazard series from provider lab, dataset our cmip6 and pathway "
+        "ssp585, with horizon not recorded."
+    ]
+    # A source document's own pathway wins.
+    assert _source_line(series({**stated, "pathway": "ssp245"}, pathway="ssp585")) == [
+        "Source: the hazard series from provider lab, dataset our cmip6 and pathway "
+        "ssp245, with horizon not recorded."
+    ]
+
+
 def test_setup_text_takes_a_comparison_table(tmp_path: Path) -> None:
     train, test = holdout(_sample())
     covers: list[Cover | DesignedCover] = [_Design(LINEAR, train), COVER]
