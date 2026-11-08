@@ -708,9 +708,9 @@ def sample_curves(
     Raises `SampleError` for fewer than two assets, mappings that name other
     assets, two assets with the same generator state, assets in different
     units, an `n_draws` or a reference the model cannot use (all before any
-    draw) and for what `sample_curve` raises for; `TypeError` for a missing or
-    unknown dependence model and wrong types. Warns as `sample_curve` does, for
-    each asset.
+    draw), a generator whose bit generator is not one of numpy's, and for what
+    `sample_curve` raises for; `TypeError` for a missing or unknown dependence
+    model and wrong types. Warns as `sample_curve` does, for each asset.
     """
     if not isinstance(curves, Mapping):
         raise TypeError(
