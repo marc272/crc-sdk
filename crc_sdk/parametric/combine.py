@@ -137,7 +137,8 @@ class CompoundDamage:
 
 
 _BUILT_IN_RULES = (CappedSum, CompoundDamage)
-_BUILT_IN_KINDS = frozenset({"capped_sum", "compound_damage", _ONE_IMPACT})
+_BUILT_IN_KINDS = frozenset({"capped_sum", "compound_damage", "table", _ONE_IMPACT})
+"""The kinds a user's rule cannot take, so that none is recorded as one of these."""
 
 
 def _one_impact_record(name: str) -> dict[str, Any]:

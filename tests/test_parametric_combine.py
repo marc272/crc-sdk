@@ -171,6 +171,9 @@ def test_anything_but_a_rule_is_a_type_error(rule: Any) -> None:
             id="one-impact-kind",
         ),
         pytest.param(
+            Rule(document={"kind": "table"}), "kind of a built-in", id="table-kind"
+        ),
+        pytest.param(
             Rule(document={"kind": "k", "statement": "x"}),
             "must not hold a 'statement' key",
             id="statement-key",

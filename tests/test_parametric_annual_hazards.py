@@ -167,9 +167,7 @@ def test_the_years_become_the_rows() -> None:
     assert sample.provenance.semantics_source == "data"
 
 
-def test_the_first_series_is_the_primary_and_the_order_of_series_sets_the_rest() -> (
-    None
-):
+def test_the_order_of_the_series_sets_the_components() -> None:
     sample = _sample()
     assert sample.index_components is not None
     assert list(sample.index_components) == ["rain", "heat"]
@@ -253,46 +251,40 @@ def test_a_user_rule_makes_the_loss_and_is_recorded() -> None:
     assert "Combined loss: The largest impact of the year is taken." in _text(sample)
 
 
+class Short(Worst):
+    def combine(self, impacts: Mapping[str, Any]) -> Any:
+        return np.zeros(3)
+
+
+class NotFinite(Worst):
+    def combine(self, impacts: Mapping[str, Any]) -> Any:
+        return np.full(8, np.nan)
+
+
+class Claims(Worst):
+    def to_document(self) -> dict[str, Any]:
+        return {"kind": "capped_sum", "cap": 1.0}
+
+
+class Mute(Worst):
+    def statement(self) -> str:
+        return ""
+
+
 @pytest.mark.parametrize(
-    ("build", "message"),
+    ("rule", "message"),
     [
         pytest.param(
-            lambda: type(
-                "Short",
-                (Worst,),
-                {"combine": lambda self, impacts: np.zeros(3)},
-            )(),
-            r"must return one value per year, shape \(8,\)",
-            id="shape",
+            Short(), r"must return one value per year, shape \(8,\)", id="shape"
         ),
-        pytest.param(
-            lambda: type(
-                "Bad",
-                (Worst,),
-                {"combine": lambda self, impacts: np.full(8, np.nan)},
-            )(),
-            "negative or non-finite",
-            id="nan",
-        ),
-        pytest.param(
-            lambda: type(
-                "Claims",
-                (Worst,),
-                {"to_document": lambda self: {"kind": "capped_sum", "cap": 1.0}},
-            )(),
-            "kind of a built-in",
-            id="built-in-kind",
-        ),
-        pytest.param(
-            lambda: type("Mute", (Worst,), {"statement": lambda self: ""})(),
-            "must state itself",
-            id="no-sentence",
-        ),
+        pytest.param(NotFinite(), "negative or non-finite", id="nan"),
+        pytest.param(Claims(), "kind of a built-in", id="built-in-kind"),
+        pytest.param(Mute(), "must state itself", id="no-sentence"),
     ],
 )
-def test_a_rule_that_fails_the_gate_stops_the_sample(build: Any, message: str) -> None:
+def test_a_rule_that_fails_the_gate_stops_the_sample(rule: Any, message: str) -> None:
     with pytest.raises(SampleError, match=message):
-        _sample(combine=build())
+        _sample(combine=rule)
 
 
 def test_the_rule_is_recorded_with_its_sentence() -> None:
@@ -867,6 +859,20 @@ def test_a_design_on_a_component_is_checked_for_leakage() -> None:
     compare([rain], test, split="out_of_sample")
     with pytest.raises(LeakageError):
         compare([rain], train, split="out_of_sample")
+
+
+def test_a_trend_fitted_on_held_out_years_is_a_leak() -> None:
+    fitted_on_all = _sample(series=_trended_series(), trend=LinearTrend(min_years=3))
+    train, test = holdout(fitted_on_all, 0.75)
+    rain = design(_rain_cover(), train.component("rain"), MSE())
+    with pytest.raises(LeakageError, match="linear trend was fitted"):
+        compare([rain], test, split="out_of_sample")
+    stated = _sample(
+        series=_trended_series(), trend=LinearTrend(min_years=3, fit_years=YEARS[:6])
+    )
+    train, test = holdout(stated, 0.75)
+    rain = design(_rain_cover(), train.component("rain"), MSE())
+    compare([rain], test, split="out_of_sample")
 
 
 def test_a_holistic_cover_and_separate_covers_in_one_comparison() -> None:
