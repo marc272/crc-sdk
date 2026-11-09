@@ -8,6 +8,7 @@ cases (other families, the grid route) are picked up when they are copied.
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import json
 import math
@@ -23,6 +24,7 @@ from crc_sdk.parametric import (
     MSE,
     BinaryPayout,
     Budget,
+    CompositeIndex,
     CostOfCapitalLoad,
     Cover,
     DesignError,
@@ -31,6 +33,7 @@ from crc_sdk.parametric import (
     EvaluationMetadata,
     ExpectedUncovered,
     Free,
+    IndexComponent,
     IndexDefinition,
     InfeasibleDesignError,
     LeakageError,
@@ -45,6 +48,7 @@ from crc_sdk.parametric import (
     SampleProvenance,
     SolverUnavailableError,
     StepPayout,
+    SumOf,
     UnboundedDesignError,
     UserObjective,
     WeightedCVaR,
@@ -459,6 +463,87 @@ def test_design_parity(path: Path) -> None:
         assert row["split"] == "out_of_sample" and row["fold"] == out["fold"]
         assert row["premium_basis"] == ("design" if expected["unique"] else "stated")
         _check_metrics(row, out["metrics"], case)
+
+
+REDUCTION_CASES = [path for path in DESIGN_CASES if _case(path)["split"] is None]
+
+
+def test_the_reduction_covers_every_objective() -> None:
+    kinds = {_case(path)["objective"]["kind"] for path in REDUCTION_CASES}
+    assert kinds == {"mse", "expected_uncovered", "weighted_cvar"}
+
+
+def _with_a_silent_component(case: Mapping[str, Any]) -> tuple[Cover, OutcomeSample]:
+    """A case's template and sample, with a second component that never pays."""
+    template = Cover.from_document(case["cover"])
+    block = case["sample"]
+    index = np.asarray(block["index"], dtype=np.float64)
+    name = template.index.hazard_name
+    sample = _block_sample(block, case["case_id"])
+    provenance = dataclasses.replace(
+        sample.provenance, hazard_dependence={"kind": "data"}, combine={"kind": "table"}
+    )
+    components = {
+        name: IndexComponent(
+            index,
+            unit=block["index_unit"],
+            tail=template.index.tail,
+            hazard=None,
+            own_loss=None,
+        ),
+        "silent": IndexComponent(
+            np.zeros_like(index), unit="x", tail="upper", hazard=None, own_loss=None
+        ),
+    }
+    silent = IndexDefinition("silent", "x", aggregation="annual_maximum")
+    composite = Cover(
+        CompositeIndex({name: template.index, "silent": silent}),
+        SumOf({name: template.payout, "silent": BinaryPayout(1.0, Free(0.0, 1e12))}),
+        payout_unit=template.payout_unit,
+        asset_id=template.asset_id,
+    )
+    return composite, dataclasses.replace(
+        sample, provenance=provenance, index_components=components
+    )
+
+
+@pytest.mark.parametrize("path", REDUCTION_CASES, ids=lambda path: path.stem)
+def test_a_sum_whose_second_component_never_pays_reproduces_the_case(
+    path: Path,
+) -> None:
+    case = _case(path)
+    expected = case["expected"]
+    tolerances = case["tolerances"]
+    template, sample = _with_a_silent_component(case)
+    name = next(iter(template.payout.index_names))
+    result = design(
+        template,
+        sample,
+        objective_from_document(case["objective"]),
+        pricing=pricing_from_document(case["pricing"]),
+        budget=budget_from_document(case["budget"]),
+        limit=limit_from_document(case["limit"]),
+        options=DesignOptions(ranges=True),
+    )
+    scale = _scale(case)
+    power = 2 if case["objective"]["kind"] == "mse" else 1
+    target = expected["objective_value"]
+    assert abs(result.objective_value - target) <= (
+        tolerances["objective_value"] * abs(target) + 1e-9 * scale**power
+    )
+    assert abs(result.premium - expected["premium"]) <= (
+        tolerances["premium"] * abs(expected["premium"]) + 1e-9 * scale
+    )
+    assert set(result.unidentified) == {
+        *(f"{name}.{item}" for item in expected["unidentified"]),
+        "silent.amount",
+    }
+    assert result.parameters["silent.amount"] == 0.0
+    allowance = tolerances["parameters"] * scale
+    assert case["compare_parameters"] == "exact"
+    for key, value in expected["parameters"].items():
+        if key not in expected["unidentified"]:
+            assert abs(result.parameters[f"{name}.{key}"] - value) <= allowance, key
 
 
 def test_parity_routes_and_flags() -> None:

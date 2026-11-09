@@ -46,7 +46,7 @@ each designed on its own, beside a cover on several components. It gets one
 `"asset"` row per contract and one `"package"` row, with the metrics of the
 year's total payout against the combined loss and the sum of the contracts'
 premiums. `split_budget` splits one budget between the contracts, by stated
-shares. A measurement of a stated setup, as every row here.
+shares. Each row is a measurement of a stated setup, and `compare` ranks nothing.
 
 **In and out of sample.** In sample means the design sample. Out of sample
 means a held-out block of years (`holdout`, `year_block_kfold`), fresh Monte
@@ -1626,7 +1626,9 @@ def _table(
 # -- the breakdown -----------------------------------------------------------
 
 
-def _user_parts(payout: Any, parts: Any, n_draws: int) -> list[tuple[str, FloatArray]]:
+def _checked_parts(
+    payout: Any, parts: Any, n_draws: int
+) -> list[tuple[str, FloatArray]]:
     """A `breakdown`'s columns; raise `EvaluationError` if they are invalid."""
     if not isinstance(parts, Mapping) or not parts:
         raise EvaluationError(
@@ -1667,7 +1669,7 @@ def _cover_parts(
     if not callable(breakdown):
         return payout_values, [("whole", "whole", payout_values)]
     kind = _PART_KINDS.get(type(payout), "user")
-    parts = _user_parts(payout, breakdown(values), len(sample))
+    parts = _checked_parts(payout, breakdown(values), len(sample))
     return payout_values, [(name, kind, part) for name, part in parts]
 
 

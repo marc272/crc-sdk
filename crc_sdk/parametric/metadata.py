@@ -2156,6 +2156,9 @@ def _row_lines(
                     or "designed on a sample of one hazard"
                 )
                 pricing = _pricing(record.get("pricing"), place)
+            elif row.get("design_id") is not None:
+                designed = "designed, with no design record given here"
+                pricing = "as its design states"
             else:
                 designed = "given as is"
                 pricing = _pricing(evaluation.get("pricing"), place)
