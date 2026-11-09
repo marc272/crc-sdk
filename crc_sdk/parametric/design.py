@@ -85,6 +85,12 @@ over fixed component amounts is one LP or QP in the scale, with basis
 that LP or QP at each point. Every other `MaxOf`, and a `SumOf` with a component
 without amounts, is searched in numpy on a grid over every free parameter.
 
+A `StepGrid` is one LP or QP on the one-hot basis of its cells. Its free
+thresholds are searched on their grids in the same way: every point of the
+product over both axes counts towards `max_grid_points`, and a point with
+unordered thresholds is recorded as `"invalid"`. A cell no design year reaches
+is `unidentified`, and the fill rule runs on the order along both axes.
+
 `Limit` on a `SumOf` bounds the year's total: for every choice of one amount
 per component, the chosen amounts sum to at most the limit. That holds when the
 rows of each component's basis sum to at most 1, so `design` raises

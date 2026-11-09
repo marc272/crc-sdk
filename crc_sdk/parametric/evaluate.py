@@ -66,7 +66,7 @@ agreed at design; otherwise the premium priced on the evaluation sample with
 separate table with one row per entry and part: the part's expected payout, its
 share of the entry's and how often it pays. The rows of one entry add up to its
 E[payout]. A `MaxOf`'s rows are an attribution, because one contract pays one
-amount.
+amount, and a `StepGrid`'s are regions, because a grid has no payout per hazard.
 
 Invalid arguments raise `EvaluationError` (a `ValueError`), and arguments of
 the wrong type `TypeError`; problems of the cover or the sample raise
@@ -120,7 +120,7 @@ from crc_sdk.parametric.metrics import (
     metric_columns,
     metric_values,
 )
-from crc_sdk.parametric.payouts import MaxOf, SumOf
+from crc_sdk.parametric.payouts import MaxOf, StepGrid, SumOf
 from crc_sdk.parametric.pricing import CostOfCapitalLoad, Pricing, PurePremium
 from crc_sdk.parametric.sample import (
     OutcomeSample,
@@ -177,7 +177,11 @@ _PARTS_TOLERANCE = 1e-9
 _SHARES_TOLERANCE = 1e-9
 """How far the stated shares of a budget may sum from 1."""
 
-_PART_KINDS: Mapping[type[Any], str] = {SumOf: "component", MaxOf: "attribution"}
+_PART_KINDS: Mapping[type[Any], str] = {
+    SumOf: "component",
+    MaxOf: "attribution",
+    StepGrid: "region",
+}
 """The `part_kind` of each built-in family with a `breakdown`."""
 
 
@@ -2005,8 +2009,12 @@ def payout_breakdown(
       each component of a `SumOf` or a package (`"component"`); each component
       of a `MaxOf` (`"attribution"`, each year's payout going to the component
       paying most, in equal shares when several tie, because one contract
-      pays one amount); the keys of a user family's `breakdown(index)`
-      (`"user"`); or `"whole"` for a user family with none (`"whole"`);
+      pays one amount); `only:<first>`, `only:<second>` and `both` for a
+      `StepGrid` (`"region"`: the years where one index is past its first
+      threshold and the other is not, and those where both are, because a
+      grid has no payout per hazard); the keys of a user family's
+      `breakdown(index)` (`"user"`); or `"whole"` for a user family with none
+      (`"whole"`);
     - `expected_payout`, the part's expected payout;
     - `share`, its share of the entry's E[payout], null when that is 0;
     - `payout_frequency`, P(the part pays more than `options.payout_threshold`).
