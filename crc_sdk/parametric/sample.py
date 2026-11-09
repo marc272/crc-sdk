@@ -525,11 +525,18 @@ class SampleProvenance:
       is needed. `None` on a one-hazard sample.
     - `components`: for a sample with index components, each component's own
       provenance document, by name. `None` on a one-hazard sample.
+    - `source_lineages`: for a sample whose rows read several series or streams
+      of draws, each one's lineage by name: a component's name on a sample of
+      several hazards from per-year series or curves, `"hazard"` and `"index"`
+      on a per-year sample with an index series. It is the lineage that source
+      has in a sample of its own, so a leakage check sees a year of one source
+      through any sample that holds it. A component's view keeps the sources it
+      reads. `None` on every other sample.
 
     Mappings and sequences are stored read-only; `to_document()` returns
-    plain JSON types, without the three fields of a sample with components
-    when they are `None`. Raises `SampleError` for unknown kinds or values that
-    are not plain JSON.
+    plain JSON types, without the three fields of a sample with components and
+    without `source_lineages` when they are `None`. Raises `SampleError` for
+    unknown kinds or values that are not plain JSON.
     """
 
     source_kind: SourceKind
@@ -552,6 +559,7 @@ class SampleProvenance:
     hazard_dependence: Mapping[str, Any] | None = None
     combine: Mapping[str, Any] | None = None
     components: Mapping[str, Mapping[str, Any]] | None = None
+    source_lineages: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         if self.source_kind not in get_args(SourceKind):
@@ -589,6 +597,7 @@ class SampleProvenance:
             "hazard_dependence",
             "combine",
             "components",
+            "source_lineages",
         ):
             value = getattr(self, name)
             if value is not None and not isinstance(value, Mapping):
@@ -609,6 +618,11 @@ class SampleProvenance:
             raise SampleError(
                 "components must map each component name to a provenance document"
             )
+        if self.source_lineages is not None and not all(
+            isinstance(name, str) and isinstance(lineage, str)
+            for name, lineage in self.source_lineages.items()
+        ):
+            raise SampleError("source_lineages must map each source to its lineage")
         if not isinstance(self.details, Mapping):
             raise SampleError("details must be a mapping")
         if isinstance(self.notes, str) or not all(
@@ -630,6 +644,7 @@ class SampleProvenance:
             "hazard_dependence",
             "combine",
             "components",
+            "source_lineages",
         ):
             value = getattr(self, name)
             _check_json(name, value)
@@ -639,13 +654,14 @@ class SampleProvenance:
     def to_document(self) -> dict[str, Any]:
         """Return every field as plain JSON types.
 
-        The fields of a sample with index components are left out when they
-        are `None`, so a one-hazard sample's document does not change.
+        The fields of a sample with index components, and `source_lineages`,
+        are left out when they are `None`, so the document of a sample that
+        reads one source does not change.
         """
         return {
             item.name: _thaw(getattr(self, item.name))
             for item in dataclasses.fields(self)
-            if item.name not in _COMPONENT_FIELDS
+            if item.name not in _LEFT_OUT_WHEN_NONE
             or getattr(self, item.name) is not None
         }
 
@@ -696,6 +712,9 @@ class SampleProvenance:
 
 _COMPONENT_FIELDS = frozenset({"hazard_dependence", "combine", "components"})
 """The provenance fields of a sample with index components."""
+
+_LEFT_OUT_WHEN_NONE = _COMPONENT_FIELDS | {"source_lineages"}
+"""The provenance fields a document holds only when they are set."""
 
 
 # -- the components of a sample ----------------------------------------------
@@ -1140,7 +1159,9 @@ class OutcomeSample:
         The provenance is the component's own, from the provenance's
         `components` when it has them, and `selection` records the step after
         the steps of that component's own sample. The lineage is this sample's,
-        so a leakage check still sees the source.
+        so a leakage check still sees the source. `source_lineages` keeps the
+        sources the view reads: its own, and with `loss="combined"` those of
+        every component with an impact, which are in that loss.
 
         Raises `SampleError` on a sample without index components, for a
         component the sample does not hold, an unknown `loss`, and for
@@ -1183,6 +1204,11 @@ class OutcomeSample:
         # Taking a component commutes with a split, and a split stays the last
         # step: the setup text reads the block from the last one.
         step = {"kind": "component", "name": name, "loss": loss}
+        read = {name} | (
+            {key for key, each in components.items() if each.own_loss is not None}
+            if loss == "combined"
+            else set()
+        )
         provenance = dataclasses.replace(
             own if part is None else part,
             parent=own.parent or self.content_hash,
@@ -1192,6 +1218,15 @@ class OutcomeSample:
             hazard_dependence=None,
             combine=None,
             components=None,
+            source_lineages=(
+                None
+                if own.source_lineages is None
+                else {
+                    key: lineage
+                    for key, lineage in own.source_lineages.items()
+                    if key in read
+                }
+            ),
         )
         return OutcomeSample(
             asset_ids=self.asset_ids,
@@ -1225,8 +1260,10 @@ class OutcomeSample:
         own, because the rows are the same years of the data, and holds each
         part's provenance in `parts`. Its sources, licences, generator records
         and notes are the parts', each source, record and note naming its
-        asset. Its lineage is new, built from the parts' lineages. The loss
-        and basis-risk models are per asset, so they are in `parts` only.
+        asset. Its lineage is new, built from the parts' lineages, and a
+        leakage check reads each part's own in `parts` too, so a year of a part
+        is the same row here and in that part. The loss and basis-risk models
+        are per asset, so they are in `parts` only.
 
         Monte Carlo samples are refused: independently drawn curve samples
         line up by draw number only, so joining them would impose independence
@@ -2517,62 +2554,150 @@ def year_block_kfold(
     return tuple(folds)
 
 
-def _years_by_run(sample: OutcomeSample) -> dict[str, IntArray]:
-    """The source of a sample's rows, by lineage, with the years each holds.
+@dataclass(frozen=True, eq=False)
+class _SourceRows:
+    """The rows of a sample that one source feeds, and what to call the source."""
+
+    rows: NDArray[np.bool_]
+    name: str
+
+
+def _stated_table_lineage(document: Mapping[str, Any], asset: str) -> str | None:
+    """`asset`'s lineage in a table with a stated source; `None` for any other.
+
+    `from_table` identifies a table of several assets by all of them, so each
+    asset needs this to link to a table of that asset alone from the same
+    source. A table with no stated source is identified by its data, which
+    links it to nothing else.
+    """
+    sources: Sequence[Mapping[str, Any]] = document.get("sources") or ()
+    if document.get("source_kind") != "table" or len(sources) != 1:
+        return None
+    stated = sources[0].get("source")
+    if sources[0].get("role") != "table" or not stated:
+        return None
+    return content_hash({"kind": "table", "asset_id": asset, "source": stated})
+
+
+def _sources_in(
+    document: Mapping[str, Any],
+    *,
+    lineage: str | None,
+    asset: str | None,
+    owner: str,
+    pool: Mapping[str, Any] | None,
+    every_row: NDArray[np.bool_],
+) -> dict[str, _SourceRows]:
+    """The sources in a provenance document, on the rows of its sample.
+
+    `pool` is the document's pool on those rows. A part of a joined sample
+    feeds every row of it, so the parts are read the same way, each asset's
+    own pool brought to the sample's current rows.
+    """
+    sources: dict[str, _SourceRows] = {}
+    if pool is not None:
+        positions = np.asarray(pool["run"], dtype=np.int64)
+        for position, run in enumerate(pool["runs"]):
+            sources[str(run["lineage"])] = _SourceRows(
+                positions == position,
+                f"run {run['model']} {run['member']} of {owner}",
+            )
+    elif lineage is not None:
+        sources[lineage] = _SourceRows(every_row, owner)
+    for name, own in (document.get("source_lineages") or {}).items():
+        sources.setdefault(own, _SourceRows(every_row, f"{name!r} of {owner}"))
+    if asset is not None:
+        stated = _stated_table_lineage(document, asset)
+        if stated is not None:
+            sources.setdefault(stated, _SourceRows(every_row, owner))
+    for part_asset, part in (document.get("parts") or {}).items():
+        found = _sources_in(
+            part,
+            lineage=part.get("lineage"),
+            asset=part_asset,
+            owner=f"asset {part_asset!r}",
+            pool=_part_pool(pool, part.get("pool")),
+            every_row=every_row,
+        )
+        for key, each in found.items():
+            sources.setdefault(key, each)
+    return sources
+
+
+def _rows_by_source(sample: OutcomeSample) -> dict[str, _SourceRows]:
+    """The sources of a sample's rows, by lineage, with the rows each one feeds.
 
     A pool's rows come from its runs, and any other sample counts as one run,
     so that a model-year is the same row in a pool and in a sample of its run.
+    A sample of several hazards, one with an index series and a joined or drawn
+    sample of several assets also hold the sources they are made of, each by
+    the lineage it has alone, so that a year of one source is the same row in
+    every sample that holds it.
     """
-    pool = sample.provenance.pool
-    if pool is None:
-        return {sample.lineage: sample.period}
-    years = np.asarray(pool["year"], dtype=np.int64)
-    positions = np.asarray(pool["run"], dtype=np.int64)
-    return {
-        str(run["lineage"]): years[positions == position]
-        for position, run in enumerate(pool["runs"])
-    }
+    count = len(sample.asset_ids)
+    asset = sample.asset_ids[0] if count == 1 else None
+    return _sources_in(
+        sample.provenance.to_document(),
+        lineage=sample.lineage,
+        asset=asset,
+        owner=f"{count} assets" if asset is None else f"asset {asset!r}",
+        pool=sample.provenance.pool,
+        every_row=np.ones(len(sample), dtype=np.bool_),
+    )
 
 
 def _check_out_of_sample(design: OutcomeSample, evaluation: OutcomeSample) -> None:
     """Raise `LeakageError` if `evaluation` shares rows with `design`.
 
-    Two samples share rows when they have the same lineage (the same source,
-    or splits of one sample) and a common period. On a pool the comparison is
-    of (run lineage, year) pairs, and a plain per-year sample counts as one
-    run: a model-year cannot be on both sides, between pools of different runs
-    or between a pool and one of its runs. A linear trend fitted on a year the
-    evaluation sample holds, by either sample, leaks that year too.
+    Two samples share a row when one source feeds that row of each in the same
+    year: they have the same lineage (the same source, or splits of one
+    sample) and a common period, or one holds a source of the other. A source
+    is compared by its own lineage, whichever samples hold it: a run of a pool
+    (a plain per-year sample counts as one run, so a model-year cannot be on
+    both sides, between pools of different runs or between a pool and one of
+    its runs), a hazard or an index series of a per-year sample, a component
+    of a sample of several hazards, or an asset of a joined or drawn sample.
+    The error names the shared sources and years. A linear trend fitted on a
+    year the evaluation sample holds, by either sample, leaks that year too.
     """
     design = _require_sample(design)
     evaluation = _require_sample(evaluation)
-    designed = _years_by_run(design)
-    held = _years_by_run(evaluation)
-    common = designed.keys() & held.keys()
+    designed = _rows_by_source(design)
+    held = _rows_by_source(evaluation)
+    common = [lineage for lineage in held if lineage in designed]
     if not common:
         return
-    pooled = design.provenance.pool or evaluation.provenance.pool
-    shared = [np.intersect1d(designed[lineage], held[lineage]) for lineage in common]
-    count = sum(each.size for each in shared)
+    design_years = _row_years(design)
+    held_years = _row_years(evaluation)
+    shared = np.zeros(len(evaluation), dtype=np.bool_)
+    names: list[str] = []
+    for lineage in common:
+        rows = held[lineage].rows & np.isin(
+            held_years, design_years[designed[lineage].rows]
+        )
+        if rows.any():
+            shared |= rows
+            # The longer name is the more specific, a component's over its sample's.
+            names.append(max(designed[lineage].name, held[lineage].name, key=len))
+    count = int(shared.sum())
     if count:
+        pooled = design.provenance.pool or evaluation.provenance.pool
         noun = "period" if pooled is None else "model-year"
         noun += "" if count == 1 else "s"
-        years = np.unique(np.concatenate(shared))
+        years = np.unique(held_years[shared])
+        distinct = list(dict.fromkeys(names))
+        sources = "; ".join(distinct[:3]) + ("; ..." if len(distinct) > 3 else "")
         raise LeakageError(
             f"the evaluation sample shares {count} {noun} with the design "
-            f"sample (e.g. {years[:5].tolist()}) from the same source; evaluate "
-            "out of sample on a held-out block or on fresh draws"
+            f"sample (e.g. {years[:5].tolist()}) from the same source ({sources}); "
+            "evaluate out of sample on a held-out block or on fresh draws"
         )
+    fed = np.logical_or.reduce([held[lineage].rows for lineage in common])
     for role, sample in (("design", design), ("evaluation", evaluation)):
         fitted = _trend_of(sample).get("fit_years")
         if fitted is None:
             continue
-        fit_years = np.array(fitted, dtype=np.int64)
-        overlap = np.unique(
-            np.concatenate(
-                [np.intersect1d(fit_years, held[lineage]) for lineage in common]
-            )
-        )
+        overlap = np.intersect1d(np.array(fitted, dtype=np.int64), held_years[fed])
         if overlap.size:
             raise LeakageError(
                 f"the {role} sample's linear trend was fitted on {overlap.size} "
