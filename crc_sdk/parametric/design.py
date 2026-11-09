@@ -78,6 +78,19 @@ the component named its `hazard_name`. A design uses the loss of the sample
 it is given: `design(template, sample)` the combined loss, and
 `design(template, sample.component(name))` that hazard's own loss.
 
+**Payouts over several components.** A `SumOf` of components with amounts is
+one LP or QP on the block basis `[B_1 | ... | B_K]`. A `MaxOf` with a free scale
+over fixed component amounts is one LP or QP in the scale, with basis
+`max_k pi_k(s_k)`. Free thresholds are searched on their grids, as above, with
+that LP or QP at each point. Every other `MaxOf`, and a `SumOf` with a component
+without amounts, is searched in numpy on a grid over every free parameter.
+
+`Limit` on a `SumOf` bounds the year's total: for every choice of one amount
+per component, the chosen amounts sum to at most the limit. That holds when the
+rows of each component's basis sum to at most 1, so `design` raises
+`DesignError` if a row sums above 1 on the design sample. On a `MaxOf` with a
+free scale, with `G` the largest amount of any component, `scale <= limit / G`.
+
 Everything here works in memory and does no I/O.
 """
 
@@ -116,7 +129,12 @@ from crc_sdk.parametric.objectives import (
     WeightedCVaR,
 )
 from crc_sdk.parametric.parameters import Free, _DefinitionModel
-from crc_sdk.parametric.payouts import LinearConstraints, LinearInAmounts
+from crc_sdk.parametric.payouts import (
+    LinearConstraints,
+    LinearInAmounts,
+    SumOf,
+    _has_amounts,
+)
 from crc_sdk.parametric.pricing import CostOfCapitalLoad, Pricing, PurePremium
 from crc_sdk.parametric.sample import (
     OutcomeSample,
@@ -165,6 +183,9 @@ MSE_EIGEN_TOLERANCE = 1e-10
 
 DEGENERATE_TAIL_TOLERANCE = 1e-9
 """The rounding allowance of the degenerate-tail comparisons."""
+
+BASIS_ROW_TOLERANCE = 1e-9
+"""The rounding allowance of a basis row summing to at most 1."""
 
 StrictInt = Annotated[int, Strict()]
 StrictBool = Annotated[bool, Strict()]
@@ -352,11 +373,6 @@ class DesignResult:
             "tail_outcomes": self.tail_outcomes,
             "degenerate_tail": self.degenerate_tail,
         }
-
-
-def _has_amounts(payout: Any) -> bool:
-    """Whether a payout's amounts can be solved: `LinearInAmounts` with at least one."""
-    return isinstance(payout, LinearInAmounts) and bool(payout.amount_names())
 
 
 # -- the problem -------------------------------------------------------------
@@ -930,6 +946,27 @@ def _amount_values(
     }
 
 
+def _check_limit_rows(payout: Any, context: _Context) -> None:
+    """Raise `DesignError` if a `Limit` on a `SumOf` would not bound the year.
+
+    The limit's rows take each component's largest amount as the most that
+    component pays, which needs its basis rows to sum to at most 1.
+    """
+    if context.limit is None or not isinstance(payout, SumOf):
+        return
+    above = [
+        name
+        for name, largest in payout._largest_row_sums(context.index).items()
+        if largest > 1.0 + BASIS_ROW_TOLERANCE
+    ]
+    if above:
+        raise context.error(
+            DesignError,
+            f"the basis rows of the components {above} sum above 1 on the design "
+            "sample, so a limit on the amounts does not bound the year's total",
+        )
+
+
 def _read_block(candidate: Cover, context: _Context) -> _Block:
     """Read a cover's basis and constraints; raise `DesignError` if unusable."""
     payout = cast(LinearInAmounts, candidate.payout)
@@ -943,6 +980,7 @@ def _read_block(candidate: Cover, context: _Context) -> _Block:
         )
     if not np.isfinite(basis).all():
         raise context.error(DesignError, "the payout's basis is not finite")
+    _check_limit_rows(payout, context)
     constraints = payout.amount_constraints(context.limit)
     if constraints.n_amounts != len(names):
         raise context.error(
@@ -1189,7 +1227,7 @@ def _grid(
             rows.append((point, amounts.objective_value, "optimal"))
             continue
         payout = candidate.payout_values(context.index)
-        status = _grid_status(context, candidate, payout, linear)
+        status = _grid_status(context, template, candidate, payout, linear)
         value = _objective_value(context, payout) if status == "feasible" else None
         rows.append((point, value, status))
     if not inner:
@@ -1240,22 +1278,42 @@ def _counts_text(counts: Mapping[str, int]) -> str:
     return ", ".join(f"{name}: {count}" for name, count in counts.items())
 
 
+def _breaks_constraints(
+    context: _Context, values: FloatArray, constraints: LinearConstraints
+) -> bool:
+    """Whether resolved amounts break their upper bounds or the rows of `a_ub`."""
+    above = values - constraints.upper
+    if (above > np.array([context.slack(b) for b in constraints.upper])).any():
+        return True
+    if constraints.a_ub.shape[0] == 0:
+        return False
+    slack = np.array([context.slack(b) for b in constraints.b_ub])
+    return bool((constraints.a_ub @ values - constraints.b_ub > slack).any())
+
+
 def _grid_status(
-    context: _Context, candidate: Cover, payout: FloatArray, linear: bool
+    context: _Context,
+    template: Cover,
+    candidate: Cover,
+    payout: FloatArray,
+    linear: bool,
 ) -> str:
     """Whether a fully resolved candidate meets the budget and the limit."""
     if context.limit is not None:
         if linear:
-            family = cast(LinearInAmounts, candidate.payout)
-            constraints = family.amount_constraints(context.limit)
-            values = np.array(
-                [
-                    float(cast(float, candidate.payout.parameters()[name]))
-                    for name in family.amount_names()
-                ]
+            # A resolved `MaxOf` answers no amounts; its template states the bound.
+            family = cast(
+                LinearInAmounts,
+                candidate.payout if _has_amounts(candidate.payout) else template.payout,
             )
-            over = values - constraints.upper
-            if (over > np.array([context.slack(b) for b in constraints.upper])).any():
+            _check_limit_rows(candidate.payout, context)
+            parameters = candidate.payout.parameters()
+            values = np.array(
+                [float(cast(float, parameters[name])) for name in family.amount_names()]
+            )
+            if _breaks_constraints(
+                context, values, family.amount_constraints(context.limit)
+            ):
                 return "over_limit"
         elif float(payout.max(initial=0.0)) - context.limit > context.slack(
             context.limit

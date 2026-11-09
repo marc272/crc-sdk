@@ -21,9 +21,10 @@ with sorted keys. It holds:
   its rows and the allocation rule);
 - `columns`: for every metric column, its metric, parameter, unit and a
   one-line definition;
-- `covers`: every cover's label, hash and full document, and the hash of every
+- `covers`: every cover's label, hash and full document, the hash of every
   set of covers a `"total"` or allocated row names, with the asset ids and
-  cover hashes it is made of;
+  cover hashes it is made of, and the hash of every package a `"package"` row
+  names, with the component names and cover hashes it is made of;
 - `designs`: the record of every design evaluated, with the label of its
   cover as evaluated (`cover_label`);
 - `sources`, `licences` and `rng`: the samples' source documents, their
@@ -36,11 +37,12 @@ with sorted keys. It holds:
   (asset id, value) pairs when the caller knows them, as a plan does and as
   an allocation's `values=` state them. Asset values are never written.
 
-A document or table without the `scope` column, or without an evaluation's
-`level`, `scope` and `allocation` or a sample's `dependence`, reads as rows of
-single assets: `level` `["asset"]`, `scope` `["individual"]`, no allocation and
-no dependence. A sample without `trend` has none recorded, which on per-year
-values reads as the years as recorded, and a sample without `pool` is no pool.
+A document or table without the `scope`, `components` or `design_budget` column,
+or without an evaluation's `level`, `scope` and `allocation` or a sample's
+`dependence`, reads as rows of single assets: `level` `["asset"]`, `scope`
+`["individual"]`, no allocation, no dependence and no component. A sample
+without `trend` has none recorded, which on per-year values reads as the years
+as recorded, and a sample without `pool` is no pool.
 
 The module claims no licence of its own for a comparison: it is derived data
 under its inputs' terms, which `licences` lists.
@@ -98,11 +100,16 @@ IDENTITY_COLUMNS = (
     "unique",
     "ties",
     "degenerate_tail",
+    "components",
+    "design_budget",
 )
 """The columns of a comparison table before its metric columns."""
 
-_ADDED_IDENTITY_COLUMNS = ("scope",)
+_ADDED_IDENTITY_COLUMNS = ("scope", "components", "design_budget")
 """The identity columns that a table written earlier doesn't have."""
+
+_BREAKDOWN_COLUMNS = ("part", "part_kind")
+"""The columns of a payout breakdown beside the identity columns."""
 
 KEY_COLUMNS = (
     "cover_hash",
@@ -117,12 +124,18 @@ KEY_COLUMNS = (
 
 
 def _identity_columns(names: Iterable[str]) -> list[str]:
-    """The identity columns among `names`, those added since optional."""
+    """The identity columns among `names`, those added since optional.
+
+    A payout breakdown's `part` and `part_kind` are identity columns too.
+    """
     present = set(names)
     return [
-        name
-        for name in IDENTITY_COLUMNS
-        if name in present or name not in _ADDED_IDENTITY_COLUMNS
+        *(
+            name
+            for name in IDENTITY_COLUMNS
+            if name in present or name not in _ADDED_IDENTITY_COLUMNS
+        ),
+        *(name for name in _BREAKDOWN_COLUMNS if name in present),
     ]
 
 
@@ -446,9 +459,10 @@ class EvaluationMetadata(_EvaluationModel):
         """Check that this metadata describes `table`, a comparison table.
 
         The table must have the identity columns and exactly the metric
-        columns of `columns`; a table written before `scope` was added may
-        lack it. Its key (`cover_hash`, `design_id`, `asset_id`, `level`,
-        `scenario`, `split`, `fold`) must be unique; and every cover, design,
+        columns of `columns`; a table written before `scope`, `components` or
+        `design_budget` was added may lack them. Its key (`cover_hash`,
+        `design_id`, `asset_id`, `level`, `scenario`, `split`, `fold`, and
+        `part` on a payout breakdown) must be unique; and every cover, design,
         sample and evaluation it names must be described here. Raises
         `EvaluationError` otherwise.
         """
@@ -457,7 +471,7 @@ class EvaluationMetadata(_EvaluationModel):
         missing = [name for name in identity if name not in names]
         if missing:
             raise EvaluationError(f"the comparison table lacks the columns {missing}")
-        metrics = [name for name in names if name not in IDENTITY_COLUMNS]
+        metrics = [name for name in names if name not in identity]
         if set(metrics) != set(self.columns):
             unknown = sorted(set(metrics) - set(self.columns))
             absent = sorted(set(self.columns) - set(metrics))
@@ -466,7 +480,8 @@ class EvaluationMetadata(_EvaluationModel):
                 f"undescribed {unknown}, absent {absent}"
             )
         rows = table.select(identity).to_pylist()
-        keys = [tuple(row[name] for name in KEY_COLUMNS) for row in rows]
+        key_columns = (*KEY_COLUMNS, "part") if "part" in names else KEY_COLUMNS
+        keys = [tuple(row[name] for name in key_columns) for row in rows]
         if len(set(keys)) != len(keys):
             raise EvaluationError("the comparison table repeats a row key")
         covers = {entry.hash for entry in self.covers}
@@ -1347,19 +1362,40 @@ def _of_rows(
             "table's metadata describes.",
         )
     described = [name for name in ("level", "scope") if name in table.column_names]
-    rows = table.select([*_ROW_KEYS, *described]).to_pylist()
+    hashed = "cover_hash" in table.column_names
+    rows = table.select(
+        [*_ROW_KEYS, *described, *(["cover_hash"] if hashed else [])]
+    ).to_pylist()
     # The levels and scopes of the rows the table still holds.
     named: dict[Any, dict[str, list[str]]] = {}
+    covers: dict[Any, set[str]] = {}
     for row in rows:
-        entry = named.setdefault(
-            (row["sample_hash"], row["split"], row["fold"]),
-            {name: [] for name in described},
-        )
+        key = (row["sample_hash"], row["split"], row["fold"])
+        entry = named.setdefault(key, {name: [] for name in described})
         for name in described:
             if row[name] not in entry[name]:
                 entry[name].append(row[name])
+        if hashed:
+            covers.setdefault(key, set()).add(row["cover_hash"])
+
+    def of_covers(evaluation: Mapping[str, Any], key: Any) -> dict[str, Any]:
+        """The row and package records of the covers the table still names."""
+        if not hashed:
+            return {}
+        return {
+            name: [
+                item for item in evaluation[name] if item["cover_hash"] in covers[key]
+            ]
+            for name in ("rows", "packages")
+            if name in evaluation
+        }
+
     evaluations = [
-        {**entry, **named[(entry["sample_hash"], entry["split"], entry["fold"])]}
+        {
+            **entry,
+            **named[(entry["sample_hash"], entry["split"], entry["fold"])],
+            **of_covers(entry, (entry["sample_hash"], entry["split"], entry["fold"])),
+        }
         for entry in setup["evaluations"]
         if (entry["sample_hash"], entry["split"], entry["fold"]) in named
     ]
@@ -2072,6 +2108,11 @@ def _levels_of(
                 f"total, the sum over {' or over '.join(_first_seen(sums))} in each "
                 "draw: the owner's total loss against the total payout"
             )
+        elif level == "package":
+            words.append(
+                f"package, the separate contracts of {each} as one row: their "
+                "payouts and their premiums added up"
+            )
         elif level in _ALLOCATED_LEVELS:
             words.append(
                 f"{level}, one row per asset ({each}): its share of the joint "
@@ -2089,6 +2130,104 @@ def _levels_of(
     else:
         text += f". Scope: {_join(sorted(scopes))}, kept apart by the scope column"
     return levels, scopes, text
+
+
+def _row_lines(
+    evaluations: Sequence[Mapping[str, Any]],
+    designs: Sequence[Mapping[str, Any]],
+    samples: Mapping[str, Mapping[str, Any]],
+    unit: str,
+) -> list[str]:
+    """One line per row on a sample of several hazards: what it reads and is under."""
+    records = {str(record["design_id"]): record for record in designs}
+    lines: list[str] = []
+    for i, evaluation in enumerate(evaluations):
+        where = f"setup.evaluations[{i}]"
+        for j, row in enumerate(_objects(evaluation, "rows", where)):
+            place = f"{where}.rows[{j}]"
+            level = _get(row, "level", str, place)
+            record = records.get(str(row.get("design_id")))
+            if level == "package":
+                designed = "each contract designed or given on its own"
+                pricing = "each contract on its own terms"
+            elif record is not None:
+                designed = (
+                    _designed_on(record, samples, place)
+                    or "designed on a sample of one hazard"
+                )
+                pricing = _pricing(record.get("pricing"), place)
+            elif row.get("design_id") is not None:
+                designed = "designed, with no design record given here"
+                pricing = "as its design states"
+            else:
+                designed = "given as is"
+                pricing = _pricing(evaluation.get("pricing"), place)
+            bound = row.get("design_budget")
+            budget = (
+                "no design budget"
+                if bound is None
+                else f"budget: premium at most {_number(bound, place)} {unit}"
+            )
+            reads = _join((_get(row, "components", str, place) or "").split("+"))
+            lines.append(
+                f"Row {_get(row, 'cover_label', str, place)} ({level}): reads {reads}; "
+                f"{designed}; {budget}; pricing: {pricing}."
+            )
+    return _first_seen(lines)
+
+
+def _contract_text(contract: Mapping[str, Any], unit: str, where: str) -> str:
+    bound, limit = contract.get("budget"), contract.get("limit")
+    budget = (
+        "no design budget"
+        if bound is None
+        else f"budget at most {_number(bound, where)} {unit}"
+    )
+    stated = (
+        "no limit stated at design"
+        if limit is None
+        else f"limit {_number(limit, where)} {unit}"
+    )
+    premium = _number(contract.get("premium"), f"{where}.premium")
+    name = _get(contract, "name", str, where)
+    return f"{name} ({budget}, premium {premium} {unit}, {stated})"
+
+
+def _package_lines(evaluations: Sequence[Mapping[str, Any]], unit: str) -> list[str]:
+    """One line per package: its contracts' terms, their sums and what they mean."""
+    lines: list[str] = []
+    for i, evaluation in enumerate(evaluations):
+        where = f"setup.evaluations[{i}]"
+        for j, package in enumerate(_objects(evaluation, "packages", where)):
+            place = f"{where}.packages[{j}]"
+            contracts = _objects(package, "contracts", place)
+            budget = package.get("budget")
+            summed = _number(package.get("premium_sum"), f"{place}.premium_sum")
+            text = (
+                f"Package {_get(package, 'label', str, place)}: "
+                + _join(
+                    [
+                        _contract_text(contract, unit, f"{place}.contracts[{k}]")
+                        for k, contract in enumerate(contracts)
+                    ]
+                )
+                + (
+                    "; not every contract has a design budget"
+                    if budget is None
+                    else f"; the budgets sum to {_number(budget, place)} {unit}"
+                )
+                + f"; the premiums sum to {summed} {unit}"
+            )
+            if package.get("premium_basis") == "stated":
+                stated = _number(package.get("premium"), f"{place}.premium")
+                text += f", and its row uses the stated premium {stated} {unit}"
+            lines.append(
+                text + ". Each cover keeps its own limit, and the package has none of "
+                "its own: its largest year is at most the sum of its covers' limits. "
+                "A loading is not additive across contracts, so these premiums "
+                "price each contract on its own, not one contract on the sum."
+            )
+    return _first_seen(lines)
 
 
 def _is_document(value: Any) -> TypeGuard[Mapping[str, Any]]:
@@ -2164,6 +2303,14 @@ def setup_text(
       Before execution, one line per objective and scope that a plan's
       `explain()` document plans, naming its templates, with the objective,
       pricing, budget and limit;
+    - `Row`, on a sample of several hazards, one line per row: the components
+      its cover reads, what loss it was designed on, its budget and its
+      pricing;
+    - `Package`, one line per package row: each contract's budget, premium and
+      limit, their sums, that each cover keeps its own limit and that a loading
+      is not additive across contracts;
+    - `Payout breakdown`, for a breakdown holding a `MaxOf` cover: that its rows
+      are an attribution;
     - `Metrics`: the levels beta, the return periods and the loss and payout
       thresholds.
 
@@ -2364,8 +2511,32 @@ def setup_text(
         )
     if "joint" in scopes:
         priced += " A joint design's premium is that of one contract on the total."
-    lines.append(priced)
+    if "package" in levels:
+        priced += (
+            " The package row holds the sum of its contracts' premiums, one per "
+            "contract, unless a total premium is stated."
+        )
+    part_kinds = [
+        str(kind)
+        for i, evaluation in enumerate(evaluations)
+        for kind in _list(evaluation, "part_kinds", f"setup.evaluations[{i}]")
+    ]
+    if not part_kinds:
+        lines.append(priced)
+    else:
+        lines.append(
+            "Pricing: a payout breakdown holds no premiums; a design's line states "
+            "its pricing."
+        )
     lines += [_design(record, labels, unit, by_hash) for record in designs]
+    lines += _row_lines(evaluations, designs, by_hash, unit)
+    lines += _package_lines(evaluations, unit)
+    if "attribution" in part_kinds:
+        lines.append(
+            "Payout breakdown: the rows of a MaxOf cover are an attribution: each "
+            "year's payout goes to the component paying most, in equal shares when "
+            "several tie. One contract pays one amount."
+        )
     if explained is not None:
         lines += _planned_designs(explained, assets, unit)
     options = setup.get("metric_options")

@@ -362,7 +362,7 @@ def test_the_docs_comparison_table_lists_every_identity_column() -> None:
     section = section[: section.index("\n## ")]
     for column in IDENTITY_COLUMNS:
         assert f"`{column}`" in section
-    for level in ("asset", "total", "asset_by_value", "asset_by_loss"):
+    for level in ("asset", "total", "asset_by_value", "asset_by_loss", "package"):
         assert f'`"{level}"`' in section
     assert '`"individual"`' in section and '`"joint"`' in section
 
