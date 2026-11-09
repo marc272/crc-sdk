@@ -1086,6 +1086,15 @@ def test_free_breakpoints_search_the_ordered_points_of_the_product() -> None:
     ) == pytest.approx(best[0], rel=1e-9)
 
 
+def test_two_free_breakpoints_per_axis_at_eight_points_are_784_ordered_points() -> None:
+    rain, heat, loss, _ = _draws(60)
+    points = np.linspace(10.0, 80.0, 8).tolist()
+    free = [Free(10.0, 80.0, grid=points), Free(10.0, 80.0, grid=points)]
+    grid = StepGrid({"rain": free, "heat": free}, _free_table(3, 3), monotone=False)
+    result = design(_cover(grid), _sample(rain, heat, loss), MSE())
+    assert result.grid == {"candidates": 4096, "optimal": 784, "invalid": 3312}
+
+
 def test_free_breakpoints_stay_under_the_grid_cap() -> None:
     rain, heat, loss, _ = _draws()
     with pytest.raises(DesignError, match="18 points, more than max_grid_points=17"):
@@ -1103,7 +1112,7 @@ def test_free_breakpoints_work_on_a_lower_tail() -> None:
     grid = StepGrid(
         {
             "rain": [40.0],
-            "heat": [Free(0.0, 90.0, grid=[60.0, 40.0][::-1])],
+            "heat": [Free(0.0, 90.0, grid=[40.0, 60.0])],
         },
         _free_table(2, 2),
         tail=tails,
@@ -1257,7 +1266,7 @@ def test_the_regions_add_up_to_the_expected_payout() -> None:
     assert compared["expected_payout"] == pytest.approx((10.0 + 12.0 + 9.0) / 8)
 
 
-def test_a_region_a_cell_of_zero_leaves_empty() -> None:
+def test_a_region_of_cells_at_zero_pays_nothing() -> None:
     cover = _breakdown_cover(((0.0, 0.0), (5.0, 9.0)))
     table = payout_breakdown([cover], _breakdown_sample(), split="in_sample")
     alone = _row(table, part="only:heat")
@@ -1331,3 +1340,4 @@ def test_a_grid_is_a_row_of_a_comparison_beside_separate_covers() -> None:
     assert package["components"] == "rain+heat"
     assert holistic["sample_hash"] == package["sample_hash"]
     assert holistic["design_budget"] == pytest.approx(package["design_budget"])
+    assert "reads rain and heat" in setup_text(table)
