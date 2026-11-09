@@ -14,7 +14,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, ClassVar, Self
+from typing import Any, ClassVar, Self, cast
 
 import numpy as np
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
@@ -47,6 +47,7 @@ from crc_sdk.parametric import (
     SampleError,
     SampleProvenance,
     SolverUnavailableError,
+    StepGrid,
     StepPayout,
     SumOf,
     UnboundedDesignError,
@@ -544,6 +545,93 @@ def test_a_sum_whose_second_component_never_pays_reproduces_the_case(
     for key, value in expected["parameters"].items():
         if key not in expected["unidentified"]:
             assert abs(result.parameters[f"{name}.{key}"] - value) <= allowance, key
+
+
+STEP_CASES = [
+    path for path in REDUCTION_CASES if _case(path)["cover"]["payout"]["kind"] == "step"
+]
+
+
+def test_the_grid_reduction_covers_every_objective_and_both_tails() -> None:
+    cases = [_case(path) for path in STEP_CASES]
+    assert {case["objective"]["kind"] for case in cases} == {
+        "mse",
+        "expected_uncovered",
+        "weighted_cvar",
+    }
+    assert {case["cover"]["payout"]["tail"] for case in cases} == {"upper", "lower"}
+
+
+def _on_a_grid(case: Mapping[str, Any]) -> tuple[Cover, OutcomeSample, StepPayout]:
+    """A step case on a grid, on an axis that no year passes the first threshold of.
+
+    The case's bands become the first column of the table, its levels as the
+    case states them. The second column is free and no year reaches it.
+    """
+    template, sample = _with_a_silent_component(case)
+    step = Cover.from_document(case["cover"]).payout
+    assert isinstance(step, StepPayout)
+    name = next(iter(template.payout.index_names))
+    top = max(cast(Free, level).upper or 0.0 for level in step.levels)
+    grid = StepGrid(
+        {name: list(step.breakpoints), "silent": [1.0]},
+        [[0.0, Free(0.0, top)], *[[level, Free(0.0, top)] for level in step.levels]],
+        tail=(step.tail, "upper"),
+        monotone=step.monotone,
+    )
+    cover = Cover(
+        template.index_definition,
+        grid,
+        payout_unit=template.payout_unit,
+        asset_id=template.asset_id,
+    )
+    return cover, sample, step
+
+
+@pytest.mark.parametrize("path", STEP_CASES, ids=lambda path: path.stem)
+def test_a_grid_on_a_silent_second_axis_reproduces_the_step_case(path: Path) -> None:
+    case = _case(path)
+    expected = case["expected"]
+    tolerances = case["tolerances"]
+    template, sample, step = _on_a_grid(case)
+    result = design(
+        template,
+        sample,
+        objective_from_document(case["objective"]),
+        pricing=pricing_from_document(case["pricing"]),
+        budget=budget_from_document(case["budget"]),
+        limit=limit_from_document(case["limit"]),
+    )
+    scale = _scale(case)
+    power = 2 if case["objective"]["kind"] == "mse" else 1
+    target = expected["objective_value"]
+    assert abs(result.objective_value - target) <= (
+        tolerances["objective_value"] * abs(target) + 1e-9 * scale**power
+    )
+    assert abs(result.premium - expected["premium"]) <= (
+        tolerances["premium"] * abs(expected["premium"]) + 1e-9 * scale
+    )
+    n_levels = len(step.levels)
+    assert set(result.unidentified) == {
+        *(f"levels[{i},1]" for i in range(n_levels + 1)),
+        *(f"levels[{int(item[7:-1]) + 1},0]" for item in expected["unidentified"]),
+    }
+    allowance = tolerances["parameters"] * scale
+    assert case["compare_parameters"] == "exact"
+    for key, value in expected["parameters"].items():
+        if key not in expected["unidentified"]:
+            k = int(key[7:-1])
+            assert abs(result.parameters[f"levels[{k + 1},0]"] - value) <= allowance, (
+                key
+            )
+    # Year by year, the grid pays what the case's step payout pays.
+    index = np.asarray(case["sample"]["index"], dtype=np.float64)
+    assert index.shape[1] == 1
+    paid = result.cover.payout_values(
+        np.column_stack([index[:, 0], np.zeros(index.shape[0])])
+    )
+    reference = step.with_values(expected["parameters"]).evaluate(index[:, 0])
+    assert np.abs(paid - reference).max(initial=0.0) <= allowance
 
 
 def test_parity_routes_and_flags() -> None:
