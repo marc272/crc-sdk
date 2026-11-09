@@ -38,6 +38,14 @@ states how the climate trend is treated (`AsRecorded`, the default,
 `RecentYears` or `LinearTrend`; see `crc_sdk.parametric.trend`), and `scenario=`
 is the caller's name for the rows.
 
+**Several hazards, per year** (`sample_annual_hazards`). The series of several
+hazards at one asset, over the same years, make one sample with named index
+components. A row's values are the same year's, so the dependence between the
+hazards is the data's own and is recorded as `{"kind": "data"}`. The rows are the
+same years and not the same events: two annual maxima of one year may come from
+different events. Two impacts or more need a stated rule for the combined loss
+(`crc_sdk.parametric.combine`).
+
 **Pooled model-years** (`ModelRun`, `sample_annual_pool`). One climate model
 gives few years for a tail, so the years of several models can be pooled for
 one asset under one pathway. Every model-year is one row with probability
@@ -85,6 +93,12 @@ from pydantic import BaseModel
 
 from crc_sdk.parametric._canonical import content_hash
 from crc_sdk.parametric.basis_risk import BasisRisk, ImpactNoise, NoBasisRisk
+from crc_sdk.parametric.combine import (
+    CombineRule,
+    _combined_impact,
+    _one_impact_record,
+    _rule_record,
+)
 from crc_sdk.parametric.dependence import (
     Comonotonic,
     Dependence,
@@ -96,16 +110,20 @@ from crc_sdk.parametric.errors import (
     ProbabilitySemanticsError,
     SampleError,
 )
+from crc_sdk.parametric.index import Tail, _component_name
 from crc_sdk.parametric.loss import LossModel
 from crc_sdk.parametric.metadata import _year_spans
 from crc_sdk.parametric.sample import (
     COMONOTONE_MESSAGE,
+    IndexComponent,
     OutcomeSample,
     SampleProvenance,
     _arrow_table,
     _asset_note,
+    _by_component,
     _check_json,
     _column,
+    _component_note,
     _freeze,
     _generator_record,
     _identifier,
@@ -131,6 +149,7 @@ __all__ = [
     "ModelRun",
     "OutsideSupport",
     "sample_annual",
+    "sample_annual_hazards",
     "sample_annual_pool",
     "sample_curve",
     "sample_curves",
@@ -1441,6 +1460,29 @@ def sample_annual(
     return sample
 
 
+def _no_value_error(dropped: Sequence[int], which: Sequence[str]) -> SampleError:
+    """The error for years without a value; `which` says which series lack them."""
+    years_have, them = (
+        ("year has", "it") if len(dropped) == 1 else ("years have", "them")
+    )
+    return SampleError(
+        f"{len(dropped)} {years_have} no value ({'; '.join(which)}); pass "
+        f"missing='drop_year' to drop {them}, listed in the provenance"
+    )
+
+
+def _dropped_notes(dropped: Sequence[int]) -> list[str]:
+    """The note for the years dropped as missing; none if no year was."""
+    if not dropped:
+        return []
+    noun, verb = ("year", "was") if len(dropped) == 1 else ("years", "were")
+    return [
+        f"{len(dropped)} {noun} without a value {verb} dropped: "
+        f"{', '.join(str(year) for year in dropped[:10])}"
+        f"{', ...' if len(dropped) > 10 else ''}."
+    ]
+
+
 def _annual_lineage(
     asset_id: str, hazard: AnnualSeries, index: AnnualSeries | None
 ) -> str:
@@ -1508,13 +1550,7 @@ def _annual_rows(
             which.append(f"hazard {[int(y) for y in years[hazard_missing]][:10]}")
         if index is not None and index_missing.any():
             which.append(f"index {[int(y) for y in years[index_missing]][:10]}")
-        years_have, them = (
-            ("year has", "it") if len(dropped) == 1 else ("years have", "them")
-        )
-        raise SampleError(
-            f"{len(dropped)} {years_have} no value ({'; '.join(which)}); pass "
-            f"missing='drop_year' to drop {them}, listed in the provenance"
-        )
+        raise _no_value_error(dropped, which)
     keep = ~gaps
     if not keep.any():
         raise SampleError("no year has a value")
@@ -1534,14 +1570,7 @@ def _annual_rows(
     )
     loss = loss_model.loss_values(impact)
 
-    notes: list[str] = []
-    if dropped:
-        noun, verb = ("year", "was") if len(dropped) == 1 else ("years", "were")
-        notes.append(
-            f"{len(dropped)} {noun} without a value {verb} dropped: "
-            f"{', '.join(str(year) for year in dropped[:10])}"
-            f"{', ...' if len(dropped) > 10 else ''}."
-        )
+    notes = _dropped_notes(dropped)
     notes += _basis_risk_notes(basis_risk, separate_index=index is not None)
     sources: list[dict[str, Any]] = [
         {"role": "hazard", "unit": hazard.unit, "series": _thaw(hazard.provenance)}
@@ -1584,6 +1613,453 @@ def _annual_rows(
         semantics="annual",
         provenance=provenance,
         scenario=scenario,
+    )
+
+
+# -- several hazards, per year -------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _HazardInputs:
+    """The checked arguments of `sample_annual_hazards`, by component name."""
+
+    series: dict[str, AnnualSeries]
+    tails: dict[str, Tail]
+    models: dict[str, LossModel]
+
+    @property
+    def impacted(self) -> list[str]:
+        """The components with an impact, in component order."""
+        return [name for name in self.series if name in self.models]
+
+
+def _hazard_inputs(
+    series: Any, tails: Any, loss_models: Any, basis_risk: Any, asset: str
+) -> _HazardInputs:
+    """Check the mappings of `sample_annual_hazards`, before anything is drawn."""
+    if not isinstance(series, Mapping):
+        raise TypeError(
+            "series must map each component name to an AnnualSeries, got "
+            f"{type(series).__name__}"
+        )
+    names = list(series)
+    if len(names) < 2:
+        raise SampleError(
+            f"sample_annual_hazards takes two hazards or more, got {len(names)}; "
+            "for one hazard use sample_annual"
+        )
+    for name, each in series.items():
+        _component_name(name, SampleError)
+        if not isinstance(each, AnnualSeries):
+            raise TypeError(
+                f"series[{name!r}] must be an AnnualSeries, got {type(each).__name__}"
+            )
+    severe = _by_component("tails", tails, names, every=True)
+    for name, tail in severe.items():
+        if tail not in get_args(Tail):
+            raise SampleError(
+                f"tails[{name!r}] must be 'upper' or 'lower', got {tail!r}"
+            )
+    models = _by_component("loss_models", loss_models, names, every=False)
+    if not models:
+        raise SampleError(
+            "no component has an impact, so the sample would have no loss; give at "
+            "least one a LossModel in loss_models"
+        )
+    for name, model in models.items():
+        if not isinstance(model, LossModel):
+            raise TypeError(
+                f"loss_models[{name!r}] must be a LossModel, got {type(model).__name__}"
+            )
+        _check_models(model, basis_risk, asset)
+        model._require_bound()
+        model.check_hazard_unit(series[name].unit)
+    _check_one_value(models)
+    return _HazardInputs(series=dict(series), tails=severe, models=models)
+
+
+def _check_one_value(models: Mapping[str, LossModel]) -> None:
+    """Raise `SampleError` unless the loss models have one value between them.
+
+    A rule acts on impacts and its result is multiplied by the value, so there
+    must be one. Values themselves are not named: a record never holds them.
+    """
+    for label, stated in (
+        ("value_unit", {name: model.value_unit for name, model in models.items()}),
+        ("value_column", {name: model.value_column for name, model in models.items()}),
+    ):
+        if len(set(stated.values())) > 1:
+            raise SampleError(
+                f"the loss models must have one {label}, but they state {stated}"
+            )
+    if len({model._value for model in models.values()}) > 1:
+        raise SampleError(
+            f"the loss models must have one value, but those of {list(models)} differ"
+        )
+
+
+def _combine_record(combine: Any, impacted: Sequence[str]) -> dict[str, Any]:
+    """What a sample records of its rule; raises unless one is stated when needed."""
+    if len(impacted) >= 2:
+        if combine is None:
+            raise SampleError(
+                f"the components {list(impacted)} each have an impact, so the rule "
+                "for their combined loss must be stated, and none is assumed: pass "
+                "combine=CappedSum(cap), combine=CompoundDamage() or a CombineRule "
+                "of your own"
+            )
+        return _rule_record(combine)
+    if combine is not None:
+        raise SampleError(
+            f"combine= combines two impacts or more, but only component "
+            f"{impacted[0]!r} has one: remove combine=, or add a loss model"
+        )
+    return _one_impact_record(impacted[0])
+
+
+def _same_years(series: Mapping[str, AnnualSeries]) -> IntArray:
+    """The years every series holds; raises, listing each one's, if they differ."""
+    first = next(iter(series.values())).years
+    if all(np.array_equal(each.years, first) for each in series.values()):
+        return first
+    held = "; ".join(
+        f"{name}: {_year_spans(each.years.tolist())}" for name, each in series.items()
+    )
+    raise SampleError(
+        "the series must hold the same years, so that a row is one year of every "
+        f"hazard; they hold {held}"
+    )
+
+
+def _named_fits(
+    record: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """A trend record with each fit naming its component, and each one's own.
+
+    The fits were made with the component names as their series' roles, so that
+    an error names the series. A record without fits is every component's own.
+    """
+    fits = [
+        {**fit, "role": "hazard", "component": fit["role"]}
+        for fit in record.get("fits", ())
+    ]
+    if not fits:
+        return dict(record), {}
+    return {**record, "fits": fits}, {
+        fit["component"]: {**record, "fits": [fit]} for fit in fits
+    }
+
+
+def _distinct(entries: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The entries, each once, in order."""
+    distinct: list[dict[str, Any]] = []
+    for entry in entries:
+        if entry not in distinct:
+            distinct.append(entry)
+    return distinct
+
+
+def sample_annual_hazards(
+    series: Mapping[str, AnnualSeries],
+    *,
+    tails: Mapping[str, Tail],
+    loss_models: Mapping[str, LossModel],
+    combine: CombineRule | None = None,
+    basis_risk: BasisRisk,
+    asset_id: str,
+    rng: np.random.Generator | None = None,
+    missing: MissingYears = "raise",
+    trend: Trend = AsRecorded(),
+    scenario: str = "baseline",
+) -> OutcomeSample:
+    """Build a sample of one asset whose rows are the same years of several hazards.
+
+    `series`, `tails` and `loss_models` are mappings by component name, and the
+    order of `series` sets the components: the first is the primary, whose
+    values the sample's `index` holds. Two or more, each named without
+    surrounding whitespace and without `.`, `+`, `[` or `]`. `tails` states each
+    component's severe side. Each year is one row with probability `1/n`, and
+    `period` is the year.
+
+    The dependence between the hazards is the data's own: the provenance's
+    `hazard_dependence` is `{"kind": "data"}`. The rows are the same years, not
+    the same events, so two annual maxima of one year may come from different
+    events, and the setup text says so.
+
+    The steps come in this order: the window of `RecentYears`; the missing
+    years; the fit and the adjustment of every series, one fit each, on the
+    same fit years with the same reference year; each component's impact on its
+    adjusted hazard; the basis-risk model; the rule. `trend` is one option for
+    every series. `basis_risk` is one model for every component, and it draws
+    from `rng` in component order, so the first component's draws are those of
+    `sample_annual` with the same generator. The provenance's `rng` records the
+    generator's state before each component's step.
+
+    **The loss.** A component's impact comes from its `LossModel`, on its
+    hazard, after the basis-risk model, and its `own_loss` is that impact times
+    the value. `combine` takes the impacts, and the sample's `loss` is its
+    result times the value: `CappedSum(cap)`, `CompoundDamage()` or a
+    `CombineRule` of the caller's. It is required when two or more components
+    have an impact, and refused with fewer. A component left out of
+    `loss_models` has no impact: it needs no rule, has no `own_loss`, and the
+    basis-risk model doesn't act on it or draw for it. With one impact the
+    sample's loss is that component's own, and `combine` records that. The loss
+    models must have one value, one `value_unit` and one `value_column`.
+
+    A year without a value in any series raises, unless `missing="drop_year"`
+    drops it from all of them and lists it in the provenance. `scenario` is
+    the caller's name for the rows, as in `sample_annual`.
+
+    `sample.component(name)` is that hazard's own sample. On the same years,
+    with no basis-risk draws or for the first component, it has the content
+    hash of `sample_annual` on that series.
+
+    Raises `SampleError` for fewer than two series or an invalid name, tails
+    not stated for every component, no impact at all, series that hold
+    different years (listing each one's), a hazard unit a component's impact is
+    not calibrated for, loss models with different values, units or value
+    columns, a missing or invalid rule, missing years, a trend the series cannot
+    take or invalid arguments, and `TypeError` for wrong types, a bare callable
+    as `combine` included. These are checked before any draw, apart from a
+    rule's result. Warns with `ComonotoneIndexWarning` for `NoBasisRisk()`.
+    """
+    sample = _annual_hazard_rows(
+        series,
+        tails=tails,
+        loss_models=loss_models,
+        combine=combine,
+        basis_risk=basis_risk,
+        asset_id=asset_id,
+        rng=rng,
+        missing=missing,
+        trend=trend,
+        scenario=scenario,
+    )
+    _warn_comonotone(basis_risk, separate_index=False)
+    return sample
+
+
+def _kept_hazards(
+    series: Mapping[str, AnnualSeries], missing: MissingYears, trend: Trend
+) -> tuple[IntArray, dict[str, FloatArray], list[int], Mapping[str, Any]]:
+    """The window, the missing years and the trend, for every series alike.
+
+    Returns the kept years, each series' adjusted values, the years dropped and
+    what the trend made.
+    """
+    all_years = _same_years(series)
+    first_row = trend._first_row(all_years.shape[0])
+    years = all_years[first_row:]
+    recorded = {name: each.values[first_row:] for name, each in series.items()}
+    holes = {name: np.isnan(values) for name, values in recorded.items()}
+    gaps = np.logical_or.reduce(list(holes.values()))
+    dropped = [int(year) for year in years[gaps]]
+    if dropped and missing == "raise":
+        raise _no_value_error(
+            dropped,
+            [
+                f"{name} {[int(year) for year in years[hole]][:10]}"
+                for name, hole in holes.items()
+                if hole.any()
+            ],
+        )
+    keep = ~gaps
+    if not keep.any():
+        raise SampleError("no year has a value in every series")
+    kept_years = years[keep]
+    adjusted, made = trend._apply(
+        years,
+        kept_years,
+        [
+            _Series(name, each.unit, np.array(recorded[name][keep]))
+            for name, each in series.items()
+        ],
+    )
+    return kept_years, dict(zip(series, adjusted, strict=True)), dropped, made
+
+
+def _annual_hazard_rows(
+    series: Any,
+    *,
+    tails: Any,
+    loss_models: Any,
+    combine: Any,
+    basis_risk: BasisRisk,
+    asset_id: str,
+    rng: np.random.Generator | None,
+    missing: MissingYears,
+    trend: Trend,
+    scenario: str,
+) -> OutcomeSample:
+    """`sample_annual_hazards`, without its warning: a plan rebuilds per fold."""
+    asset = _identifier("asset_id", asset_id)
+    inputs = _hazard_inputs(series, tails, loss_models, basis_risk, asset)
+    if rng is not None:
+        rng = _require_generator(rng)
+    if missing not in get_args(MissingYears):
+        raise SampleError(
+            f"missing must be one of {get_args(MissingYears)}, got {missing!r}"
+        )
+    trend = _require_trend(trend)
+    scenario = _identifier("scenario", scenario)
+    rule_record = _combine_record(combine, inputs.impacted)
+    kept_years, hazards, dropped, trend_made = _kept_hazards(
+        inputs.series, missing, trend
+    )
+
+    components: dict[str, IndexComponent] = {}
+    impacts: dict[str, FloatArray] = {}
+    summaries: dict[str, dict[str, Any]] = {}
+    rng_records: dict[str, dict[str, Any]] = {}
+    for name, values in hazards.items():
+        unit = inputs.series[name].unit
+        model = inputs.models.get(name)
+        if model is None:
+            components[name] = IndexComponent(
+                values, unit=unit, tail=inputs.tails[name]
+            )
+            continue
+        impact = model.impact_values(values)
+        if rng is not None:
+            rng_records[name] = {
+                **_generator_record(rng, "basis_risk"),
+                "component": name,
+            }
+        new_index, impacts[name], summaries[name] = _apply_basis_risk(
+            basis_risk, values, values, impact, rng
+        )
+        components[name] = IndexComponent(
+            new_index,
+            unit=unit,
+            tail=inputs.tails[name],
+            hazard=None if np.array_equal(new_index, values) else values,
+            own_loss=model.loss_values(impacts[name]),
+        )
+    one_model = inputs.models[inputs.impacted[0]]
+    loss = one_model.loss_values(
+        next(iter(impacts.values()))
+        if combine is None
+        else _combined_impact(combine, str(rule_record["kind"]), impacts)
+    )
+    n = kept_years.shape[0]
+    first = next(iter(components.values()))
+    return OutcomeSample(
+        asset_ids=(asset,),
+        period=kept_years,
+        probability=np.full(n, 1.0 / n),
+        index=first.values,
+        loss=loss,
+        hazard=first.hazard,
+        index_unit=first.unit,
+        loss_unit=one_model.value_unit,
+        semantics="annual",
+        provenance=_hazards_provenance(
+            inputs,
+            asset=asset,
+            basis_risk=basis_risk,
+            kept_years=kept_years,
+            dropped=dropped,
+            missing=missing,
+            trend_made=trend_made,
+            rule_record=rule_record,
+            summaries=summaries,
+            rng_records=rng_records,
+        ),
+        scenario=scenario,
+        index_components=components,
+    )
+
+
+def _hazards_provenance(
+    inputs: _HazardInputs,
+    *,
+    asset: str,
+    basis_risk: BasisRisk,
+    kept_years: IntArray,
+    dropped: Sequence[int],
+    missing: MissingYears,
+    trend_made: Mapping[str, Any],
+    rule_record: Mapping[str, Any],
+    summaries: Mapping[str, Mapping[str, Any]],
+    rng_records: Mapping[str, Mapping[str, Any]],
+) -> SampleProvenance:
+    """The provenance of a per-year sample of several hazards, and each one's own."""
+    series, models = inputs.series, inputs.models
+    details = {
+        "years": [int(kept_years[0]), int(kept_years[-1])],
+        "n_years": int(kept_years.shape[0]),
+        "missing": missing,
+        "dropped_years": list(dropped),
+        "index_from": "hazard",
+    }
+    shared_notes = _dropped_notes(dropped)
+    own_notes = {
+        name: _basis_risk_notes(basis_risk, separate_index=False)
+        for name in inputs.impacted
+    }
+    trend_record, own_trends = _named_fits(trend_made)
+    sources = {
+        name: {
+            "role": "hazard",
+            "component": name,
+            "unit": each.unit,
+            "series": _thaw(each.provenance),
+        }
+        for name, each in series.items()
+    }
+    licences = {name: _series_licence("hazard", each) for name, each in series.items()}
+    loss_documents = {name: models[name]._document(asset) for name in inputs.impacted}
+    return SampleProvenance(
+        source_kind="annual",
+        sources=tuple(sources.values()),
+        semantics_source="data",
+        # A list, because canonical JSON sorts keys and the order is the components'.
+        loss_model={
+            "kind": "components",
+            "components": [
+                {"name": name, "loss_model": document}
+                for name, document in loss_documents.items()
+            ],
+        },
+        basis_risk=basis_risk.to_document(),
+        rng=tuple(rng_records.values()),
+        licences=tuple(_distinct(licences.values())),
+        details={**details, "basis_risk": summaries},
+        notes=(
+            *shared_notes,
+            *(
+                _component_note(name, note)
+                for name, notes in own_notes.items()
+                for note in notes
+            ),
+        ),
+        lineage=content_hash(
+            {
+                "kind": "annual_hazards",
+                "asset_id": asset,
+                "hazards": {
+                    name: _series_identity(each) for name, each in series.items()
+                },
+            }
+        ),
+        trend=trend_record,
+        hazard_dependence={"kind": "data"},
+        combine=rule_record,
+        components={
+            name: SampleProvenance(
+                source_kind="annual",
+                sources=(sources[name],),
+                semantics_source="data",
+                loss_model=loss_documents.get(name),
+                basis_risk=basis_risk.to_document(),
+                rng=(rng_records[name],) if name in rng_records else (),
+                licences=(licences[name],),
+                details={**details, "basis_risk": summaries.get(name)},
+                notes=(*shared_notes, *own_notes.get(name, ())),
+                trend=own_trends.get(name, trend_record),
+            ).to_document()
+            for name in series
+        },
     )
 
 

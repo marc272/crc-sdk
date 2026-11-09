@@ -15,9 +15,11 @@ with an index value and a loss: `sample_curve` draws simulated years from a
 fitted curve, `sample_annual` reads the years of an `AnnualSeries`, and
 `OutcomeSample.from_table` takes a user table, which may hold several index
 columns: a sample may hold named `IndexComponent`s at one asset, and
-`OutcomeSample.component` takes one hazard's sample out of it. `LossModel`
-turns the hazard into a loss and a `BasisRisk` model states how index and
-loss differ. On per-year samples, `AsRecorded`, `RecentYears` and
+`OutcomeSample.component` takes one hazard's sample out of it.
+`sample_annual_hazards` reads the same years of several hazards at one asset,
+and `CappedSum`, `CompoundDamage` or a `CombineRule` states their combined loss.
+`LossModel` turns the hazard into a loss and a `BasisRisk` model states how index
+and loss differ. On per-year samples, `AsRecorded`, `RecentYears` and
 `LinearTrend` state how the climate trend is treated, and `sample_annual_pool`
 pools the model-years of several `ModelRun`s.
 
@@ -47,6 +49,7 @@ plan reads its source and assets only at its execution points (`samples`,
 """
 
 from crc_sdk.parametric.basis_risk import BasisRisk, ImpactNoise, NoBasisRisk
+from crc_sdk.parametric.combine import CappedSum, CombineRule, CompoundDamage
 from crc_sdk.parametric.constraints import Budget, Limit
 from crc_sdk.parametric.cover import Cover
 from crc_sdk.parametric.dependence import Comonotonic, EmpiricalCopula, Independent
@@ -135,6 +138,7 @@ from crc_sdk.parametric.sources import (
     AnnualSeries,
     ModelRun,
     sample_annual,
+    sample_annual_hazards,
     sample_annual_pool,
     sample_curve,
     sample_curves,
@@ -151,9 +155,12 @@ __all__ = [
     "BasisRisk",
     "BinaryPayout",
     "Budget",
+    "CappedSum",
+    "CombineRule",
     "ComonotoneIndexWarning",
     "Comonotonic",
     "CompositeIndex",
+    "CompoundDamage",
     "CostOfCapitalLoad",
     "Cover",
     "CoverDefinitionError",
@@ -221,6 +228,7 @@ __all__ = [
     "payout_breakdown",
     "register_payout",
     "sample_annual",
+    "sample_annual_hazards",
     "sample_annual_pool",
     "sample_curve",
     "sample_curves",
