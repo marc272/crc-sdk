@@ -1374,7 +1374,7 @@ between the two.
 | `cover_hash` | string | `Cover.definition_hash`. On `"total"` and allocated rows, the hash of the set of covers, one per asset |
 | `design_id` | string, nullable | The design's id; null for a cover given as is, and on the `"total"` row of a set of covers |
 | `asset_id` | string, nullable | The asset; null exactly on `"total"` rows |
-| `level` | string | `"asset"`: an asset's own cover. `"total"`: the sum over the assets of one owner, draw by draw. `"asset_by_value"`, `"asset_by_loss"`: an asset's share of a joint design's total payout, under the rule in the name |
+| `level` | string | `"asset"`: an asset's own cover. `"total"`: the sum over the assets of one owner, draw by draw. `"asset_by_value"`, `"asset_by_loss"`: an asset's share of a joint design's total payout, under the rule in the name. `"package"`: the sum of one asset's separate contracts (`CoverPackage`), draw by draw, against the combined loss, with the sum of their premiums; `cover_hash` is the package's hash and `design_id` is null |
 | `scope` | string | `"individual"`, each cover standing on its own, or `"joint"`, one objective and one budget on the owner's total |
 | `scenario` | string | The sample's scenario, `"baseline"` by default |
 | `split` | string | `"in_sample"` or `"out_of_sample"` |
@@ -1382,10 +1382,12 @@ between the two.
 | `sample_hash` | string | The evaluation sample's `content_hash` |
 | `premium_basis` | string, nullable | `"stated"`, `"design"` or `"evaluation"`; null exactly on allocated rows |
 | `unique`, `ties`, `degenerate_tail` | bool, int32, string; nullable | The design's non-uniqueness report; null for a cover given as is |
+| `components` | string, nullable | What the row's cover reads of a sample with index components, joined by `+`; null on a sample of one hazard |
+| `design_budget` | float64, nullable | The design's budget bound in payout units. On a `"package"` row, or the `"total"` row of a set of covers, the sum of the covers' bounds, null if any has none. Null for a cover given as is |
 | one column per metric | float64, nullable | As defined above; null where undefined |
 
 A comparison on one asset has `level` `"asset"` and `scope` `"individual"`
-on every row. [Joint design](#the-rows-of-a-joint-design) says what the other
+on every row, apart from a package's `"package"` row. [Joint design](#the-rows-of-a-joint-design) says what the other
 values hold. The key (`cover_hash`, `design_id`, `asset_id`, `level`,
 `scenario`, `split`, `fold`) is unique; `compare` raises `EvaluationError` for
 the same cover twice. Invalid evaluation arguments, metric options and comparison metadata
