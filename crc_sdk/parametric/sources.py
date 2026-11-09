@@ -834,14 +834,19 @@ def _column_fields(
 def _moved_documents(
     documents: Mapping[str, Mapping[str, Any]], order: IntArray, kind: str
 ) -> dict[str, dict[str, Any]]:
-    """Each column's own provenance, with a step if the model moved its rows."""
+    """Each column's own provenance, with a step if the model moved its rows.
+
+    An `EmpiricalCopula`'s rows come in reference-year blocks even where a
+    column's draws happen to stay in place, so its columns always have the step.
+    """
     in_draw_order = np.arange(order.shape[0], dtype=np.int64)
     return {
         column: {
             **own,
             "selection": (
                 []
-                if np.array_equal(order[:, j], in_draw_order)
+                if kind != "empirical_copula"
+                and np.array_equal(order[:, j], in_draw_order)
                 else [{"kind": "reorder", "dependence": kind}]
             ),
         }

@@ -1208,6 +1208,33 @@ def test_a_split_of_a_copula_sample_is_refused(split: Any, name: str) -> None:
         split(OutcomeSample.from_written_table(sample.to_table()))
 
 
+def test_a_split_is_refused_on_a_copula_component_whose_rows_stayed_in_place() -> None:
+    m = 30
+    uniforms = _uniforms(n=m)
+    series = {
+        "rain": AnnualSeries(
+            np.arange(1990, 1990 + m), uniforms[:, 0] * 100.0, "mm/day", {}
+        ),
+        "heat": AnnualSeries(
+            np.arange(1990, 1990 + m), uniforms[::-1, 1] * 100.0, "degC", {}
+        ),
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ComonotoneIndexWarning)
+        reference = sample_annual_hazards(
+            series,
+            tails=dict.fromkeys(NAMES, "upper"),
+            loss_models={"rain": _loss("rain")},
+            basis_risk=NoBasisRisk(),
+            asset_id=ASSET,
+        )
+    sample = _draws(EmpiricalCopula(reference), n=m)
+    # The reference's ranks of rain are those of its uniforms: no row moves.
+    assert np.array_equal(_values(sample, "rain"), _single("rain", m).index[:, 0])
+    with pytest.raises(SampleError, match="holdout cannot split"):
+        holdout(sample.component("rain"))
+
+
 @pytest.mark.parametrize("model", [Independent(), Comonotonic(), GaussianCopula(0.4)])
 def test_the_other_models_split_on_every_array(model: Any) -> None:
     sample = _draws(model)
