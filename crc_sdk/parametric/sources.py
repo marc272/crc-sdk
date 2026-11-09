@@ -1132,7 +1132,7 @@ def sample_curve_hazards(
         basis_risk,
         asset,
     )
-    rule_record = _combine_record(combine, [n for n in names if n in models])
+    rule_record = _combine_record(combine, [name for name in names if name in models])
     _check_own_generators(generators, "component")
     # Before any draw, so a refused call leaves the generators untouched.
     document, sentence = _model_record(dependence, n, names, "hazards")
