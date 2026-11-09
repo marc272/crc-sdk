@@ -18,6 +18,10 @@ columns: a sample may hold named `IndexComponent`s at one asset, and
 `OutcomeSample.component` takes one hazard's sample out of it.
 `sample_annual_hazards` reads the same years of several hazards at one asset,
 and `CappedSum`, `CompoundDamage` or a `CombineRule` states their combined loss.
+`sample_curve_hazards` draws several hazards at one asset from fitted curves,
+under a dependence the caller states (`Independent`, `Comonotonic`,
+`EmpiricalCopula`, `GaussianCopula` or a `DependenceModel`), and `sample_curves`
+does the same across assets.
 `LossModel` turns the hazard into a loss and a `BasisRisk` model states how index
 and loss differ. On per-year samples, `AsRecorded`, `RecentYears` and
 `LinearTrend` state how the climate trend is treated, and `sample_annual_pool`
@@ -52,7 +56,13 @@ from crc_sdk.parametric.basis_risk import BasisRisk, ImpactNoise, NoBasisRisk
 from crc_sdk.parametric.combine import CappedSum, CombineRule, CompoundDamage
 from crc_sdk.parametric.constraints import Budget, Limit
 from crc_sdk.parametric.cover import Cover
-from crc_sdk.parametric.dependence import Comonotonic, EmpiricalCopula, Independent
+from crc_sdk.parametric.dependence import (
+    Comonotonic,
+    DependenceModel,
+    EmpiricalCopula,
+    GaussianCopula,
+    Independent,
+)
 from crc_sdk.parametric.design import DesignOptions, DesignResult, design
 from crc_sdk.parametric.errors import (
     ComonotoneIndexWarning,
@@ -141,6 +151,7 @@ from crc_sdk.parametric.sources import (
     sample_annual_hazards,
     sample_annual_pool,
     sample_curve,
+    sample_curve_hazards,
     sample_curves,
 )
 from crc_sdk.parametric.trend import AsRecorded, LinearTrend, RecentYears
@@ -165,6 +176,7 @@ __all__ = [
     "Cover",
     "CoverDefinitionError",
     "CoverPackage",
+    "DependenceModel",
     "DesignError",
     "DesignOptions",
     "DesignResult",
@@ -174,6 +186,7 @@ __all__ = [
     "ExpectedUncovered",
     "Free",
     "FreshDraws",
+    "GaussianCopula",
     "H3Cell",
     "Holdout",
     "ImpactNoise",
@@ -231,6 +244,7 @@ __all__ = [
     "sample_annual_hazards",
     "sample_annual_pool",
     "sample_curve",
+    "sample_curve_hazards",
     "sample_curves",
     "setup_text",
     "split_budget",
