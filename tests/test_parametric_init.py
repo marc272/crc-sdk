@@ -71,6 +71,7 @@ PUBLIC = [
     "SampleProvenance",
     "SolverUnavailableError",
     "StationColumn",
+    "StepGrid",
     "StepPayout",
     "SumOf",
     "UnboundedDesignError",

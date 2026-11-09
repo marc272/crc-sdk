@@ -7,7 +7,8 @@ user family that implements `PayoutFunction` and is registered with
 design chooses within bounds. Covers round-trip through canonical JSON and
 carry a `definition_hash`, as `ImpactExpression` does. A cover on several
 hazards pays on a `CompositeIndex`, through a family with several
-`index_names`: `SumOf` and `MaxOf` combine one-index payouts, or a user family.
+`index_names`: `SumOf` and `MaxOf` combine one-index payouts, `StepGrid` is one
+table over two indices, or a user family.
 
 Covers are designed and evaluated on an `OutcomeSample`, one row per year
 with an index value and a loss: `sample_curve` draws simulated years from a
@@ -106,6 +107,7 @@ from crc_sdk.parametric.payouts import (
     MaxOf,
     PayoutFunction,
     PiecewiseLinearPayout,
+    StepGrid,
     StepPayout,
     SumOf,
     register_payout,
@@ -203,6 +205,7 @@ __all__ = [
     "SampleProvenance",
     "SolverUnavailableError",
     "StationColumn",
+    "StepGrid",
     "StepPayout",
     "SumOf",
     "UnboundedDesignError",

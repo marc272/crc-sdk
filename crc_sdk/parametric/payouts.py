@@ -42,6 +42,11 @@ go on a cover with a `CompositeIndex` of those names:
 A component's parameter is named `<component>.<parameter>`, such as
 `rx1day.levels[2]`, and a `MaxOf`'s own is `scale`. Component payouts are read
 through the registry, so a registered user family can be a component.
+
+`StepGrid(breakpoints, levels)` is one table over exactly two components: a
+year pays the level of the cell its two severities fall in, and only the cell
+below both first thresholds pays nothing. Its parameters are named
+`<component>.breakpoints[k]` and `levels[i,j]`.
 """
 
 from __future__ import annotations
@@ -87,6 +92,7 @@ __all__ = [
     "MaxOf",
     "PayoutFunction",
     "PiecewiseLinearPayout",
+    "StepGrid",
     "StepPayout",
     "SumOf",
     "register_payout",
@@ -301,6 +307,36 @@ def _check_thresholds(
         previous = later[0]
 
 
+def _least_amount(value: float | Free, previous: float) -> float | None:
+    """The smallest value an amount can take at or above `previous`, if it has one."""
+    if not isinstance(value, Free):
+        return value if value >= previous else None
+    lowest = max(previous, value.lower)
+    if value.grid is not None:
+        return next((point for point in value.grid if point >= lowest), None)
+    return lowest if value.upper is None or value.upper >= lowest else None
+
+
+def _amount_bounds(
+    values: Sequence[float | Free], limit: float | None
+) -> tuple[FloatArray, FloatArray]:
+    """The lower and upper bounds of amounts, each upper bound capped at `limit`."""
+    lower = np.array(
+        [value.lower if isinstance(value, Free) else value for value in values]
+    )
+    upper = np.array(
+        [
+            (math.inf if value.upper is None else value.upper)
+            if isinstance(value, Free)
+            else value
+            for value in values
+        ]
+    )
+    if limit is not None:
+        upper = np.minimum(upper, _checked_limit(limit))
+    return lower, upper
+
+
 def _check_amounts(
     names: Sequence[str], values: Sequence[float | Free], *, monotone: bool, what: str
 ) -> None:
@@ -316,22 +352,12 @@ def _check_amounts(
         return
     previous = 0.0
     for value in values:
-        if isinstance(value, Free):
-            lowest = max(previous, value.lower)
-            if value.grid is not None:
-                above = [point for point in value.grid if point >= lowest]
-                feasible = bool(above)
-                lowest = above[0] if above else lowest
-            else:
-                feasible = value.upper is None or value.upper >= lowest
-        else:
-            feasible = value >= previous
-            lowest = value
-        if not feasible:
+        least = _least_amount(value, previous)
+        if least is None:
             raise CoverDefinitionError(
                 f"{what} must be non-decreasing when monotone=True"
             )
-        previous = lowest
+        previous = least
 
 
 def _location(name: str) -> tuple[str, int | None]:
@@ -461,19 +487,7 @@ class _BuiltinPayout(_DefinitionModel):
         negative or non-finite limit.
         """
         items = self._field_items(self._amount_fields)
-        lower = np.array(
-            [value.lower if isinstance(value, Free) else value for _, value in items]
-        )
-        upper = np.array(
-            [
-                (math.inf if value.upper is None else value.upper)
-                if isinstance(value, Free)
-                else value
-                for _, value in items
-            ]
-        )
-        if limit is not None:
-            upper = np.minimum(upper, _checked_limit(limit))
+        lower, upper = _amount_bounds([value for _, value in items], limit)
         n_amounts = len(items)
         if self._monotone() and n_amounts > 1:
             a_ub = np.zeros((n_amounts - 1, n_amounts))
@@ -860,6 +874,17 @@ def _payout_from_document(document: Mapping[str, Any]) -> Any:
     return _payout_reader(document["kind"])(document)
 
 
+def _index_columns(index: ArrayLike, names: Sequence[str]) -> FloatArray:
+    """Return an `(n, k)` index with one column per name; raise `SampleError` if not."""
+    values = _index_values(index, ndim=2)
+    if values.shape[1] != len(names):
+        raise SampleError(
+            f"index values must have one column per component "
+            f"{list(names)}, got shape {values.shape}"
+        )
+    return values
+
+
 def _no_constraints() -> LinearConstraints:
     return LinearConstraints(
         a_ub=np.zeros((0, 0)),
@@ -960,13 +985,7 @@ class _OfComponents:
             )
 
     def _columns(self, index: ArrayLike) -> FloatArray:
-        values = _index_values(index, ndim=2)
-        if values.shape[1] != len(self.components):
-            raise SampleError(
-                f"index values must have one column per component "
-                f"{list(self.components)}, got shape {values.shape}"
-            )
-        return values
+        return _index_columns(index, tuple(self.components))
 
     def _component_payouts(self, index: ArrayLike) -> FloatArray:
         """Each component's payout: `(n, k)`, one column per component."""
@@ -1329,6 +1348,388 @@ class MaxOf(_OfComponents):
         return cls(components, scale=document["scale"])
 
 
+_GRID_KEYS = frozenset({"breakpoints", "kind", "levels", "monotone", "tail"})
+_GRID_AXIS_KEYS = frozenset({"name", "thresholds"})
+
+
+def _grid_parameters(what: str, values: Any) -> tuple[float | Free, ...]:
+    """Read a sequence of parameters; an error names `what`."""
+    try:
+        return tuple(_parameter_value(item) for item in _parameter_list(values))
+    except CoverDefinitionError as error:
+        raise CoverDefinitionError(f"{what} {error}") from error
+
+
+def _grid_tails(tail: Any) -> tuple[Tail, Tail]:
+    if (
+        isinstance(tail, str)
+        or not isinstance(tail, Sequence)
+        or len(tail) != 2
+        or any(side not in ("upper", "lower") for side in tail)
+    ):
+        raise CoverDefinitionError(
+            f"tail must hold two of 'upper' and 'lower', one per component, "
+            f"got {tail!r}"
+        )
+    return cast("tuple[Tail, Tail]", tuple(tail))
+
+
+def _grid_breakpoints(
+    breakpoints: Any, tails: tuple[Tail, Tail]
+) -> dict[str, tuple[float | Free, ...]]:
+    """Read the thresholds of the two components; raise if they are invalid."""
+    if not isinstance(breakpoints, Mapping):
+        raise CoverDefinitionError(
+            "a step grid maps each of its two component names to its thresholds, "
+            f"got {type(breakpoints).__name__}"
+        )
+    if len(breakpoints) != 2:
+        raise CoverDefinitionError(
+            f"a step grid holds exactly two components, got {len(breakpoints)}"
+        )
+    axes: dict[str, tuple[float | Free, ...]] = {}
+    for (name, thresholds), tail in zip(breakpoints.items(), tails, strict=True):
+        _component_name(name)
+        read = _grid_parameters(f"the breakpoints of {name!r}", thresholds)
+        if not read:
+            raise CoverDefinitionError(
+                f"the breakpoints of {name!r} must hold at least 1 value"
+            )
+        names = [f"{name}.breakpoints[{k}]" for k in range(len(read))]
+        _check_thresholds(names, read, tail, f"the breakpoints of {name!r}")
+        axes[name] = read
+    return axes
+
+
+def _grid_levels(
+    levels: Any, n_rows: int, n_columns: int
+) -> tuple[tuple[float | Free, ...], ...]:
+    """Read the table; raise unless it has its shape and pays nothing at (0, 0)."""
+    try:
+        rows = [_parameter_list(row) for row in _parameter_list(levels)]
+    except CoverDefinitionError as error:
+        raise CoverDefinitionError(f"levels {error}") from error
+    if len(rows) != n_rows or any(len(row) != n_columns for row in rows):
+        raise CoverDefinitionError(
+            f"levels must have {n_rows} rows of {n_columns} values, one row per bin "
+            "of the first component and one value per bin of the second"
+        )
+    table = tuple(_grid_parameters(f"levels[{i}]", row) for i, row in enumerate(rows))
+    if isinstance(table[0][0], Free) or table[0][0] != 0.0:
+        raise CoverDefinitionError(
+            "levels[0][0] must be 0.0: the cell below both first thresholds pays "
+            f"nothing, got {table[0][0]!r}"
+        )
+    return table
+
+
+def _check_grid_order(levels: tuple[tuple[float | Free, ...], ...]) -> None:
+    """Levels must be non-decreasing along both axes, for some choice of the free ones.
+
+    The least value of each cell given its two predecessors is the least of
+    every feasible table, so a table is feasible exactly when this finds one.
+    """
+    least: list[list[float]] = []
+    for i, row in enumerate(levels):
+        found: list[float] = []
+        for j, value in enumerate(row):
+            above = least[i - 1][j] if i else 0.0
+            left = found[j - 1] if j else 0.0
+            smallest = _least_amount(value, max(above, left))
+            if smallest is None:
+                raise CoverDefinitionError(
+                    "levels must be non-decreasing along both axes when "
+                    f"monotone=True; no value of levels[{i},{j}] is"
+                )
+            found.append(smallest)
+        least.append(found)
+
+
+@dataclass(frozen=True, eq=False, init=False)
+class StepGrid:
+    """Pays a level per cell of a table over two index components.
+
+    `breakpoints` maps exactly two component names to their thresholds, in
+    increasing severity (increasing for `"upper"`, decreasing for `"lower"`),
+    and `tail` holds each component's severe side, in that order. On each axis
+    bin 0 lies below the first threshold, bin k holds `b_{k-1} <= s < b_k`, and
+    the last bin runs from the last threshold up; a severity equal to a
+    threshold belongs to the more severe bin.
+
+    `levels` is the table of amounts: with m thresholds on the first component
+    and q on the second, m + 1 rows of q + 1 values, rows along the first
+    component. A year pays `levels[i][j]`, with i and j the bins of its two
+    severities. Only the cell below both first thresholds pays nothing, so
+    `levels[0][0]` must be 0.0 and cannot be `Free`, and a year can pay on one
+    component alone, in the cells `(i, 0)` and `(0, j)`.
+
+    `monotone=True`, the default, requires levels non-decreasing along both
+    axes. Each axis works on its own severity, so mixed tails need nothing
+    more. `monotone=False` allows any non-negative levels and is recorded.
+
+    Parameters are named `<component>.breakpoints[k]` and `levels[i,j]`, with
+    no `levels[0,0]`. A free threshold needs a finite upper bound and a grid.
+    The payout is linear in every level: `basis` is one-hot on the
+    `(m + 1)(q + 1) - 1` cells, and a design solves the levels as one linear or
+    quadratic programme. A limit bounds every cell.
+
+    A resolved `SumOf` of two step payouts with levels `theta` and `phi` equals
+    the grid with levels `theta_i + phi_j`, and a `MaxOf` the grid with
+    `max(theta_i, phi_j)`, taking `theta_0 = phi_0 = 0`.
+
+    Raises `CoverDefinitionError` for anything but two valid component names,
+    unordered thresholds, a table of the wrong shape, `levels[0][0]` other than
+    0.0, a negative amount, or levels that break `monotone=True`.
+    """
+
+    kind: ClassVar[str] = "step_grid"
+
+    breakpoints: Mapping[str, tuple[float | Free, ...]]
+    levels: tuple[tuple[float | Free, ...], ...]
+    tail: tuple[Tail, Tail]
+    monotone: bool
+
+    def __init__(
+        self,
+        breakpoints: Mapping[str, Sequence[float | Free] | NDArray[np.float64]],
+        levels: Sequence[Sequence[float | Free]] | NDArray[np.float64],
+        *,
+        tail: tuple[Tail, Tail] = ("upper", "upper"),
+        monotone: bool = True,
+    ) -> None:
+        if not isinstance(monotone, bool):
+            raise CoverDefinitionError(f"monotone must be a bool, got {monotone!r}")
+        tails = _grid_tails(tail)
+        axes = _grid_breakpoints(breakpoints, tails)
+        first, second = axes.values()
+        table = _grid_levels(levels, len(first) + 1, len(second) + 1)
+        object.__setattr__(self, "breakpoints", MappingProxyType(axes))
+        object.__setattr__(self, "levels", table)
+        object.__setattr__(self, "tail", tails)
+        object.__setattr__(self, "monotone", monotone)
+        amounts = self._amount_parameters()
+        _check_amounts(
+            list(amounts), list(amounts.values()), monotone=False, what="levels"
+        )
+        if monotone:
+            _check_grid_order(table)
+
+    @property
+    def index_names(self) -> tuple[str, ...]:
+        """The two components, in the order of the columns of the index."""
+        return tuple(self.breakpoints)
+
+    def _threshold_parameters(self) -> dict[str, float | Free]:
+        return {
+            f"{name}.breakpoints[{k}]": value
+            for name, thresholds in self.breakpoints.items()
+            for k, value in enumerate(thresholds)
+        }
+
+    def _amount_parameters(self) -> dict[str, float | Free]:
+        return {
+            f"levels[{i},{j}]": value
+            for i, row in enumerate(self.levels)
+            for j, value in enumerate(row)
+            if (i, j) != (0, 0)
+        }
+
+    def parameters(self) -> dict[str, float | Free]:
+        """Every parameter by flat name: the thresholds, then the levels by row."""
+        return {**self._threshold_parameters(), **self._amount_parameters()}
+
+    def amount_names(self) -> tuple[str, ...]:
+        """The levels, by row, in the column order of `basis`."""
+        return tuple(self._amount_parameters())
+
+    def with_values(self, values: Mapping[str, float]) -> Self:
+        """Return a copy with values for some of the free parameters.
+
+        Raises `CoverDefinitionError` for an unknown or fixed parameter, a
+        value outside its bounds, or a table that becomes invalid, such as
+        unordered thresholds.
+        """
+        checked = _resolve_values(self.parameters(), values)
+        axes = {name: list(items) for name, items in self.breakpoints.items()}
+        table = [list(row) for row in self.levels]
+        for key, value in checked.items():
+            head, _, position = key[:-1].partition("[")
+            if head == "levels":
+                row, column = position.split(",")
+                table[int(row)][int(column)] = value
+            else:
+                axes[head.partition(".")[0]][int(position)] = value
+        return type(self)(axes, table, tail=self.tail, monotone=self.monotone)
+
+    def _require_resolved(self, parameters: Mapping[str, float | Free]) -> None:
+        free = [key for key, value in parameters.items() if isinstance(value, Free)]
+        if free:
+            raise UnresolvedParameterError(
+                f"the {self.kind} payout has free parameters: {', '.join(free)}"
+            )
+
+    def _bins(self, index: ArrayLike) -> list[NDArray[np.intp]]:
+        """Each row's bin on each axis: 0 below the first threshold."""
+        values = _index_columns(index, self.index_names)
+        bins: list[NDArray[np.intp]] = []
+        for column, (items, tail) in enumerate(
+            zip(self.breakpoints.values(), self.tail, strict=True)
+        ):
+            sign = 1.0 if tail == "upper" else -1.0
+            thresholds = sign * np.asarray(items, dtype=np.float64)
+            bins.append(
+                np.searchsorted(thresholds, sign * values[:, column], side="right")
+            )
+        return bins
+
+    def evaluate(self, index: FloatArray) -> FloatArray:
+        """Return the payout of each row of an `(n, 2)` index: `(n,)`.
+
+        Raises `UnresolvedParameterError` if a parameter is free, and
+        `SampleError` for an index of the wrong shape or with non-finite
+        values.
+        """
+        self._require_resolved(self.parameters())
+        first, second = self._bins(index)
+        paid: FloatArray = np.asarray(self.levels, dtype=np.float64)[first, second]
+        return paid
+
+    def breakdown(self, index: FloatArray) -> dict[str, FloatArray]:
+        """Return the payout by region of an `(n, 2)` index.
+
+        `only:<first>` and `only:<second>` hold the years where one index is
+        past its first threshold and the other is not, and `both` those where
+        both are. A grid has no payout per component.
+        """
+        paid = self.evaluate(index)
+        first, second = self._bins(index)
+        names = self.index_names
+        return {
+            f"only:{names[0]}": np.where((first > 0) & (second == 0), paid, 0.0),
+            f"only:{names[1]}": np.where((first == 0) & (second > 0), paid, 0.0),
+            "both": np.where((first > 0) & (second > 0), paid, 0.0),
+        }
+
+    def basis(self, index: FloatArray) -> FloatArray:
+        """Return the one-hot basis of the cells, `(n, len(amount_names()))`.
+
+        The payout is `basis(index) @ amounts`, each row holding at most one
+        1. Needs the thresholds resolved; raises `UnresolvedParameterError`
+        otherwise, and `SampleError` for an index of the wrong shape.
+        """
+        self._require_resolved(self._threshold_parameters())
+        first, second = self._bins(index)
+        n_columns = len(self.levels[0])
+        cell = first * n_columns + second - 1
+        matrix = np.zeros((cell.shape[0], len(self.levels) * n_columns - 1))
+        rows = np.flatnonzero(cell >= 0)
+        matrix[rows, cell[rows]] = 1.0
+        return matrix
+
+    def _order_rows(self) -> FloatArray:
+        """The rows `levels[i,j] <= next` along each axis, leaving out cell (0, 0)."""
+        n_rows, n_columns = len(self.levels), len(self.levels[0])
+        pairs = [
+            ((i, j), (i + 1, j))
+            for i in range(n_rows - 1)
+            for j in range(n_columns)
+            if (i, j) != (0, 0)
+        ] + [
+            ((i, j), (i, j + 1))
+            for i in range(n_rows)
+            for j in range(n_columns - 1)
+            if (i, j) != (0, 0)
+        ]
+        a_ub = np.zeros((len(pairs), n_rows * n_columns - 1))
+        for row, ((i, j), (k, m)) in enumerate(pairs):
+            a_ub[row, i * n_columns + j - 1] = 1.0
+            a_ub[row, k * n_columns + m - 1] = -1.0
+        return a_ub
+
+    def amount_constraints(self, limit: float | None = None) -> LinearConstraints:
+        """Return the bounds and constraints on the levels.
+
+        A fixed level is bounded by its value on both sides, a free one by its
+        `Free` bounds, and `limit` caps every level. With `monotone=True` each
+        level is at most the next along both axes. Raises
+        `CoverDefinitionError` for a negative or non-finite limit.
+        """
+        lower, upper = _amount_bounds(list(self._amount_parameters().values()), limit)
+        a_ub = self._order_rows() if self.monotone else np.zeros((0, lower.shape[0]))
+        return LinearConstraints(
+            a_ub=a_ub, b_ub=np.zeros(a_ub.shape[0]), lower=lower, upper=upper
+        )
+
+    def to_document(self) -> dict[str, Any]:
+        """Return `kind` and every term; `Free` parameters in document form."""
+        # A list, because canonical JSON sorts the keys of an object and the
+        # order of the components is part of the terms.
+        return {
+            "breakpoints": [
+                {"name": name, "thresholds": _document_value(thresholds)}
+                for name, thresholds in self.breakpoints.items()
+            ],
+            "kind": self.kind,
+            "levels": _document_value(self.levels),
+            "monotone": self.monotone,
+            "tail": list(self.tail),
+        }
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any]) -> Self:
+        """Read a payout written by `to_document`.
+
+        Raises `CoverDefinitionError` for another `kind`, invalid keys or
+        invalid values.
+        """
+        if not isinstance(document, Mapping):
+            raise CoverDefinitionError("a payout document must be an object")
+        if document.get("kind") != cls.kind:
+            raise CoverDefinitionError(
+                f"expected a payout of kind {cls.kind!r}, got {document.get('kind')!r}"
+            )
+        if set(document) != _GRID_KEYS:
+            raise CoverDefinitionError(
+                f"a {cls.kind} document has the keys {sorted(_GRID_KEYS)}"
+            )
+        entries = document["breakpoints"]
+        if isinstance(entries, str | bytes | Mapping) or not isinstance(
+            entries, Sequence
+        ):
+            raise CoverDefinitionError(f"a {cls.kind} document's breakpoints is a list")
+        axes: dict[str, Any] = {}
+        for entry in entries:
+            if not isinstance(entry, Mapping) or set(entry) != _GRID_AXIS_KEYS:
+                raise CoverDefinitionError(
+                    f"each axis of a {cls.kind} document has the keys "
+                    f"{sorted(_GRID_AXIS_KEYS)}"
+                )
+            name = _component_name(entry["name"])
+            if name in axes:
+                raise CoverDefinitionError(
+                    f"a {cls.kind} document repeats component {name!r}"
+                )
+            axes[name] = entry["thresholds"]
+        return cls(
+            axes,
+            document["levels"],
+            tail=document["tail"],
+            monotone=document["monotone"],
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is not type(self):
+            return NotImplemented
+        assert isinstance(other, StepGrid)
+        return canonical_json(self.to_document()) == canonical_json(other.to_document())
+
+    def __hash__(self) -> int:
+        return hash(canonical_json(self.to_document()))
+
+    def __reduce__(self) -> tuple[Any, tuple[dict[str, Any]]]:
+        return (_payout_from_document, (self.to_document(),))
+
+
 _KIND = re.compile(r"^\S(?:.*\S)?$")
 _PAYOUT_METHODS = ("parameters", "with_values", "evaluate", "to_document")
 _REGISTRY: dict[str, type[Any]] = {}
@@ -1397,6 +1798,7 @@ for _family in (
     BinaryPayout,
     SumOf,
     MaxOf,
+    StepGrid,
 ):
     register_payout(_family)
 del _family
