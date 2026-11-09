@@ -675,6 +675,11 @@ def _basis_risk(sample: Mapping[str, Any], where: str) -> str:
 
 def _loss(sample: Mapping[str, Any], where: str) -> str:
     unit = _get(sample, "loss_unit", str, where) or "an unstated unit"
+    if any(
+        step.get("kind") == "component" and step.get("loss") == "combined"
+        for step in _objects(sample, "selection", where)
+    ):
+        return f"the combined loss of the hazards, in {unit}"
     if "loss_model" not in sample:
         return f"model not stated, in {unit}"
     model = sample["loss_model"]
@@ -682,8 +687,21 @@ def _loss(sample: Mapping[str, Any], where: str) -> str:
         return f"from the table, in {unit}"
     if not isinstance(model, Mapping):
         raise EvaluationError(f"{where}.loss_model must be an object")
-    impact = _get(model, "impact", Mapping, f"{where}.loss_model") or {}
-    value = _get(model, "value", Mapping, f"{where}.loss_model") or {}
+    place = f"{where}.loss_model"
+    if model.get("kind") != "components":
+        return _loss_model(model, unit, place)
+    described: list[str] = []
+    for i, entry in enumerate(_objects(model, "components", place)):
+        at = f"{place}.components[{i}]"
+        each = _get(entry, "loss_model", Mapping, at) or {}
+        described.append(f"{entry.get('name')}: {_loss_model(each, unit, at)}")
+    return "; ".join(described)
+
+
+def _loss_model(model: Mapping[str, Any], unit: str, where: str) -> str:
+    """One loss model's document in words, with the unit of its loss."""
+    impact = _get(model, "impact", Mapping, where) or {}
+    value = _get(model, "value", Mapping, where) or {}
     kind = {
         "expression": "impact expression",
         "function": "impact function",
@@ -756,6 +774,13 @@ def _dependence(
     return f"{kind}, as stated"
 
 
+_ANNUAL_MAXIMA = (
+    "Two annual maxima of one year may come from different events: the rows are "
+    "the same years, not the same events."
+)
+"""What per-year rows of several hazards are not, stated next to every number."""
+
+
 def _components(sample: Mapping[str, Any], where: str) -> str | None:
     """A multi-hazard sample's components, its combined loss and its dependence."""
     entries = _objects(sample, "components", where)
@@ -775,13 +800,21 @@ def _components(sample: Mapping[str, Any], where: str) -> str | None:
         )
     text = f"Index components: {_join(described)}; the first is the sample's index."
     rule = _get(sample, "combine", Mapping, where) or {}
+    statement = _get(rule, "statement", str, f"{where}.combine")
     if rule.get("kind") == "table":
         text += " Combined loss: as the table states it."
+    elif statement is not None:
+        text += f" Combined loss: {statement.rstrip().removesuffix('.')}."
     elif rule:
         text += f" Combined loss: {rule.get('kind')}, as stated."
     dependence = _dependence(sample, where, "hazard_dependence")
     if dependence is not None:
         text += f" Dependence between the hazards: {dependence}."
+    model = _get(sample, "hazard_dependence", Mapping, where) or {}
+    if model.get("kind") == "data":
+        text += f" {_ANNUAL_MAXIMA}"
+    if len({entry.get("tail") for entry in entries}) > 1:
+        text += " With mixed tails, that dependence is between values, not severities."
     return text
 
 
@@ -822,6 +855,9 @@ def _year_spans(years: Sequence[int]) -> str:
 def _trend_fit(fit: Mapping[str, Any], where: str) -> str:
     """One series' fit: its role, asset and run, its slope and intercept with units."""
     role = _get(fit, "role", str, where) or "series"
+    component = _get(fit, "component", str, where)
+    if component is not None:
+        role += f" of component {component}"
     asset = _get(fit, "asset_id", str, where)
     model = _get(fit, "model", str, where)
     run = "" if model is None else f" ({model} {_get(fit, 'member', str, where)})"
@@ -1130,6 +1166,9 @@ def _source_record(
     else:
         document = entry
         head = f"the {role}"
+    component = _recorded(entry, "component", where)
+    if component is not None:
+        head += f" of component {component}"
     name = _recorded(document, "name", where)
     if name is not None:
         head += f' "{name}"'
@@ -1275,17 +1314,29 @@ def _location_lines(
     share a line that names each asset and its cell or, above `_MANY_ASSETS`,
     counts the assets and cells and gives the range of the centres. An asset
     with several cells for one role, as on the different grids of a pool's
-    models, has each run named. Other series record no cell and have no line.
+    models, has each run named. Other series record no cell and have no line,
+    but a component's series read from the rows of a stated filter has one, which
+    says where it is read.
     """
     groups: dict[tuple[str, str, str], dict[tuple[str, float, float], list[str]]] = {}
     cells: dict[tuple[str, str], set[tuple[float, float]]] = {}
+    filtered: list[str] = []
     for i, entry in enumerate(sources):
         where = f"sources[{i}]"
         series = _get(entry, "series", Mapping, where)
-        if series is None or series.get("kind") != "nearest_cell":
+        if series is None:
             continue
         place = f"{where}.series"
-        role = _recorded(entry, "role", where) or "source"
+        role = f"{_recorded(entry, 'role', where) or 'source'} series"
+        component = _recorded(entry, "component", where)
+        if component is not None:
+            role += f" of component {component}"
+        if series.get("kind") != "nearest_cell":
+            chosen = _get(series, "where", Mapping, place)
+            if component is not None and chosen:
+                stated = _join([f"{key} = {chosen[key]}" for key in sorted(chosen)])
+                filtered.append(f"Location: {role}, the rows where {stated}.")
+            continue
         located = _get(series, "asset_location", str, place)
         how = _LOCATED_BY.get(located) or f"{located}, in a matched grid cell"
         latitude, longitude = _latitude_longitude(series, "cell", place)
@@ -1316,10 +1367,9 @@ def _location_lines(
                 named.append(f"{name} at ({_degrees(latitude)}, {_degrees(longitude)})")
             which = f"{_join(named)}, the cell centres as (latitude, longitude)"
         lines.append(
-            f"Location: {role} series, located by {how} (grid step {step} degrees): "
-            f"{which}."
+            f"Location: {role}, located by {how} (grid step {step} degrees): {which}."
         )
-    return lines
+    return lines + _first_seen(filtered)
 
 
 _ROW_KEYS = ("sample_hash", "split", "fold", "design_id")
@@ -2257,24 +2307,31 @@ def setup_text(
       (`fresh_draws_seed`) that the evaluations' `details` record, if any;
     - `Sample`: the source kind, the probability semantics and who stated
       them, the basis-risk model and its parameters, the loss model (of each
-      asset, when the assets differ), the dependence between the assets, and
-      on a sample with index components each component's name, unit, tail and
-      whether it has a loss of its own, the combined loss and the dependence
-      between the hazards;
+      asset, when the assets differ, and of each component on a per-year
+      sample of several hazards), the dependence between the assets, and on a
+      sample with index components each component's name, unit, tail and
+      whether it has a loss of its own, the rule of the combined loss or that
+      a table states it, and the dependence between the hazards: the data's
+      own, with the sentence that two annual maxima of one year may come from
+      different events, and, with mixed tails, that the dependence is between
+      values and not severities;
     - `Combined loss`, when a sample evaluated on has index components: that
       every row's metrics are on the combined loss;
     - `Source`: each source record of the samples, such as a hazard curve or
-      a per-year series, with its provider, dataset, horizon and pathway, and
-      which of them the record does not hold, and for a curve that a plan
+      a per-year series, named by its component on a sample of several
+      hazards, with its provider, dataset, horizon and pathway, and which of
+      them the record does not hold, and for a curve that a plan
       read, its canonical dataset's path and SHA-256; before execution, the
       sources that a plan's `explain()` document states (a canonical dataset's
       path and selection, or a per-year source's provider and dataset, and the
       file, table or plan it is read from);
     - `Location`, for per-year series read at the nearest grid cell: whether
       each asset was located by a point or by its H3 cell, the grid step and
-      the matched cell's centre, one line per role, way and grid step; above
-      five assets, the number of assets and cells and the range of the
-      centres. The asset's point and its distance to the cell are not recorded;
+      the matched cell's centre, one line per role, component, way and grid
+      step; above five assets, the number of assets and cells and the range of
+      the centres. The asset's point and its distance to the cell are not
+      recorded. A component's series read from the rows of a stated filter has
+      a line too, naming the filter;
     - `Trend`, for per-year samples: the years as recorded, the window of
       recent years, or the linear trend removed, with its fit years, each
       series' slope and intercept with their units, and the reference year;

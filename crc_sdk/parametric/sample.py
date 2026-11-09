@@ -25,8 +25,9 @@ work on one asset's sample.
 
 A sample of one asset may hold several named hazards, its `index_components`:
 one `IndexComponent` per hazard, the first being what `index` holds, while
-`loss` is the combined loss. `OutcomeSample.component` takes one hazard's
-sample out of it.
+`loss` is the combined loss. Such a sample comes from the same years of several
+hazards (`sample_annual_hazards`) or from a user table.
+`OutcomeSample.component` takes one hazard's sample out of it.
 
 `holdout` and `year_block_kfold` split a sample into contiguous blocks of
 periods, so the held-out block of a per-year sample is its latest years. A
@@ -476,7 +477,10 @@ class SampleProvenance:
       `semantics="annual"`) or `"data"` (per-year values are years).
     - `probability_semantics`: the curve's probability semantics, for Monte
       Carlo samples; otherwise `None`.
-    - `loss_model` and `basis_risk`: their documents; `None` for a table.
+    - `loss_model` and `basis_risk`: their documents; `None` for a table. On a
+      per-year sample of several hazards, `loss_model` is `{"kind":
+      "components", "components": [{"name": name, "loss_model": document},
+      ...]}`, in component order, for the components with an impact.
     - `rng`: for every random step, in draw order, the bit generator's name
       and its state before the step, as JSON text. `generator()` rebuilds it.
     - `licences`: the licence and attribution each input declares.
@@ -513,8 +517,10 @@ class SampleProvenance:
       dependence between the hazards comes from; such a sample must state it.
       `{"kind": "data"}` is the data's own. `None` on a one-hazard sample.
     - `combine`: for a sample with index components, how the combined loss was
-      made: `{"kind": "table"}` when a table states it, or the rule's document.
-      `None` on a one-hazard sample.
+      made: `{"kind": "table"}` when a table states it, the rule's document with
+      its sentence under `statement`, or `{"kind": "one_impact", "component":
+      name, "statement": ...}` when only one component has an impact and no rule
+      is needed. `None` on a one-hazard sample.
     - `components`: for a sample with index components, each component's own
       provenance document, by name. `None` on a one-hazard sample.
 
