@@ -12,7 +12,10 @@ with sorted keys. It holds:
   draw is one year), the metric options, every sample (source kind, draws
   and periods, semantics and who stated them, the basis-risk and loss
   models, units, lineage and split steps, the dependence between its assets,
-  its trend record and its pool of model-years, without the row arrays)
+  its trend record and its pool of model-years, without the row arrays; a
+  sample with index components also its `components`, each with its name,
+  unit, tail and whether it has a loss of its own, its `combine` and its
+  `hazard_dependence`)
   and every evaluation (sample, split, fold, how the split was made, the
   design samples checked for leakage, the pricing, the levels and scopes of
   its rows and the allocation rule);
@@ -709,9 +712,11 @@ def _for_each_part(
     return "; ".join(f"{asset}: {text}" for asset, text in texts.items())
 
 
-def _dependence(sample: Mapping[str, Any], where: str) -> str | None:
-    """Where the dependence between a sample's assets comes from, if stated."""
-    model = _get(sample, "dependence", Mapping, where)
+def _dependence(
+    sample: Mapping[str, Any], where: str, key: str = "dependence"
+) -> str | None:
+    """Where the dependence under `key` of a sample comes from, if stated."""
+    model = _get(sample, key, Mapping, where)
     if model is None:
         return None
     kind = model.get("kind")
@@ -722,7 +727,7 @@ def _dependence(sample: Mapping[str, Any], where: str) -> str | None:
     if kind == "comonotonic":
         return "Comonotonic(), a stated assumption"
     if kind == "empirical_copula":
-        place = f"{where}.dependence"
+        place = f"{where}.{key}"
         years = _get(model, "m", int, place)
         first = _get(model, "first_year", int, place)
         last = _get(model, "last_year", int, place)
@@ -736,6 +741,35 @@ def _dependence(sample: Mapping[str, Any], where: str) -> str | None:
     return f"{kind}, as stated"
 
 
+def _components(sample: Mapping[str, Any], where: str) -> str | None:
+    """A multi-hazard sample's components, its combined loss and its dependence."""
+    entries = _objects(sample, "components", where)
+    if not entries:
+        return None
+    described: list[str] = []
+    for i, entry in enumerate(entries):
+        place = f"{where}.components[{i}]"
+        own = (
+            "with a loss of its own"
+            if _get(entry, "own_loss", bool, place)
+            else "with no loss of its own"
+        )
+        described.append(
+            f"{_get(entry, 'name', str, place)} (in {_get(entry, 'unit', str, place)}, "
+            f"{_get(entry, 'tail', str, place)} tail, {own})"
+        )
+    text = f"Index components: {_join(described)}; the first is the sample's index."
+    rule = _get(sample, "combine", Mapping, where) or {}
+    if rule.get("kind") == "table":
+        text += " Combined loss: as the table states it."
+    elif rule:
+        text += f" Combined loss: {rule.get('kind')}, as stated."
+    dependence = _dependence(sample, where, "hazard_dependence")
+    if dependence is not None:
+        text += f" Dependence between the hazards: {dependence}."
+    return text
+
+
 def _sample_text(sample: Mapping[str, Any], where: str) -> str:
     text = (
         f"{_source(sample, where)}. "
@@ -745,6 +779,9 @@ def _sample_text(sample: Mapping[str, Any], where: str) -> str:
     dependence = _dependence(sample, where)
     if dependence is not None:
         text += f" Dependence between the assets: {dependence}."
+    components = _components(sample, where)
+    if components is not None:
+        text += f" {components}"
     return text
 
 
@@ -1848,8 +1885,31 @@ def _design_terms(record: Mapping[str, Any], unit: str, where: str) -> list[str]
     return parts
 
 
+def _designed_on(
+    record: Mapping[str, Any],
+    samples: Mapping[str, Mapping[str, Any]],
+    where: str,
+) -> str | None:
+    """What loss a design on a sample of several hazards read, if it was on one."""
+    sample = samples.get(str(record.get("sample_hash")))
+    if sample is None:
+        return None
+    if _objects(sample, "components", where):
+        return "designed on the combined loss"
+    for step in reversed(_objects(sample, "selection", where)):
+        if step.get("kind") == "component":
+            name = step.get("name")
+            if step.get("loss") == "own":
+                return f"designed on the own loss of component {name}"
+            return f"designed on the index of component {name}, on the combined loss"
+    return None
+
+
 def _design(
-    record: Mapping[str, Any], labels: Mapping[str, str | None], unit: str
+    record: Mapping[str, Any],
+    labels: Mapping[str, str | None],
+    unit: str,
+    samples: Mapping[str, Mapping[str, Any]],
 ) -> str:
     design_id = _short(record["design_id"])
     where = f"designs[{design_id}]"
@@ -1859,6 +1919,9 @@ def _design(
     joint = scope.get("kind") == "joint"
     on_total = " on the total" if joint else ""
     parts = _design_terms(record, unit, where)
+    designed_on = _designed_on(record, samples, where)
+    if designed_on is not None:
+        parts.append(designed_on)
     if record.get("premium") is not None:
         premium = _number(record["premium"], f"{where}.premium")
         parts.append(f"design premium: {premium} {unit}{on_total}")
@@ -2055,7 +2118,12 @@ def setup_text(
       (`fresh_draws_seed`) that the evaluations' `details` record, if any;
     - `Sample`: the source kind, the probability semantics and who stated
       them, the basis-risk model and its parameters, the loss model (of each
-      asset, when the assets differ) and the dependence between the assets;
+      asset, when the assets differ), the dependence between the assets, and
+      on a sample with index components each component's name, unit, tail and
+      whether it has a loss of its own, the combined loss and the dependence
+      between the hazards;
+    - `Combined loss`, when a sample evaluated on has index components: that
+      every row's metrics are on the combined loss;
     - `Source`: each source record of the samples, such as a hazard curve or
       a per-year series, with its provider, dataset, horizon and pathway, and
       which of them the record does not hold, and for a curve that a plan
@@ -2091,7 +2159,8 @@ def setup_text(
     - `Design`, one line per design: the objective, pricing, budget and
       limit, the design premium, the route, the non-uniqueness report
       (`unique`, `ties`, amounts no design year reaches) and a degenerate
-      tail; for a joint design also its scope and which assets it covers.
+      tail; for a joint design also its scope and which assets it covers,
+      and for a design on a sample of several hazards the loss it read.
       Before execution, one line per objective and scope that a plan's
       `explain()` document plans, naming its templates, with the objective,
       pricing, budget and limit;
@@ -2260,6 +2329,15 @@ def setup_text(
             f"Sample of {span}: {text}"
             for span, text in zip(years, descriptions, strict=True)
         ]
+    if any(
+        sample.get("components") and "evaluation" in _list(sample, "roles", "sample")
+        for sample in samples
+    ):
+        lines.append(
+            "Combined loss: every row's metrics are on the combined loss of its "
+            "sample, so the row of a cover on one hazard sets that cover's payout "
+            "against the loss of all the hazards."
+        )
 
     if source is not None:
         lines.append(source)
@@ -2287,7 +2365,7 @@ def setup_text(
     if "joint" in scopes:
         priced += " A joint design's premium is that of one contract on the total."
     lines.append(priced)
-    lines += [_design(record, labels, unit) for record in designs]
+    lines += [_design(record, labels, unit, by_hash) for record in designs]
     if explained is not None:
         lines += _planned_designs(explained, assets, unit)
     options = setup.get("metric_options")

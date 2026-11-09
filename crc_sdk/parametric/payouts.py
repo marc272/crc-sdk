@@ -28,7 +28,8 @@ Each parameter is a float (fixed) or `Free` (chosen by a design). Parameter
 names are flat strings: `attachment`, `levels[2]`, `knots[1]`, ... A user
 family implements `PayoutFunction` (and `LinearInAmounts` for payouts linear
 in their amounts) and is made readable from cover documents with
-`register_payout`.
+`register_payout`. A user family on several index components has several
+`index_names`, a `tail` of one entry per name, and takes an `(n, k)` index.
 """
 
 from __future__ import annotations
@@ -82,7 +83,7 @@ class PayoutFunction(Protocol):
     `kind` is the registry key written into the cover document. `tail` is
     the severe side of the index; a cover requires it to equal its index's.
     `index_names` names the index components the payout reads, in the order
-    of the columns of a multi-component index; Phase 1 covers read one,
+    of the columns of a multi-component index; a cover on one index reads
     `("index",)`.
 
     `parameters()` returns every parameter by flat name, in a fixed order,
@@ -91,12 +92,17 @@ class PayoutFunction(Protocol):
     shape and non-negative, and needs every parameter resolved. The document
     holds `kind` and every parameter, with `Free` ones in their document
     form, so that `from_document(to_document())` rebuilds the payout.
+
+    A payout on several components names them in `index_names` and has as
+    `tail` a tuple of one `Tail` per name, in that order. It goes on a cover
+    with a `CompositeIndex` of those names, its `evaluate` takes `(n, k)`
+    index values, one column per name, and returns `(n,)`.
     """
 
     kind: ClassVar[str]
 
     @property
-    def tail(self) -> Tail: ...
+    def tail(self) -> Tail | tuple[Tail, ...]: ...
 
     @property
     def index_names(self) -> tuple[str, ...]: ...
@@ -123,7 +129,11 @@ class LinearInAmounts(PayoutFunction, Protocol):
     still be free. `amount_constraints(limit)` states the bounds and linear
     constraints on the amounts, with every amount at most `limit` when one
     is given. Designs use these to solve for the amounts as a linear or
-    quadratic programme.
+    quadratic programme, when there is at least one amount; a payout with no
+    amounts is searched on the grids of its free parameters.
+
+    On several index components `basis` takes the `(n, k)` index of
+    `PayoutFunction.evaluate` and still returns `(n, n_amounts)`.
     """
 
     def amount_names(self) -> tuple[str, ...]: ...

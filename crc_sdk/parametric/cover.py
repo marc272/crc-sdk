@@ -12,15 +12,27 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from crc_sdk.parametric._canonical import canonical_json, content_hash
-from crc_sdk.parametric.errors import CoverDefinitionError, UnresolvedParameterError
-from crc_sdk.parametric.index import IndexDefinition
+from crc_sdk.parametric.errors import (
+    CoverDefinitionError,
+    SampleError,
+    UnresolvedParameterError,
+)
+from crc_sdk.parametric.index import CompositeIndex, IndexDefinition
 from crc_sdk.parametric.parameters import Free, _resolve_values
 from crc_sdk.parametric.payouts import PayoutFunction, _index_values, _payout_reader
 
-__all__ = ["COVER_SCHEMA_VERSION", "COVER_SEMANTICS_VERSION", "Cover"]
+__all__ = [
+    "COMPOSITE_COVER_SCHEMA_VERSION",
+    "COVER_SCHEMA_VERSION",
+    "COVER_SEMANTICS_VERSION",
+    "Cover",
+]
 
 COVER_SCHEMA_VERSION = "1.0"
-"""The `schema_version` of cover documents."""
+"""The `schema_version` of the document of a cover on one index."""
+
+COMPOSITE_COVER_SCHEMA_VERSION = "1.1"
+"""The `schema_version` of the document of a cover on a `CompositeIndex`."""
 
 COVER_SEMANTICS_VERSION = "crc-parametric-cover/1"
 """The `semantics_version` of cover documents."""
@@ -60,6 +72,35 @@ def _reject_constant(name: str) -> NoReturn:
     raise CoverDefinitionError(f"cover JSON must not contain {name}")
 
 
+def _check_payout_reads(
+    payout: PayoutFunction, index: IndexDefinition | CompositeIndex
+) -> None:
+    """Raise `CoverDefinitionError` unless `payout` reads what `index` holds."""
+    if isinstance(index, CompositeIndex):
+        if tuple(payout.index_names) != index.names:
+            raise CoverDefinitionError(
+                f"the payout reads the components {payout.index_names!r}, but the "
+                f"index holds {index.names!r}, in that order"
+            )
+        if payout.tail != index.tails:
+            raise CoverDefinitionError(
+                f"the payout's tails {payout.tail!r} differ from the index's "
+                f"tails {index.tails!r}: a payout on several components has a "
+                "tuple of one tail per component, in order"
+            )
+        return
+    if payout.tail != index.tail:
+        raise CoverDefinitionError(
+            f"the payout's tail {payout.tail!r} differs from the index's "
+            f"tail {index.tail!r}"
+        )
+    if tuple(payout.index_names) != ("index",):
+        raise CoverDefinitionError(
+            "a cover on one index reads one index component, index_names == "
+            f"('index',); got {payout.index_names!r}"
+        )
+
+
 class Cover:
     """A parametric cover: what it pays on, how much, and for whom.
 
@@ -70,6 +111,12 @@ class Cover:
     currency. `asset_id` names the asset the cover is written for; the same
     terms on another asset are another contract. `label` is a display name
     only.
+
+    `index` may instead be a `CompositeIndex`, for a cover on several hazards.
+    The payout's `index_names` must then equal its names and its `tail` be the
+    tuple of its tails, in order, and the cover document writes
+    `COMPOSITE_COVER_SCHEMA_VERSION`, so that a reader of the one-index
+    document refuses it.
 
     A cover with `Free` parameters is a template: it has a document and a
     hash, but `payout_values` raises until `with_values` (or a design)
@@ -82,7 +129,8 @@ class Cover:
     equal whatever their labels, and they pickle through their JSON.
 
     Raises `CoverDefinitionError` for an invalid index, payout, unit, asset
-    id or label, or a payout whose tail differs from the index's.
+    id or label, or a payout whose tail or index names differ from the
+    index's.
     """
 
     __slots__ = (
@@ -98,31 +146,23 @@ class Cover:
 
     def __init__(
         self,
-        index: IndexDefinition,
+        index: IndexDefinition | CompositeIndex,
         payout: PayoutFunction,
         *,
         payout_unit: str,
         asset_id: str | None = None,
         label: str | None = None,
     ) -> None:
-        if not isinstance(index, IndexDefinition):
+        if not isinstance(index, IndexDefinition | CompositeIndex):
             raise CoverDefinitionError(
-                f"index must be an IndexDefinition, got {type(index).__name__}"
+                "index must be an IndexDefinition or a CompositeIndex, got "
+                f"{type(index).__name__}"
             )
         if not isinstance(payout, PayoutFunction):
             raise CoverDefinitionError(
                 f"payout must implement PayoutFunction, got {type(payout).__name__}"
             )
-        if payout.tail != index.tail:
-            raise CoverDefinitionError(
-                f"the payout's tail {payout.tail!r} differs from the index's "
-                f"tail {index.tail!r}"
-            )
-        if tuple(payout.index_names) != ("index",):
-            raise CoverDefinitionError(
-                "a cover reads one index component, index_names == ('index',); "
-                f"got {payout.index_names!r}"
-            )
+        _check_payout_reads(payout, index)
         payout_document = payout.to_document()
         if (
             not isinstance(payout_document, Mapping)
@@ -138,7 +178,11 @@ class Cover:
             "index": index.to_document(),
             "payout": dict(payout_document),
             "payout_unit": unit,
-            "schema_version": COVER_SCHEMA_VERSION,
+            "schema_version": (
+                COMPOSITE_COVER_SCHEMA_VERSION
+                if isinstance(index, CompositeIndex)
+                else COVER_SCHEMA_VERSION
+            ),
             "semantics_version": COVER_SEMANTICS_VERSION,
         }
         if label is not None and (not isinstance(label, str) or not label.strip()):
@@ -162,7 +206,23 @@ class Cover:
 
     @property
     def index(self) -> IndexDefinition:
-        """What the cover pays on."""
+        """The index of a cover on one index.
+
+        Raises `CoverDefinitionError` on a cover with a `CompositeIndex`,
+        which has no one index: read `index_definition`.
+        """
+        if isinstance(self._index, CompositeIndex):
+            raise CoverDefinitionError(
+                f"this cover pays on the components {list(self._index.names)}, not "
+                "on one index: read cover.index_definition. ParametricPlan takes "
+                "covers on one index for now; design and evaluate this cover with "
+                "the functions"
+            )
+        return self._index
+
+    @property
+    def index_definition(self) -> IndexDefinition | CompositeIndex:
+        """What the cover pays on: an `IndexDefinition` or a `CompositeIndex`."""
         return self._index
 
     @property
@@ -218,9 +278,12 @@ class Cover:
     def payout_values(self, index_values: ArrayLike) -> NDArray[np.float64]:
         """Return the payout for each index value, in `payout_unit`.
 
-        The result has the shape of `index_values`. Raises
-        `UnresolvedParameterError` on a template, and `SampleError` for
-        non-numeric or non-finite index values.
+        The result has the shape of `index_values`. On a cover with a
+        `CompositeIndex`, `index_values` has shape `(n, k)`, one row per draw
+        and one column per component in `index_names` order, and the result
+        `(n,)`. Raises `UnresolvedParameterError` on a template, and
+        `SampleError` for non-numeric or non-finite index values or, on a
+        composite cover, the wrong shape.
         """
         free = self.free_parameters()
         if free:
@@ -228,9 +291,20 @@ class Cover:
                 f"the cover is a template; resolve its free parameters first: "
                 f"{', '.join(free)}"
             )
-        values = _index_values(index_values)
+        if isinstance(self._index, CompositeIndex):
+            values = _index_values(index_values, ndim=2)
+            names = self._index.names
+            if values.shape[1] != len(names):
+                raise SampleError(
+                    f"index values must have one column per component {list(names)}, "
+                    f"got shape {values.shape}"
+                )
+            shape = values.shape[:1]
+        else:
+            values = _index_values(index_values)
+            shape = values.shape
         payout = np.asarray(self._payout.evaluate(values), dtype=np.float64)
-        if payout.shape != values.shape:
+        if payout.shape != shape:
             raise CoverDefinitionError(
                 f"payout {self._payout.kind!r} returned shape {payout.shape} "
                 f"for index values of shape {values.shape}"
@@ -256,9 +330,11 @@ class Cover:
         """Read a cover document, as `to_document` returns it.
 
         The payout's `kind` is looked up among the registered payout
-        classes. Raises `UnknownPayoutKindError` for an unregistered kind,
-        and `CoverDefinitionError` for missing or unknown keys, another
-        schema or semantics version, or invalid terms.
+        classes. A document of `COVER_SCHEMA_VERSION` holds one index, and one
+        of `COMPOSITE_COVER_SCHEMA_VERSION` a `CompositeIndex`. Raises
+        `UnknownPayoutKindError` for an unregistered kind, and
+        `CoverDefinitionError` for missing or unknown keys, another schema or
+        semantics version, or invalid terms.
         """
         if not isinstance(document, Mapping):
             raise CoverDefinitionError("a cover document must be an object")
@@ -270,7 +346,8 @@ class Cover:
                 f"a cover document has the keys {sorted(_DOCUMENT_KEYS)}; "
                 f"missing: {missing}; unknown: {unknown}"
             )
-        if document["schema_version"] != COVER_SCHEMA_VERSION:
+        version = document["schema_version"]
+        if version not in (COVER_SCHEMA_VERSION, COMPOSITE_COVER_SCHEMA_VERSION):
             raise CoverDefinitionError(
                 f"unsupported cover schema_version {document['schema_version']!r}"
             )
@@ -283,7 +360,11 @@ class Cover:
             raise CoverDefinitionError("a payout document must be an object")
         payout = _payout_reader(payout_document.get("kind"))(payout_document)
         return cls(
-            IndexDefinition.from_document(document["index"]),
+            (
+                CompositeIndex.from_document(document["index"])
+                if version == COMPOSITE_COVER_SCHEMA_VERSION
+                else IndexDefinition.from_document(document["index"])
+            ),
             payout,
             payout_unit=document["payout_unit"],
             asset_id=document["asset_id"],

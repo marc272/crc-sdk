@@ -23,6 +23,11 @@ takes one asset's sample out of it, and `OutcomeSample.join` puts one-asset
 samples of the same years side by side. `design`, `evaluate` and `compare`
 work on one asset's sample.
 
+A sample of one asset may hold several named hazards, its `index_components`:
+one `IndexComponent` per hazard, the first being what `index` holds, while
+`loss` is the combined loss. `OutcomeSample.component` takes one hazard's
+sample out of it.
+
 `holdout` and `year_block_kfold` split a sample into contiguous blocks of
 periods, so the held-out block of a per-year sample is its latest years. A
 pool of model-years is split by its distinct years, not by its rows, so every
@@ -47,7 +52,7 @@ import os
 import re
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import KW_ONLY, dataclass, field
 from functools import cached_property
 from numbers import Real
 from types import MappingProxyType
@@ -60,11 +65,19 @@ from pydantic import BaseModel
 
 from crc_sdk.parametric._canonical import content_hash
 from crc_sdk.parametric.errors import ComonotoneIndexWarning, LeakageError, SampleError
+from crc_sdk.parametric.index import (
+    CompositeIndex,
+    IndexDefinition,
+    Tail,
+    _component_name,
+)
 
 __all__ = [
+    "SAMPLE_COMPONENTS_SCHEMA_VERSION",
     "SAMPLE_METADATA_KEY",
     "SAMPLE_SCHEMA_VERSION",
     "SAMPLE_SEMANTICS_VERSION",
+    "IndexComponent",
     "OutcomeSample",
     "SampleProvenance",
     "SemanticsSource",
@@ -80,7 +93,10 @@ SAMPLE_METADATA_KEY = "crc.parametric.sample"
 """The Parquet schema metadata key of `OutcomeSample.to_table()`."""
 
 SAMPLE_SCHEMA_VERSION = "1.0"
-"""The `schema_version` of a sample's hash document and table metadata."""
+"""The `schema_version` of a one-hazard sample's hash document and table metadata."""
+
+SAMPLE_COMPONENTS_SCHEMA_VERSION = "1.1"
+"""The `schema_version` of the same documents of a sample with index components."""
 
 SAMPLE_SEMANTICS_VERSION = "crc-parametric-sample/1"
 """The `semantics_version` of a sample's hash document and table metadata."""
@@ -90,6 +106,9 @@ SourceKind = Literal["monte_carlo", "annual", "table"]
 
 SemanticsSource = Literal["dataset", "caller", "data"]
 """Who stated what a row means: the dataset, the caller, or the data itself."""
+
+ComponentLoss = Literal["own", "combined"]
+"""The loss of a component's view: its hazard's own, or the combined loss."""
 
 _PROBABILITY_TOLERANCE = 1e-12
 _HOLDOUT_TOLERANCE = 1e-9
@@ -321,6 +340,11 @@ def _asset_note(asset: str, note: str) -> str:
     return f"Asset {asset}: {note}"
 
 
+def _component_note(name: str, note: str) -> str:
+    """One component's note, in the notes of a sample with index components."""
+    return f"Component {name}: {note}"
+
+
 def _read_only(array: NDArray[Any]) -> NDArray[Any]:
     array.setflags(write=False)
     return array
@@ -338,8 +362,14 @@ def _hash_document(
     loss_unit: str,
     semantics: str,
     scenario: str,
+    components: Mapping[str, IndexComponent] | None = None,
 ) -> dict[str, Any]:
-    """The document behind `content_hash`: the long table, sorted, and its units."""
+    """The document behind `content_hash`: the long table, sorted, and its units.
+
+    A sample with index components adds each one's values, in component order,
+    under another `schema_version`; a one-hazard sample's document holds no
+    trace of them.
+    """
     order = sorted(range(len(asset_ids)), key=lambda j: asset_ids[j].encode("utf-8"))
     n_assets = len(order)
 
@@ -347,7 +377,7 @@ def _hash_document(
         values: list[float] = array[:, order].reshape(-1).tolist()
         return values
 
-    return {
+    document: dict[str, Any] = {
         "asset_id": [asset_ids[j] for j in order] * period.shape[0],
         "hazard": None if hazard is None else flat(hazard),
         "index": flat(index),
@@ -361,6 +391,24 @@ def _hash_document(
         "semantics": semantics,
         "semantics_version": SAMPLE_SEMANTICS_VERSION,
     }
+    if components is not None:
+        document["schema_version"] = SAMPLE_COMPONENTS_SCHEMA_VERSION
+
+        def column(array: FloatArray | None) -> list[float] | None:
+            return None if array is None else array[:, 0].tolist()
+
+        document["components"] = [
+            {
+                "hazard": column(component.hazard),
+                "name": name,
+                "own_loss": column(component.own_loss),
+                "tail": component.tail,
+                "unit": component.unit,
+                "values": column(component.values),
+            }
+            for name, component in components.items()
+        ]
+    return document
 
 
 def _is_monotone_function(index: FloatArray, loss: FloatArray) -> bool:
@@ -460,9 +508,18 @@ class SampleProvenance:
       row, the calendar year and the run's position in `runs`. `select`,
       `holdout` and `year_block_kfold` keep the entries of the rows they keep.
       `None` on every other sample.
+    - `hazard_dependence`: for a sample with index components, where the
+      dependence between the hazards comes from; such a sample must state it.
+      `{"kind": "data"}` is the data's own. `None` on a one-hazard sample.
+    - `combine`: for a sample with index components, how the combined loss was
+      made: `{"kind": "table"}` when a table states it, or the rule's document.
+      `None` on a one-hazard sample.
+    - `components`: for a sample with index components, each component's own
+      provenance document, by name. `None` on a one-hazard sample.
 
     Mappings and sequences are stored read-only; `to_document()` returns
-    plain JSON types. Raises `SampleError` for unknown kinds or values that
+    plain JSON types, without the three fields of a sample with components
+    when they are `None`. Raises `SampleError` for unknown kinds or values that
     are not plain JSON.
     """
 
@@ -483,6 +540,9 @@ class SampleProvenance:
     parts: Mapping[str, Mapping[str, Any]] | None = None
     trend: Mapping[str, Any] | None = None
     pool: Mapping[str, Any] | None = None
+    hazard_dependence: Mapping[str, Any] | None = None
+    combine: Mapping[str, Any] | None = None
+    components: Mapping[str, Mapping[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         if self.source_kind not in get_args(SourceKind):
@@ -517,11 +577,14 @@ class SampleProvenance:
             "parts",
             "trend",
             "pool",
+            "hazard_dependence",
+            "combine",
+            "components",
         ):
             value = getattr(self, name)
             if value is not None and not isinstance(value, Mapping):
                 raise SampleError(f"{name} must be a mapping or None")
-        for name in ("dependence", "trend"):
+        for name in ("dependence", "trend", "hazard_dependence", "combine"):
             value = getattr(self, name)
             if value is not None and "kind" not in value:
                 raise SampleError(f"{name} must name its kind")
@@ -531,6 +594,12 @@ class SampleProvenance:
             isinstance(part, Mapping) for part in self.parts.values()
         ):
             raise SampleError("parts must map each asset id to a provenance document")
+        if self.components is not None and not all(
+            isinstance(part, Mapping) for part in self.components.values()
+        ):
+            raise SampleError(
+                "components must map each component name to a provenance document"
+            )
         if not isinstance(self.details, Mapping):
             raise SampleError("details must be a mapping")
         if isinstance(self.notes, str) or not all(
@@ -549,6 +618,9 @@ class SampleProvenance:
             "parts",
             "trend",
             "pool",
+            "hazard_dependence",
+            "combine",
+            "components",
         ):
             value = getattr(self, name)
             _check_json(name, value)
@@ -556,10 +628,16 @@ class SampleProvenance:
         object.__setattr__(self, "notes", tuple(self.notes))
 
     def to_document(self) -> dict[str, Any]:
-        """Return every field as plain JSON types."""
+        """Return every field as plain JSON types.
+
+        The fields of a sample with index components are left out when they
+        are `None`, so a one-hazard sample's document does not change.
+        """
         return {
             item.name: _thaw(getattr(self, item.name))
             for item in dataclasses.fields(self)
+            if item.name not in _COMPONENT_FIELDS
+            or getattr(self, item.name) is not None
         }
 
     def generator(self, step: int = 0) -> np.random.Generator:
@@ -607,6 +685,148 @@ class SampleProvenance:
         )
 
 
+_COMPONENT_FIELDS = frozenset({"hazard_dependence", "combine", "components"})
+"""The provenance fields of a sample with index components."""
+
+
+# -- the components of a sample ----------------------------------------------
+
+
+def _component_column(name: str, value: Any) -> FloatArray:
+    """Return a component's column as a finite, read-only `(n, 1)` array."""
+    array = _float_array(name, value)
+    if array.ndim == 1:
+        array = array.reshape(-1, 1)
+    if array.ndim != 2 or array.shape[1] != 1 or array.shape[0] == 0:
+        raise SampleError(f"{name} must have shape (n, 1), got {array.shape}")
+    if not np.isfinite(array).all():
+        raise SampleError(f"{name} must be finite")
+    return _read_only(array)
+
+
+@dataclass(frozen=True, eq=False)
+class IndexComponent:
+    """One named hazard of a sample: its index, unit, tail and own loss.
+
+    `values` is the component's index, `(n, 1)`, finite; a 1-D array is read
+    as one column. `unit` is its unit, and `tail` the severe side, `"upper"`
+    or `"lower"`. `hazard` is the value the loss model read, kept when it
+    differs from the index, else `None`. `own_loss` is the loss of this hazard
+    alone, finite and non-negative, in the sample's loss unit, and `None` for
+    a component with no impact. The arrays are read-only copies.
+
+    Raises `SampleError` for any invalid field.
+    """
+
+    values: FloatArray
+    _: KW_ONLY
+    unit: str
+    tail: Tail
+    hazard: FloatArray | None = None
+    own_loss: FloatArray | None = None
+
+    def __post_init__(self) -> None:
+        values = _component_column("values", self.values)
+        _identifier("unit", self.unit)
+        if self.tail not in get_args(Tail):
+            raise SampleError(f"tail must be 'upper' or 'lower', got {self.tail!r}")
+        hazard, own_loss = (
+            None if value is None else _component_column(name, value)
+            for name, value in (("hazard", self.hazard), ("own_loss", self.own_loss))
+        )
+        for name, column in (("hazard", hazard), ("own_loss", own_loss)):
+            if column is not None and column.shape != values.shape:
+                raise SampleError(
+                    f"{name} must have the shape of values, {values.shape}; "
+                    f"got {column.shape}"
+                )
+        if own_loss is not None and (own_loss < 0).any():
+            raise SampleError("own_loss must be non-negative")
+        object.__setattr__(self, "values", values)
+        object.__setattr__(self, "hazard", hazard)
+        object.__setattr__(self, "own_loss", own_loss)
+
+    def _subset(self, rows: NDArray[np.bool_]) -> IndexComponent:
+        return dataclasses.replace(
+            self,
+            values=self.values[rows],
+            hazard=None if self.hazard is None else self.hazard[rows],
+            own_loss=None if self.own_loss is None else self.own_loss[rows],
+        )
+
+
+def _checked_components(
+    components: Any,
+    *,
+    n: int,
+    n_assets: int,
+    index: FloatArray,
+    hazard: FloatArray | None,
+    index_unit: str,
+    provenance: SampleProvenance,
+) -> Mapping[str, IndexComponent]:
+    """Check a sample's components and return them read-only, in order."""
+    if not isinstance(components, Mapping):
+        raise SampleError(
+            "index_components must map each component name to an IndexComponent, "
+            f"got {type(components).__name__}"
+        )
+    if len(components) < 2:
+        raise SampleError(
+            f"index_components holds two components or more, got {len(components)}"
+        )
+    for name, component in components.items():
+        _component_name(name, SampleError)
+        if not isinstance(component, IndexComponent):
+            raise SampleError(
+                f"component {name!r} must be an IndexComponent, "
+                f"got {type(component).__name__}"
+            )
+        if component.values.shape[0] != n:
+            raise SampleError(
+                f"component {name!r} has {component.values.shape[0]} rows, but the "
+                f"sample holds {n} periods"
+            )
+    if n_assets != 1:
+        raise SampleError(
+            f"a sample with index components holds exactly one asset, got {n_assets}: "
+            "several assets with several hazards need a dependence model over both"
+        )
+    first_name, first = next(iter(components.items()))
+    if not np.array_equal(index, first.values):
+        raise SampleError(
+            f"index must hold the values of the first component, {first_name!r}"
+        )
+    if index_unit != first.unit:
+        raise SampleError(
+            f"index_unit {index_unit!r} must be the unit of the first component, "
+            f"{first_name!r}, which is {first.unit!r}"
+        )
+    same_hazard = (
+        hazard is None and first.hazard is None
+        if hazard is None or first.hazard is None
+        else np.array_equal(hazard, first.hazard)
+    )
+    if not same_hazard:
+        raise SampleError(
+            f"hazard must hold the hazard of the first component, {first_name!r}"
+        )
+    if provenance.hazard_dependence is None:
+        raise SampleError(
+            "a sample with index components must state where the dependence between "
+            "its hazards comes from: set the provenance's hazard_dependence, for "
+            'example {"kind": "data"} for the same years of the data'
+        )
+    if provenance.components is not None and set(provenance.components) != set(
+        components
+    ):
+        raise SampleError(
+            f"the provenance's components are for {sorted(provenance.components)}, "
+            f"but the sample holds {sorted(components)}"
+        )
+    return MappingProxyType(dict(components))
+
+
 # -- the sample --------------------------------------------------------------
 
 
@@ -631,6 +851,15 @@ class OutcomeSample:
     The arrays are read-only copies. Samples compare by identity; compare
     `content_hash` for equal contents.
 
+    `index_components` maps each named hazard of a multi-hazard sample to its
+    `IndexComponent`, two or more, in order and read-only; it is `None` on every
+    other sample. Such a sample holds one asset and states the dependence
+    between its hazards in its provenance's `hazard_dependence`. Its first
+    component is the primary: `index`, `index_unit` and `hazard` hold its
+    values, so code that reads one index reads it, while `loss` is the
+    combined loss. Each name is non-empty, with no surrounding whitespace and
+    no `.`, `+`, `[` or `]`. `component` takes one hazard's sample out of it.
+
     Raises `SampleError` for any invalid field.
     """
 
@@ -645,6 +874,7 @@ class OutcomeSample:
     semantics: Literal["annual"]
     provenance: SampleProvenance
     scenario: str = "baseline"
+    index_components: Mapping[str, IndexComponent] | None = None
 
     def __post_init__(self) -> None:
         ids = self.asset_ids
@@ -714,6 +944,25 @@ class OutcomeSample:
                 f"sample holds {n}"
             )
         _identifier("scenario", self.scenario)
+        components: Mapping[str, IndexComponent] | None = None
+        if self.index_components is not None:
+            components = _checked_components(
+                self.index_components,
+                n=n,
+                n_assets=len(asset_ids),
+                index=index,
+                hazard=hazard,
+                index_unit=self.index_unit,
+                provenance=self.provenance,
+            )
+        elif any(
+            getattr(self.provenance, name) is not None for name in _COMPONENT_FIELDS
+        ):
+            raise SampleError(
+                "a sample without index components has no dependence between hazards, "
+                "no rule for a combined loss and no components in its provenance"
+            )
+        object.__setattr__(self, "index_components", components)
         object.__setattr__(self, "asset_ids", asset_ids)
         object.__setattr__(self, "period", _read_only(period))
         object.__setattr__(self, "probability", _read_only(probability))
@@ -733,7 +982,8 @@ class OutcomeSample:
         The document holds the long table (`to_table` without the scenario
         column), sorted by period and asset id, with the units, the
         semantics and the scenario, in the canonical JSON of cover documents.
-        The provenance is not part of it.
+        A sample with index components adds each one's name, unit, tail,
+        values, hazard and own loss. The provenance is not part of it.
         """
         return content_hash(
             _hash_document(
@@ -747,6 +997,7 @@ class OutcomeSample:
                 loss_unit=self.loss_unit,
                 semantics=self.semantics,
                 scenario=self.scenario,
+                components=self.index_components,
             )
         )
 
@@ -804,6 +1055,14 @@ class OutcomeSample:
             semantics=self.semantics,
             provenance=provenance,
             scenario=self.scenario,
+            index_components=(
+                None
+                if self.index_components is None
+                else {
+                    name: component._subset(rows)
+                    for name, component in self.index_components.items()
+                }
+            ),
         )
 
     def asset(self, asset_id: str) -> OutcomeSample:
@@ -860,6 +1119,85 @@ class OutcomeSample:
             scenario=self.scenario,
         )
 
+    def component(self, name: str, *, loss: ComponentLoss = "own") -> OutcomeSample:
+        """Return one hazard's sample: the same periods and probabilities.
+
+        Its `index`, `index_unit` and `hazard` are the component's. With
+        `loss="own"` its loss is the component's `own_loss`, so a separate
+        cover can be designed on its own hazard's loss; with
+        `loss="combined"` it keeps this sample's combined loss, for a cover on
+        this index designed against what the owner loses in total.
+
+        The provenance is the component's own, from the provenance's
+        `components` when it has them, and `selection` records the step after
+        the steps of that component's own sample. The lineage is this sample's,
+        so a leakage check still sees the source.
+
+        Raises `SampleError` on a sample without index components, for a
+        component the sample does not hold, an unknown `loss`, and for
+        `loss="own"` on a component with no impact, which has no own loss.
+        """
+        components = self.index_components
+        if components is None:
+            raise SampleError(
+                "this sample holds one hazard, so it has no components to take; "
+                "use it as it is"
+            )
+        if name not in components:
+            raise SampleError(
+                f"the sample holds no component {name!r}; it holds {list(components)}"
+            )
+        if loss not in get_args(ComponentLoss):
+            raise SampleError(
+                f"loss must be one of {get_args(ComponentLoss)}, got {loss!r}"
+            )
+        chosen = components[name]
+        if loss == "own":
+            if chosen.own_loss is None:
+                raise SampleError(
+                    f"component {name!r} has no impact, so it has no loss of its own: "
+                    f"use component({name!r}, loss='combined') for this index against "
+                    "the combined loss"
+                )
+            values = chosen.own_loss
+        else:
+            values = self.loss
+        own = self.provenance
+        part = (
+            None
+            if own.components is None
+            else _written_provenance(own.components[name])
+        )
+        earlier: tuple[Mapping[str, Any], ...] = (
+            _hazard_reorder(own) if part is None else part.selection
+        )
+        # Taking a component commutes with a split, and a split stays the last
+        # step: the setup text reads the block from the last one.
+        step = {"kind": "component", "name": name, "loss": loss}
+        provenance = dataclasses.replace(
+            own if part is None else part,
+            parent=own.parent or self.content_hash,
+            lineage=self.lineage,
+            selection=(*earlier, step, *own.selection),
+            pool=own.pool,
+            hazard_dependence=None,
+            combine=None,
+            components=None,
+        )
+        return OutcomeSample(
+            asset_ids=self.asset_ids,
+            period=self.period,
+            probability=self.probability,
+            index=chosen.values,
+            loss=values,
+            hazard=chosen.hazard,
+            index_unit=chosen.unit,
+            loss_unit=self.loss_unit,
+            semantics=self.semantics,
+            provenance=provenance,
+            scenario=self.scenario,
+        )
+
     @classmethod
     def join(cls, samples: Iterable[OutcomeSample]) -> OutcomeSample:
         """Put one-asset samples of the same years side by side.
@@ -883,12 +1221,13 @@ class OutcomeSample:
 
         Monte Carlo samples are refused: independently drawn curve samples
         line up by draw number only, so joining them would impose independence
-        without stating it.
+        without stating it. Samples with index components are refused too:
+        several assets with several hazards need a dependence model over both.
 
         Raises `SampleError` for fewer than two samples, a sample of several
-        assets, a Monte Carlo sample, a repeated asset id, any field that
-        differs or a pool beside a sample that is not one, and `TypeError` for
-        anything but an iterable of samples.
+        assets, a Monte Carlo sample, a sample with index components, a repeated
+        asset id, any field that differs or a pool beside a sample that is not
+        one, and `TypeError` for anything but an iterable of samples.
         """
         if isinstance(samples, (str, bytes, Mapping)) or not isinstance(
             samples, Iterable
@@ -905,6 +1244,12 @@ class OutcomeSample:
                 raise SampleError(
                     "join takes one-asset samples, but one holds "
                     f"{len(part.asset_ids)} assets; take each with asset() first"
+                )
+            if part.index_components is not None:
+                raise SampleError(
+                    f"join refuses the sample of asset {part.asset_ids[0]!r}, which "
+                    "holds index components: several assets with several hazards "
+                    "need a dependence model over both"
                 )
             if part.provenance.source_kind == "monte_carlo":
                 raise SampleError(
@@ -1017,6 +1362,11 @@ class OutcomeSample:
         the units, the semantics, the scenario, the asset ids, the content
         hash and the provenance, so `pyarrow.parquet.write_table` writes a
         self-describing file.
+
+        A sample with index components adds, per component, the columns
+        `index[<name>]`, `hazard[<name>]` and `own_loss[<name>]`, null where it
+        has none, and the metadata adds `components`, each one's name, unit
+        and tail, in order.
         """
         order = sorted(
             range(len(self.asset_ids)), key=lambda j: self.asset_ids[j].encode("utf-8")
@@ -1030,7 +1380,8 @@ class OutcomeSample:
                 np.ascontiguousarray(array[:, order]).reshape(-1), pa.float64()
             )
 
-        metadata = {
+        components = self.index_components
+        metadata: dict[str, Any] = {
             "asset_ids": list(self.asset_ids),
             "content_hash": self.content_hash,
             "index_unit": self.index_unit,
@@ -1041,6 +1392,12 @@ class OutcomeSample:
             "semantics": self.semantics,
             "semantics_version": SAMPLE_SEMANTICS_VERSION,
         }
+        if components is not None:
+            metadata["schema_version"] = SAMPLE_COMPONENTS_SCHEMA_VERSION
+            metadata["components"] = [
+                {"name": name, "tail": component.tail, "unit": component.unit}
+                for name, component in components.items()
+            ]
         hazard = (
             pa.nulls(rows, pa.float64()) if self.hazard is None else flat(self.hazard)
         )
@@ -1049,34 +1406,43 @@ class OutcomeSample:
             if len(sorted_ids) == 1
             else pa.array(sorted_ids * n_periods, pa.string())
         )
+        fields = [
+            ("scenario", pa.string()),
+            ("period", pa.int64()),
+            ("asset_id", pa.string()),
+            ("probability", pa.float64()),
+            ("index", pa.float64()),
+            ("loss", pa.float64()),
+            ("hazard", pa.float64()),
+        ]
+        arrays = [
+            pa.repeat(pa.scalar(self.scenario, pa.string()), rows),
+            pa.array(np.repeat(self.period, len(order)), pa.int64()),
+            asset_column,
+            pa.array(np.repeat(self.probability, len(order)), pa.float64()),
+            flat(self.index),
+            flat(self.loss),
+            hazard,
+        ]
+        for name, component in (components or {}).items():
+            for column, values in (
+                ("index", component.values),
+                ("hazard", component.hazard),
+                ("own_loss", component.own_loss),
+            ):
+                fields.append((f"{column}[{name}]", pa.float64()))
+                arrays.append(
+                    pa.nulls(rows, pa.float64()) if values is None else flat(values)
+                )
         schema = pa.schema(
-            [
-                ("scenario", pa.string()),
-                ("period", pa.int64()),
-                ("asset_id", pa.string()),
-                ("probability", pa.float64()),
-                ("index", pa.float64()),
-                ("loss", pa.float64()),
-                ("hazard", pa.float64()),
-            ],
+            fields,
             metadata={
                 SAMPLE_METADATA_KEY: json.dumps(
                     metadata, sort_keys=True, separators=(",", ":"), allow_nan=False
                 )
             },
         )
-        return pa.Table.from_arrays(
-            [
-                pa.repeat(pa.scalar(self.scenario, pa.string()), rows),
-                pa.array(np.repeat(self.period, len(order)), pa.int64()),
-                asset_column,
-                pa.array(np.repeat(self.probability, len(order)), pa.float64()),
-                flat(self.index),
-                flat(self.loss),
-                hazard,
-            ],
-            schema=schema,
-        )
+        return pa.Table.from_arrays(arrays, schema=schema)
 
     @classmethod
     def from_written_table(cls, table: Any) -> OutcomeSample:
@@ -1145,17 +1511,32 @@ class OutcomeSample:
             values = _float_values(_column(data, name, what), name)
             return values.reshape(n, n_assets)[:, columns]
 
-        hazard_column = _column(data, "hazard", what)
-        if hazard_column.null_count == rows:
-            hazard: FloatArray | None = None
-        elif hazard_column.null_count == 0:
-            hazard = per_asset("hazard")
-        else:
+        def optional(name: str, meaning: str) -> FloatArray | None:
+            nulls = _column(data, name, what).null_count
+            if nulls == rows:
+                return None
+            if nulls == 0:
+                return per_asset(name)
             raise SampleError(
-                f"column 'hazard' is null in {hazard_column.null_count} of {rows} "
-                "rows; it must be null in every row (the hazard is the index) or "
-                "in none"
+                f"column {name!r} is null in {nulls} of {rows} rows; it must be "
+                f"null in every row ({meaning}) or in none"
             )
+
+        hazard = optional("hazard", "the hazard is the index")
+        index_components: dict[str, IndexComponent] | None = None
+        if "components" in metadata:
+            index_components = {
+                name: IndexComponent(
+                    per_asset(f"index[{name}]"),
+                    unit=unit,
+                    tail=tail,
+                    hazard=optional(f"hazard[{name}]", "the hazard is the index"),
+                    own_loss=optional(
+                        f"own_loss[{name}]", "the component has no impact"
+                    ),
+                )
+                for name, unit, tail in _written_components(metadata["components"])
+            }
         sample = cls(
             asset_ids=tuple(asset_ids),
             period=per_period(
@@ -1173,6 +1554,7 @@ class OutcomeSample:
             semantics=metadata["semantics"],
             provenance=_written_provenance(metadata["provenance"]),
             scenario=scenario,
+            index_components=index_components,
         )
         if sample.content_hash != metadata["content_hash"]:
             raise SampleError(
@@ -1189,13 +1571,15 @@ class OutcomeSample:
         *,
         period: str,
         asset_id: str,
-        index: str,
+        index: str | Mapping[str, str],
         loss: str,
         probability: str | None = None,
-        hazard: str | None = None,
+        hazard: str | Mapping[str, str] | None = None,
+        own_loss: Mapping[str, str] | None = None,
         semantics: Literal["annual"],
-        index_unit: str,
+        index_unit: str | Mapping[str, str],
         loss_unit: str,
+        tails: Mapping[str, Tail] | None = None,
         source: Any = None,
     ) -> OutcomeSample:
         """Build a sample from a user table, one row per period and asset.
@@ -1218,15 +1602,48 @@ class OutcomeSample:
         an asset's loss is a monotone function of its index, this warns with
         `ComonotoneIndexWarning`.
 
+        With a mapping from component name to column as `index`, two or more,
+        the table builds a multi-hazard sample of one asset, whose first
+        component is the primary. `index_unit` is then a mapping by name too,
+        `tails` is required and maps each name to `"upper"` or `"lower"`, and
+        `hazard` and `own_loss` map any of the names to a column. `loss` is the
+        combined loss as the caller states it: `combine` records
+        `{"kind": "table"}`, and `hazard_dependence` `{"kind": "data"}`, as
+        the rows are what the caller states. If a component's index determines
+        the combined loss or its own loss monotonically, this warns with
+        `ComonotoneIndexWarning`.
+
         Raises `SampleError` for a missing column, nulls, non-integer
         periods, repeated or missing (period, asset) pairs, or invalid
-        values, and `TypeError` for a file path or a non-table.
+        values, for arguments that don't suit the form of `index`, and for
+        several assets with several index columns, and `TypeError` for a file
+        path or a non-table.
         """
         if semantics != "annual":
             raise SampleError(
                 f"semantics must be 'annual' (one row is one year), got "
                 f"{semantics!r}; 'event' is reserved"
             )
+        if isinstance(index, Mapping):
+            return cls._from_components_table(
+                table,
+                period=period,
+                asset_id=asset_id,
+                index=index,
+                loss=loss,
+                probability=probability,
+                hazard=hazard,
+                own_loss=own_loss,
+                semantics=semantics,
+                index_unit=index_unit,
+                loss_unit=loss_unit,
+                tails=tails,
+                source=source,
+            )
+        _refuse_component_arguments(
+            tails=tails, own_loss=own_loss, hazard=hazard, index_unit=index_unit
+        )
+        assert not isinstance(hazard, Mapping) and not isinstance(index_unit, Mapping)
         data = _arrow_table(table, "a sample table")
         what = "the sample table"
         periods = _integer_values(_column(data, period, what), period)
@@ -1368,6 +1785,226 @@ class OutcomeSample:
             )
         return dataclasses.replace(bare, provenance=provenance)
 
+    @classmethod
+    def _from_components_table(
+        cls,
+        table: Any,
+        *,
+        period: str,
+        asset_id: str,
+        index: Mapping[str, str],
+        loss: str,
+        probability: str | None,
+        hazard: Any,
+        own_loss: Any,
+        semantics: Literal["annual"],
+        index_unit: Any,
+        loss_unit: str,
+        tails: Any,
+        source: Any,
+    ) -> OutcomeSample:
+        """Build a multi-hazard sample from a user table; see `from_table`."""
+        names = list(index)
+        if len(names) < 2:
+            raise SampleError(
+                "a mapping as index names two components or more, got "
+                f"{len(names)}; for one hazard give the column's name"
+            )
+        for name in names:
+            _component_name(name, SampleError)
+        units = _by_component("index_unit", index_unit, names, every=True)
+        severe = _by_component("tails", tails, names, every=True)
+        hazards = _by_component("hazard", hazard, names, every=False)
+        own_losses = _by_component("own_loss", own_loss, names, every=False)
+        data = _arrow_table(table, "a sample table")
+        what = "the sample table"
+        periods = _integer_values(_column(data, period, what), period)
+        ids = _string_values(_column(data, asset_id, what), asset_id)
+        if not ids:
+            raise SampleError("the sample table has no rows")
+        distinct = sorted(set(ids))
+        if len(distinct) > 1:
+            raise SampleError(
+                "a sample with index components holds exactly one asset, but the "
+                f"table holds {len(distinct)}: {distinct[:5]}"
+                + (" ..." if len(distinct) > 5 else "")
+            )
+        asset = distinct[0]
+        all_periods, rows, counts = np.unique(
+            periods, return_inverse=True, return_counts=True
+        )
+        repeated = all_periods[counts > 1]
+        if repeated.size:
+            raise SampleError(
+                f"periods {repeated[:10].tolist()} appear more than once for "
+                f"asset {asset!r}"
+            )
+        n = all_periods.shape[0]
+
+        def by_period(name: str) -> FloatArray:
+            array = np.empty(n, dtype=np.float64)
+            array[rows] = _float_values(_column(data, name, what), name)
+            return array
+
+        loss_values = by_period(loss)
+        components = {
+            name: IndexComponent(
+                by_period(index[name]),
+                unit=units[name],
+                tail=severe[name],
+                hazard=by_period(hazards[name]) if name in hazards else None,
+                own_loss=by_period(own_losses[name]) if name in own_losses else None,
+            )
+            for name in names
+        }
+        first = components[names[0]]
+        per_period = (
+            np.full(n, 1.0 / n) if probability is None else by_period(probability)
+        )
+        source_document = _source_document(source)
+        # Validate every field first; the provenance needs the content hash.
+        bare = cls(
+            asset_ids=(asset,),
+            period=all_periods,
+            probability=per_period,
+            index=first.values,
+            loss=loss_values,
+            hazard=first.hazard,
+            index_unit=first.unit,
+            loss_unit=loss_unit,
+            semantics=semantics,
+            provenance=SampleProvenance(
+                source_kind="table",
+                sources=(),
+                semantics_source="caller",
+                hazard_dependence={"kind": "data"},
+                combine={"kind": "table"},
+            ),
+            index_components=components,
+        )
+        table_hash = bare.content_hash
+        comonotone = [
+            name
+            for name, component in components.items()
+            if _is_monotone_function(component.values[:, 0], loss_values)
+            or (
+                component.own_loss is not None
+                and _is_monotone_function(
+                    component.values[:, 0], component.own_loss[:, 0]
+                )
+            )
+        ]
+        if comonotone:
+            warnings.warn(
+                f"{COMONOTONE_MESSAGE} (components {', '.join(comonotone)})",
+                ComonotoneIndexWarning,
+                stacklevel=3,
+            )
+        identity: dict[str, Any] = {"kind": "table", "asset_id": asset}
+        if source_document:
+            identity["source"] = source_document
+        else:
+            identity["data"] = table_hash
+        licences = (_licence_entry("table", source_document),)
+        details = {
+            "draws": n,
+            "periods": [int(all_periods[0]), int(all_periods[-1])],
+            "probability": "uniform" if probability is None else "column",
+        }
+        shared_columns = {
+            "period": period,
+            "asset_id": asset_id,
+            "probability": probability,
+        }
+        provenance = SampleProvenance(
+            source_kind="table",
+            sources=(
+                {
+                    "role": "table",
+                    "source": source_document,
+                    "columns": {
+                        **shared_columns,
+                        "index": dict(index),
+                        "loss": loss,
+                        "hazard": hazards or None,
+                        "own_loss": own_losses or None,
+                    },
+                    "content_hash": table_hash,
+                },
+            ),
+            semantics_source="caller",
+            licences=licences,
+            details=details,
+            notes=tuple(
+                _component_note(name, _TABLE_COMONOTONE_NOTE) for name in comonotone
+            ),
+            lineage=content_hash(identity),
+            hazard_dependence={"kind": "data"},
+            combine={"kind": "table"},
+            components={
+                name: SampleProvenance(
+                    source_kind="table",
+                    sources=(
+                        {
+                            "role": "table",
+                            "component": name,
+                            "source": source_document,
+                            "columns": {
+                                **shared_columns,
+                                "index": index[name],
+                                "loss": own_losses.get(name),
+                                "hazard": hazards.get(name),
+                            },
+                            "content_hash": table_hash,
+                        },
+                    ),
+                    semantics_source="caller",
+                    licences=licences,
+                    details=details,
+                    notes=(_TABLE_COMONOTONE_NOTE,) if name in comonotone else (),
+                ).to_document()
+                for name in names
+            },
+        )
+        return dataclasses.replace(bare, provenance=provenance)
+
+
+def _refuse_component_arguments(
+    *, tails: Any, own_loss: Any, hazard: Any, index_unit: Any
+) -> None:
+    """Raise `SampleError` for arguments that go with several index columns."""
+    if tails is not None or own_loss is not None:
+        raise SampleError(
+            "tails and own_loss go with several index columns: a mapping from "
+            "component name to column as index"
+        )
+    if isinstance(hazard, Mapping) or isinstance(index_unit, Mapping):
+        raise SampleError(
+            "hazard and index_unit are mappings only with several index columns: "
+            "a mapping from component name to column as index"
+        )
+
+
+def _by_component(
+    name: str, value: Any, names: Sequence[str], *, every: bool
+) -> dict[str, Any]:
+    """`value` as a mapping over component names; all of them if `every`."""
+    if value is None and not every:
+        return {}
+    if not isinstance(value, Mapping):
+        raise SampleError(
+            f"with several index columns, {name} must be a mapping by component "
+            f"name, got {value!r}"
+        )
+    unknown = sorted(str(key) for key in value if key not in names)
+    missing = [component for component in names if component not in value]
+    if unknown or (every and missing):
+        raise SampleError(
+            f"{name} is keyed by the components {list(names)}: "
+            f"unknown {unknown}, missing {missing if every else []}"
+        )
+    return dict(value)
+
 
 # -- written samples ---------------------------------------------------------
 
@@ -1403,24 +2040,42 @@ def _written_metadata(table: Any) -> dict[str, Any]:
         ) from error
     if not isinstance(document, dict):
         raise SampleError(f"the {SAMPLE_METADATA_KEY!r} metadata must be an object")
-    missing = sorted(_WRITTEN_KEYS - set(document))
+    with_components = document.get("schema_version") == SAMPLE_COMPONENTS_SCHEMA_VERSION
+    expected_keys = _WRITTEN_KEYS | ({"components"} if with_components else set())
+    missing = sorted(expected_keys - set(document))
     if missing:
         raise SampleError(f"the {SAMPLE_METADATA_KEY!r} metadata lacks {missing}")
-    unknown = sorted(set(document) - _WRITTEN_KEYS)
+    unknown = sorted(set(document) - expected_keys)
     if unknown:
         raise SampleError(
             f"the {SAMPLE_METADATA_KEY!r} metadata has unknown keys {unknown}"
         )
-    for key, expected in (
-        ("schema_version", SAMPLE_SCHEMA_VERSION),
-        ("semantics_version", SAMPLE_SEMANTICS_VERSION),
-    ):
-        if document[key] != expected:
-            raise SampleError(
-                f"the written sample has {key} {document[key]!r}; this version of "
-                f"crc-sdk reads {expected!r}"
-            )
+    if not with_components and document["schema_version"] != SAMPLE_SCHEMA_VERSION:
+        raise SampleError(
+            f"the written sample has schema_version {document['schema_version']!r}; "
+            f"this version of crc-sdk reads {SAMPLE_SCHEMA_VERSION!r} and "
+            f"{SAMPLE_COMPONENTS_SCHEMA_VERSION!r}"
+        )
+    if document["semantics_version"] != SAMPLE_SEMANTICS_VERSION:
+        raise SampleError(
+            f"the written sample has semantics_version "
+            f"{document['semantics_version']!r}; this version of crc-sdk reads "
+            f"{SAMPLE_SEMANTICS_VERSION!r}"
+        )
     return document
+
+
+def _written_components(documents: Any) -> list[tuple[str, str, Any]]:
+    """Each component's (name, unit, tail) of a written sample's metadata."""
+    if not isinstance(documents, list) or not all(
+        isinstance(entry, dict) and set(entry) == {"name", "tail", "unit"}
+        for entry in documents
+    ):
+        raise SampleError(
+            f"the {SAMPLE_METADATA_KEY!r} metadata's components must be a list of "
+            "objects with a name, a unit and a tail"
+        )
+    return [(entry["name"], entry["unit"], entry["tail"]) for entry in documents]
 
 
 def _written_provenance(document: Any) -> SampleProvenance:
@@ -1638,6 +2293,88 @@ def _sample_years(sample: OutcomeSample) -> IntArray:
     return years
 
 
+def _named_components(
+    index: IndexDefinition | CompositeIndex, sample: OutcomeSample
+) -> tuple[IndexComponent, ...]:
+    """The components a cover on `index` reads, in order.
+
+    A one-index cover reads the component named its `hazard_name`, and a
+    `CompositeIndex` the components of its names. Each unit and tail must be
+    the component's. Raises `SampleError` otherwise, and when the sample has
+    no index components.
+    """
+    components = sample.index_components
+    if isinstance(index, CompositeIndex):
+        wanted = dict(index.components)
+        if components is None:
+            raise SampleError(
+                f"the cover reads the components {list(index.names)}, but this "
+                "sample holds one index; it needs a sample with index_components"
+            )
+        missing = [name for name in wanted if name not in components]
+        if missing:
+            raise SampleError(
+                f"the cover reads the components {list(index.names)}, but the "
+                f"sample holds no {missing}; it holds {list(components)}"
+            )
+    else:
+        wanted = {index.hazard_name: index}
+        if components is None or index.hazard_name not in components:
+            raise SampleError(
+                f"the cover pays on the hazard {index.hazard_name!r}, but the sample "
+                f"holds no such component; it holds "
+                f"{[] if components is None else list(components)}. "
+                "Take one with sample.component(name, loss='combined') to read "
+                "another component's index against the combined loss"
+            )
+    read: list[IndexComponent] = []
+    for name, definition in wanted.items():
+        assert components is not None
+        component = components[name]
+        if definition.unit != component.unit:
+            raise SampleError(
+                f"the cover's index {name!r} is in {definition.unit!r}, but the "
+                f"sample's component is in {component.unit!r}"
+            )
+        if definition.tail != component.tail:
+            raise SampleError(
+                f"the cover's index {name!r} has the tail {definition.tail!r}, but "
+                f"the sample's component has {component.tail!r}"
+            )
+        read.append(component)
+    return tuple(read)
+
+
+def _check_cover_index(
+    index: IndexDefinition | CompositeIndex, sample: OutcomeSample
+) -> None:
+    """Raise `SampleError` unless a cover on `index` can read `sample`."""
+    if isinstance(index, IndexDefinition) and sample.index_components is None:
+        if index.unit != sample.index_unit:
+            raise SampleError(
+                f"the cover's index is in {index.unit!r}, but the sample's "
+                f"index is in {sample.index_unit!r}"
+            )
+        return
+    _named_components(index, sample)
+
+
+def _cover_index_values(
+    index: IndexDefinition | CompositeIndex, sample: OutcomeSample, column: int = 0
+) -> FloatArray:
+    """What a cover on `index` reads of `sample`, for the asset in `column`.
+
+    `(n,)`, or `(n, k)` for a `CompositeIndex`, one column per component.
+    """
+    if isinstance(index, IndexDefinition) and sample.index_components is None:
+        values: FloatArray = sample.index[:, column]
+        return values
+    read = _named_components(index, sample)
+    if isinstance(index, CompositeIndex):
+        return np.hstack([component.values for component in read])
+    return read[0].values[:, 0]
+
+
 def _require_one_asset(sample: OutcomeSample, function: str) -> None:
     """Raise `SampleError` if `sample` holds several assets; `function` needs one."""
     count = len(sample.asset_ids)
@@ -1650,6 +2387,18 @@ def _require_one_asset(sample: OutcomeSample, function: str) -> None:
         )
 
 
+def _hazard_reorder(provenance: SampleProvenance) -> tuple[Mapping[str, Any], ...]:
+    """The reorder step of an `EmpiricalCopula` across hazards, if it has one.
+
+    A component's own document records its reorder; a sample with no such
+    documents has only this to record it, so that a split is still refused.
+    """
+    model = provenance.hazard_dependence
+    if model is None or model["kind"] != "empirical_copula":
+        return ()
+    return ({"kind": "reorder", "dependence": model["kind"]},)
+
+
 def _refuse_reference_year_blocks(sample: OutcomeSample, function: str) -> None:
     """Raise `SampleError` if `sample`'s rows come in reference-year blocks.
 
@@ -1659,8 +2408,9 @@ def _refuse_reference_year_blocks(sample: OutcomeSample, function: str) -> None:
     """
     provenance = sample.provenance
     models = {step.get("dependence") for step in provenance.selection}
-    if provenance.dependence is not None:
-        models.add(provenance.dependence["kind"])
+    for model in (provenance.dependence, provenance.hazard_dependence):
+        if model is not None:
+            models.add(model["kind"])
     if "empirical_copula" in models:
         raise SampleError(
             f"{function} cannot split an EmpiricalCopula sample: its rows come in "
