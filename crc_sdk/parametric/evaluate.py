@@ -474,7 +474,7 @@ class CoverPackage:
         object.__setattr__(self, "index", index)
         object.__setattr__(self, "payout", payout)
         object.__setattr__(self, "package_hash", covers_hash(resolved))
-        object.__setattr__(self, "_items", MappingProxyType(items))
+        object.__setattr__(self, "_items", items)
 
     @property
     def covers(self) -> Mapping[str, Cover]:

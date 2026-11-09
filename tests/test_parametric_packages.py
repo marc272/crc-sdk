@@ -8,6 +8,7 @@ about a cover or a cover form.
 from __future__ import annotations
 
 import dataclasses
+import pickle
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any, ClassVar, Self
@@ -217,6 +218,12 @@ def test_as_cover_is_the_same_payout_as_one_contract() -> None:
 def test_the_package_hash_differs_from_the_one_contract_hash() -> None:
     package = _as_is_package()
     assert package.package_hash != package.as_cover().definition_hash
+
+
+def test_a_package_pickles() -> None:
+    package = _as_is_package(label="separate")
+    read = pickle.loads(pickle.dumps(package))
+    assert read.package_hash == package.package_hash and read.label == "separate"
 
 
 def test_a_package_keeps_each_key_as_the_component_it_reads() -> None:
