@@ -1191,13 +1191,12 @@ def evaluate(
     """Evaluate one cover on a sample; return a comparison table.
 
     On a sample of one asset, `cover` is a resolved `Cover` or a design
-    (`DesignedCover`), and the table has one row. On a sample of several
-    assets, `cover` is a `JointDesignResult`, or a mapping from every asset id
-    of the sample to that asset's `Cover` or design (all covers or all
-    designs, each designed on that asset's own sample). On a sample of one
-    asset with index components, a cover reads its components and the row's
-    loss is the combined loss. The rows are then
-    those of the module docstring: a mapping gives one `"asset"` row per
+    (`DesignedCover`), and the table has one row. With index components, a
+    cover reads its components and the row's loss is the combined loss. On a
+    sample of several assets, `cover` is a `JointDesignResult`, or a mapping
+    from every asset id of the sample to that asset's `Cover` or design (all
+    covers or all designs, each designed on that asset's own sample). The rows
+    are then those of the module docstring: a mapping gives one `"asset"` row per
     asset and one `"total"` row, and a joint design one `"total"` row and, under
     `allocation`, one allocated row per asset. `split` is `"in_sample"` (on the
     design sample) or `"out_of_sample"` (on a sample that shares no period

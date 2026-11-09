@@ -22,10 +22,9 @@ searched on their stated grids, with the LP or QP above at each grid point
 (`route="grid"`). A `UserObjective`, or a payout that is not linear in its
 amounts or has no amounts, is searched on a grid over every free parameter
 and evaluated in numpy; candidates that break the budget or the limit are
-dropped. On a
-finite sample the objective is piecewise constant or piecewise smooth in the
-thresholds, so a stated grid is used rather than gradients; the objective at
-every candidate is kept (`DesignResult.profile`).
+dropped. On a finite sample the objective is piecewise constant or piecewise
+smooth in the thresholds, so a stated grid is used rather than gradients; the
+objective at every candidate is kept (`DesignResult.profile`).
 
 **Solver.** The LP and QP routes use HiGHS from the optional extra
 `crc-sdk[parametric]` (`pip install crc-sdk[parametric]`), imported only

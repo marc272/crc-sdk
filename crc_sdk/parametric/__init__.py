@@ -15,11 +15,10 @@ fitted curve, `sample_annual` reads the years of an `AnnualSeries`, and
 `OutcomeSample.from_table` takes a user table, which may hold several index
 columns: a sample may hold named `IndexComponent`s at one asset, and
 `OutcomeSample.component` takes one hazard's sample out of it. `LossModel`
-turns the hazard
-into a loss and a `BasisRisk` model states how index and loss differ. On
-per-year samples, `AsRecorded`, `RecentYears` and `LinearTrend` state how the
-climate trend is treated, and `sample_annual_pool` pools the model-years of
-several `ModelRun`s.
+turns the hazard into a loss and a `BasisRisk` model states how index and
+loss differ. On per-year samples, `AsRecorded`, `RecentYears` and
+`LinearTrend` state how the climate trend is treated, and `sample_annual_pool`
+pools the model-years of several `ModelRun`s.
 
 `design` chooses a template's free parameters on an outcome sample for an
 objective (`MSE`, `ExpectedUncovered`, `WeightedCVaR` or a `UserObjective`)
