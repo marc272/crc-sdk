@@ -479,9 +479,9 @@ class SampleProvenance:
     - `probability_semantics`: the curve's probability semantics, for Monte
       Carlo samples; otherwise `None`.
     - `loss_model` and `basis_risk`: their documents; `None` for a table. On a
-      sample of several hazards drawn or read per year, `loss_model` is `{"kind":
-      "components", "components": [{"name": name, "loss_model": document},
-      ...]}`, in component order, for the components with an impact.
+      sample of several hazards from curves or per-year series, `loss_model` is
+      `{"kind": "components", "components": [{"name": name, "loss_model":
+      document}, ...]}`, in component order, for the components with an impact.
     - `rng`: for every random step, in draw order, the bit generator's name
       and its state before the step, as JSON text. `generator()` rebuilds it.
     - `licences`: the licence and attribution each input declares.
