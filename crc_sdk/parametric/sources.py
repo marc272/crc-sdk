@@ -1091,7 +1091,10 @@ def sample_curve_hazards(
 
     The lineage is built from the components' lineages and not from the model,
     as the same generators give the same draws under every model: a design and
-    an evaluation need different generators, whichever models they state.
+    an evaluation need different generators, whichever models they state. The
+    provenance's `source_lineages` holds each component's lineage, which is
+    `sample_curve`'s for the same curve and generator, so a leakage check sees
+    those draws in either sample.
 
     Raises `SampleError` for fewer than two curves or an invalid name, mappings
     that name other components, no impact at all, a hazard unit a component's
@@ -1217,6 +1220,7 @@ def sample_curve_hazards(
                     },
                 }
             ),
+            source_lineages={name: each["lineage"] for name, each in own.items()},
             hazard_dependence=document,
             combine=rule_record,
             components=_moved_documents(own, order, document["kind"]),
@@ -1743,6 +1747,8 @@ def sample_annual(
     series the cover pays on: another cell, station or hazard than the loss
     reads, so the index and the loss differ by the data's own dependence.
     Its years must equal the hazard's. Without it the index is the hazard.
+    With it, the provenance's `source_lineages` holds each series' own lineage,
+    so a leakage check sees a year of either series in this sample.
 
     Each year is one row with probability `1/n`, and `period` is the year.
     A year without a value (in either series) raises, unless
@@ -1931,6 +1937,14 @@ def _annual_rows(
         notes=tuple(notes),
         lineage=_annual_lineage(asset, hazard, index),
         trend=trend_record,
+        source_lineages=(
+            None
+            if index is None
+            else {
+                "hazard": _annual_lineage(asset, hazard, None),
+                "index": _annual_lineage(asset, index, None),
+            }
+        ),
     )
     return OutcomeSample(
         asset_ids=(asset,),
@@ -2176,7 +2190,9 @@ def sample_annual_hazards(
 
     `sample.component(name)` is that hazard's own sample. On the same years,
     with no basis-risk draws or for the first component, it has the content
-    hash of `sample_annual` on that series.
+    hash of `sample_annual` on that series. The provenance's `source_lineages`
+    holds each series' lineage, which is `sample_annual`'s for that series and
+    asset, so a leakage check sees a year of the series in either sample.
 
     Raises `SampleError` for fewer than two series or an invalid name, tails
     not stated for every component, no impact at all, series that hold
@@ -2403,6 +2419,9 @@ def _hazards_provenance(
             }
         ),
         trend=trend_record,
+        source_lineages={
+            name: _annual_lineage(asset, each, None) for name, each in series.items()
+        },
         hazard_dependence={"kind": "data"},
         combine=rule_record,
         components={
