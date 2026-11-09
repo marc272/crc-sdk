@@ -2692,12 +2692,14 @@ def _check_out_of_sample(design: OutcomeSample, evaluation: OutcomeSample) -> No
             f"sample (e.g. {years[:5].tolist()}) from the same source ({sources}); "
             "evaluate out of sample on a held-out block or on fresh draws"
         )
-    fed = np.logical_or.reduce([held[lineage].rows for lineage in common])
+    common_rows = np.logical_or.reduce([held[lineage].rows for lineage in common])
     for role, sample in (("design", design), ("evaluation", evaluation)):
         fitted = _trend_of(sample).get("fit_years")
         if fitted is None:
             continue
-        overlap = np.intersect1d(np.array(fitted, dtype=np.int64), held_years[fed])
+        overlap = np.intersect1d(
+            np.array(fitted, dtype=np.int64), held_years[common_rows]
+        )
         if overlap.size:
             raise LeakageError(
                 f"the {role} sample's linear trend was fitted on {overlap.size} "
