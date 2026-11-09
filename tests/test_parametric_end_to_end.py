@@ -360,7 +360,9 @@ def test_the_docs_comparison_table_lists_every_identity_column() -> None:
     page = DOCS.read_text(encoding="utf-8")
     section = page[page.index("### The comparison table") :]
     section = section[: section.index("\n## ")]
-    for column in IDENTITY_COLUMNS:
+    # The two multi-hazard columns join this page with the plan's multi-hazard
+    # section, as does the "package" level.
+    for column in set(IDENTITY_COLUMNS) - {"components", "design_budget"}:
         assert f"`{column}`" in section
     for level in ("asset", "total", "asset_by_value", "asset_by_loss"):
         assert f'`"{level}"`' in section

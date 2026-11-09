@@ -66,6 +66,8 @@ from crc_sdk.parametric.metadata import _EvaluationModel
 __all__ = [
     "MetricColumn",
     "MetricOptions",
+    "breakdown_columns",
+    "breakdown_values",
     "metric_columns",
     "metric_values",
 ]
@@ -434,3 +436,55 @@ def metric_values(
                 1.0 - 1.0 / period
             )
     return values
+
+
+def breakdown_columns(options: MetricOptions) -> tuple[MetricColumn, ...]:
+    """Return the value columns of a payout breakdown, in table order."""
+    return (
+        MetricColumn(
+            "expected_payout",
+            "expected_payout",
+            {},
+            "loss",
+            "E[payout of the part]; the rows of one entry add up to its E[payout]",
+        ),
+        MetricColumn(
+            "share",
+            "share",
+            {},
+            "ratio",
+            "the part's share of the entry's E[payout]; null when that is 0",
+        ),
+        MetricColumn(
+            "payout_frequency",
+            "payout_frequency",
+            {},
+            "ratio",
+            f"P(the part pays more than {options.payout_threshold:g})",
+        ),
+    )
+
+
+def breakdown_values(
+    part: ArrayLike,
+    probability: ArrayLike,
+    *,
+    expected_payout: float,
+    options: MetricOptions,
+) -> dict[str, float | None]:
+    """Return the values of `breakdown_columns(options)` for one part.
+
+    `part` holds the part's payout per draw and `expected_payout` the entry's
+    E[payout]. Raises `EvaluationError` for an invalid part or probabilities.
+    """
+    try:
+        draws = Draws(part, probability)
+    except ValueError as error:
+        raise EvaluationError(str(error)) from error
+    pays = draws.values > options.payout_threshold
+    expected = draws.mean()
+    return {
+        "expected_payout": expected,
+        "share": _ratio(expected, expected_payout),
+        "payout_frequency": _fsum(draws.probability[pays]) + 0.0,
+    }

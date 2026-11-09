@@ -69,6 +69,7 @@ from crc_sdk.parametric.cover import (
 )
 from crc_sdk.parametric.errors import SolverUnavailableError
 from crc_sdk.parametric.index import Tail
+from crc_sdk.parametric.metadata import IDENTITY_COLUMNS
 from crc_sdk.parametric.parameters import _resolve_values
 from crc_sdk.parametric.payouts import _REGISTRY
 from crc_sdk.parametric.sample import (
@@ -1670,7 +1671,7 @@ def test_a_table_of_both_kinds_writes_and_reads(tmp_path: Path) -> None:
     write_comparison(table, path)
     read = pq.read_table(path)
     assert read.num_rows == 2
-    assert to_long(read).num_rows == 2 * (read.num_columns - 14)
+    assert to_long(read).num_rows == 2 * (read.num_columns - len(IDENTITY_COLUMNS))
 
 
 def test_a_composite_document_goes_into_the_metadata() -> None:

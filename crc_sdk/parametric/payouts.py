@@ -30,15 +30,30 @@ family implements `PayoutFunction` (and `LinearInAmounts` for payouts linear
 in their amounts) and is made readable from cover documents with
 `register_payout`. A user family on several index components has several
 `index_names`, a `tail` of one entry per name, and takes an `(n, k)` index.
+
+Two built-in families combine one-index payouts, one per index component, and
+go on a cover with a `CompositeIndex` of those names:
+
+- `SumOf(components)`: the sum of the components' payouts. A year pays on
+  each component that pays, independently of the others.
+- `MaxOf(components, scale=1.0)`: `scale` times the largest of the components'
+  payouts. One year pays one amount.
+
+A component's parameter is named `<component>.<parameter>`, such as
+`rx1day.levels[2]`, and a `MaxOf`'s own is `scale`. Component payouts are read
+through the registry, so a registered user family can be a component.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import itertools
 import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Real
+from types import MappingProxyType
 from typing import (
     Annotated,
     Any,
@@ -46,6 +61,7 @@ from typing import (
     Protocol,
     Self,
     TypeVar,
+    cast,
     runtime_checkable,
 )
 
@@ -53,13 +69,14 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from pydantic import BeforeValidator, Strict, model_validator
 
+from crc_sdk.parametric._canonical import canonical_json
 from crc_sdk.parametric.errors import (
     CoverDefinitionError,
     SampleError,
     UnknownPayoutKindError,
     UnresolvedParameterError,
 )
-from crc_sdk.parametric.index import Tail
+from crc_sdk.parametric.index import Tail, _component_name
 from crc_sdk.parametric.parameters import Free, _DefinitionModel, _resolve_values
 
 __all__ = [
@@ -67,9 +84,11 @@ __all__ = [
     "LinearConstraints",
     "LinearInAmounts",
     "LinearPayout",
+    "MaxOf",
     "PayoutFunction",
     "PiecewiseLinearPayout",
     "StepPayout",
+    "SumOf",
     "register_payout",
 ]
 
@@ -141,6 +160,11 @@ class LinearInAmounts(PayoutFunction, Protocol):
     def basis(self, index: FloatArray) -> FloatArray: ...
 
     def amount_constraints(self, limit: float | None = None) -> LinearConstraints: ...
+
+
+def _has_amounts(payout: Any) -> bool:
+    """Whether a payout's amounts can be solved: `LinearInAmounts` with at least one."""
+    return isinstance(payout, LinearInAmounts) and bool(payout.amount_names())
 
 
 def _float_array(name: str, values: ArrayLike, ndim: int) -> FloatArray:
@@ -449,12 +473,7 @@ class _BuiltinPayout(_DefinitionModel):
             ]
         )
         if limit is not None:
-            cap = None if isinstance(limit, bool) else _parameter_or_none(limit)
-            if cap is None or cap < 0:
-                raise CoverDefinitionError(
-                    f"limit must be a finite number >= 0, got {limit!r}"
-                )
-            upper = np.minimum(upper, cap)
+            upper = np.minimum(upper, _checked_limit(limit))
         n_amounts = len(items)
         if self._monotone() and n_amounts > 1:
             a_ub = np.zeros((n_amounts - 1, n_amounts))
@@ -505,6 +524,14 @@ def _parameter_or_none(value: Any) -> float | None:
         return None
     number = float(value)
     return number if math.isfinite(number) else None
+
+
+def _checked_limit(limit: Any) -> float:
+    """Return a limit as a float; raise `CoverDefinitionError` if it is invalid."""
+    cap = None if isinstance(limit, bool) else _parameter_or_none(limit)
+    if cap is None or cap < 0:
+        raise CoverDefinitionError(f"limit must be a finite number >= 0, got {limit!r}")
+    return cap
 
 
 def _document_value(value: Any) -> Any:
@@ -767,6 +794,541 @@ def _check_banded(
     )
 
 
+_COMPONENT_ENTRY_KEYS = frozenset({"name", "payout"})
+
+
+def _read_components(components: Any, kind: str) -> Mapping[str, PayoutFunction]:
+    """Return the components, read-only; raise `CoverDefinitionError` if invalid."""
+    if not isinstance(components, Mapping):
+        raise CoverDefinitionError(
+            f"a {kind} payout maps each component name to a one-index payout, "
+            f"got {type(components).__name__}"
+        )
+    if len(components) < 2:
+        raise CoverDefinitionError(
+            f"a {kind} payout holds two components or more, got {len(components)}"
+        )
+    for name, payout in components.items():
+        _component_name(name)
+        if not isinstance(payout, PayoutFunction):
+            raise CoverDefinitionError(
+                f"component {name!r} must implement PayoutFunction, "
+                f"got {type(payout).__name__}"
+            )
+        if tuple(payout.index_names) != ("index",) or not isinstance(payout.tail, str):
+            raise CoverDefinitionError(
+                f"component {name!r} must be a payout on one index, "
+                f"index_names == ('index',); got {payout.index_names!r}"
+            )
+    return MappingProxyType(dict(components))
+
+
+def _components_from_document(
+    document: Any, kind: str, keys: frozenset[str]
+) -> dict[str, PayoutFunction]:
+    """Read the components of a document that `to_document` wrote."""
+    if not isinstance(document, Mapping):
+        raise CoverDefinitionError("a payout document must be an object")
+    if document.get("kind") != kind:
+        raise CoverDefinitionError(
+            f"expected a payout of kind {kind!r}, got {document.get('kind')!r}"
+        )
+    if set(document) != keys:
+        raise CoverDefinitionError(f"a {kind} document has the keys {sorted(keys)}")
+    entries = document["components"]
+    if isinstance(entries, str | bytes | Mapping) or not isinstance(entries, Sequence):
+        raise CoverDefinitionError(f"a {kind} document's components is a list")
+    components: dict[str, PayoutFunction] = {}
+    for entry in entries:
+        if not isinstance(entry, Mapping) or set(entry) != _COMPONENT_ENTRY_KEYS:
+            raise CoverDefinitionError(
+                f"each component of a {kind} document has the keys "
+                f"{sorted(_COMPONENT_ENTRY_KEYS)}"
+            )
+        name = _component_name(entry["name"])
+        if name in components:
+            raise CoverDefinitionError(f"a {kind} document repeats component {name!r}")
+        payout = entry["payout"]
+        if not isinstance(payout, Mapping):
+            raise CoverDefinitionError("a payout document must be an object")
+        components[name] = _payout_reader(payout.get("kind"))(payout)
+    return components
+
+
+def _payout_from_document(document: Mapping[str, Any]) -> Any:
+    """Read a payout document through the registry."""
+    return _payout_reader(document["kind"])(document)
+
+
+def _no_constraints() -> LinearConstraints:
+    return LinearConstraints(
+        a_ub=np.zeros((0, 0)),
+        b_ub=np.zeros(0),
+        lower=np.zeros(0),
+        upper=np.zeros(0),
+    )
+
+
+def _is_ordered(constraints: LinearConstraints) -> bool:
+    """Whether the constraints hold `a_i <= a_{i+1}` for every pair of amounts."""
+    needed = {(i, i + 1) for i in range(constraints.n_amounts - 1)}
+    for row, bound in zip(constraints.a_ub, constraints.b_ub, strict=True):
+        nonzero = np.flatnonzero(row)
+        if (
+            nonzero.size == 2
+            and bound == 0.0
+            and row[nonzero[0]] == 1.0
+            and row[nonzero[1]] == -1.0
+        ):
+            needed.discard((int(nonzero[0]), int(nonzero[1])))
+    return not needed
+
+
+def _total_limit_rows(parts: Sequence[LinearConstraints]) -> FloatArray:
+    """The rows that keep every choice of one amount per component within a limit.
+
+    A component whose amounts are ordered pays at most its last one, so it
+    offers only that; any other offers each of its amounts.
+    """
+    choices: list[list[int]] = []
+    start = 0
+    for part in parts:
+        end = start + part.n_amounts
+        choices.append([end - 1] if _is_ordered(part) else list(range(start, end)))
+        start = end
+    picks = np.array(list(itertools.product(*choices)), dtype=np.int64)
+    rows = np.zeros((picks.shape[0], start))
+    rows[np.arange(picks.shape[0])[:, None], picks] = 1.0
+    return rows
+
+
+@dataclass(frozen=True, eq=False)
+class _OfComponents:
+    """What `SumOf` and `MaxOf` share: one-index payouts, by component name."""
+
+    kind: ClassVar[str]
+
+    components: Mapping[str, PayoutFunction]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "components", _read_components(self.components, self.kind)
+        )
+
+    @property
+    def tail(self) -> tuple[Tail, ...]:
+        """Each component's severe side, in order."""
+        return tuple(cast(Tail, payout.tail) for payout in self.components.values())
+
+    @property
+    def index_names(self) -> tuple[str, ...]:
+        """The components, in the order of the columns of the index."""
+        return tuple(self.components)
+
+    def _component_parameters(self) -> dict[str, float | Free]:
+        return {
+            f"{name}.{key}": value
+            for name, payout in self.components.items()
+            for key, value in payout.parameters().items()
+        }
+
+    def parameters(self) -> dict[str, float | Free]:
+        """Every parameter by `<component>.<its name>`, in component order."""
+        return self._component_parameters()
+
+    def _with_component_values(
+        self, values: Mapping[str, float]
+    ) -> dict[str, PayoutFunction]:
+        """The components with `values`, keyed `<component>.<parameter>`."""
+        parts: dict[str, dict[str, float]] = {name: {} for name in self.components}
+        for key, value in values.items():
+            name, _, parameter = key.partition(".")
+            parts[name][parameter] = value
+        return {
+            name: payout.with_values(parts[name]) if parts[name] else payout
+            for name, payout in self.components.items()
+        }
+
+    def _require_resolved(
+        self, parameters: Mapping[str, float | Free] | None = None
+    ) -> None:
+        chosen = self.parameters() if parameters is None else parameters
+        free = [key for key, value in chosen.items() if isinstance(value, Free)]
+        if free:
+            raise UnresolvedParameterError(
+                f"the {self.kind} payout has free parameters: {', '.join(free)}"
+            )
+
+    def _columns(self, index: ArrayLike) -> FloatArray:
+        values = _index_values(index, ndim=2)
+        if values.shape[1] != len(self.components):
+            raise SampleError(
+                f"index values must have one column per component "
+                f"{list(self.components)}, got shape {values.shape}"
+            )
+        return values
+
+    def _component_payouts(self, index: ArrayLike) -> FloatArray:
+        """Each component's payout: `(n, k)`, one column per component."""
+        values = self._columns(index)
+        columns: list[FloatArray] = []
+        for column, (name, payout) in enumerate(self.components.items()):
+            paid = np.asarray(payout.evaluate(values[:, column]), dtype=np.float64)
+            if paid.shape != (values.shape[0],):
+                raise CoverDefinitionError(
+                    f"component {name!r} returned shape {paid.shape} for "
+                    f"{values.shape[0]} index values"
+                )
+            columns.append(paid)
+        return np.column_stack(columns)
+
+    def _components_document(self) -> list[dict[str, Any]]:
+        # A list, because canonical JSON sorts the keys of an object and the
+        # order of the components is part of the terms.
+        return [
+            {"name": name, "payout": dict(payout.to_document())}
+            for name, payout in self.components.items()
+        ]
+
+    def to_document(self) -> dict[str, Any]:
+        """Return `kind` and the components, each with its own document."""
+        return {"components": self._components_document(), "kind": self.kind}
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is not type(self):
+            return NotImplemented
+        assert isinstance(other, _OfComponents)
+        return canonical_json(self.to_document()) == canonical_json(other.to_document())
+
+    def __hash__(self) -> int:
+        return hash(canonical_json(self.to_document()))
+
+    def __reduce__(self) -> tuple[Any, tuple[dict[str, Any]]]:
+        return (_payout_from_document, (self.to_document(),))
+
+
+@dataclass(frozen=True, eq=False)
+class SumOf(_OfComponents):
+    """Pays the sum of one-index payouts, one per index component.
+
+    `components` maps each component's name to a one-index payout (a built-in
+    family or a registered user family), two or more, in order. A year pays
+    `sum_k pi_k(s_k)`, each component on its own index, so its parameters are
+    named `<component>.<parameter>`. It goes on a cover with a `CompositeIndex`
+    of the same names.
+
+    The payout is linear in every amount when every component is
+    `LinearInAmounts` with at least one amount: `basis` is then the block
+    `[B_1 | ... | B_K]`. Otherwise `amount_names()` is empty and a design takes
+    the numpy grid over every free parameter.
+
+    A limit bounds the year's total, not each amount: see
+    `amount_constraints`.
+
+    Raises `CoverDefinitionError` for fewer than two components, an invalid
+    name, or a component that is not a one-index payout.
+    """
+
+    kind: ClassVar[str] = "sum_of"
+
+    def with_values(self, values: Mapping[str, float]) -> Self:
+        """Return a copy with values for some of the free parameters.
+
+        Raises `CoverDefinitionError` for an unknown or fixed parameter, a
+        value outside its bounds, or a component that becomes invalid.
+        """
+        checked = _resolve_values(self.parameters(), values)
+        return type(self)(self._with_component_values(checked))
+
+    def evaluate(self, index: FloatArray) -> FloatArray:
+        """Return the payout of each row of an `(n, k)` index: `(n,)`.
+
+        Raises `UnresolvedParameterError` if a parameter is free, and
+        `SampleError` for an index of the wrong shape or with non-finite
+        values.
+        """
+        self._require_resolved()
+        payout: FloatArray = self._component_payouts(index).sum(axis=1)
+        return payout
+
+    def breakdown(self, index: FloatArray) -> dict[str, FloatArray]:
+        """Return each component's payout of an `(n, k)` index, by name."""
+        self._require_resolved()
+        paid = self._component_payouts(index)
+        return {name: paid[:, j] for j, name in enumerate(self.components)}
+
+    def _linear(self) -> bool:
+        return all(_has_amounts(payout) for payout in self.components.values())
+
+    def amount_names(self) -> tuple[str, ...]:
+        """The amounts, in the column order of `basis`; empty if not linear."""
+        if not self._linear():
+            return ()
+        return tuple(
+            f"{name}.{amount}"
+            for name, payout in self.components.items()
+            for amount in cast(LinearInAmounts, payout).amount_names()
+        )
+
+    def _bases(self, index: ArrayLike) -> list[FloatArray]:
+        values = self._columns(index)
+        bases: list[FloatArray] = []
+        for column, (name, payout) in enumerate(self.components.items()):
+            family = cast(LinearInAmounts, payout)
+            basis = np.asarray(family.basis(values[:, column]), dtype=np.float64)
+            if basis.shape != (values.shape[0], len(family.amount_names())):
+                raise CoverDefinitionError(
+                    f"component {name!r} returned a basis of shape {basis.shape}"
+                )
+            bases.append(basis)
+        return bases
+
+    def basis(self, index: FloatArray) -> FloatArray:
+        """Return the block basis `[B_1 | ... | B_K]`, `(n, len(amount_names()))`.
+
+        Needs the thresholds resolved; raises `UnresolvedParameterError`
+        otherwise, and `SampleError` for an index of the wrong shape.
+        """
+        if not self._linear():
+            return np.zeros((self._columns(index).shape[0], 0))
+        return np.hstack(self._bases(index))
+
+    def _largest_row_sums(self, index: ArrayLike) -> dict[str, float]:
+        """The largest sum of a row of each component's basis, by name."""
+        return {
+            name: float(basis.sum(axis=1).max(initial=0.0))
+            for name, basis in zip(self.components, self._bases(index), strict=True)
+        }
+
+    def amount_constraints(self, limit: float | None = None) -> LinearConstraints:
+        """Return the bounds and constraints of the components, side by side.
+
+        `limit` bounds the year's total: for every choice of one amount per
+        component, the chosen amounts sum to at most `limit`. Each component
+        pays at most its largest amount and any can reach it, so that is the
+        worst year. A component with ordered amounts offers its last amount,
+        so with every component monotone this is one row, and otherwise up to
+        the product of the numbers of amounts. No amount can then exceed the
+        limit either, so every upper bound is capped at it. Raises
+        `CoverDefinitionError` for a negative or non-finite limit.
+        """
+        if not self._linear():
+            return _no_constraints()
+        cap = None if limit is None else _checked_limit(limit)
+        parts = [
+            cast(LinearInAmounts, payout).amount_constraints(cap)
+            for payout in self.components.values()
+        ]
+        n_amounts = sum(part.n_amounts for part in parts)
+        blocks: list[FloatArray] = []
+        bounds = [part.b_ub for part in parts]
+        start = 0
+        for part in parts:
+            block = np.zeros((part.a_ub.shape[0], n_amounts))
+            block[:, start : start + part.n_amounts] = part.a_ub
+            blocks.append(block)
+            start += part.n_amounts
+        if cap is not None:
+            rows = _total_limit_rows(parts)
+            blocks.append(rows)
+            bounds.append(np.full(rows.shape[0], cap))
+        return LinearConstraints(
+            a_ub=np.vstack(blocks),
+            b_ub=np.concatenate(bounds),
+            lower=np.concatenate([part.lower for part in parts]),
+            upper=np.concatenate([part.upper for part in parts]),
+        )
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any]) -> Self:
+        """Read a payout written by `to_document`.
+
+        Raises `UnknownPayoutKindError` for a component of an unregistered
+        kind, and `CoverDefinitionError` for another `kind` or invalid keys.
+        """
+        return cls(
+            _components_from_document(
+                document, cls.kind, frozenset({"components", "kind"})
+            )
+        )
+
+
+@dataclass(frozen=True, eq=False)
+class MaxOf(_OfComponents):
+    """Pays a scale times the largest of one-index payouts, one per component.
+
+    `components` is as for `SumOf`, and a year pays
+    `scale * max_k pi_k(s_k)`: one contract, one amount. `scale` is a float, or
+    `Free` for a design to choose it.
+
+    The payout is linear in the scale when the scale is free and every
+    component is `LinearInAmounts` with fixed amounts: `amount_names()` is then
+    `("scale",)` and `basis` the column `max_k pi_k(s_k)`. In every other case
+    `amount_names()` is empty and a design takes the numpy grid over every free
+    parameter: the objective is not convex in the component amounts, so they
+    have no linear or quadratic programme.
+
+    On a free scale a limit bounds the largest year: with `G` the largest
+    amount of any component, `scale <= limit / G`.
+
+    Raises `CoverDefinitionError` as `SumOf` does, for a negative or non-finite
+    scale, and for a free scale beside a free component amount, because the
+    scale would multiply amounts that are free already, so it is not
+    identified.
+    """
+
+    kind: ClassVar[str] = "max_of"
+
+    scale: float | Free = dataclasses.field(default=1.0, kw_only=True)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        try:
+            scale = _parameter_value(self.scale)
+        except CoverDefinitionError as error:
+            raise CoverDefinitionError(f"scale {error}") from error
+        _check_amounts(("scale",), (scale,), monotone=False, what="scale")
+        object.__setattr__(self, "scale", scale)
+        if isinstance(scale, Free):
+            free = self._free_amounts()
+            if free:
+                raise CoverDefinitionError(
+                    "a free scale beside free component amounts is not identified: "
+                    f"it would multiply {free}, which are free already; fix the "
+                    "scale or those amounts"
+                )
+
+    def _free_amounts(self) -> list[str]:
+        amounts: list[str] = []
+        for name, payout in self.components.items():
+            if isinstance(payout, LinearInAmounts):
+                values = payout.parameters()
+                amounts += [
+                    f"{name}.{amount}"
+                    for amount in payout.amount_names()
+                    if isinstance(values[amount], Free)
+                ]
+        return amounts
+
+    def parameters(self) -> dict[str, float | Free]:
+        """Every parameter: the components', then `scale`."""
+        return {**super().parameters(), "scale": self.scale}
+
+    def with_values(self, values: Mapping[str, float]) -> Self:
+        """Return a copy with values for some of the free parameters.
+
+        Raises `CoverDefinitionError` for an unknown or fixed parameter, a
+        value outside its bounds, or a component that becomes invalid.
+        """
+        checked = _resolve_values(self.parameters(), values)
+        scale = checked.pop("scale", self.scale)
+        return type(self)(self._with_component_values(checked), scale=scale)
+
+    def _largest(self, index: ArrayLike) -> FloatArray:
+        largest: FloatArray = self._component_payouts(index).max(axis=1)
+        return largest
+
+    def evaluate(self, index: FloatArray) -> FloatArray:
+        """Return the payout of each row of an `(n, k)` index: `(n,)`.
+
+        Raises `UnresolvedParameterError` if a parameter is free, and
+        `SampleError` for an index of the wrong shape or with non-finite
+        values.
+        """
+        self._require_resolved()
+        payout: FloatArray = cast(float, self.scale) * self._largest(index)
+        return payout
+
+    def breakdown(self, index: FloatArray) -> dict[str, FloatArray]:
+        """Return an attribution of each year's payout to the components.
+
+        The year's payout goes to the component paying most, in equal shares
+        when several tie. It is an attribution: one contract pays one amount.
+        """
+        self._require_resolved()
+        paid = self._component_payouts(index)
+        largest = paid.max(axis=1, keepdims=True)
+        paying = paid == largest
+        share = paying / paying.sum(axis=1, keepdims=True)
+        attributed = cast(float, self.scale) * largest * share
+        return {name: attributed[:, j] for j, name in enumerate(self.components)}
+
+    def _linear(self) -> bool:
+        return isinstance(self.scale, Free) and all(
+            _has_amounts(payout) for payout in self.components.values()
+        )
+
+    def amount_names(self) -> tuple[str, ...]:
+        """`("scale",)` when the payout is linear in a free scale, else empty."""
+        return ("scale",) if self._linear() else ()
+
+    def basis(self, index: FloatArray) -> FloatArray:
+        """Return the column `max_k pi_k(s_k)`, `(n, len(amount_names()))`.
+
+        Needs every component parameter resolved; raises
+        `UnresolvedParameterError` otherwise, and `SampleError` for an index of
+        the wrong shape.
+        """
+        if not self._linear():
+            return np.zeros((self._columns(index).shape[0], 0))
+        self._require_resolved(self._component_parameters())
+        return self._largest(index).reshape(-1, 1)
+
+    def _largest_amount(self) -> float:
+        """The largest amount of any component; every amount is fixed."""
+        amounts: list[float] = []
+        for payout in self.components.values():
+            family = cast(LinearInAmounts, payout)
+            values = family.parameters()
+            amounts += [
+                float(cast(float, values[amount])) for amount in family.amount_names()
+            ]
+        return max(amounts)
+
+    def amount_constraints(self, limit: float | None = None) -> LinearConstraints:
+        """Return the bounds of a free scale, under `limit` if one is given.
+
+        With `G` the largest amount of any component, `limit` adds
+        `scale <= limit / G`. Raises `CoverDefinitionError` for a negative or
+        non-finite limit.
+        """
+        if not self._linear():
+            return _no_constraints()
+        scale = cast(Free, self.scale)
+        upper = math.inf if scale.upper is None else scale.upper
+        if limit is not None:
+            cap = _checked_limit(limit)
+            largest = self._largest_amount()
+            if largest > 0.0:
+                upper = min(upper, cap / largest)
+        return LinearConstraints(
+            a_ub=np.zeros((0, 1)),
+            b_ub=np.zeros(0),
+            lower=np.array([scale.lower]),
+            upper=np.array([upper]),
+        )
+
+    def to_document(self) -> dict[str, Any]:
+        """Return `kind`, the components and the scale."""
+        return {
+            **super().to_document(),
+            "scale": _document_value(self.scale),
+        }
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any]) -> Self:
+        """Read a payout written by `to_document`.
+
+        Raises `UnknownPayoutKindError` for a component of an unregistered
+        kind, and `CoverDefinitionError` for another `kind`, invalid keys or
+        an invalid scale.
+        """
+        components = _components_from_document(
+            document, cls.kind, frozenset({"components", "kind", "scale"})
+        )
+        return cls(components, scale=document["scale"])
+
+
 _KIND = re.compile(r"^\S(?:.*\S)?$")
 _PAYOUT_METHODS = ("parameters", "with_values", "evaluate", "to_document")
 _REGISTRY: dict[str, type[Any]] = {}
@@ -828,6 +1390,13 @@ def _payout_reader(kind: Any) -> Callable[[Mapping[str, Any]], Any]:
     return reader
 
 
-for _family in (LinearPayout, StepPayout, PiecewiseLinearPayout, BinaryPayout):
+for _family in (
+    LinearPayout,
+    StepPayout,
+    PiecewiseLinearPayout,
+    BinaryPayout,
+    SumOf,
+    MaxOf,
+):
     register_payout(_family)
 del _family

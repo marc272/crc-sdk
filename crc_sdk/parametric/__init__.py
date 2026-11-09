@@ -7,7 +7,7 @@ user family that implements `PayoutFunction` and is registered with
 design chooses within bounds. Covers round-trip through canonical JSON and
 carry a `definition_hash`, as `ImpactExpression` does. A cover on several
 hazards pays on a `CompositeIndex`, through a family with several
-`index_names`.
+`index_names`: `SumOf` and `MaxOf` combine one-index payouts, or a user family.
 
 Covers are designed and evaluated on an `OutcomeSample`, one row per year
 with an index value and a loss: `sample_curve` draws simulated years from a
@@ -25,7 +25,10 @@ objective (`MSE`, `ExpectedUncovered`, `WeightedCVaR` or a `UserObjective`)
 under a `Budget` and a `Limit`; its LP and QP routes need the optional extra
 `crc-sdk[parametric]`. `design_joint` designs one cover per asset of a
 sample of several assets, for one objective and one budget on the asset
-owner's total. `evaluate` and `compare` assess covers and designs.
+owner's total. `evaluate` and `compare` assess covers and designs, and
+`payout_breakdown` splits each one's expected payout into its parts. A
+`CoverPackage` is separately designed contracts on one asset's hazards, as one
+row of a comparison, and `split_budget` splits one budget between them.
 
 `ParametricPlan` chains these steps as a lazy plan, to a written
 comparison: `ParametricPlan.for_evaluation(request)` from the fitted hazard
@@ -62,7 +65,15 @@ from crc_sdk.parametric.errors import (
     UnknownPayoutKindError,
     UnresolvedParameterError,
 )
-from crc_sdk.parametric.evaluate import compare, evaluate, to_long, write_comparison
+from crc_sdk.parametric.evaluate import (
+    CoverPackage,
+    compare,
+    evaluate,
+    payout_breakdown,
+    split_budget,
+    to_long,
+    write_comparison,
+)
 from crc_sdk.parametric.index import (
     AtAsset,
     AtCell,
@@ -92,9 +103,11 @@ from crc_sdk.parametric.payouts import (
     LinearConstraints,
     LinearInAmounts,
     LinearPayout,
+    MaxOf,
     PayoutFunction,
     PiecewiseLinearPayout,
     StepPayout,
+    SumOf,
     register_payout,
 )
 from crc_sdk.parametric.plan import (
@@ -142,6 +155,7 @@ __all__ = [
     "CostOfCapitalLoad",
     "Cover",
     "CoverDefinitionError",
+    "CoverPackage",
     "DesignError",
     "DesignOptions",
     "DesignResult",
@@ -170,6 +184,7 @@ __all__ = [
     "LinearTrend",
     "LossModel",
     "MSE",
+    "MaxOf",
     "MetricOptions",
     "ModelPool",
     "ModelRun",
@@ -189,6 +204,7 @@ __all__ = [
     "SolverUnavailableError",
     "StationColumn",
     "StepPayout",
+    "SumOf",
     "UnboundedDesignError",
     "UnknownPayoutKindError",
     "UnresolvedParameterError",
@@ -199,12 +215,14 @@ __all__ = [
     "design_joint",
     "evaluate",
     "holdout",
+    "payout_breakdown",
     "register_payout",
     "sample_annual",
     "sample_annual_pool",
     "sample_curve",
     "sample_curves",
     "setup_text",
+    "split_budget",
     "to_long",
     "write_comparison",
     "year_block_kfold",

@@ -38,6 +38,15 @@ rows have no premium and no net-loss columns.
 read the loss of the sample, the combined loss, for every cover: a cover with
 a `CompositeIndex` pays on the components of its names, and a cover on one
 index on the component named its `hazard_name`, so both kinds share one table.
+The column `components` says what each row's cover reads, and `design_budget`
+the design's budget bound; a row of a cover given as is has none.
+
+**A package of separate contracts** (`CoverPackage`) sets one-index covers,
+each designed on its own, beside a cover on several components. It gets one
+`"asset"` row per contract and one `"package"` row, with the metrics of the
+year's total payout against the combined loss and the sum of the contracts'
+premiums. `split_budget` splits one budget between the contracts, by stated
+shares. A measurement of a stated setup, as every row here.
 
 **In and out of sample.** In sample means the design sample. Out of sample
 means a held-out block of years (`holdout`, `year_block_kfold`), fresh Monte
@@ -53,6 +62,12 @@ priced on the design sample (`"design"`), so out-of-sample rows use the price
 agreed at design; otherwise the premium priced on the evaluation sample with
 `pricing` (`"evaluation"`).
 
+**The breakdown.** `payout_breakdown(covers, sample, *, split, ...)` returns a
+separate table with one row per entry and part: the part's expected payout, its
+share of the entry's and how often it pays. The rows of one entry add up to its
+E[payout]. A `MaxOf`'s rows are an attribution, because one contract pays one
+amount.
+
 Invalid arguments raise `EvaluationError` (a `ValueError`), and arguments of
 the wrong type `TypeError`; problems of the cover or the sample raise
 `UnresolvedParameterError`, `SampleError` or `LeakageError`.
@@ -65,9 +80,10 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal, Protocol, get_args, runtime_checkable
 from uuid import uuid4
 
@@ -78,12 +94,14 @@ from numpy.typing import NDArray
 
 from crc_sdk._version import framework_version, platform_tag, sdk_version
 from crc_sdk.parametric._canonical import content_hash
+from crc_sdk.parametric.constraints import Budget
 from crc_sdk.parametric.cover import Cover
 from crc_sdk.parametric.errors import (
     EvaluationError,
     SampleError,
     UnresolvedParameterError,
 )
+from crc_sdk.parametric.index import CompositeIndex, _component_name
 from crc_sdk.parametric.joint import JointDesignResult, covers_hash
 from crc_sdk.parametric.metadata import (
     EVALUATION_METADATA_KEY,
@@ -94,7 +112,15 @@ from crc_sdk.parametric.metadata import (
     EvaluationSetup,
     _identity_columns,
 )
-from crc_sdk.parametric.metrics import MetricOptions, metric_columns, metric_values
+from crc_sdk.parametric.metrics import (
+    MetricColumn,
+    MetricOptions,
+    breakdown_columns,
+    breakdown_values,
+    metric_columns,
+    metric_values,
+)
+from crc_sdk.parametric.payouts import MaxOf, SumOf
 from crc_sdk.parametric.pricing import CostOfCapitalLoad, Pricing, PurePremium
 from crc_sdk.parametric.sample import (
     OutcomeSample,
@@ -107,6 +133,7 @@ from crc_sdk.parametric.sample import (
 
 __all__ = [
     "Allocation",
+    "CoverPackage",
     "CoverSet",
     "DesignedCover",
     "EvaluationEntry",
@@ -114,6 +141,8 @@ __all__ = [
     "Split",
     "compare",
     "evaluate",
+    "payout_breakdown",
+    "split_budget",
     "to_long",
     "write_comparison",
 ]
@@ -141,6 +170,15 @@ _NO_PREMIUM_METRICS = frozenset(
     {"premium", "var_net_loss", "cvar_net_loss", "net_loss_rp"}
 )
 """The metrics that need a premium, so an allocated row leaves them null."""
+
+_PARTS_TOLERANCE = 1e-9
+"""How far the parts of a payout may be from it, relative to its largest year."""
+
+_SHARES_TOLERANCE = 1e-9
+"""How far the stated shares of a budget may sum from 1."""
+
+_PART_KINDS: Mapping[type[Any], str] = {SumOf: "component", MaxOf: "attribution"}
+"""The `part_kind` of each built-in family with a `breakdown`."""
 
 
 @runtime_checkable
@@ -190,9 +228,6 @@ class DesignedCover(Protocol):
 CoverSet = Mapping[str, Cover | DesignedCover]
 """Covers that each stand on their own: every asset id to its cover or design."""
 
-EvaluationEntry = Cover | DesignedCover | JointDesignResult | CoverSet
-"""What `evaluate` and `compare` take: see their docstrings."""
-
 
 @dataclass(frozen=True)
 class _Item:
@@ -220,9 +255,6 @@ class _JointEntry:
 
     design: JointDesignResult
     record: dict[str, Any]
-
-
-_Entry = _Item | _CoverSet | _JointEntry
 
 
 @dataclass(frozen=True)
@@ -356,7 +388,130 @@ def _cover_set(entry: Mapping[Any, Any]) -> _CoverSet:
     return _CoverSet(items)
 
 
+@dataclass(frozen=True, eq=False, init=False)
+class CoverPackage:
+    """Separate contracts on one asset's hazards, as one row of a comparison.
+
+    `covers` maps each component name to the one-index cover or the design of
+    the contract on that component: two or more, all covers or all designs,
+    with one `payout_unit` and one `asset_id` (or none). Each key is the
+    component the contract reads, so it need not equal the cover's
+    `hazard_name`. `label` is a display name.
+
+    A package holds contracts that each keep their own terms, record and
+    premium:
+
+    - `covers`: the covers, by component name;
+    - `index`: the `CompositeIndex` of their indices;
+    - `payout`: the `SumOf` of the covers as designed, every amount fixed;
+    - `as_cover()`: the same payout as one contract;
+    - `package_hash`: `covers_hash` of `covers`, so it cannot collide with the
+      `definition_hash` of a one-contract `SumOf` of the same terms.
+
+    `evaluate` and `compare` take a package as an entry and give one row per
+    contract and one `"package"` row: the premium there is the sum of the
+    contracts', each on its own terms, so a loading applies per contract. Each
+    cover keeps its own limit, and the package has none of its own.
+
+    Raises `EvaluationError` for fewer than two covers, a mix of covers and
+    designs, a cover on several components, or different units or assets;
+    `UnresolvedParameterError` for a template; `TypeError` for arguments of
+    the wrong type.
+    """
+
+    label: str | None
+    index: CompositeIndex
+    payout: SumOf
+    package_hash: str
+    _items: Mapping[str, _Item] = field(repr=False)
+
+    def __init__(
+        self, covers: Mapping[str, Cover | DesignedCover], *, label: str | None = None
+    ) -> None:
+        if not isinstance(covers, Mapping):
+            raise TypeError(
+                "covers must map each component name to its cover or design, got "
+                f"{type(covers).__name__}"
+            )
+        if len(covers) < 2:
+            raise EvaluationError(
+                f"a CoverPackage holds two covers or more, got {len(covers)}"
+            )
+        if label is not None and (not isinstance(label, str) or not label.strip()):
+            raise EvaluationError(f"label must be a non-empty string, got {label!r}")
+        items: dict[str, _Item] = {}
+        for name, value in covers.items():
+            items[_component_name(name, EvaluationError)] = _item(value)
+        if len({item.design is None for item in items.values()}) > 1:
+            raise EvaluationError(
+                "a CoverPackage holds covers or designs, not a mix of the two"
+            )
+        for name, item in items.items():
+            if isinstance(item.cover.index_definition, CompositeIndex):
+                raise EvaluationError(
+                    f"a CoverPackage holds covers on one index, but the cover of "
+                    f"{name!r} pays on several components"
+                )
+            free = item.cover.free_parameters()
+            if free:
+                raise UnresolvedParameterError(
+                    f"the cover of {name!r} is a template; resolve its free "
+                    f"parameters first: {', '.join(free)}"
+                )
+        resolved = {name: item.cover for name, item in items.items()}
+        for what, seen in (
+            ("payout_unit", {cover.payout_unit for cover in resolved.values()}),
+            ("asset_id", {cover.asset_id for cover in resolved.values()}),
+        ):
+            if len(seen) > 1:
+                raise EvaluationError(
+                    f"the covers of a CoverPackage share one {what}, got "
+                    f"{sorted(map(repr, seen))}"
+                )
+        index = CompositeIndex({name: cover.index for name, cover in resolved.items()})
+        payout = SumOf({name: cover.payout for name, cover in resolved.items()})
+        object.__setattr__(self, "label", label)
+        object.__setattr__(self, "index", index)
+        object.__setattr__(self, "payout", payout)
+        object.__setattr__(self, "package_hash", covers_hash(resolved))
+        object.__setattr__(self, "_items", MappingProxyType(items))
+
+    @property
+    def covers(self) -> Mapping[str, Cover]:
+        """The covers, by component name, in order."""
+        return MappingProxyType(
+            {name: item.cover for name, item in self._items.items()}
+        )
+
+    def as_cover(self) -> Cover:
+        """Return the same payout as one contract: a `Cover` with the `SumOf`.
+
+        It has one document and one premium, so under a loading it is priced
+        on the sum and not per contract.
+        """
+        first = next(iter(self._items.values())).cover
+        return Cover(
+            self.index,
+            self.payout,
+            payout_unit=first.payout_unit,
+            asset_id=first.asset_id,
+            label=self.label,
+        )
+
+    @property
+    def _designed(self) -> bool:
+        return all(item.design is not None for item in self._items.values())
+
+
+EvaluationEntry = Cover | DesignedCover | JointDesignResult | CoverSet | CoverPackage
+"""What `evaluate` and `compare` take: see their docstrings."""
+
+_Entry = _Item | _CoverSet | _JointEntry | CoverPackage
+
+
 def _entry(entry: Any) -> _Entry:
+    if isinstance(entry, CoverPackage):
+        return entry
     if isinstance(entry, JointDesignResult):
         return _JointEntry(entry, entry.to_record())
     if isinstance(entry, Mapping):
@@ -437,7 +592,14 @@ def _values_hash(values: Mapping[str, float]) -> str:
     return content_hash({"asset_values": pairs, "value_column": None})
 
 
-def _check_cover(cover: Cover, sample: OutcomeSample, asset: str) -> None:
+def _check_cover(
+    cover: Cover, sample: OutcomeSample, asset: str, *, read_index: bool = True
+) -> None:
+    """Raise unless `cover` can be evaluated on `sample` for `asset`.
+
+    A package's contracts read their components by key, so `_check_package`
+    checks the index and passes `read_index=False`.
+    """
     free = cover.free_parameters()
     if free:
         raise UnresolvedParameterError(
@@ -449,7 +611,8 @@ def _check_cover(cover: Cover, sample: OutcomeSample, asset: str) -> None:
             f"the cover pays in {cover.payout_unit!r}, but the sample's loss is "
             f"in {sample.loss_unit!r}"
         )
-    _check_cover_index(cover.index_definition, sample)
+    if read_index:
+        _check_cover_index(cover.index_definition, sample)
     if cover.asset_id is not None and cover.asset_id != asset:
         raise SampleError(
             f"the cover is written for asset {cover.asset_id!r}, but the sample "
@@ -497,6 +660,12 @@ def _check_item(
             "every asset id to its cover, or give a design from design_joint"
         )
     _check_cover(item.cover, sample, sample.asset_ids[0])
+    _check_item_design(item, sample, given)
+
+
+def _check_item_design(
+    item: _Item, sample: OutcomeSample, given: OutcomeSample | None
+) -> None:
     if item.design is None:
         return
     own = item.design.design_sample
@@ -507,14 +676,29 @@ def _check_item(
     _check_own_sample(own, None if given is None else _component_view(given, own))
 
 
+def _check_package(
+    entry: CoverPackage, sample: OutcomeSample, given: OutcomeSample | None
+) -> None:
+    _check_cover_index(entry.index, sample)
+    asset = sample.asset_ids[0]
+    for item in entry._items.values():
+        _check_cover(item.cover, sample, asset, read_index=False)
+        _check_item_design(item, sample, given)
+
+
 def _check_set(
     entry: _CoverSet, sample: OutcomeSample, given: OutcomeSample | None
 ) -> None:
     assets = sample.asset_ids
     if len(assets) == 1:
+        hint = (
+            "give a CoverPackage for separate contracts on its hazards"
+            if sample.index_components is not None
+            else "give its cover"
+        )
         raise SampleError(
             f"a mapping of covers is for a sample of several assets, but this one "
-            f"holds one, {assets[0]!r}: give its cover"
+            f"holds one, {assets[0]!r}: {hint}"
         )
     if set(entry.items) != set(assets):
         raise SampleError(
@@ -556,6 +740,8 @@ def _check_entry(
         _check_item(entry, sample, given)
     elif isinstance(entry, _CoverSet):
         _check_set(entry, sample, given)
+    elif isinstance(entry, CoverPackage):
+        _check_package(entry, sample, given)
     else:
         _check_joint(entry, sample, given)
 
@@ -624,6 +810,8 @@ def _design_pairs(
             assert known is not None
             pairs.append((known, view))
         return pairs
+    if isinstance(entry, CoverPackage) and entry._designed:
+        return _package_pairs(entry, sample, split)
     own: OutcomeSample | None = None
     if isinstance(entry, _Item) and entry.design is not None:
         own = entry.design.design_sample
@@ -631,6 +819,21 @@ def _design_pairs(
         own = entry.design.design_sample
     known = _check_split(own, sample, split, given)
     return [] if known is None else [(known, sample)]
+
+
+def _package_pairs(
+    entry: CoverPackage, sample: OutcomeSample, split: Split
+) -> list[tuple[OutcomeSample, OutcomeSample]]:
+    """Check each contract's design sample against its view of `sample`."""
+    pairs: list[tuple[OutcomeSample, OutcomeSample]] = []
+    for item in entry._items.values():
+        assert item.design is not None
+        own = item.design.design_sample
+        view = _component_view(sample, own)
+        known = _check_split(own, view, split, None)
+        assert known is not None
+        pairs.append((known, view))
+    return pairs
 
 
 def _split_document(
@@ -702,6 +905,8 @@ def _identity(
     level: str,
     scope: str,
     basis: PremiumBasis | None,
+    components: str | None = None,
+    budget: float | None = None,
 ) -> dict[str, Any]:
     """The columns of a row before its metrics."""
     return {
@@ -719,28 +924,63 @@ def _identity(
         "unique": None if design is None else design.unique,
         "ties": None if design is None or design.ties is None else int(design.ties),
         "degenerate_tail": None if design is None else design.degenerate_tail,
+        "components": components,
+        "design_budget": budget,
     }
 
 
-def _asset_row(
-    item: _Item, asset: str, run: _Run, *, premium: float | None
-) -> dict[str, Any]:
-    """The row of one asset's own cover, on that asset's column of the sample."""
-    sample = run.sample
-    probability = sample.probability
-    column = sample.asset_ids.index(asset)
-    loss = sample.loss[:, column]
-    payout = item.cover.payout_values(
-        _cover_index_values(item.cover.index_definition, sample, column)
+def _reads(cover: Cover, sample: OutcomeSample) -> str | None:
+    """What `cover` reads of a sample with index components, joined by `+`."""
+    if sample.index_components is None:
+        return None
+    index = cover.index_definition
+    return (
+        "+".join(index.names)
+        if isinstance(index, CompositeIndex)
+        else (index.hazard_name)
     )
-    basis: PremiumBasis
-    if premium is not None:
-        basis, used = "stated", premium
-    elif item.design is not None:
-        basis, used = "design", float(item.design.premium) + 0.0
-    else:
-        basis, used = "evaluation", run.pricing.premium(payout, probability)
-    row = _identity(
+
+
+def _budget_bound(record: Mapping[str, Any] | None) -> float | None:
+    """A design's budget bound in payout units; `None` if it has no budget."""
+    bound = None if record is None else record.get("budget_bound")
+    if bound is None:
+        return None
+    if (
+        isinstance(bound, bool)
+        or not isinstance(bound, (int, float, np.number))
+        or not math.isfinite(float(bound))
+    ):
+        raise EvaluationError(
+            f"a design's budget_bound must be a number, got {bound!r}"
+        )
+    return float(bound) + 0.0
+
+
+def _summed_budget(rows: Sequence[Mapping[str, Any]]) -> float | None:
+    """The sum of the rows' budget bounds; `None` if any row has none."""
+    bounds = [row["design_budget"] for row in rows]
+    return None if None in bounds else math.fsum(bounds) + 0.0
+
+
+def _component_values(sample: OutcomeSample, name: str) -> FloatArray:
+    """The index values of a component of `sample`, `(n,)`."""
+    components = sample.index_components
+    assert components is not None
+    values: FloatArray = components[name].values[:, 0]
+    return values
+
+
+def _item_identity(
+    item: _Item,
+    asset: str,
+    run: _Run,
+    *,
+    basis: PremiumBasis,
+    component: str | None,
+) -> dict[str, Any]:
+    """The columns before the metrics of one cover's row."""
+    return _identity(
         run,
         label=_label(item.cover),
         cover_hash=item.cover.definition_hash,
@@ -749,7 +989,40 @@ def _asset_row(
         level="asset",
         scope="individual",
         basis=basis,
+        components=component or _reads(item.cover, run.sample),
+        budget=_budget_bound(item.record),
     )
+
+
+def _asset_row(
+    item: _Item,
+    asset: str,
+    run: _Run,
+    *,
+    premium: float | None,
+    component: str | None = None,
+) -> dict[str, Any]:
+    """The row of one asset's own cover, on that asset's column of the sample.
+
+    `component` names what a package's contract reads, its key in the package.
+    """
+    sample = run.sample
+    probability = sample.probability
+    column = sample.asset_ids.index(asset)
+    loss = sample.loss[:, column]
+    payout = item.cover.payout_values(
+        _cover_index_values(item.cover.index_definition, sample, column)
+        if component is None
+        else _component_values(sample, component)
+    )
+    basis: PremiumBasis
+    if premium is not None:
+        basis, used = "stated", premium
+    elif item.design is not None:
+        basis, used = "design", float(item.design.premium) + 0.0
+    else:
+        basis, used = "evaluation", run.pricing.premium(payout, probability)
+    row = _item_identity(item, asset, run, basis=basis, component=component)
     row.update(
         metric_values(loss, payout, probability, premium=used, options=run.options)
     )
@@ -791,6 +1064,7 @@ def _set_rows(entry: _CoverSet, run: _Run) -> list[dict[str, Any]]:
         level="total",
         scope="individual",
         basis=basis,
+        budget=_summed_budget(rows),
     )
     total.update(
         metric_values(
@@ -848,6 +1122,7 @@ def _joint_rows(entry: _JointEntry, run: _Run) -> list[dict[str, Any]]:
         level="total",
         scope="joint",
         basis=basis,
+        budget=_budget_bound(entry.record),
     )
     total.update(
         metric_values(
@@ -892,15 +1167,77 @@ def _joint_rows(entry: _JointEntry, run: _Run) -> list[dict[str, Any]]:
     return rows
 
 
+def _package_label(entry: CoverPackage) -> str:
+    if entry.label is not None:
+        return entry.label
+    return entry.package_hash.removeprefix("sha256:")[:12]
+
+
+def _package_identity(
+    entry: CoverPackage,
+    run: _Run,
+    *,
+    basis: PremiumBasis,
+    budget: float | None,
+) -> dict[str, Any]:
+    """The columns before the metrics of a package's row."""
+    return _identity(
+        run,
+        label=_package_label(entry),
+        cover_hash=entry.package_hash,
+        design=None,
+        asset_id=run.sample.asset_ids[0],
+        level="package",
+        scope="individual",
+        basis=basis,
+        components="+".join(entry.index.names),
+        budget=budget,
+    )
+
+
+def _package_rows(entry: CoverPackage, run: _Run) -> list[dict[str, Any]]:
+    """One row per contract, then the package: their sum on the combined loss."""
+    sample = run.sample
+    asset = sample.asset_ids[0]
+    rows = [
+        _asset_row(item, asset, run, premium=None, component=name)
+        for name, item in entry._items.items()
+    ]
+    basis: PremiumBasis
+    if run.premium is not None:
+        basis, used = "stated", run.premium
+    else:
+        basis = rows[0]["premium_basis"]
+        used = math.fsum(row["premium"] for row in rows) + 0.0
+    package = _package_identity(entry, run, basis=basis, budget=_summed_budget(rows))
+    package.update(
+        metric_values(
+            sample.loss[:, 0],
+            entry.as_cover().payout_values(_cover_index_values(entry.index, sample)),
+            sample.probability,
+            premium=used,
+            options=run.options,
+        )
+    )
+    return [*rows, package]
+
+
 def _rows(entry: _Entry, run: _Run) -> list[dict[str, Any]]:
     if isinstance(entry, _Item):
         return [_asset_row(entry, run.sample.asset_ids[0], run, premium=run.premium)]
     if isinstance(entry, _CoverSet):
         return _set_rows(entry, run)
+    if isinstance(entry, CoverPackage):
+        return _package_rows(entry, run)
     return _joint_rows(entry, run)
 
 
-def _schema(options: MetricOptions, metadata: EvaluationMetadata) -> Any:
+def _schema(
+    columns: Sequence[MetricColumn],
+    metadata: EvaluationMetadata,
+    *,
+    extra: Sequence[Any] = (),
+) -> Any:
     identity = [
         pa.field("cover_label", pa.string(), nullable=False),
         pa.field("cover_hash", pa.string(), nullable=False),
@@ -916,12 +1253,12 @@ def _schema(options: MetricOptions, metadata: EvaluationMetadata) -> Any:
         pa.field("unique", pa.bool_()),
         pa.field("ties", pa.int32()),
         pa.field("degenerate_tail", pa.string()),
+        pa.field("components", pa.string()),
+        pa.field("design_budget", pa.float64()),
     ]
-    metrics = [
-        pa.field(column.name, pa.float64()) for column in metric_columns(options)
-    ]
+    metrics = [pa.field(column.name, pa.float64()) for column in columns]
     return pa.schema(
-        identity + metrics,
+        [*identity, *extra, *metrics],
         metadata={EVALUATION_METADATA_KEY: metadata.to_json()},
     )
 
@@ -1000,9 +1337,25 @@ def _set_entry(covers: Mapping[str, Cover]) -> CoverEntry:
     )
 
 
+def _package_entry(entry: CoverPackage) -> CoverEntry:
+    """The entry of a package: the hash its row names, and its contracts."""
+    return CoverEntry(
+        label=entry.label,
+        hash=entry.package_hash,
+        document={
+            "kind": "package",
+            "covers": {
+                name: cover.definition_hash for name, cover in entry.covers.items()
+            },
+        },
+    )
+
+
 def _cover_entries(entry: _Entry) -> list[CoverEntry]:
     if isinstance(entry, _Item):
         return [_cover_entry(entry.cover)]
+    if isinstance(entry, CoverPackage):
+        return [*map(_cover_entry, entry.covers.values()), _package_entry(entry)]
     covers = entry.covers if isinstance(entry, _CoverSet) else entry.design.covers
     return [*map(_cover_entry, covers.values()), _set_entry(covers)]
 
@@ -1011,7 +1364,13 @@ def _records(entry: _Entry) -> list[dict[str, Any]]:
     """The design records of an entry, each with the label as evaluated."""
     if isinstance(entry, _JointEntry):
         return [{**entry.record, "cover_label": _shared_label(entry.design.covers)}]
-    items = list(entry.items.values()) if isinstance(entry, _CoverSet) else [entry]
+    items: list[_Item]
+    if isinstance(entry, _CoverSet):
+        items = list(entry.items.values())
+    elif isinstance(entry, CoverPackage):
+        items = list(entry._items.values())
+    else:
+        items = [entry]
     # The label of the cover as evaluated, so each design keeps its own even
     # when two designs resolve to the same cover.
     return [
@@ -1028,6 +1387,7 @@ def _metadata(
     evaluation: dict[str, Any],
     design_samples: Sequence[OutcomeSample],
     options: MetricOptions,
+    columns: Sequence[MetricColumn],
     values_sha256: str | None,
 ) -> EvaluationMetadata:
     roles: dict[str, tuple[OutcomeSample, set[str]]] = {
@@ -1081,7 +1441,7 @@ def _metadata(
         ),
         columns={
             column.name: ColumnEntry(**column.to_document(sample.loss_unit))
-            for column in metric_columns(options)
+            for column in columns
         },
         covers=tuple(covers.values()),
         designs=tuple(records.values()),
@@ -1096,7 +1456,7 @@ def _metadata(
     )
 
 
-def _table(
+def _prepared(
     entries: Sequence[_Entry],
     sample: OutcomeSample,
     *,
@@ -1108,7 +1468,8 @@ def _table(
     design_sample: Any,
     allocation: Any,
     values: Any,
-) -> Any:
+) -> tuple[_Run, dict[str, Any], tuple[OutcomeSample, ...]]:
+    """Check an evaluation; return its run, its record and its design samples."""
     sample = _sample(sample, "sample")
     checked_split = _split(split)
     checked_fold = _fold(fold)
@@ -1151,25 +1512,235 @@ def _table(
         allocation=rule,
         values=checked_values,
     )
-    rows = [row for entry in entries for row in _rows(entry, run)]
-    evaluation["level"] = list(dict.fromkeys(row["level"] for row in rows))
-    evaluation["scope"] = list(dict.fromkeys(row["scope"] for row in rows))
-    evaluation["allocation"] = rule
-    keys = [tuple(row[name] for name in KEY_COLUMNS) for row in rows]
+    return run, evaluation, tuple(design_samples.values())
+
+
+def _check_keys(rows: Sequence[Mapping[str, Any]], columns: Sequence[str]) -> None:
+    """Raise `EvaluationError` if two rows share a key."""
+    keys = [tuple(row[name] for name in columns) for row in rows]
     repeated = sorted({key[0] for key in keys if keys.count(key) > 1})
     if repeated:
         raise EvaluationError(
             f"covers repeat a row key (the same cover and design twice): {repeated}"
         )
-    metadata = _metadata(
+
+
+def _row_record(row: Mapping[str, Any]) -> dict[str, Any]:
+    """What the setup text says of a row on a sample of several hazards."""
+    return {
+        key: row[key]
+        for key in (
+            "components",
+            "cover_hash",
+            "cover_label",
+            "design_budget",
+            "design_id",
+            "level",
+        )
+    }
+
+
+def _package_record(
+    entry: CoverPackage, rows: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """Each contract's terms and the package's sums, for the setup text."""
+    *contracts, package = rows
+
+    def limit(item: _Item) -> float | None:
+        stated = None if item.record is None else item.record.get("limit")
+        amount = stated.get("amount") if isinstance(stated, Mapping) else None
+        return None if amount is None else float(amount) + 0.0
+
+    return {
+        "budget": package["design_budget"],
+        "contracts": [
+            {
+                "budget": row["design_budget"],
+                "limit": limit(item),
+                "name": name,
+                "premium": row["premium"],
+            }
+            for (name, item), row in zip(entry._items.items(), contracts, strict=True)
+        ],
+        "cover_hash": entry.package_hash,
+        "label": package["cover_label"],
+        "premium": package["premium"],
+        "premium_basis": package["premium_basis"],
+        "premium_sum": math.fsum(row["premium"] for row in contracts) + 0.0,
+    }
+
+
+def _table(
+    entries: Sequence[_Entry],
+    sample: OutcomeSample,
+    *,
+    split: Any,
+    fold: Any,
+    pricing: Any,
+    premium: Any,
+    options: Any,
+    design_sample: Any,
+    allocation: Any,
+    values: Any,
+) -> Any:
+    run, evaluation, design_samples = _prepared(
         entries,
         sample,
-        evaluation=evaluation,
-        design_samples=tuple(design_samples.values()),
-        options=checked_options,
-        values_sha256=None if checked_values is None else _values_hash(checked_values),
+        split=split,
+        fold=fold,
+        pricing=pricing,
+        premium=premium,
+        options=options,
+        design_sample=design_sample,
+        allocation=allocation,
+        values=values,
     )
-    return pa.Table.from_pylist(rows, schema=_schema(checked_options, metadata))
+    by_entry = [_rows(entry, run) for entry in entries]
+    rows = [row for group in by_entry for row in group]
+    evaluation["level"] = list(dict.fromkeys(row["level"] for row in rows))
+    evaluation["scope"] = list(dict.fromkeys(row["scope"] for row in rows))
+    evaluation["allocation"] = run.allocation
+    if run.sample.index_components is not None:
+        evaluation["rows"] = [_row_record(row) for row in rows]
+    packages = [
+        _package_record(entry, group)
+        for entry, group in zip(entries, by_entry, strict=True)
+        if isinstance(entry, CoverPackage)
+    ]
+    if packages:
+        evaluation["packages"] = packages
+    _check_keys(rows, KEY_COLUMNS)
+    columns = metric_columns(run.options)
+    metadata = _metadata(
+        entries,
+        run.sample,
+        evaluation=evaluation,
+        design_samples=design_samples,
+        options=run.options,
+        columns=columns,
+        values_sha256=None if run.values is None else _values_hash(run.values),
+    )
+    return pa.Table.from_pylist(rows, schema=_schema(columns, metadata))
+
+
+# -- the breakdown -----------------------------------------------------------
+
+
+def _user_parts(payout: Any, parts: Any, n_draws: int) -> list[tuple[str, FloatArray]]:
+    """A `breakdown`'s columns; raise `EvaluationError` if they are invalid."""
+    if not isinstance(parts, Mapping) or not parts:
+        raise EvaluationError(
+            f"the breakdown of payout {payout.kind!r} must be a non-empty mapping "
+            "from a part's name to its payouts"
+        )
+    checked: list[tuple[str, FloatArray]] = []
+    for name, values in parts.items():
+        if not isinstance(name, str) or not name:
+            raise EvaluationError(
+                f"the breakdown of payout {payout.kind!r} names a part {name!r}"
+            )
+        part = np.asarray(values, dtype=np.float64)
+        if (
+            part.shape != (n_draws,)
+            or not np.isfinite(part).all()
+            or (part < 0.0).any()
+        ):
+            raise EvaluationError(
+                f"part {name!r} of payout {payout.kind!r} must be finite and "
+                f"non-negative, with one value per draw; got shape {part.shape}"
+            )
+        checked.append((name, part))
+    return checked
+
+
+def _cover_parts(
+    cover: Cover, sample: OutcomeSample
+) -> tuple[FloatArray, list[tuple[str, str, FloatArray]]]:
+    """A cover's payout and its parts: each one's name, kind and values."""
+    index = cover.index_definition
+    values = _cover_index_values(index, sample)
+    payout_values = cover.payout_values(values)
+    if not isinstance(index, CompositeIndex):
+        return payout_values, [(index.hazard_name, "component", payout_values)]
+    payout = cover.payout
+    breakdown = getattr(payout, "breakdown", None)
+    if not callable(breakdown):
+        return payout_values, [("whole", "whole", payout_values)]
+    kind = _PART_KINDS.get(type(payout), "user")
+    parts = _user_parts(payout, breakdown(values), len(sample))
+    return payout_values, [(name, kind, part) for name, part in parts]
+
+
+def _check_parts(
+    label: str, payout: FloatArray, parts: Sequence[tuple[str, str, FloatArray]]
+) -> None:
+    """Raise `EvaluationError` unless the parts add up to the payout, year by year."""
+    summed = np.sum([part for _, _, part in parts], axis=0)
+    allowed = _PARTS_TOLERANCE * float(payout.max(initial=0.0))
+    gap = float(np.abs(summed - payout).max(initial=0.0))
+    if gap > allowed:
+        raise EvaluationError(
+            f"the parts of {label!r} differ from its payout by {gap:.3g} in a year"
+        )
+
+
+def _breakdown_rows(entry: _Entry, run: _Run) -> list[dict[str, Any]]:
+    """One row per part of one entry."""
+    sample = run.sample
+    asset = sample.asset_ids[0]
+    identity: dict[str, Any]
+    parts: list[tuple[str, str, FloatArray]]
+    if isinstance(entry, _Item):
+        payout, parts = _cover_parts(entry.cover, sample)
+        identity = _item_identity(
+            entry,
+            asset,
+            run,
+            basis="evaluation" if entry.design is None else "design",
+            component=None,
+        )
+    elif isinstance(entry, CoverPackage):
+        parts = [
+            (
+                name,
+                "component",
+                item.cover.payout_values(_component_values(sample, name)),
+            )
+            for name, item in entry._items.items()
+        ]
+        payout = entry.as_cover().payout_values(
+            _cover_index_values(entry.index, sample)
+        )
+        identity = _package_identity(
+            entry,
+            run,
+            basis="design" if entry._designed else "evaluation",
+            budget=_summed_budget(
+                [
+                    {"design_budget": _budget_bound(item.record)}
+                    for item in entry._items.values()
+                ]
+            ),
+        )
+    else:
+        raise EvaluationError(
+            "payout_breakdown takes covers, designs and packages on one asset's "
+            "sample, not a set of covers or a joint design"
+        )
+    _check_parts(identity["cover_label"], payout, parts)
+    probability = sample.probability
+    expected = math.fsum((probability * payout).tolist()) + 0.0
+    return [
+        {
+            **identity,
+            "part": name,
+            "part_kind": kind,
+            **breakdown_values(
+                part, probability, expected_payout=expected, options=run.options
+            ),
+        }
+        for name, kind, part in parts
+    ]
 
 
 # -- the public functions ----------------------------------------------------
@@ -1198,7 +1769,9 @@ def evaluate(
     covers or all designs, each designed on that asset's own sample). The rows
     are then those of the module docstring: a mapping gives one `"asset"` row per
     asset and one `"total"` row, and a joint design one `"total"` row and, under
-    `allocation`, one allocated row per asset. `split` is `"in_sample"` (on the
+    `allocation`, one allocated row per asset. On a sample with index components,
+    `cover` may be a `CoverPackage`, which gives one `"asset"` row per contract
+    and one `"package"` row. `split` is `"in_sample"` (on the
     design sample) or `"out_of_sample"` (on a sample that shares no period
     with it), and `fold` the fold of a k-fold split (0 for a holdout and for
     fresh draws). `options` states the metrics' levels and thresholds.
@@ -1208,7 +1781,8 @@ def evaluate(
     which. A joint design's premium is that of one contract on the total. A
     set of covers pays one premium per contract: its asset rows use their
     own premiums, and its `"total"` row their sum, or `premium` if given, which
-    states the total and leaves the asset rows as they are.
+    states the total and leaves the asset rows as they are. A package does the
+    same with its contracts and its `"package"` row.
 
     `design_sample` is the sample a cover given as is was chosen on. Out of
     sample, a design sample is required (a design brings its own), and the
@@ -1222,14 +1796,19 @@ def evaluate(
 
     The table has the identity columns (`cover_label`, `cover_hash`,
     `design_id`, `asset_id`, `level`, `scope`, `scenario`, `split`, `fold`,
-    `sample_hash`, `premium_basis`, `unique`, `ties`, `degenerate_tail`)
-    and one float64 column per metric, null where the metric is undefined.
+    `sample_hash`, `premium_basis`, `unique`, `ties`, `degenerate_tail`,
+    `components`, `design_budget`) and one float64 column per metric, null
+    where the metric is undefined. `components` is what the row's cover reads,
+    joined by `+`, and null on a sample of one hazard. `design_budget` is the
+    design's budget bound in payout units, the sum on a package or a total of
+    separate covers, and null for a cover given as is.
     `asset_id` is null on `"total"` rows. `premium_basis`, `premium` and the
     net-loss columns are null on allocated rows. On `"total"` and allocated
     rows, `cover_hash` is the hash of the set of covers and `cover_label` their
-    shared label, or else the first 12 hex digits of that hash. Its schema
-    metadata holds the `EvaluationMetadata` under
-    `crc.parametric.evaluation`.
+    shared label, or else the first 12 hex digits of that hash; on a
+    `"package"` row, `cover_hash` is the `package_hash` and `cover_label` the
+    package's label, or else the first 12 hex digits. Its schema metadata holds
+    the `EvaluationMetadata` under `crc.parametric.evaluation`.
 
     Raises `UnresolvedParameterError` for a template, `SampleError` if one
     cover is given for a sample of several assets (take one with
@@ -1300,6 +1879,181 @@ def compare(
         allocation=allocation,
         values=values,
     )
+
+
+def _own_loss_shares(
+    components: Mapping[str, Any], probability: FloatArray
+) -> dict[str, float]:
+    """Each component's share of the summed expected own losses."""
+    missing = [name for name, part in components.items() if part.own_loss is None]
+    if missing:
+        raise SampleError(
+            f"shares='own_loss' needs every component's own loss, but {missing} "
+            "have none; state the shares as a mapping"
+        )
+    expected = {
+        name: math.fsum((probability * part.own_loss[:, 0]).tolist())
+        for name, part in components.items()
+    }
+    total = math.fsum(expected.values())
+    if total <= 0.0:
+        raise SampleError(
+            "shares='own_loss' divides by the summed expected own losses, which "
+            "are zero; state the shares as a mapping"
+        )
+    return {name: value / total for name, value in expected.items()}
+
+
+def _stated_shares(
+    shares: Mapping[Any, Any], components: Mapping[str, Any]
+) -> dict[str, float]:
+    """The stated shares; raise `EvaluationError` if they are invalid."""
+    unknown = [name for name in shares if name not in components]
+    if unknown:
+        raise EvaluationError(
+            f"shares names {unknown}, which the sample does not hold; it holds "
+            f"{list(components)}"
+        )
+    checked: dict[str, float] = {}
+    for name, share in shares.items():
+        if (
+            isinstance(share, bool)
+            or not isinstance(share, (int, float, np.number))
+            or not math.isfinite(float(share))
+            or float(share) < 0.0
+        ):
+            raise EvaluationError(
+                f"the share of {name!r} must be a finite number >= 0, got {share!r}"
+            )
+        checked[name] = float(share) + 0.0
+    total = math.fsum(checked.values())
+    if abs(total - 1.0) > _SHARES_TOLERANCE:
+        raise EvaluationError(f"the shares must sum to 1, got {total}")
+    return checked
+
+
+def split_budget(
+    budget: Budget,
+    sample: OutcomeSample,
+    *,
+    shares: Literal["own_loss"] | Mapping[str, float],
+) -> Mapping[str, Budget]:
+    """Split one budget between the contracts on a sample's components.
+
+    Returns a `Budget(amount=...)` per component: the bound of `budget` on
+    `sample` (for a ratio, of the expected combined loss) times the
+    component's share, so the bounds sum to the budget's bound on `sample`.
+
+    `shares` has no default, because how to split a budget between hazards is
+    an assumption. `"own_loss"` takes each component's share of the summed
+    expected own losses, over every component of the sample. A mapping states
+    the shares of the components named, which must sum to 1.
+
+    Raises `SampleError` for a sample without index components and for
+    `"own_loss"` on a component with no own loss or on own losses that are all
+    zero; `EvaluationError` for invalid shares; `TypeError` for arguments of
+    the wrong type.
+    """
+    if not isinstance(budget, Budget):
+        raise TypeError(f"budget must be a Budget, got {type(budget).__name__}")
+    checked = _sample(sample, "sample")
+    components = checked.index_components
+    if components is None:
+        raise SampleError(
+            "split_budget splits a budget between the components of a sample of "
+            "several hazards, and this sample has none"
+        )
+    probability = checked.probability
+    fractions: dict[str, float]
+    if isinstance(shares, str):
+        if shares != "own_loss":
+            raise EvaluationError(
+                f"shares must be 'own_loss' or a mapping, got {shares!r}"
+            )
+        fractions = _own_loss_shares(components, probability)
+    elif isinstance(shares, Mapping):
+        fractions = _stated_shares(shares, components)
+    else:
+        raise TypeError(
+            "shares must be 'own_loss' or a mapping from component name to share, "
+            f"got {type(shares).__name__}"
+        )
+    bound = budget.bound(math.fsum((probability * checked.loss[:, 0]).tolist()))
+    return MappingProxyType(
+        {name: Budget(amount=bound * share) for name, share in fractions.items()}
+    )
+
+
+def payout_breakdown(
+    covers: Sequence[EvaluationEntry],
+    sample: OutcomeSample,
+    *,
+    split: Split,
+    fold: int = 0,
+    options: MetricOptions = MetricOptions(),
+    design_sample: OutcomeSample | None = None,
+) -> Any:
+    """Break each entry's payout down into its parts; return one table.
+
+    `covers` is what `compare` takes, on one asset's `sample`: covers, designs
+    and packages. The table has one row per entry and part, with the identity
+    columns of `compare` and:
+
+    - `part` and `part_kind`: a one-index cover's component (`"component"`);
+      each component of a `SumOf` or a package (`"component"`); each component
+      of a `MaxOf` (`"attribution"`, each year's payout going to the component
+      paying most, in equal shares when several tie, because one contract
+      pays one amount); the keys of a user family's `breakdown(index)`
+      (`"user"`); or `"whole"` for a user family with none (`"whole"`);
+    - `expected_payout`, the part's expected payout;
+    - `share`, its share of the entry's E[payout], null when that is 0;
+    - `payout_frequency`, P(the part pays more than `options.payout_threshold`).
+
+    The rows of one entry add up to its E[payout]: the parts are checked
+    against the payout year by year. The table holds an `EvaluationMetadata`
+    under the same key as a comparison's, and `write_comparison` writes it.
+    `split`, `fold` and `design_sample` are those of `evaluate`.
+
+    Raises as `compare` does, `SampleError` for a sample of several assets, and
+    `EvaluationError` when a user family's parts are invalid or do not add up
+    to its payout.
+    """
+    entries = _entries(covers)
+    _require_one_asset(_sample(sample, "sample"), "payout_breakdown")
+    run, evaluation, design_samples = _prepared(
+        entries,
+        sample,
+        split=split,
+        fold=fold,
+        pricing=PurePremium(),
+        premium=None,
+        options=options,
+        design_sample=design_sample,
+        allocation=None,
+        values=None,
+    )
+    rows = [row for entry in entries for row in _breakdown_rows(entry, run)]
+    _check_keys(rows, (*KEY_COLUMNS, "part"))
+    evaluation["pricing"] = None
+    evaluation["level"] = list(dict.fromkeys(row["level"] for row in rows))
+    evaluation["scope"] = list(dict.fromkeys(row["scope"] for row in rows))
+    evaluation["allocation"] = None
+    evaluation["part_kinds"] = list(dict.fromkeys(row["part_kind"] for row in rows))
+    columns = breakdown_columns(run.options)
+    metadata = _metadata(
+        entries,
+        run.sample,
+        evaluation=evaluation,
+        design_samples=design_samples,
+        options=run.options,
+        columns=columns,
+        values_sha256=None,
+    )
+    extra = (
+        pa.field("part", pa.string(), nullable=False),
+        pa.field("part_kind", pa.string(), nullable=False),
+    )
+    return pa.Table.from_pylist(rows, schema=_schema(columns, metadata, extra=extra))
 
 
 def write_comparison(
