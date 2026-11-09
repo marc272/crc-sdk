@@ -608,7 +608,7 @@ def test_models_are_small_frozen_and_documented() -> None:
         copula.reference = reference  # type: ignore[misc]
 
 
-def test_the_module_needs_numpy_only() -> None:
+def test_the_module_needs_numpy_and_the_standard_library_only() -> None:
     source = Path(dependence_module.__file__).read_text(encoding="utf-8")
     roots: set[str] = set()
     for node in ast.walk(ast.parse(source)):
@@ -622,7 +622,11 @@ def test_the_module_needs_numpy_only() -> None:
         "collections",
         "crc_sdk",
         "dataclasses",
+        "json",
+        "math",
+        "numbers",
         "numpy",
+        "statistics",
         "typing",
     }
 

@@ -26,7 +26,8 @@ work on one asset's sample.
 A sample of one asset may hold several named hazards, its `index_components`:
 one `IndexComponent` per hazard, the first being what `index` holds, while
 `loss` is the combined loss. Such a sample comes from the same years of several
-hazards (`sample_annual_hazards`) or from a user table.
+hazards (`sample_annual_hazards`), from fitted curves under a stated dependence
+(`sample_curve_hazards`) or from a user table.
 `OutcomeSample.component` takes one hazard's sample out of it.
 
 `holdout` and `year_block_kfold` split a sample into contiguous blocks of
@@ -478,9 +479,9 @@ class SampleProvenance:
     - `probability_semantics`: the curve's probability semantics, for Monte
       Carlo samples; otherwise `None`.
     - `loss_model` and `basis_risk`: their documents; `None` for a table. On a
-      per-year sample of several hazards, `loss_model` is `{"kind":
-      "components", "components": [{"name": name, "loss_model": document},
-      ...]}`, in component order, for the components with an impact.
+      sample of several hazards from curves or per-year series, `loss_model` is
+      `{"kind": "components", "components": [{"name": name, "loss_model":
+      document}, ...]}`, in component order, for the components with an impact.
     - `rng`: for every random step, in draw order, the bit generator's name
       and its state before the step, as JSON text. `generator()` rebuilds it.
     - `licences`: the licence and attribution each input declares.
@@ -515,7 +516,8 @@ class SampleProvenance:
       `None` on every other sample.
     - `hazard_dependence`: for a sample with index components, where the
       dependence between the hazards comes from; such a sample must state it.
-      `{"kind": "data"}` is the data's own. `None` on a one-hazard sample.
+      `{"kind": "data"}` is the data's own; on a sample drawn from curves it is
+      the record of the stated model. `None` on a one-hazard sample.
     - `combine`: for a sample with index components, how the combined loss was
       made: `{"kind": "table"}` when a table states it, the rule's document with
       its sentence under `statement`, or `{"kind": "one_impact", "component":
@@ -2424,7 +2426,8 @@ def _refuse_reference_year_blocks(sample: OutcomeSample, function: str) -> None:
             f"{function} cannot split an EmpiricalCopula sample: its rows come in "
             "reference-year blocks, so a block of rows is a set of reference years; "
             "test it out of sample on fresh draws (FreshDraws on a plan, or "
-            "sample_curves with new generators and the same reference)"
+            "sample_curves or sample_curve_hazards with new generators and the same "
+            "reference)"
         )
 
 

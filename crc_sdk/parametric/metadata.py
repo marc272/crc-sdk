@@ -771,7 +771,14 @@ def _dependence(
             f"{row}s, {first} to {last} ({_short(model.get('content_hash'))})"
             + ("" if draws is None else f", {draws} draws per {row}")
         )
-    return f"{kind}, as stated"
+    if kind == "gaussian_copula":
+        correlation = model.get("correlation")
+        order = ", in column order" if isinstance(correlation, list) else ""
+        return (
+            "GaussianCopula, a stated assumption: correlation "
+            f"{json.dumps(correlation)}{order}"
+        )
+    return f"{kind}, a stated assumption"
 
 
 _ANNUAL_MAXIMA = (
@@ -2307,14 +2314,14 @@ def setup_text(
       (`fresh_draws_seed`) that the evaluations' `details` record, if any;
     - `Sample`: the source kind, the probability semantics and who stated
       them, the basis-risk model and its parameters, the loss model (of each
-      asset, when the assets differ, and of each component on a per-year
-      sample of several hazards), the dependence between the assets, and on a
-      sample with index components each component's name, unit, tail and
-      whether it has a loss of its own, the rule of the combined loss or that
-      a table states it, and the dependence between the hazards: the data's
-      own, with the sentence that two annual maxima of one year may come from
-      different events, and, with mixed tails, that the dependence is between
-      values and not severities;
+      asset, when the assets differ, and of each component on a sample of
+      several hazards), the dependence between the assets, and on a sample
+      with index components each component's name, unit, tail and whether it
+      has a loss of its own, the rule of the combined loss or that a table
+      states it, and the dependence between the hazards: the data's own, with
+      the sentence that two annual maxima of one year may come from different
+      events, or the stated model, called an assumption, and, with mixed
+      tails, that the dependence is between values and not severities;
     - `Combined loss`, when a sample evaluated on has index components: that
       every row's metrics are on the combined loss;
     - `Source`: each source record of the samples, such as a hazard curve or

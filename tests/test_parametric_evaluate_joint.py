@@ -1032,7 +1032,7 @@ def _dependence_text(document: Mapping[str, Any]) -> str:
             "EmpiricalCopula, a stated assumption: the ranks of 30 reference years, "
             "1990 to 2019 (aaaaaaaaaaaa), 40 draws per year.",
         ),
-        ({"kind": "other"}, "other, as stated."),
+        ({"kind": "other"}, "other, a stated assumption."),
     ],
     ids=["independent", "comonotonic", "copula", "unknown"],
 )

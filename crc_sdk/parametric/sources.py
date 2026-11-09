@@ -24,9 +24,16 @@ extrapolation and `"clamp"` the nearest knot, and the choice is recorded.
 
 **Several assets from curves** (`sample_curves`). Curves say nothing about how
 assets move together, so a stated dependence model (`Independent`,
-`Comonotonic` or `EmpiricalCopula`) is required, and has no default. Each asset
-is drawn exactly as `sample_curve` draws it, from its own generator; the model
-then only puts that asset's rows in another order.
+`Comonotonic`, `EmpiricalCopula`, `GaussianCopula` or a `DependenceModel` of the
+caller's) is required, and has no default. Each asset is drawn exactly as
+`sample_curve` draws it, from its own generator; the model then only puts that
+asset's rows in another order.
+
+**Several hazards from curves** (`sample_curve_hazards`). Fitted curves carry no
+dependence between hazards either, so the same models state it, across the
+named components of one asset. Each component is drawn as `sample_curve` draws
+it, from its own generator, the model puts its rows in another order, and the
+combined loss is made from the rows as they then stand.
 
 **Per-year values** (`AnnualSeries`, `sample_annual`). The years of an
 `annual_extremes()` table (ERA5, CMIP6, NEX-GDDP-CMIP6, stations) become the
@@ -74,7 +81,7 @@ import hashlib
 import inspect
 import math
 import warnings
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from numbers import Real
 from typing import Any, Literal, get_args
@@ -100,10 +107,10 @@ from crc_sdk.parametric.combine import (
     _rule_record,
 )
 from crc_sdk.parametric.dependence import (
-    Comonotonic,
-    Dependence,
-    EmpiricalCopula,
-    Independent,
+    DependenceModel,
+    _checked_order,
+    _model_record,
+    _require_model,
 )
 from crc_sdk.parametric.errors import (
     ComonotoneIndexWarning,
@@ -152,6 +159,7 @@ __all__ = [
     "sample_annual_hazards",
     "sample_annual_pool",
     "sample_curve",
+    "sample_curve_hazards",
     "sample_curves",
 ]
 
@@ -445,6 +453,23 @@ def _draw_count(n_draws: Any) -> int:
     return int(n_draws)
 
 
+@dataclass(frozen=True, eq=False)
+class _CurveDraws:
+    """One curve's draws, in draw order, and what a sample records of them.
+
+    `impact` and `loss` are `None` for a hazard with no impact.
+    """
+
+    uniforms: FloatArray
+    hazard: FloatArray
+    index: FloatArray
+    impact: FloatArray | None
+    loss: FloatArray | None
+    provenance: SampleProvenance
+    rarer: int
+    """How many draws are rarer than the curve's fitted support."""
+
+
 def sample_curve(
     curve: Any,
     *,
@@ -482,16 +507,83 @@ def sample_curve(
     the fitted support, and with `ComonotoneIndexWarning` for
     `NoBasisRisk()`.
     """
+    asset = _identifier("asset_id", asset_id)
+    _check_models(loss_model, basis_risk, asset)
+    draws = _draw_curve(
+        curve,
+        metadata=metadata,
+        n_draws=n_draws,
+        rng=rng,
+        loss_model=loss_model,
+        basis_risk=basis_risk,
+        asset=asset,
+        assume_semantics=assume_semantics,
+        outside_support=outside_support,
+        details=details,
+    )
+    assert draws.loss is not None
+    n = draws.hazard.shape[0]
+    sample = OutcomeSample(
+        asset_ids=(asset,),
+        period=np.arange(n, dtype=np.int64),
+        probability=np.full(n, 1.0 / n),
+        index=draws.index,
+        loss=draws.loss,
+        hazard=None if np.array_equal(draws.index, draws.hazard) else draws.hazard,
+        index_unit=metadata.value_unit,
+        loss_unit=loss_model.value_unit,
+        semantics="annual",
+        provenance=draws.provenance,
+    )
+    _warn_rarer(draws.rarer, n)
+    _warn_comonotone(basis_risk, separate_index=False)
+    return sample
+
+
+def _warn_rarer(count: int, n: int, whose: str = "") -> None:
+    """Warn if `count` of the `n` draws are rarer than the fitted support."""
+    if not count:
+        return
+    rarer = (
+        "is rarer than the curve's fitted support; its value is"
+        if count == 1
+        else "are rarer than the curve's fitted support; their values are"
+    )
+    warnings.warn(
+        f"{whose}{count} of {n} draws {rarer} extrapolated",
+        ReturnPeriodExtrapolationWarning,
+        stacklevel=3,
+    )
+
+
+def _draw_curve(
+    curve: Any,
+    *,
+    metadata: HazardDatasetMetadata,
+    n_draws: int,
+    rng: np.random.Generator,
+    loss_model: LossModel | None,
+    basis_risk: BasisRisk,
+    asset: str,
+    assume_semantics: AnnualSemantics | None,
+    outside_support: OutsideSupport,
+    details: Mapping[str, Any] | None,
+) -> _CurveDraws:
+    """`sample_curve`'s draws and records, without its sample and its warnings.
+
+    The caller has checked `loss_model` and `basis_risk`. With `loss_model=None`
+    the hazard has no impact: the basis-risk model doesn't act on it or draw
+    for it, and the draws have no impact and no loss.
+    """
     if not isinstance(metadata, HazardDatasetMetadata):
         raise TypeError(
             f"metadata must be HazardDatasetMetadata, got {type(metadata).__name__}"
         )
     n = _draw_count(n_draws)
     rng = _require_generator(rng)
-    asset = _identifier("asset_id", asset_id)
-    _check_models(loss_model, basis_risk, asset)
     # Before any draw, so a refused call leaves the generator untouched.
-    loss_model.check_hazard_unit(metadata.value_unit)
+    if loss_model is not None:
+        loss_model.check_hazard_unit(metadata.value_unit)
     if outside_support not in get_args(OutsideSupport):
         raise SampleError(
             f"outside_support must be one of {get_args(OutsideSupport)}, "
@@ -604,13 +696,18 @@ def sample_curve(
             "year-to-year variability."
         )
 
-    impact = loss_model.impact_values(hazard)
-    rng_records.append(_generator_record(rng, "basis_risk"))
-    index, impact, basis_summary = _apply_basis_risk(
-        basis_risk, hazard, hazard, impact, rng
-    )
-    loss = loss_model.loss_values(impact)
-    notes += _basis_risk_notes(basis_risk, separate_index=False)
+    index = hazard
+    impact: FloatArray | None = None
+    loss: FloatArray | None = None
+    basis_summary: dict[str, Any] | None = None
+    if loss_model is not None:
+        impact = loss_model.impact_values(hazard)
+        rng_records.append(_generator_record(rng, "basis_risk"))
+        index, impact, basis_summary = _apply_basis_risk(
+            basis_risk, hazard, hazard, impact, rng
+        )
+        loss = loss_model.loss_values(impact)
+        notes += _basis_risk_notes(basis_risk, separate_index=False)
 
     source = {
         "role": "hazard",
@@ -626,7 +723,7 @@ def sample_curve(
         sources=(source,),
         semantics_source=semantics_source,
         probability_semantics=semantics,
-        loss_model=loss_model._document(asset),
+        loss_model=None if loss_model is None else loss_model._document(asset),
         basis_risk=basis_risk.to_document(),
         rng=tuple(rng_records),
         licences=(_licence_entry("hazard", metadata.source.model_dump(mode="json")),),
@@ -650,31 +747,111 @@ def sample_curve(
             }
         ),
     )
-    sample = OutcomeSample(
-        asset_ids=(asset,),
-        period=np.arange(n, dtype=np.int64),
-        probability=np.full(n, 1.0 / n),
+    return _CurveDraws(
+        uniforms=uniforms,
+        hazard=hazard,
         index=index,
+        impact=impact,
         loss=loss,
-        hazard=None if np.array_equal(index, hazard) else hazard,
-        index_unit=metadata.value_unit,
-        loss_unit=loss_model.value_unit,
-        semantics="annual",
         provenance=provenance,
+        rarer=0 if counts is None else counts["above"],
     )
-    if counts is not None and counts["above"]:
-        rarer = (
-            "is rarer than the curve's fitted support; its value is"
-            if counts["above"] == 1
-            else "are rarer than the curve's fitted support; their values are"
+
+
+# -- several columns from curves -----------------------------------------------
+
+
+def _check_own_generators(rngs: Mapping[str, np.random.Generator], owners: str) -> None:
+    """Raise `SampleError` if two columns' generators are in the same state.
+
+    Equal states would give equal draws, whatever the model says of them.
+    """
+    states = {
+        column: _generator_record(rng, "hazard")["state"]
+        for column, rng in rngs.items()
+    }
+    if len(set(states.values())) < len(states):
+        raise SampleError(
+            f"rngs must give each {owners} its own generator state: two {owners}s "
+            "with the same state would draw the same uniforms"
         )
-        warnings.warn(
-            f"{counts['above']} of {n} draws {rarer} extrapolated",
-            ReturnPeriodExtrapolationWarning,
-            stacklevel=2,
-        )
-    _warn_comonotone(basis_risk, separate_index=False)
-    return sample
+
+
+def _column_fields(
+    documents: Mapping[str, Mapping[str, Any]],
+    *,
+    key: str,
+    note: Callable[[str, str], str],
+    record: Mapping[str, Any],
+    sentence: str,
+    n: int,
+) -> dict[str, Any]:
+    """The provenance fields of a sample of several curves' columns.
+
+    `documents` holds each column's own provenance; `key` is what each of its
+    sources and generator records names the column as.
+    """
+    declared = sorted({own["probability_semantics"] for own in documents.values()})
+    stated = {own["semantics_source"] for own in documents.values()}
+    return {
+        "source_kind": "monte_carlo",
+        "sources": tuple(
+            {**source, key: column}
+            for column, own in documents.items()
+            for source in own["sources"]
+        ),
+        # Columns that differ here are stated side by side because the caller says.
+        "semantics_source": stated.pop() if len(stated) == 1 else "caller",
+        "probability_semantics": ", ".join(declared),
+        "rng": tuple(
+            {**generator, key: column}
+            for column, own in documents.items()
+            for generator in own["rng"]
+        ),
+        "licences": tuple(
+            _distinct(
+                [
+                    *(entry for own in documents.values() for entry in own["licences"]),
+                    *(
+                        {**entry, "role": "dependence"}
+                        for entry in record.get("licences", ())
+                    ),
+                ]
+            )
+        ),
+        "details": {"draws": n, "periods": [0, n - 1]},
+        "notes": (
+            sentence,
+            *(
+                note(column, text)
+                for column, own in documents.items()
+                for text in own["notes"]
+            ),
+        ),
+    }
+
+
+def _moved_documents(
+    documents: Mapping[str, Mapping[str, Any]], order: IntArray, kind: str
+) -> dict[str, dict[str, Any]]:
+    """Each column's own provenance, with a step if the model moved its rows.
+
+    An `EmpiricalCopula`'s rows come in reference-year blocks even where a
+    column's draws happen to stay in place, so its columns always have the step.
+    """
+    in_draw_order = np.arange(order.shape[0], dtype=np.int64)
+    return {
+        column: {
+            **own,
+            "selection": (
+                []
+                if kind != "empirical_copula"
+                and np.array_equal(order[:, j], in_draw_order)
+                else [{"kind": "reorder", "dependence": kind}]
+            ),
+        }
+        for j, (column, own) in enumerate(documents.items())
+    }
 
 
 # -- several assets from curves ------------------------------------------------
@@ -704,7 +881,7 @@ def _one_unit(name: str, units: Mapping[str, str]) -> str:
 def sample_curves(
     curves: Mapping[str, Any],
     *,
-    dependence: Dependence,
+    dependence: DependenceModel,
     metadata: Mapping[str, HazardDatasetMetadata],
     n_draws: int,
     rngs: Mapping[str, np.random.Generator],
@@ -719,8 +896,10 @@ def sample_curves(
     `curves`, `metadata`, `rngs` and `loss_models` are mappings by asset id;
     the order of `curves` sets `asset_ids`. `dependence` is required: curves
     say nothing about how assets move together, so the dependence is an
-    assumption the caller states with `Independent()`, `Comonotonic()` or
-    `EmpiricalCopula(reference)`. `basis_risk` is one model for every asset;
+    assumption the caller states with `Independent()`, `Comonotonic()`,
+    `EmpiricalCopula(reference)`, `GaussianCopula(correlation)` or a
+    `DependenceModel` of the caller's, which passes the gate described in
+    `crc_sdk.parametric.dependence`. `basis_risk` is one model for every asset;
     `details` is added to every asset's provenance; the other arguments are
     those of `sample_curve`.
 
@@ -744,9 +923,10 @@ def sample_curves(
     Raises `SampleError` for fewer than two assets, mappings that name other
     assets, two assets with the same generator state, assets in different
     units, an `n_draws` or a reference the model cannot use (all before any
-    draw), a generator whose bit generator is not one of numpy's, and for what
-    `sample_curve` raises for; `TypeError` for a missing or unknown dependence
-    model and wrong types. Warns as `sample_curve` does, for each asset.
+    draw), a model that doesn't pass the gate, a generator whose bit generator
+    is not one of numpy's, and for what `sample_curve` raises for; `TypeError`
+    for a missing dependence model, a bare callable as one and wrong types.
+    Warns as `sample_curve` does, for each asset.
     """
     if not isinstance(curves, Mapping):
         raise TypeError(
@@ -758,12 +938,7 @@ def sample_curves(
             f"sample_curves needs two assets or more, got {list(assets)}; "
             "use sample_curve for one"
         )
-    if not isinstance(dependence, (Independent, Comonotonic, EmpiricalCopula)):
-        raise TypeError(
-            "dependence must be stated, as Independent(), Comonotonic() or "
-            "EmpiricalCopula(reference): curves say nothing about how assets move "
-            f"together, so there is no default; got {type(dependence).__name__}"
-        )
+    _require_model(dependence, "assets")
     metadata = _by_asset("metadata", metadata, assets)
     rngs = _by_asset("rngs", rngs, assets)
     loss_models = _by_asset("loss_models", loss_models, assets)
@@ -782,17 +957,9 @@ def sample_curves(
     loss_unit = _one_unit(
         "loss unit", {asset: loss_models[asset].value_unit for asset in assets}
     )
-    # Equal states would give equal draws, whatever the model says of them.
-    states = {
-        asset: _generator_record(rngs[asset], "hazard")["state"] for asset in assets
-    }
-    if len(set(states.values())) < len(assets):
-        raise SampleError(
-            "rngs must give each asset its own generator state: two assets with "
-            "the same state would draw the same uniforms"
-        )
+    _check_own_generators(rngs, "asset")
     # Before any draw, so a refused call leaves the generators untouched.
-    document = dependence.record(n, assets)
+    document, sentence = _model_record(dependence, n, assets, "assets")
 
     parts = {
         asset: sample_curve(
@@ -813,7 +980,7 @@ def sample_curves(
     uniforms = np.column_stack(
         [parts[asset].provenance.generator(0).random(n) for asset in assets]
     )
-    order = dependence.reorder(uniforms, assets)
+    order = _checked_order(dependence, document["kind"], uniforms, assets)
 
     def reordered(values: Mapping[str, FloatArray]) -> FloatArray:
         return np.column_stack(
@@ -821,42 +988,16 @@ def sample_curves(
         )
 
     documents = {asset: parts[asset].provenance.to_document() for asset in assets}
-    licences: list[dict[str, Any]] = []
-    for licence in [
-        *(entry for own in documents.values() for entry in own["licences"]),
-        *({**entry, "role": "dependence"} for entry in document.get("licences", ())),
-    ]:
-        if licence not in licences:
-            licences.append(licence)
-    declared = sorted({own["probability_semantics"] for own in documents.values()})
-    stated = {own["semantics_source"] for own in documents.values()}
-    in_draw_order = np.arange(n, dtype=np.int64)
     provenance = SampleProvenance(
-        source_kind="monte_carlo",
-        sources=tuple(
-            {**source, "asset_id": asset}
-            for asset, own in documents.items()
-            for source in own["sources"]
+        **_column_fields(
+            documents,
+            key="asset_id",
+            note=_asset_note,
+            record=document,
+            sentence=sentence,
+            n=n,
         ),
-        # Assets that differ here are stated side by side because the caller says.
-        semantics_source=stated.pop() if len(stated) == 1 else "caller",
-        probability_semantics=", ".join(declared),
         basis_risk=basis_risk.to_document(),
-        rng=tuple(
-            {**record, "asset_id": asset}
-            for asset, own in documents.items()
-            for record in own["rng"]
-        ),
-        licences=tuple(licences),
-        details={"draws": n, "periods": [0, n - 1]},
-        notes=(
-            dependence.statement(n, "assets"),
-            *(
-                _asset_note(asset, note)
-                for asset, own in documents.items()
-                for note in own["notes"]
-            ),
-        ),
         lineage=content_hash(
             {
                 "kind": "monte_carlo",
@@ -864,18 +1005,7 @@ def sample_curves(
             }
         ),
         dependence=document,
-        parts={
-            asset: {
-                **documents[asset],
-                "lineage": parts[asset].lineage,
-                "selection": (
-                    []
-                    if np.array_equal(order[:, j], in_draw_order)
-                    else [{"kind": "reorder", "dependence": document["kind"]}]
-                ),
-            }
-            for j, asset in enumerate(assets)
-        },
+        parts=_moved_documents(documents, order, document["kind"]),
     )
     hazards = {
         asset: part.index if part.hazard is None else part.hazard
@@ -883,7 +1013,7 @@ def sample_curves(
     }
     return OutcomeSample(
         asset_ids=assets,
-        period=in_draw_order,
+        period=np.arange(n, dtype=np.int64),
         probability=np.full(n, 1.0 / n),
         index=reordered({asset: part.index for asset, part in parts.items()}),
         loss=reordered({asset: part.loss for asset, part in parts.items()}),
@@ -897,6 +1027,207 @@ def sample_curves(
         semantics="annual",
         provenance=provenance,
     )
+
+
+# -- several hazards from curves -----------------------------------------------
+
+
+def sample_curve_hazards(
+    curves: Mapping[str, Any],
+    *,
+    dependence: DependenceModel,
+    metadata: Mapping[str, HazardDatasetMetadata],
+    n_draws: int,
+    rngs: Mapping[str, np.random.Generator],
+    loss_models: Mapping[str, LossModel],
+    combine: CombineRule | None = None,
+    basis_risk: BasisRisk,
+    asset_id: str,
+    assume_semantics: AnnualSemantics | None = None,
+    outside_support: OutsideSupport = "raise",
+    details: Mapping[str, Any] | None = None,
+    scenario: str = "baseline",
+) -> OutcomeSample:
+    """Draw simulated years of several hazards at one asset, under a stated dependence.
+
+    `curves`, `metadata`, `rngs` and `loss_models` are mappings by component
+    name, and the order of `curves` sets the components: the first is the
+    primary, whose values the sample's `index` holds. Two or more, each named
+    without surrounding whitespace and without `.`, `+`, `[` or `]`. Each
+    component's unit is its dataset's `value_unit` and its tail the dataset's
+    `return_period_tail`. `details` is added to every component's provenance;
+    `scenario` is the caller's name for the rows; the other arguments are those
+    of `sample_curve`.
+
+    **The dependence.** `dependence` is required: fitted curves carry no
+    dependence between hazards, so it is an assumption the caller states with
+    `Independent()`, `Comonotonic()`, `EmpiricalCopula(reference)`,
+    `GaussianCopula(correlation)` or a `DependenceModel` of the caller's, which
+    passes the gate described in `crc_sdk.parametric.dependence`.
+    `EmpiricalCopula`'s reference is a sample of per-year rows holding exactly
+    these components, as `sample_annual_hazards` makes one. The provenance's
+    `hazard_dependence` holds the model's record, and the notes and the setup
+    text call the dependence an assumption. Every model orders the draws by
+    value, not by severity, which the setup text says when the tails are mixed.
+
+    **The draws.** Each component is what `sample_curve` makes with that
+    component's generator: the uniforms first, then the basis-risk model. The
+    model then puts that component's rows in another order, by the ranks of the
+    uniforms: a row's hazard, index and own loss stay together, no value changes
+    and no further random number is used. So each component holds the rows of
+    `sample_curve`, and under `Independent()` `sample.component(name)` has its
+    `content_hash` for the same generator. `period` is the row number, 0 to
+    `n_draws - 1`, and each row has probability `1/n_draws`.
+
+    **The loss.** A component's impact comes from its `LossModel`, on its
+    hazard, after the basis-risk model, and its `own_loss` is that impact times
+    the value. After the reorder, `combine` takes the impacts of each row, and
+    the sample's `loss` is its result times the value. It is required when two
+    or more components have an impact, and refused with fewer. A component left
+    out of `loss_models` has no impact: it needs no rule, has no `own_loss`, and
+    the basis-risk model doesn't act on it or draw for it. With one impact the
+    sample's loss is that component's own, and `combine` records that. The loss
+    models must have one value, one `value_unit` and one `value_column`.
+
+    The lineage is built from the components' lineages and not from the model,
+    as the same generators give the same draws under every model: a design and
+    an evaluation need different generators, whichever models they state.
+
+    Raises `SampleError` for fewer than two curves or an invalid name, mappings
+    that name other components, no impact at all, a hazard unit a component's
+    impact is not calibrated for, loss models with different values, units or
+    value columns, a missing or invalid rule, two components with the same
+    generator state, an `n_draws` or a reference the model cannot use (all
+    before any draw), a model that doesn't pass the gate, a rule's invalid
+    result, and for what `sample_curve` raises for. Raises `TypeError` for a
+    missing dependence model, a bare callable as one or as `combine`, and wrong
+    types. Warns as `sample_curve` does: for each component with draws rarer than
+    its fitted support, and once for `NoBasisRisk()`.
+    """
+    if not isinstance(curves, Mapping):
+        raise TypeError(
+            "curves must map each component name to a curve, got "
+            f"{type(curves).__name__}"
+        )
+    names = tuple(curves)
+    if len(names) < 2:
+        raise SampleError(
+            f"sample_curve_hazards takes two hazards or more, got {len(names)}; "
+            "for one hazard use sample_curve"
+        )
+    for name in names:
+        _component_name(name, SampleError)
+    _require_model(dependence, "hazards")
+    asset = _identifier("asset_id", asset_id)
+    scenario = _identifier("scenario", scenario)
+    datasets = _by_component("metadata", metadata, names, every=True)
+    generators = _by_component("rngs", rngs, names, every=True)
+    n = _draw_count(n_draws)
+    for name in names:
+        if not isinstance(datasets[name], HazardDatasetMetadata):
+            raise TypeError(
+                "metadata must hold HazardDatasetMetadata, got "
+                f"{type(datasets[name]).__name__} for component {name!r}"
+            )
+        _require_generator(generators[name])
+    models = _hazard_models(
+        loss_models,
+        names,
+        {name: datasets[name].value_unit for name in names},
+        basis_risk,
+        asset,
+    )
+    rule_record = _combine_record(combine, [name for name in names if name in models])
+    _check_own_generators(generators, "component")
+    # Before any draw, so a refused call leaves the generators untouched.
+    document, sentence = _model_record(dependence, n, names, "hazards")
+
+    draws = {
+        name: _draw_curve(
+            curves[name],
+            metadata=datasets[name],
+            n_draws=n,
+            rng=generators[name],
+            loss_model=models.get(name),
+            basis_risk=basis_risk,
+            asset=asset,
+            assume_semantics=assume_semantics,
+            outside_support=outside_support,
+            details=details,
+        )
+        for name in names
+    }
+    order = _checked_order(
+        dependence,
+        document["kind"],
+        np.column_stack([each.uniforms for each in draws.values()]),
+        names,
+    )
+    components: dict[str, IndexComponent] = {}
+    impacts: dict[str, FloatArray] = {}
+    for j, (name, each) in enumerate(draws.items()):
+        rows = order[:, j]
+        index, hazard = each.index[rows], each.hazard[rows]
+        if each.impact is not None:
+            impacts[name] = each.impact[rows]
+        components[name] = IndexComponent(
+            index,
+            unit=datasets[name].value_unit,
+            tail=datasets[name].return_period_tail,
+            hazard=None if np.array_equal(index, hazard) else hazard,
+            own_loss=None if each.loss is None else each.loss[rows],
+        )
+    loss = _combined_loss(models, combine, rule_record, impacts)
+    first = next(iter(components.values()))
+    own = {name: each.provenance.to_document() for name, each in draws.items()}
+    loss_documents = [
+        {"name": name, "loss_model": own[name]["loss_model"]}
+        for name in names
+        if name in models
+    ]
+    sample = OutcomeSample(
+        asset_ids=(asset,),
+        period=np.arange(n, dtype=np.int64),
+        probability=np.full(n, 1.0 / n),
+        index=first.values,
+        loss=loss,
+        hazard=first.hazard,
+        index_unit=first.unit,
+        loss_unit=models[next(iter(impacts))].value_unit,
+        semantics="annual",
+        provenance=SampleProvenance(
+            **_column_fields(
+                own,
+                key="component",
+                note=_component_note,
+                record=document,
+                sentence=sentence,
+                n=n,
+            ),
+            # A list, because canonical JSON sorts keys and the order is the
+            # components'.
+            loss_model={"kind": "components", "components": loss_documents},
+            basis_risk=basis_risk.to_document(),
+            lineage=content_hash(
+                {
+                    "kind": "monte_carlo_hazards",
+                    "asset_id": asset,
+                    "lineages": {
+                        name: each.provenance.lineage for name, each in draws.items()
+                    },
+                }
+            ),
+            hazard_dependence=document,
+            combine=rule_record,
+            components=_moved_documents(own, order, document["kind"]),
+        ),
+        scenario=scenario,
+        index_components=components,
+    )
+    for name, each in draws.items():
+        _warn_rarer(each.rarer, n, f"component {name}: ")
+    _warn_comonotone(basis_risk, separate_index=False)
+    return sample
 
 
 # -- per-year values -----------------------------------------------------------
@@ -1660,6 +1991,24 @@ def _hazard_inputs(
             raise SampleError(
                 f"tails[{name!r}] must be 'upper' or 'lower', got {tail!r}"
             )
+    models = _hazard_models(
+        loss_models,
+        names,
+        {name: each.unit for name, each in series.items()},
+        basis_risk,
+        asset,
+    )
+    return _HazardInputs(series=dict(series), tails=severe, models=models)
+
+
+def _hazard_models(
+    loss_models: Any,
+    names: Sequence[str],
+    units: Mapping[str, str],
+    basis_risk: Any,
+    asset: str,
+) -> dict[str, LossModel]:
+    """Check the loss models of several hazards, before anything is drawn."""
     models = _by_component("loss_models", loss_models, names, every=False)
     if not models:
         raise SampleError(
@@ -1673,9 +2022,9 @@ def _hazard_inputs(
             )
         _check_models(model, basis_risk, asset)
         model._require_bound()
-        model.check_hazard_unit(series[name].unit)
+        model.check_hazard_unit(units[name])
     _check_one_value(models)
-    return _HazardInputs(series=dict(series), tails=severe, models=models)
+    return models
 
 
 def _check_one_value(models: Mapping[str, LossModel]) -> None:
@@ -1715,6 +2064,21 @@ def _combine_record(combine: Any, impacted: Sequence[str]) -> dict[str, Any]:
             f"{impacted[0]!r} has one: remove combine=, or add a loss model"
         )
     return _one_impact_record(impacted[0])
+
+
+def _combined_loss(
+    models: Mapping[str, LossModel],
+    combine: Any,
+    rule_record: Mapping[str, Any],
+    impacts: Mapping[str, FloatArray],
+) -> FloatArray:
+    """A row's loss: its one impact, or the rule's result, times the value."""
+    first, only = next(iter(impacts.items()))
+    return models[first].loss_values(
+        only
+        if combine is None
+        else _combined_impact(combine, str(rule_record["kind"]), impacts)
+    )
 
 
 def _same_years(series: Mapping[str, AnnualSeries]) -> IntArray:
@@ -1936,11 +2300,7 @@ def _annual_hazard_rows(
             own_loss=model.loss_values(impacts[name]),
         )
     one_model = inputs.models[inputs.impacted[0]]
-    loss = one_model.loss_values(
-        next(iter(impacts.values()))
-        if combine is None
-        else _combined_impact(combine, str(rule_record["kind"]), impacts)
-    )
+    loss = _combined_loss(inputs.models, combine, rule_record, impacts)
     n = kept_years.shape[0]
     first = next(iter(components.values()))
     return OutcomeSample(
