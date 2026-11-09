@@ -64,10 +64,11 @@ FIXED = Cover(RAIN_INDEX, LinearPayout(10.0, 90.0, 500.0), payout_unit="EUR")
 
 
 def _series(name: str, *, years: Any = YEARS) -> AnnualSeries:
-    rng = np.random.default_rng(sum(name.encode("utf-8")))
+    """Whole numbers, so that a pinned hash is the same on every platform."""
+    shift = sum(name.encode("utf-8"))
     return AnnualSeries(
         np.asarray(years),
-        rng.uniform(1.0, 99.0, len(years)),
+        np.array([float((year * 7 + shift) % 89 + 1) for year in years]),
         "mm/day",
         {"source": {"name": name}},
     )
@@ -668,23 +669,23 @@ _KINDS: dict[str, Any] = {
 
 _PINNED: dict[str, tuple[str, str]] = {
     "per-year": (
-        "sha256:00e5033f3fdfb02c811f52f0e7f7f292a77555ef126e2728c44eaf397dcad488",
+        "sha256:8c8b7479ad968fce4ecbc5f67263696c63af4cff5b83377dfb7c35e60d122c37",
         "sha256:90e1bc8dabea1b7ac818dbff2726d460d3cf37567c73d2e993d4f1711da93dce",
     ),
     "per-year with an index": (
-        "sha256:63676e20ac181f2776a6fee5137dfd17ccc1551d7a235e8105f18953f76d3038",
+        "sha256:fd9775eed052cdb29b4c8945901e8e268741cc7dd9f7b69f2360268a8deb7fc6",
         "sha256:5058cd6e64e2a916c1cfae45ad94d488527113dd919a45e7db7f49cb4469a7df",
     ),
     "several hazards": (
-        "sha256:a506fe0734c0c1301fcb50188e36c7aad2f92d34027c5752afa2bc9030cef835",
+        "sha256:5e4d488978f940909d04aaae79cc35fe8906fc21d6cf4a05a1fcb1526c3165a8",
         "sha256:342be33478ae474ed56b5064a88c713937e4c88016486a1fae7cb7e5aaefd4fc",
     ),
     "pool": (
-        "sha256:2064dd4667236aef56824438ccd1dcbbfa3400ef5bc4310fdeb07f5989bb2723",
+        "sha256:a44b4f865f11632054718d5676d166afe4b19d662e76167535e3701407de05a7",
         "sha256:03e286e2c72be8a57e7600dea61373e0905a6c0dc52308777adb7c1de796d3c6",
     ),
     "join": (
-        "sha256:b92c11a809b8b5d458b2f2e74a2deeb0812bc60980bd481be8dbe4f8fb2a7a13",
+        "sha256:ab4deb71f3623ded0af2927aa3b1d7b45755fce5a03d36df9fac638a3ff3db25",
         "sha256:b4423daee4c831e002aa74c829c992645f20b646b7d23be1ceca0821fb3c33c7",
     ),
     "curve": (
