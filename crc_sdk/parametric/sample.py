@@ -77,6 +77,7 @@ __all__ = [
     "SAMPLE_METADATA_KEY",
     "SAMPLE_SCHEMA_VERSION",
     "SAMPLE_SEMANTICS_VERSION",
+    "ComponentLoss",
     "IndexComponent",
     "OutcomeSample",
     "SampleProvenance",
@@ -2040,7 +2041,14 @@ def _written_metadata(table: Any) -> dict[str, Any]:
         ) from error
     if not isinstance(document, dict):
         raise SampleError(f"the {SAMPLE_METADATA_KEY!r} metadata must be an object")
-    with_components = document.get("schema_version") == SAMPLE_COMPONENTS_SCHEMA_VERSION
+    version = document.get("schema_version", SAMPLE_SCHEMA_VERSION)
+    if version not in (SAMPLE_SCHEMA_VERSION, SAMPLE_COMPONENTS_SCHEMA_VERSION):
+        raise SampleError(
+            f"the written sample has schema_version {version!r}; this version of "
+            f"crc-sdk reads {SAMPLE_SCHEMA_VERSION!r} and "
+            f"{SAMPLE_COMPONENTS_SCHEMA_VERSION!r}"
+        )
+    with_components = version == SAMPLE_COMPONENTS_SCHEMA_VERSION
     expected_keys = _WRITTEN_KEYS | ({"components"} if with_components else set())
     missing = sorted(expected_keys - set(document))
     if missing:
@@ -2049,12 +2057,6 @@ def _written_metadata(table: Any) -> dict[str, Any]:
     if unknown:
         raise SampleError(
             f"the {SAMPLE_METADATA_KEY!r} metadata has unknown keys {unknown}"
-        )
-    if not with_components and document["schema_version"] != SAMPLE_SCHEMA_VERSION:
-        raise SampleError(
-            f"the written sample has schema_version {document['schema_version']!r}; "
-            f"this version of crc-sdk reads {SAMPLE_SCHEMA_VERSION!r} and "
-            f"{SAMPLE_COMPONENTS_SCHEMA_VERSION!r}"
         )
     if document["semantics_version"] != SAMPLE_SEMANTICS_VERSION:
         raise SampleError(
