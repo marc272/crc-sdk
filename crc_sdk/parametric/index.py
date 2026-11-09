@@ -1,9 +1,15 @@
-"""What a parametric cover pays on: the index definition and its location."""
+"""What a parametric cover pays on: the index definition and its location.
+
+`IndexDefinition` is one index. `CompositeIndex` names several, for a cover
+that pays on several hazards at once.
+"""
 
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Annotated, Any, Literal, Self
 
 import numpy as np
@@ -18,6 +24,7 @@ __all__ = [
     "AtCell",
     "AtPoint",
     "AtStation",
+    "CompositeIndex",
     "IndexDefinition",
     "Location",
     "Tail",
@@ -27,6 +34,23 @@ Tail = Literal["upper", "lower"]
 """Which side of the index is severe: larger values (`"upper"`) or smaller."""
 
 _H3_CELL = re.compile(r"^[0-9a-f]{15}$")
+_COMPONENT_NAME = re.compile(r"[^\s.+\[\]](?:[^.+\[\]]*[^\s.+\[\]])?")
+
+
+def _component_name(
+    name: Any, error: type[Exception] = CoverDefinitionError, what: str = "a component"
+) -> str:
+    """Return a valid index component name; raise `error` otherwise.
+
+    Parameter names and table columns are built from component names, so a
+    name holds no `.`, `+`, `[` or `]` and no surrounding whitespace.
+    """
+    if not isinstance(name, str) or not _COMPONENT_NAME.fullmatch(name):
+        raise error(
+            f"{what} name must be a non-empty string without surrounding "
+            f"whitespace and without '.', '+', '[' or ']', got {name!r}"
+        )
+    return name
 
 
 class AtAsset(_DefinitionModel):
@@ -176,3 +200,121 @@ class IndexDefinition(_DefinitionModel):
     def from_document(cls, document: Mapping[str, Any]) -> Self:
         """Read a definition written by `to_document`."""
         return cls._validated(document)
+
+
+_COMPOSITE_KEYS = frozenset({"components", "kind"})
+_COMPOSITE_COMPONENT_KEYS = frozenset({"index", "name"})
+
+
+@dataclass(frozen=True, eq=False)
+class CompositeIndex:
+    """Several named indices a cover pays on together.
+
+    `components` maps each component's name to its `IndexDefinition`, two or
+    more, in order: the order is part of the terms, and the columns of the
+    index values a payout reads follow it. A sample's component of the same
+    name supplies each one's values.
+
+    Two composite indices are equal when they hold the same names and
+    definitions in the same order. Raises `CoverDefinitionError` for fewer
+    than two components, an invalid name or a value that is not an
+    `IndexDefinition`.
+    """
+
+    components: Mapping[str, IndexDefinition]
+
+    def __post_init__(self) -> None:
+        components = self.components
+        if not isinstance(components, Mapping):
+            raise CoverDefinitionError(
+                "components must map each component name to an IndexDefinition, "
+                f"got {type(components).__name__}"
+            )
+        if len(components) < 2:
+            raise CoverDefinitionError(
+                "a CompositeIndex holds two components or more, got "
+                f"{len(components)}; a cover on one index takes its IndexDefinition"
+            )
+        for name, index in components.items():
+            _component_name(name)
+            if not isinstance(index, IndexDefinition):
+                raise CoverDefinitionError(
+                    f"component {name!r} must be an IndexDefinition, "
+                    f"got {type(index).__name__}"
+                )
+        object.__setattr__(self, "components", MappingProxyType(dict(components)))
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        """The component names, in order."""
+        return tuple(self.components)
+
+    @property
+    def tails(self) -> tuple[Tail, ...]:
+        """Each component's severe side, in order."""
+        return tuple(index.tail for index in self.components.values())
+
+    def to_document(self) -> dict[str, Any]:
+        """Return the definition as plain JSON types, as the cover stores it.
+
+        The components are a list, because canonical JSON sorts the keys of
+        an object and their order is part of the terms.
+        """
+        return {
+            "components": [
+                {"index": index.to_document(), "name": name}
+                for name, index in self.components.items()
+            ],
+            "kind": "composite",
+        }
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any]) -> Self:
+        """Read a definition written by `to_document`.
+
+        Raises `CoverDefinitionError` for another `kind`, unknown or missing
+        keys, or a component name that repeats.
+        """
+        if not isinstance(document, Mapping) or set(document) != _COMPOSITE_KEYS:
+            raise CoverDefinitionError(
+                f"a CompositeIndex document has the keys {sorted(_COMPOSITE_KEYS)}"
+            )
+        if document["kind"] != "composite":
+            raise CoverDefinitionError(
+                f"expected an index of kind 'composite', got {document['kind']!r}"
+            )
+        entries = document["components"]
+        if isinstance(entries, (str, bytes, Mapping)) or not isinstance(
+            entries, Sequence
+        ):
+            raise CoverDefinitionError(
+                "a CompositeIndex document's components is a list"
+            )
+        components: dict[str, IndexDefinition] = {}
+        for entry in entries:
+            if (
+                not isinstance(entry, Mapping)
+                or set(entry) != _COMPOSITE_COMPONENT_KEYS
+            ):
+                raise CoverDefinitionError(
+                    "each component of a CompositeIndex document has the keys "
+                    f"{sorted(_COMPOSITE_COMPONENT_KEYS)}"
+                )
+            name = _component_name(entry["name"])
+            if name in components:
+                raise CoverDefinitionError(
+                    f"a CompositeIndex document repeats the component {name!r}"
+                )
+            components[name] = IndexDefinition.from_document(entry["index"])
+        return cls(components)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, CompositeIndex):
+            return NotImplemented
+        return tuple(self.components.items()) == tuple(other.components.items())
+
+    def __hash__(self) -> int:
+        return hash(tuple(self.components.items()))
+
+    def __reduce__(self) -> tuple[Any, tuple[dict[str, IndexDefinition]]]:
+        return (type(self), (dict(self.components),))

@@ -5,16 +5,20 @@ A `Cover` pays on an index, an `IndexDefinition`, through a payout function:
 user family that implements `PayoutFunction` and is registered with
 `register_payout`. Each payout parameter is a float or `Free`, a value a
 design chooses within bounds. Covers round-trip through canonical JSON and
-carry a `definition_hash`, as `ImpactExpression` does.
+carry a `definition_hash`, as `ImpactExpression` does. A cover on several
+hazards pays on a `CompositeIndex`, through a family with several
+`index_names`.
 
 Covers are designed and evaluated on an `OutcomeSample`, one row per year
 with an index value and a loss: `sample_curve` draws simulated years from a
 fitted curve, `sample_annual` reads the years of an `AnnualSeries`, and
-`OutcomeSample.from_table` takes a user table. `LossModel` turns the hazard
-into a loss and a `BasisRisk` model states how index and loss differ. On
-per-year samples, `AsRecorded`, `RecentYears` and `LinearTrend` state how the
-climate trend is treated, and `sample_annual_pool` pools the model-years of
-several `ModelRun`s.
+`OutcomeSample.from_table` takes a user table, which may hold several index
+columns: a sample may hold named `IndexComponent`s at one asset, and
+`OutcomeSample.component` takes one hazard's sample out of it. `LossModel`
+turns the hazard into a loss and a `BasisRisk` model states how index and
+loss differ. On per-year samples, `AsRecorded`, `RecentYears` and
+`LinearTrend` state how the climate trend is treated, and `sample_annual_pool`
+pools the model-years of several `ModelRun`s.
 
 `design` chooses a template's free parameters on an outcome sample for an
 objective (`MSE`, `ExpectedUncovered`, `WeightedCVaR` or a `UserObjective`)
@@ -64,6 +68,7 @@ from crc_sdk.parametric.index import (
     AtCell,
     AtPoint,
     AtStation,
+    CompositeIndex,
     IndexDefinition,
 )
 from crc_sdk.parametric.joint import (
@@ -105,6 +110,7 @@ from crc_sdk.parametric.plan import (
 )
 from crc_sdk.parametric.pricing import CostOfCapitalLoad, PurePremium
 from crc_sdk.parametric.sample import (
+    IndexComponent,
     OutcomeSample,
     SampleProvenance,
     holdout,
@@ -132,6 +138,7 @@ __all__ = [
     "Budget",
     "ComonotoneIndexWarning",
     "Comonotonic",
+    "CompositeIndex",
     "CostOfCapitalLoad",
     "Cover",
     "CoverDefinitionError",
@@ -148,6 +155,7 @@ __all__ = [
     "Holdout",
     "ImpactNoise",
     "Independent",
+    "IndexComponent",
     "IndexDefinition",
     "Individual",
     "InfeasibleDesignError",

@@ -34,6 +34,11 @@ loss). An allocation is an accounting statement about the total payout, not
 the payout of an asset's cover; a pricing prices the total payout, so these
 rows have no premium and no net-loss columns.
 
+**A sample of several hazards** has `index_components`. Its one asset's rows
+read the loss of the sample, the combined loss, for every cover: a cover with
+a `CompositeIndex` pays on the components of its names, and a cover on one
+index on the component named its `hazard_name`, so both kinds share one table.
+
 **In and out of sample.** In sample means the design sample. Out of sample
 means a held-out block of years (`holdout`, `year_block_kfold`), fresh Monte
 Carlo draws, or any other sample that shares no year with the design sample.
@@ -93,7 +98,9 @@ from crc_sdk.parametric.metrics import MetricOptions, metric_columns, metric_val
 from crc_sdk.parametric.pricing import CostOfCapitalLoad, Pricing, PurePremium
 from crc_sdk.parametric.sample import (
     OutcomeSample,
+    _check_cover_index,
     _check_out_of_sample,
+    _cover_index_values,
     _pool_entry,
     _require_one_asset,
 )
@@ -442,11 +449,7 @@ def _check_cover(cover: Cover, sample: OutcomeSample, asset: str) -> None:
             f"the cover pays in {cover.payout_unit!r}, but the sample's loss is "
             f"in {sample.loss_unit!r}"
         )
-    if cover.index.unit != sample.index_unit:
-        raise SampleError(
-            f"the cover's index is in {cover.index.unit!r}, but the sample's "
-            f"index is in {sample.index_unit!r}"
-        )
+    _check_cover_index(cover.index_definition, sample)
     if cover.asset_id is not None and cover.asset_id != asset:
         raise SampleError(
             f"the cover is written for asset {cover.asset_id!r}, but the sample "
@@ -460,6 +463,26 @@ def _check_own_sample(own: OutcomeSample, given: OutcomeSample | None) -> None:
             "design_sample= differs from the design's own design sample; "
             "leave it out for designed covers"
         )
+
+
+def _component_view(sample: OutcomeSample, own: OutcomeSample) -> OutcomeSample:
+    """`sample` as a design sample read it: that component's view, if it is one.
+
+    A cover designed on `sample.component(name)` has a one-hazard design
+    sample, so it is compared with the same component's view of a multi-hazard
+    sample. Any other design sample is compared with `sample` itself.
+    """
+    components = sample.index_components
+    if components is None or own.index_components is not None:
+        return sample
+    for step in reversed(own.provenance.selection):
+        if step.get("kind") != "component":
+            continue
+        chosen = components.get(step["name"])
+        if chosen is None or (step["loss"] == "own" and chosen.own_loss is None):
+            return sample
+        return sample.component(step["name"], loss=step["loss"])
+    return sample
 
 
 def _check_item(
@@ -481,7 +504,7 @@ def _check_item(
         raise SampleError(
             "the design sample and the evaluation sample hold different assets"
         )
-    _check_own_sample(own, given)
+    _check_own_sample(own, None if given is None else _component_view(given, own))
 
 
 def _check_set(
@@ -558,7 +581,10 @@ def _check_split(
     """Check the split for one cover; return its design sample, if known."""
     known = own if own is not None else design_sample
     if split == "in_sample":
-        if known is not None and known.content_hash != sample.content_hash:
+        if (
+            known is not None
+            and known.content_hash != _component_view(sample, known).content_hash
+        ):
             raise SampleError(
                 "in sample means on the design sample, but the sample differs "
                 "from the cover's design sample; evaluate with "
@@ -704,7 +730,9 @@ def _asset_row(
     probability = sample.probability
     column = sample.asset_ids.index(asset)
     loss = sample.loss[:, column]
-    payout = item.cover.payout_values(sample.index[:, column])
+    payout = item.cover.payout_values(
+        _cover_index_values(item.cover.index_definition, sample, column)
+    )
     basis: PremiumBasis
     if premium is not None:
         basis, used = "stated", premium
@@ -733,7 +761,9 @@ def _total_payout(covers: Mapping[str, Cover], sample: OutcomeSample) -> FloatAr
     total = np.zeros(len(sample), dtype=np.float64)
     for asset, cover in covers.items():
         column = sample.asset_ids.index(asset)
-        total += cover.payout_values(sample.index[:, column])
+        total += cover.payout_values(
+            _cover_index_values(cover.index_definition, sample, column)
+        )
     return total
 
 
@@ -912,7 +942,7 @@ def _parts_entry(provenance: Mapping[str, Any]) -> dict[str, Any] | None:
 
 def _sample_entry(sample: OutcomeSample, roles: set[str]) -> dict[str, Any]:
     provenance = sample.provenance.to_document()
-    return {
+    entry: dict[str, Any] = {
         "asset_ids": list(sample.asset_ids),
         "basis_risk": provenance["basis_risk"],
         "dependence": provenance["dependence"],
@@ -937,6 +967,19 @@ def _sample_entry(sample: OutcomeSample, roles: set[str]) -> dict[str, Any]:
         "source_kind": provenance["source_kind"],
         "trend": provenance["trend"],
     }
+    if sample.index_components is not None:
+        entry["components"] = [
+            {
+                "name": name,
+                "own_loss": component.own_loss is not None,
+                "tail": component.tail,
+                "unit": component.unit,
+            }
+            for name, component in sample.index_components.items()
+        ]
+        entry["combine"] = provenance.get("combine")
+        entry["hazard_dependence"] = provenance["hazard_dependence"]
+    return entry
 
 
 def _cover_entry(cover: Cover) -> CoverEntry:
@@ -1148,11 +1191,12 @@ def evaluate(
     """Evaluate one cover on a sample; return a comparison table.
 
     On a sample of one asset, `cover` is a resolved `Cover` or a design
-    (`DesignedCover`), and the table has one row. On a sample of several
-    assets, `cover` is a `JointDesignResult`, or a mapping from every asset id
-    of the sample to that asset's `Cover` or design (all covers or all
-    designs, each designed on that asset's own sample). The rows are then
-    those of the module docstring: a mapping gives one `"asset"` row per
+    (`DesignedCover`), and the table has one row. With index components, a
+    cover reads its components and the row's loss is the combined loss. On a
+    sample of several assets, `cover` is a `JointDesignResult`, or a mapping
+    from every asset id of the sample to that asset's `Cover` or design (all
+    covers or all designs, each designed on that asset's own sample). The rows
+    are then those of the module docstring: a mapping gives one `"asset"` row per
     asset and one `"total"` row, and a joint design one `"total"` row and, under
     `allocation`, one allocated row per asset. `split` is `"in_sample"` (on the
     design sample) or `"out_of_sample"` (on a sample that shares no period

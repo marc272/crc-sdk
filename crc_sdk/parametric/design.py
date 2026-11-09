@@ -20,11 +20,11 @@ built-in family is) has its amounts solved exactly:
 Free thresholds (attachment, exhaustion, breakpoints, knots, trigger) are
 searched on their stated grids, with the LP or QP above at each grid point
 (`route="grid"`). A `UserObjective`, or a payout that is not linear in its
-amounts, is searched on a grid over every free parameter and evaluated in
-numpy; candidates that break the budget or the limit are dropped. On a
-finite sample the objective is piecewise constant or piecewise smooth in the
-thresholds, so a stated grid is used rather than gradients; the objective at
-every candidate is kept (`DesignResult.profile`).
+amounts or has no amounts, is searched on a grid over every free parameter
+and evaluated in numpy; candidates that break the budget or the limit are
+dropped. On a finite sample the objective is piecewise constant or piecewise
+smooth in the thresholds, so a stated grid is used rather than gradients; the
+objective at every candidate is kept (`DesignResult.profile`).
 
 **Solver.** The LP and QP routes use HiGHS from the optional extra
 `crc-sdk[parametric]` (`pip install crc-sdk[parametric]`), imported only
@@ -71,6 +71,13 @@ zero loss), `tail_outcomes` (`(1 - beta) / p_min`) and `degenerate_tail`:
 `"expected_uncovered"` when `beta <= p_zero_loss` (the objective is then a
 multiple of E[U]), `"single_outcome"` when the tail holds at most one draw.
 
+**Several hazards.** A cover with a `CompositeIndex` reads the components of
+its names, in its order, so its payout sees an `(n, k)` index and everything
+above applies. A cover on one index reads, on a sample with index components,
+the component named its `hazard_name`. A design uses the loss of the sample
+it is given: `design(template, sample)` the combined loss, and
+`design(template, sample.component(name))` that hazard's own loss.
+
 Everything here works in memory and does no I/O.
 """
 
@@ -111,7 +118,12 @@ from crc_sdk.parametric.objectives import (
 from crc_sdk.parametric.parameters import Free, _DefinitionModel
 from crc_sdk.parametric.payouts import LinearConstraints, LinearInAmounts
 from crc_sdk.parametric.pricing import CostOfCapitalLoad, Pricing, PurePremium
-from crc_sdk.parametric.sample import OutcomeSample, _require_one_asset
+from crc_sdk.parametric.sample import (
+    OutcomeSample,
+    _check_cover_index,
+    _cover_index_values,
+    _require_one_asset,
+)
 
 __all__ = [
     "DESIGN_SEMANTICS_VERSION",
@@ -342,6 +354,11 @@ class DesignResult:
         }
 
 
+def _has_amounts(payout: Any) -> bool:
+    """Whether a payout's amounts can be solved: `LinearInAmounts` with at least one."""
+    return isinstance(payout, LinearInAmounts) and bool(payout.amount_names())
+
+
 # -- the problem -------------------------------------------------------------
 
 
@@ -350,7 +367,8 @@ class _Context:
     """The design problem in payout units, with its scale.
 
     `asset_id` is `None` when the problem is on several assets' total; its
-    `index` then has one column per asset.
+    `index` then has one column per asset. A cover with a `CompositeIndex`
+    has one column per component.
     """
 
     asset_id: str | None
@@ -1150,7 +1168,7 @@ def _grid(
             f"the grid has {size} points, more than max_grid_points="
             f"{context.options.max_grid_points}",
         )
-    linear = isinstance(template.payout, LinearInAmounts)
+    linear = _has_amounts(template.payout)
     rows: list[tuple[tuple[float, ...], float | None, str]] = []
     first_infeasible: str | None = None
     began = time.perf_counter()
@@ -1322,11 +1340,7 @@ def _check_units(template: Cover, sample: OutcomeSample) -> None:
             f"the cover pays in {template.payout_unit!r}, but the sample's loss "
             f"is in {sample.loss_unit!r}"
         )
-    if template.index.unit != sample.index_unit:
-        raise SampleError(
-            f"the cover's index is in {template.index.unit!r}, but the sample's "
-            f"index is in {sample.index_unit!r}"
-        )
+    _check_cover_index(template.index_definition, sample)
 
 
 def _tail_flags(
@@ -1358,9 +1372,10 @@ def design(
 
     `template` is a `Cover` with `Free` parameters, written for the sample's
     asset (or for none), paying in the sample's loss unit on an index in the
-    sample's index unit. `objective` is `MSE()`, `ExpectedUncovered()`,
-    `WeightedCVaR(alpha, beta)` or a `UserObjective`. `pricing` prices the
-    premium on the sample; `budget` (`Budget(ratio=...)` or
+    sample's index unit, or on the components of a sample with index
+    components (see the module docstring). `objective` is `MSE()`,
+    `ExpectedUncovered()`, `WeightedCVaR(alpha, beta)` or a `UserObjective`.
+    `pricing` prices the premium on the sample; `budget` (`Budget(ratio=...)` or
     `Budget(amount=...)`) bounds it; `limit` (`Limit(amount)`) bounds every
     payout. `options` (`DesignOptions`) sets the grid cap, the tolerances,
     the fill rule of unidentified amounts and whether the LP route ranges
@@ -1375,15 +1390,18 @@ def design(
     routes; `InfeasibleDesignError` when no payout meets the constraints;
     `UnboundedDesignError` for an unbounded objective; `DesignError` for any
     other failed solve or check; `SampleError` when the sample holds several
-    assets (take one with `sample.asset(asset_id)`) or the template's units or
-    asset differ from the sample's; `ValueError` for a template without free
+    assets (take one with `sample.asset(asset_id)`), the template's units or
+    asset differ from the sample's, or the sample lacks a component the
+    template reads; `ValueError` for a template without free
     parameters; and `TypeError` for arguments of the wrong type.
     """
     _check_inputs(template, sample, objective, pricing, budget, limit, options)
     _require_one_asset(sample, "design")
     _check_template(template, sample)
     loss = np.array(sample.loss[:, 0], dtype=np.float64)
-    index = np.array(sample.index[:, 0], dtype=np.float64)
+    index = np.array(
+        _cover_index_values(template.index_definition, sample), dtype=np.float64
+    )
     probability = np.array(sample.probability, dtype=np.float64)
     largest = float(loss.max())
     scale = largest if largest > SCALE_FLOOR else 1.0
@@ -1405,9 +1423,7 @@ def design(
     payout = template.payout
     free = template.free_parameters()
     solves = _Solves()
-    linear = isinstance(payout, LinearInAmounts) and not isinstance(
-        objective, UserObjective
-    )
+    linear = _has_amounts(payout) and not isinstance(objective, UserObjective)
     ties = 0
     profile: Any = None
     counts: dict[str, int] | None = None
