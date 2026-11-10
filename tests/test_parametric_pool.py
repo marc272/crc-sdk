@@ -52,6 +52,7 @@ from crc_sdk.parametric import (
     RecentYears,
     SampleError,
     SampleProvenance,
+    ScenarioError,
     StationColumn,
     StepPayout,
     evaluate,
@@ -1002,6 +1003,24 @@ def test_the_plan_s_sample_is_the_one_built_by_hand() -> None:
         )
         assert sample.content_hash == samples[asset].content_hash
         assert sample.lineage == samples[asset].lineage
+
+
+def test_a_labelled_plan_refuses_a_run_its_table_contradicts() -> None:
+    table = _table_of(scenario="ssp585").append_column(
+        "experiment", pa.array(["ssp245"] * len(_table_of()))
+    )
+    plan = _resolved(
+        _planned(table, pool=ModelPool(pathway="experiment"), scenario="x")
+    )
+    with pytest.raises(ScenarioError, match="'x'.*'ssp245'.*scenario column.*'ssp585'"):
+        plan.samples()
+
+
+def test_a_labelled_plan_whose_runs_agree_keeps_the_unlabelled_rows() -> None:
+    unlabelled = _resolved(_planned()).samples()["a"]
+    labelled = _resolved(_planned(scenario="x")).samples()["a"]
+    assert labelled.lineage == unlabelled.lineage
+    assert labelled.loss.tobytes() == unlabelled.loss.tobytes()
 
 
 def test_a_plan_on_batches_of_a_stub_nex_plan_gives_the_same_rows() -> None:
