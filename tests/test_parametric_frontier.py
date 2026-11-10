@@ -631,15 +631,15 @@ def test_an_empty_list_of_budgets_raises() -> None:
 
 
 @pytest.mark.parametrize(
-    "budgets",
+    ("budgets", "named"),
     [
-        [Budget(ratio=0.5), Budget(ratio=0.5)],
-        [Budget(ratio=1), Budget(ratio=1.0)],
-        [Budget(amount=5.0), Budget(ratio=1.0), Budget(amount=5.0)],
+        ([Budget(ratio=0.5), Budget(ratio=0.5)], r"ratio=0\.5"),
+        ([Budget(ratio=1), Budget(ratio=1.0)], r"ratio=1\.0"),
+        ([Budget(amount=5.0), Budget(ratio=1.0), Budget(amount=5.0)], r"amount=5\.0"),
     ],
 )
-def test_a_repeated_budget_raises_naming_it(budgets: list[Budget]) -> None:
-    with pytest.raises(EvaluationError, match="repeat"):
+def test_a_repeated_budget_raises_naming_it(budgets: list[Budget], named: str) -> None:
+    with pytest.raises(EvaluationError, match=f"repeat {named}"):
         _call(budgets)
 
 
