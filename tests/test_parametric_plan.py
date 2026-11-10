@@ -1083,13 +1083,13 @@ def test_hazard_noise_runs_through_a_per_year_plan() -> None:
         .split(Holdout(0.7))
         .metrics(OPTIONS)
     )
-    samples = plan.samples()
-    for sample in samples.values():
+    factors = []
+    for sample in plan.samples().values():
         assert sample.hazard is not None
         assert sample.provenance.basis_risk == {"kind": "hazard_noise", "sigma": 0.3}
-    assert not np.array_equal(
-        samples["warehouse-a"].hazard, samples["depot-b"].hazard
-    ), "each asset draws from its own generator"
+        factors.append(sample.hazard / sample.index)
+    # Each asset draws from its own generator.
+    assert not np.array_equal(factors[0], factors[1])
     text = setup_text(plan.explain(format="json"))
     assert "hazard noise, the hazard at the asset being the index times" in text
 

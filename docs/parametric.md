@@ -63,8 +63,8 @@ from crc_sdk.connectors import hazard_arrow_schema, write_hazard_dataset
 from crc_sdk.geometry import point_to_cell
 from crc_sdk.parametric import (
     MSE, Budget, Cover, ExpectedUncovered, Free, FreshDraws, HazardNoise,
-    IndexDefinition, LinearPayout, MetricOptions, ParametricPlan, StepPayout,
-    WeightedCVaR, setup_text,
+    ImpactNoise, IndexDefinition, LinearPayout, MetricOptions, ParametricPlan,
+    StepPayout, WeightedCVaR, setup_text,
 )
 from crc_sdk.types import HazardDatasetMetadata, SourceProvenance
 from crc_sdk.workflows import HazardDataset
@@ -786,8 +786,7 @@ loss_model = LossModel(PiecewiseLinearImpact([40.0, 120.0], [0.0, 0.5]),
 def draws(seed: int):
     rng = np.random.default_rng(np.random.SeedSequence(seed).spawn(1)[0])
     return sample_curve(row, metadata=metadata, n_draws=5_000, rng=rng,
-                        loss_model=loss_model,
-                        basis_risk=ImpactNoise(0.3, upper=1.0),
+                        loss_model=loss_model, basis_risk=HazardNoise(0.3),
                         asset_id="warehouse-a")
 
 design_draws, fresh_draws = draws(42), draws(7)
