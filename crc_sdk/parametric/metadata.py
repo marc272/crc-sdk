@@ -2730,7 +2730,12 @@ def _rank_block_text(
     betas: Any,
     where: str,
 ) -> str | None:
-    """The `Rank blocks` line of one evaluation, if a row reads rank blocks."""
+    """The `Rank blocks` line of one evaluation, if a row reads rank blocks.
+
+    A payout breakdown has no tail metric and no such columns, so it has none.
+    """
+    if _list(evaluation, "part_kinds", where):
+        return None
     levels = _named(evaluation, "level", "asset", where)
     components = bool(sample.get("components"))
     read = {

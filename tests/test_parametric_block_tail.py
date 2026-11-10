@@ -553,6 +553,7 @@ def test_a_payout_breakdown_has_no_such_columns() -> None:
     assert not {YEARS, *FLAGS} & set(table.column_names)
     long = to_long(table)
     assert not {YEARS, *FLAGS} & set(long.column_names)
+    assert _no_line(setup_text(table))
 
 
 # -- the setup text ------------------------------------------------------------
