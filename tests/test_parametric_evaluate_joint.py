@@ -306,6 +306,7 @@ def test_a_total_row_is_the_sum_of_the_losses_against_the_sum_of_the_payouts() -
         PROBABILITY,
         premium=row["premium"],
         options=MetricOptions(),
+        unidentified=np.zeros(5, dtype=np.bool_),
     )
     for name, value in expected.items():
         assert row[name] == pytest.approx(value, abs=1e-6), name
@@ -370,6 +371,7 @@ def test_the_value_rule_shares_each_draw_by_the_values() -> None:
             PROBABILITY,
             premium=0.0,
             options=MetricOptions(),
+            unidentified=np.zeros(5, dtype=np.bool_),
         )
         for name, value in expected.items():
             if name not in NO_PREMIUM:

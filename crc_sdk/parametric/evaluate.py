@@ -62,6 +62,15 @@ priced on the design sample (`"design"`), so out-of-sample rows use the price
 agreed at design; otherwise the premium priced on the evaluation sample with
 `pricing` (`"evaluation"`).
 
+**Amounts no design year reached.** `unidentified_share` is the probability of
+the evaluation block's draws whose payout reads an amount the design's fill rule
+set: any non-zero basis entry of such an amount counts, in full. On the design
+block it is 0 by construction, and above 0 only on a block that reaches where
+the design had no year. On a `"total"`, `"package"` or allocated row it is the
+union over the contracts, and it is null if any of them has no report: for a
+cover given as is, a design record without the key and a design on the numpy
+grid, where no fill rule ran.
+
 **The breakdown.** `payout_breakdown(covers, sample, *, split, ...)` returns a
 separate table with one row per entry and part: the part's expected payout, its
 share of the entry's and how often it pays. The rows of one entry add up to its
@@ -79,7 +88,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -104,6 +113,7 @@ from crc_sdk.parametric.errors import (
 from crc_sdk.parametric.index import CompositeIndex, _component_name
 from crc_sdk.parametric.joint import JointDesignResult, covers_hash
 from crc_sdk.parametric.metadata import (
+    _ADDED_METRIC_COLUMNS,
     EVALUATION_METADATA_KEY,
     KEY_COLUMNS,
     ColumnEntry,
@@ -120,7 +130,7 @@ from crc_sdk.parametric.metrics import (
     metric_columns,
     metric_values,
 )
-from crc_sdk.parametric.payouts import MaxOf, StepGrid, SumOf
+from crc_sdk.parametric.payouts import LinearInAmounts, MaxOf, StepGrid, SumOf
 from crc_sdk.parametric.pricing import CostOfCapitalLoad, Pricing, PurePremium
 from crc_sdk.parametric.sample import (
     OutcomeSample,
@@ -157,6 +167,7 @@ Allocation = Literal["value", "loss"]
 """How a joint design's total payout is shared out over its assets."""
 
 FloatArray = NDArray[np.float64]
+BoolArray = NDArray[np.bool_]
 
 _INT32_MAX = 2**31 - 1
 
@@ -202,7 +213,9 @@ class DesignedCover(Protocol):
     - `to_record()`: the design's record as plain JSON types, written to the
       metadata's `designs` with the label of the cover as evaluated
       (`cover_label`); a `"solver"` entry with the solver's `name` and
-      `version` is listed in its `solvers`.
+      `version` is listed in its `solvers`; an `"unidentified"` entry, the
+      names of the amounts its fill rule set, feeds `unidentified_share`,
+      which is null without one or when `"amounts"` is `"grid"`.
     """
 
     @property
@@ -975,6 +988,89 @@ def _component_values(sample: OutcomeSample, name: str) -> FloatArray:
     return values
 
 
+def _filled_amounts(
+    record: Mapping[str, Any] | None, asset: str | None = None
+) -> list[str] | None:
+    """The amounts a design's fill rule set; `None` if no fill rule is on record.
+
+    A cover given as is has no record, and on the numpy grid (`amounts` is
+    `"grid"`) no fill rule ran. A joint design's record lists them by asset, so
+    it takes `asset`.
+    """
+    if (
+        record is None
+        or "unidentified" not in record
+        or record.get("amounts") == "grid"
+    ):
+        return None
+    names = record["unidentified"]
+    if asset is not None and isinstance(names, Mapping):
+        names = names.get(asset)
+    if (
+        isinstance(names, (str, bytes))
+        or not isinstance(names, Sequence)
+        or not all(isinstance(name, str) for name in names)
+    ):
+        raise EvaluationError(
+            f"a design's unidentified must list the names of amounts, got {names!r}"
+        )
+    return list(names)
+
+
+def _amount_columns(
+    payout: Any, index: FloatArray
+) -> tuple[tuple[str, ...], FloatArray]:
+    """A resolved payout's amounts and their basis columns on `index`.
+
+    A resolved `MaxOf` has a fixed scale, so it lists no amounts. The scale is
+    the one amount a design can have set there, and its column is the payout at
+    a scale of 1.
+    """
+    if isinstance(payout, MaxOf):
+        largest = MaxOf(payout.components, scale=1.0).evaluate(index)
+        return ("scale",), largest.reshape(-1, 1)
+    if not isinstance(payout, LinearInAmounts):
+        return (), np.zeros((index.shape[0], 0), dtype=np.float64)
+    names = tuple(payout.amount_names())
+    return names, np.asarray(payout.basis(index), dtype=np.float64)
+
+
+def _reads_filled(
+    cover: Cover, names: Sequence[str], index: FloatArray
+) -> BoolArray | None:
+    """Which draws of `index` read one of `names`: any non-zero basis entry.
+
+    `None` if the cover has no column for one of `names`, so that a record of
+    a user's design that names amounts in its own way reads as null.
+    """
+    if not names:
+        return np.zeros(index.shape[0], dtype=np.bool_)
+    amounts, basis = _amount_columns(cover.payout, index)
+    if basis.shape != (index.shape[0], len(amounts)) or not np.isfinite(basis).all():
+        raise EvaluationError(
+            f"the basis of payout {cover.payout.kind!r} must be finite, with one "
+            f"row per draw and one column per amount; got shape {basis.shape}"
+        )
+    if not set(names) <= set(amounts):
+        return None
+    columns = [amounts.index(name) for name in names]
+    reads: BoolArray = (basis[:, columns] != 0.0).any(axis=1)
+    return reads
+
+
+def _item_reads(item: _Item, index: FloatArray) -> BoolArray | None:
+    """Which draws of a cover's `index` read a filled amount, if that is known."""
+    names = _filled_amounts(item.record)
+    return None if names is None else _reads_filled(item.cover, names, index)
+
+
+def _union_reads(parts: Iterable[BoolArray | None]) -> BoolArray | None:
+    """The draws in which any contract reads a filled amount, if all are known."""
+    listed = list(parts)
+    known = [part for part in listed if part is not None]
+    return None if len(known) < len(listed) else np.logical_or.reduce(known)
+
+
 def _item_identity(
     item: _Item,
     asset: str,
@@ -1014,11 +1110,12 @@ def _asset_row(
     probability = sample.probability
     column = sample.asset_ids.index(asset)
     loss = sample.loss[:, column]
-    payout = item.cover.payout_values(
+    index = (
         _cover_index_values(item.cover.index_definition, sample, column)
         if component is None
         else _component_values(sample, component)
     )
+    payout = item.cover.payout_values(index)
     basis: PremiumBasis
     if premium is not None:
         basis, used = "stated", premium
@@ -1028,7 +1125,14 @@ def _asset_row(
         basis, used = "evaluation", run.pricing.premium(payout, probability)
     row = _item_identity(item, asset, run, basis=basis, component=component)
     row.update(
-        metric_values(loss, payout, probability, premium=used, options=run.options)
+        metric_values(
+            loss,
+            payout,
+            probability,
+            premium=used,
+            options=run.options,
+            unidentified=_item_reads(item, index),
+        )
     )
     return row
 
@@ -1077,6 +1181,17 @@ def _set_rows(entry: _CoverSet, run: _Run) -> list[dict[str, Any]]:
             sample.probability,
             premium=used,
             options=run.options,
+            unidentified=_union_reads(
+                _item_reads(
+                    item,
+                    _cover_index_values(
+                        item.cover.index_definition,
+                        sample,
+                        sample.asset_ids.index(asset),
+                    ),
+                )
+                for asset, item in entry.items.items()
+            ),
         )
     )
     return [*rows, total]
@@ -1104,6 +1219,24 @@ def _allocated_payout(
     return payout * shares
 
 
+def _joint_reads(entry: _JointEntry, sample: OutcomeSample) -> BoolArray | None:
+    """The draws in which any asset's payout reads a filled amount."""
+    parts: list[BoolArray | None] = []
+    for asset, cover in entry.design.covers.items():
+        names = _filled_amounts(entry.record, asset)
+        column = sample.asset_ids.index(asset)
+        parts.append(
+            None
+            if names is None
+            else _reads_filled(
+                cover,
+                names,
+                _cover_index_values(cover.index_definition, sample, column),
+            )
+        )
+    return _union_reads(parts)
+
+
 def _joint_rows(entry: _JointEntry, run: _Run) -> list[dict[str, Any]]:
     """The total of a joint design, then its allocated rows, if a rule is set."""
     design = entry.design
@@ -1112,6 +1245,7 @@ def _joint_rows(entry: _JointEntry, run: _Run) -> list[dict[str, Any]]:
     covers = design.covers
     label = _set_label(covers, design.covers_hash)
     payout = _total_payout(covers, sample)
+    filled = _joint_reads(entry, sample)
     basis: PremiumBasis
     if run.premium is not None:
         basis, used = "stated", run.premium
@@ -1135,6 +1269,7 @@ def _joint_rows(entry: _JointEntry, run: _Run) -> list[dict[str, Any]]:
             probability,
             premium=used,
             options=run.options,
+            unidentified=filled,
         )
     )
     rows = [total]
@@ -1164,6 +1299,7 @@ def _joint_rows(entry: _JointEntry, run: _Run) -> list[dict[str, Any]]:
                 probability,
                 premium=0.0,
                 options=run.options,
+                unidentified=filled,
             )
         )
         row.update(dict.fromkeys(without))
@@ -1221,6 +1357,10 @@ def _package_rows(entry: CoverPackage, run: _Run) -> list[dict[str, Any]]:
             sample.probability,
             premium=used,
             options=run.options,
+            unidentified=_union_reads(
+                _item_reads(item, _component_values(sample, name))
+                for name, item in entry._items.items()
+            ),
         )
     )
     return [*rows, package]
@@ -1815,7 +1955,10 @@ def evaluate(
     where the metric is undefined. `components` is what the row's cover reads,
     joined by `+`, and null on a sample of one hazard. `design_budget` is the
     design's budget bound in payout units, the sum on a package or a total of
-    separate covers, and null for a cover given as is.
+    separate covers, and null for a cover given as is. `payout_frequency` is
+    the probability that the cover pays, and `unidentified_share` the
+    probability of the draws whose payout reads an amount that the design's
+    fill rule set (see the module docstring).
     `asset_id` is null on `"total"` rows. `premium_basis`, `premium` and the
     net-loss columns are null on allocated rows. On `"total"` and allocated
     rows, `cover_hash` is the hash of the set of covers and `cover_label` their
@@ -2116,6 +2259,36 @@ def write_comparison(
         staged.unlink(missing_ok=True)
 
 
+def _added_entries() -> dict[str, ColumnEntry]:
+    """The entries of the metric columns that a table written earlier lacks."""
+    return {
+        column.name: ColumnEntry(**column.to_document("1"))
+        for column in metric_columns(MetricOptions())
+        if column.name in _ADDED_METRIC_COLUMNS
+    }
+
+
+def _with_added_metrics(table: Any) -> Any:
+    """`table` with the metric columns it was written without, all null.
+
+    A payout breakdown has columns of its own and no `payout_to_loss_ratio`, so
+    it is returned as it is.
+    """
+    names = table.column_names
+    if "payout_to_loss_ratio" not in names:
+        return table
+    position = names.index("payout_to_loss_ratio") + 1
+    for name in _ADDED_METRIC_COLUMNS:
+        if name not in names:
+            table = table.add_column(
+                position,
+                pa.field(name, pa.float64()),
+                pa.nulls(table.num_rows, pa.float64()),
+            )
+        position += 1
+    return table
+
+
 def to_long(table: Any) -> Any:
     """Return the tidy form of a comparison table: one row per metric.
 
@@ -2123,7 +2296,9 @@ def to_long(table: Any) -> Any:
     wide column's name), `metric`, `parameter` and `parameter_value` (for
     example `"beta"` and 0.99; null for metrics without one), `unit` and
     `value`. Rows are ordered by metric column, then by the wide rows'
-    order. The table's metadata is kept.
+    order. The table's metadata is kept. A comparison written before
+    `payout_frequency` and `unidentified_share` existed reads as null: its
+    long form holds them with a null `value`.
 
     Raises `EvaluationError` for a table without comparison metadata or
     with metadata that does not describe it, and `TypeError` for a table
@@ -2133,6 +2308,9 @@ def to_long(table: Any) -> Any:
         raise TypeError(f"table must be a pyarrow.Table, got {type(table).__name__}")
     metadata = EvaluationMetadata.from_table(table)
     metadata.check_table(table)
+    schema_metadata = table.schema.metadata
+    table = _with_added_metrics(table)
+    described = {**_added_entries(), **metadata.columns}
     columns = _identity_columns(table.column_names)
     identity = table.select(columns)
     n = table.num_rows
@@ -2140,7 +2318,7 @@ def to_long(table: Any) -> Any:
     for name in table.column_names:
         if name in columns:
             continue
-        entry = metadata.columns[name]
+        entry = described[name]
         parameter: str | None = None
         value: float | None = None
         if entry.parameter:
@@ -2154,4 +2332,4 @@ def to_long(table: Any) -> Any:
             .append_column("value", table.column(name).cast(pa.float64()))
         )
     long = pa.concat_tables(parts)
-    return long.replace_schema_metadata(table.schema.metadata)
+    return long.replace_schema_metadata(schema_metadata)

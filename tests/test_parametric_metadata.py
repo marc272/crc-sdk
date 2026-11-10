@@ -436,7 +436,9 @@ def test_setup_text_carries_the_notes_of_curve_samples() -> None:
         "Split: out of sample, fold 0, a holdout with train fraction 0.7: "
         "evaluated on 120 simulated years (draws 280 to 399), the held-out block; "
         "designed on 280 simulated years (draws 0 to 279), the design block; the "
-        "leakage check passed: the two share no period of one source."
+        "leakage check passed: the two share no period of one source. Out of "
+        "sample here means new draws from the same curve, so these rows test the "
+        "design's sampling error, not the curve."
     ]
     assert lines["Sample"] == [
         "Sample: Monte Carlo draws from a hazard curve with annual_exceedance "
@@ -777,7 +779,9 @@ def test_setup_text_of_a_setup_known_before_drawing() -> None:
             "draw is one year.",
             "Split: out of sample, fold 0, a holdout with train fraction 0.7: "
             "evaluated on the evaluation sample, not known yet; designed on the "
-            "design sample, not known yet; no leakage check is recorded.",
+            "design sample, not known yet; no leakage check is recorded. Out of "
+            "sample here means new draws from the same curve, so these rows test "
+            "the design's sampling error, not the curve.",
             "Sample: Monte Carlo draws from a hazard curve with annual_exceedance "
             "semantics, as the dataset declares. Basis risk: impact noise, a "
             "mean-one lognormal factor with sigma 0.25. Loss: model not stated, "

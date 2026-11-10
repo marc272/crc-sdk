@@ -41,16 +41,18 @@ def _values(premium: float, **options: Any) -> dict[str, float | None]:
 
 def test_default_options_give_the_adr_columns_in_order() -> None:
     names = [column.name for column in metric_columns(MetricOptions())]
-    assert len(names) == 62
-    assert names[:6] == [
+    assert len(names) == 64
+    assert names[:8] == [
         "expected_loss",
         "expected_payout",
         "premium",
         "expected_uncovered",
         "coverage_ratio",
         "payout_to_loss_ratio",
+        "payout_frequency",
+        "unidentified_share",
     ]
-    assert names[6:14] == [
+    assert names[8:16] == [
         "tail_coverage_b0_9",
         "tail_coverage_b0_95",
         "tail_coverage_b0_99",
@@ -60,8 +62,8 @@ def test_default_options_give_the_adr_columns_in_order() -> None:
         "false_negative_rate_l0",
         "false_positive_rate_l0",
     ]
-    assert names[14:16] == ["rmse", "correlation"]
-    assert names[16:19] == [
+    assert names[16:18] == ["rmse", "correlation"]
+    assert names[18:21] == [
         "var_uncovered_b0_9",
         "var_uncovered_b0_95",
         "var_uncovered_b0_99",

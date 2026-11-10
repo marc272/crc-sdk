@@ -51,6 +51,8 @@ NEW_METRICS = {
     "false_negative_rate_l0",
     "false_positive_rate_l0",
 }
+ADDED_METRICS = {"payout_frequency", "unidentified_share"}
+"""Metrics that no fixture holds; the fixtures are byte-for-byte copies."""
 ALL_METRICS = {column.name for column in metric_columns(MetricOptions())}
 
 
@@ -180,10 +182,10 @@ def test_evaluation_cases(path: Path) -> None:
     expected = case["expected"]["metrics"]
     columns = {column.name for column in metric_columns(options)}
     if case["source"] == "closed_form":
-        assert set(expected) == columns
+        assert set(expected) == columns - ADDED_METRICS
     else:
         assert case["metric_options"] is None
-        assert set(expected) == ALL_METRICS - NEW_METRICS
+        assert set(expected) == ALL_METRICS - NEW_METRICS - ADDED_METRICS
     _check_metrics(row, expected, case)
 
 

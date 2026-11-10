@@ -12,6 +12,11 @@ cover. `metric_values` returns, in this order:
   that payouts cover (payouts above the loss do not count); null when
   E[L] = 0;
 - `payout_to_loss_ratio`: E[pi] / E[L]; null when E[L] = 0;
+- `payout_frequency`: P(pi > eps), the probability that the cover pays;
+- `unidentified_share`: the probability of the draws whose payout reads an
+  amount that no design year reached, so that a design's fill rule set it.
+  `metric_values` takes those draws as `unidentified`, and it is null without
+  them;
 - `tail_coverage_b<beta>`: sum w min(pi, L) / sum w L, with w the CVaR_beta
   weights of L: the share of the loss covered in the worst 1 - beta of loss
   years; null when sum w L = 0;
@@ -242,6 +247,22 @@ def metric_columns(options: MetricOptions) -> tuple[MetricColumn, ...]:
             "ratio",
             "E[payout] / E[L]: payouts above the loss count too",
         ),
+        MetricColumn(
+            "payout_frequency",
+            "payout_frequency",
+            {},
+            "ratio",
+            f"P(payout > {eps:g}): the probability that the cover pays",
+        ),
+        MetricColumn(
+            "unidentified_share",
+            "unidentified_share",
+            {},
+            "ratio",
+            "the probability of the block's draws whose payout reads an amount "
+            "that no design year reached, so that the design's fill rule set it; "
+            "null for a cover given as is and for a design on the numpy grid",
+        ),
     ]
     columns += _per_beta(
         "tail_coverage",
@@ -347,16 +368,20 @@ def metric_values(
     *,
     premium: float,
     options: MetricOptions,
+    unidentified: ArrayLike | None = None,
 ) -> dict[str, float | None]:
     """Return every metric of `metric_columns(options)`, in that order.
 
     `loss`, `payout` and `probability` hold one value per draw: the loss
     (>= 0), the cover's payout (>= 0) and the draw's probability (> 0,
     summing to 1 within 1e-12). `premium` is the premium used, in the loss
-    unit. A value is `None` where the metric is undefined (see the module
+    unit. `unidentified` holds one boolean per draw, true where the payout
+    reads an amount a design's fill rule set; without it `unidentified_share`
+    is `None`. A value is `None` where the metric is undefined (see the module
     docstring). Raises `EvaluationError` (a `ValueError`) for arrays of
     different shapes, non-finite or negative values, probabilities that do
-    not sum to 1, or a premium that is not a finite number.
+    not sum to 1, a premium that is not a finite number, or `unidentified`
+    that is not one boolean per draw.
     """
     try:
         loss_draws = Draws(loss, probability)
@@ -374,6 +399,9 @@ def metric_values(
         or not math.isfinite(float(premium))
     ):
         raise EvaluationError(f"premium must be a finite number, got {premium!r}")
+    filled = None if unidentified is None else np.asarray(unidentified)
+    if filled is not None and (filled.dtype != np.bool_ or filled.shape != p.shape):
+        raise EvaluationError("unidentified must hold one boolean per draw")
     L = loss_draws.values
     pi = payout_draws.values
     if (L < 0.0).any() or (pi < 0.0).any():
@@ -384,7 +412,7 @@ def metric_values(
     uncovered_draws = Draws(np.maximum(residual, 0.0), p)
     net_draws = Draws(residual + P, p)
     expected_loss = loss_draws.mean()
-    eps = options.payout_threshold
+    no_payout = pi <= options.payout_threshold
 
     values: dict[str, float | None] = {
         "expected_loss": expected_loss,
@@ -393,6 +421,8 @@ def metric_values(
         "expected_uncovered": uncovered_draws.mean(),
         "coverage_ratio": _ratio(_fsum(p * covered), expected_loss),
         "payout_to_loss_ratio": _ratio(payout_draws.mean(), expected_loss),
+        "payout_frequency": _fsum(p[~no_payout]) + 0.0,
+        "unidentified_share": None if filled is None else _fsum(p[filled]) + 0.0,
     }
     for beta in options.betas:
         weights = loss_draws.tail_weights(beta)
@@ -403,7 +433,6 @@ def metric_values(
         values[f"cvar_uncovered_to_loss_b{_label(beta)}"] = _ratio(
             uncovered_draws.cvar(beta), loss_draws.cvar(beta)
         )
-    no_payout = pi <= eps
     for threshold in options.loss_thresholds:
         loss_year = L > threshold
         values[f"false_negative_rate_l{_label(threshold)}"] = _ratio(

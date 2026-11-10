@@ -42,7 +42,8 @@ or without an evaluation's `level`, `scope` and `allocation` or a sample's
 `dependence`, reads as rows of single assets: `level` `["asset"]`, `scope`
 `["individual"]`, no allocation, no dependence and no component. A sample
 without `trend` has none recorded, which on per-year values reads as the years
-as recorded, and a sample without `pool` is no pool.
+as recorded, and a sample without `pool` is no pool. A comparison without the
+metric column `payout_frequency` or `unidentified_share` reads as null there.
 
 The module claims no licence of its own for a comparison: it is derived data
 under its inputs' terms, which `licences` lists.
@@ -107,6 +108,9 @@ IDENTITY_COLUMNS = (
 
 _ADDED_IDENTITY_COLUMNS = ("scope", "components", "design_budget")
 """The identity columns that a table written earlier doesn't have."""
+
+_ADDED_METRIC_COLUMNS = ("payout_frequency", "unidentified_share")
+"""The metric columns that a comparison written earlier doesn't have, in order."""
 
 _BREAKDOWN_COLUMNS = ("part", "part_kind")
 """The columns of a payout breakdown beside the identity columns."""
@@ -460,7 +464,9 @@ class EvaluationMetadata(_EvaluationModel):
 
         The table must have the identity columns and exactly the metric
         columns of `columns`; a table written before `scope`, `components` or
-        `design_budget` was added may lack them. Its key (`cover_hash`,
+        `design_budget` was added may lack them, and a comparison written
+        before `payout_frequency` or `unidentified_share` was added may lack
+        that column. Its key (`cover_hash`,
         `design_id`, `asset_id`, `level`, `scenario`, `split`, `fold`, and
         `part` on a payout breakdown) must be unique; and every cover, design,
         sample and evaluation it names must be described here. Raises
@@ -472,9 +478,10 @@ class EvaluationMetadata(_EvaluationModel):
         if missing:
             raise EvaluationError(f"the comparison table lacks the columns {missing}")
         metrics = [name for name in names if name not in identity]
-        if set(metrics) != set(self.columns):
-            unknown = sorted(set(metrics) - set(self.columns))
-            absent = sorted(set(self.columns) - set(metrics))
+        optional = () if "part" in names else _ADDED_METRIC_COLUMNS
+        unknown = sorted(set(metrics) - set(self.columns))
+        absent = sorted(set(self.columns) - set(metrics) - set(optional))
+        if unknown or absent:
             raise EvaluationError(
                 "the table's metric columns differ from the metadata's: "
                 f"undescribed {unknown}, absent {absent}"
@@ -2204,6 +2211,56 @@ def _metrics(options: Mapping[str, Any], unit: str) -> str:
     )
 
 
+_ONE_CURVE = (
+    "Out of sample here means new draws from the same curve, so these rows test "
+    "the design's sampling error, not the curve."
+)
+"""What an evaluation says when its blocks are draws from one curve."""
+
+
+def _draws_from_one_curve(
+    evaluation: Mapping[str, Any],
+    samples: Sequence[Mapping[str, Any]],
+    sources: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Whether an out-of-sample evaluation's blocks are draws from one curve.
+
+    Those are fresh draws, and a holdout or k-fold of draws. Before execution a
+    plan's evaluations name no sample, and its samples are all of one kind. Where
+    the metadata records the curves, a design block whose curve the evaluation
+    block does not read is not one curve, whatever the method.
+    """
+    method = evaluation.get("method")
+    if evaluation.get("split") != "out_of_sample" or method not in (
+        "fresh_draws",
+        "holdout",
+        "kfold",
+    ):
+        return False
+    sample_hash = evaluation.get("sample_hash")
+    read = [
+        sample
+        for sample in samples
+        if sample_hash is None or sample.get("sample_hash") == sample_hash
+    ]
+    if method != "fresh_draws" and (
+        not read or any(sample.get("source_kind") != "monte_carlo" for sample in read)
+    ):
+        return False
+
+    def curves(block: Any) -> set[str]:
+        return {
+            _json_text(source["curve"])
+            for source in sources
+            if source.get("sample_hash") == block and source.get("curve") is not None
+        }
+
+    held = curves(sample_hash)
+    return all(
+        curves(block) <= held for block in evaluation.get("design_samples") or ()
+    )
+
+
 _ALLOCATED_LEVELS = {
     "asset_by_value": "in proportion to its stated value",
     "asset_by_loss": (
@@ -2406,7 +2463,9 @@ def setup_text(
     - `Split`, one line per evaluation: in or out of sample, the fold, how
       the split was made (a holdout and its train fraction, k-fold and k,
       fresh draws, a separate sample), the evaluation and design samples
-      (years, periods, blocks) and the leakage check;
+      (years, periods, blocks) and the leakage check; and, where the design and
+      evaluation blocks are draws from one curve, that these rows test the
+      design's sampling error, not the curve;
     - `Seeds`: the plan's seed (`plan_seed`) and the fresh draws' seed
       (`fresh_draws_seed`) that the evaluations' `details` record, if any;
     - `Sample`: the source kind, the probability semantics and who stated
@@ -2606,6 +2665,8 @@ def setup_text(
     written: set[tuple[str, str]] = set()
     for i, evaluation in enumerate(evaluations):
         text = _split(evaluation, by_hash, f"setup.evaluations[{i}]")
+        if _draws_from_one_curve(evaluation, samples, recorded):
+            text += f" {_ONE_CURVE}"
         if not one_seed and _seeds_text(*seeds[i]):
             text += f" Seeds: {_seeds_text(*seeds[i])}."
         if not shared:
