@@ -13,7 +13,10 @@ modelled years (`sample_annual`), or the rows of a user table
 - `index` and `loss` have one row per draw and one column per asset, in
   `asset_ids` order: `(n, n_assets)`.
 - `hazard` is the value the loss model read, kept when it differs from the
-  index (a basis-risk model or a separate index series); otherwise `None`.
+  index (a basis-risk model or a separate index series); otherwise `None`. On
+  a sample of several hazards it is the first component's, so on a first
+  component with no impact, which no loss reads, it is the hazard at the asset
+  that a basis-risk model with `apply_hazard`, such as `HazardNoise`, gave.
 - `provenance` (`SampleProvenance`) records the source, the semantics, the
   loss model, the basis-risk model and the generator state.
 
@@ -870,7 +873,10 @@ class OutcomeSample:
     `index` and `loss` have shape `(n, n_assets)`, one column per asset in
     `asset_ids` order; a 1-D array is read as one column. They are finite,
     and the loss is non-negative. `hazard` is the value the loss model read,
-    when it differs from the index, else `None`. `index_unit` and
+    when it differs from the index, else `None`; on a sample of several
+    hazards it is the first component's, so on a first component with no
+    impact it is the hazard at the asset that a basis-risk model with
+    `apply_hazard`, such as `HazardNoise`, gave. `index_unit` and
     `loss_unit` name the units; the loss unit must equal a cover's payout
     unit for designs and evaluations. `semantics` is `"annual"`.
 
