@@ -39,6 +39,8 @@ row of a comparison, and `split_budget` splits one budget between them.
 `compare_pooled` computes each metric once over all the held-out years of a
 k-fold split, and `bootstrap_intervals` gives each metric an interval from
 redrawing the evaluated years.
+`ScenarioSet` holds one evaluation block per scenario under a named reference,
+and refuses a set in which anything but the hazard differs.
 
 `ParametricPlan` chains these steps as a lazy plan, to a written
 comparison: `ParametricPlan.for_evaluation(request)` from the fitted hazard
@@ -155,6 +157,7 @@ from crc_sdk.parametric.sample import (
     holdout,
     year_block_kfold,
 )
+from crc_sdk.parametric.scenarios import ScenarioSet
 from crc_sdk.parametric.sources import (
     AnnualSeries,
     ModelRun,
@@ -237,6 +240,7 @@ __all__ = [
     "SampleError",
     "SampleProvenance",
     "ScenarioError",
+    "ScenarioSet",
     "SolverUnavailableError",
     "StationColumn",
     "StepGrid",

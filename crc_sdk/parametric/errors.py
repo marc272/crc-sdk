@@ -70,7 +70,8 @@ class ScenarioError(SampleError):
     horizons, an `n_draws` that isn't a whole multiple of its members, a
     `hazard_name=` that the source contradicts, and, on a sample a caller has
     labelled with `scenario=`, an unknown pathway or sources that disagree on
-    what the row reads.
+    what the row reads. `ScenarioSet` raises it for scenarios that can't stand
+    side by side, naming the two scenarios and the field.
     """
 
 
