@@ -76,6 +76,7 @@ PUBLIC = [
     "RecentYears",
     "SampleError",
     "SampleProvenance",
+    "ScenarioError",
     "SolverUnavailableError",
     "StationColumn",
     "StepGrid",

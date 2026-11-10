@@ -22,6 +22,16 @@ tabulated curve cannot be evaluated outside its knots, so by default its
 sample raises; `outside_support="extrapolate"` uses crc-framework's own
 extrapolation and `"clamp"` the nearest knot, and the choice is recorded.
 
+**A window of horizons** (`sample_curve` with a sequence of canonical rows).
+Several horizons of one hazard, cell, pathway and dataset form one scenario: an
+equal-weight mixture of their curves, one simulated year being a draw from one
+of them. The generator draws `n_draws` uniforms once, as for one curve, and with
+`m` members, in horizon order, row `d` reads member `d mod m` at its uniform.
+`n_draws` must be a whole multiple of `m`. Every row is a draw from a curve the
+dataset holds: nothing is computed between two horizons. Because a row's member
+is its `period` modulo `m`, a block of contiguous periods holds every member,
+within one row of the others.
+
 **Several assets from curves** (`sample_curves`). Curves say nothing about how
 assets move together, so a stated dependence model (`Independent`,
 `Comonotonic`, `EmpiricalCopula`, `GaussianCopula` or a `DependenceModel` of the
@@ -117,6 +127,7 @@ from crc_sdk.parametric.combine import (
 )
 from crc_sdk.parametric.dependence import (
     DependenceModel,
+    EmpiricalCopula,
     _checked_order,
     _model_record,
     _require_model,
@@ -125,31 +136,38 @@ from crc_sdk.parametric.errors import (
     ComonotoneIndexWarning,
     ProbabilitySemanticsError,
     SampleError,
+    ScenarioError,
 )
 from crc_sdk.parametric.index import Tail, _component_name
 from crc_sdk.parametric.loss import LossModel
 from crc_sdk.parametric.metadata import _year_spans
 from crc_sdk.parametric.sample import (
     COMONOTONE_MESSAGE,
+    HazardFrom,
     IndexComponent,
     OutcomeSample,
     SampleProvenance,
+    _agreed_hazard,
     _arrow_table,
     _asset_note,
     _by_component,
     _check_json,
+    _check_known_pathway,
     _column,
     _component_note,
     _freeze,
     _generator_record,
+    _hazard_record,
     _identifier,
     _integer_values,
     _licence_entry,
+    _named_in_source,
     _require_generator,
     _source_document,
     _thaw,
 )
 from crc_sdk.parametric.trend import AsRecorded, Trend, _require_trend, _Series
+from crc_sdk.pathways import pathways_equivalent
 from crc_sdk.providers.era5 import ERA5_ATTRIBUTION, ERA5_LICENCE
 from crc_sdk.types import CurveParameters, HazardDatasetMetadata
 from crc_sdk.workflows.distributions import (
@@ -563,6 +581,190 @@ def _draw_count(n_draws: Any) -> int:
 
 
 @dataclass(frozen=True, eq=False)
+class _Member:
+    """One curve of a window of horizons."""
+
+    distribution: Any
+    row: dict[str, Any]
+    pathway: str
+    horizon: int
+
+
+def _is_window(curve: Any) -> bool:
+    """Whether `curve` is several curves: a sequence, not a row or a distribution."""
+    return isinstance(curve, Sequence) and not isinstance(curve, (str, bytes))
+
+
+def _checked_members(curve: Sequence[Any], scenario: str) -> tuple[_Member, ...]:
+    """A window's canonical rows, in horizon order, after a window's refusals.
+
+    Raises `ScenarioError` unless they are two or more rows of one hazard, cell
+    and pathway, each with a pathway crc_sdk knows and a horizon of its own. The
+    dataset is the one `metadata=` of the call: a row's `source_id` names its
+    source pixel, which may differ between horizons of one dataset.
+    """
+    if len(curve) < 2:
+        raise ScenarioError(
+            f"a window of horizons holds two canonical rows or more, got {len(curve)}; "
+            "pass one row as the curve itself"
+        )
+    members: list[_Member] = []
+    for row in curve:
+        if not isinstance(row, Mapping):
+            raise ScenarioError(
+                "the members of a window must be canonical rows, because a bare "
+                "distribution or CurveParameters states no pathway or horizon; got "
+                f"{type(row).__name__}"
+            )
+        distribution, key = _resolve_curve(row)
+        assert key is not None
+        pathway, horizon = key["pathway"], key["horizon"]
+        if not isinstance(pathway, str) or not pathway:
+            raise ScenarioError(
+                f"a member of a window must state its pathway, got {pathway!r}"
+            )
+        if isinstance(horizon, bool) or not isinstance(horizon, (int, np.integer)):
+            raise ScenarioError(
+                "a member of a window must state its horizon as a year, got "
+                f"{horizon!r}"
+            )
+        _check_known_pathway(pathway, scenario)
+        members.append(_Member(distribution, key, pathway, int(horizon)))
+    first = members[0]
+    for field_name, what in (("hazard_name", "hazard"), ("cell_index", "cell")):
+        seen = list(dict.fromkeys(member.row[field_name] for member in members))
+        if len(seen) > 1:
+            raise ScenarioError(
+                f"the members of a window differ in horizon alone, but they hold "
+                f"several {what}s: {seen}"
+            )
+    pathways = list(dict.fromkeys(member.pathway for member in members))
+    if not all(pathways_equivalent(first.pathway, label) for label in pathways):
+        raise ScenarioError(
+            f"a window holds one pathway, but its members are under {pathways}; "
+            "state one scenario per pathway"
+        )
+    horizons = [member.horizon for member in members]
+    repeated = sorted({year for year in horizons if horizons.count(year) > 1})
+    if repeated:
+        raise ScenarioError(
+            f"the members of a window differ in horizon, but {repeated} repeat"
+        )
+    return tuple(sorted(members, key=lambda member: member.horizon))
+
+
+def _check_window_draws(n: int, m: int) -> None:
+    """Raise `ScenarioError` unless every member of `m` holds as many rows."""
+    if n % m:
+        lower = max(n // m, 1) * m
+        raise ScenarioError(
+            f"a window of {m} horizons needs n_draws to be a whole multiple of {m}, "
+            f"so that every member holds as many rows, got {n}; the nearest valid "
+            f"counts are {lower} and {lower + m}"
+        )
+
+
+def _member_note(horizon: int, note: str) -> str:
+    """One member's note, in the notes of a window of horizons."""
+    return f"Horizon {horizon}: {note}"
+
+
+def _row_hazard(row: Any) -> tuple[str, HazardFrom] | None:
+    """The hazard a canonical row names, if `row` is one and names it."""
+    name = _plain(row.get("hazard_name")) if isinstance(row, Mapping) else None
+    return (name, "curve_row") if isinstance(name, str) and name else None
+
+
+def _check_stated_hazards(
+    curves: Mapping[str, Any], stated: Mapping[str, Any], scenario: str
+) -> None:
+    """Raise, before any column is drawn, for a stated name a curve contradicts."""
+    for name, curve in curves.items():
+        first = curve[0] if _is_window(curve) and curve else curve
+        _hazard_record(stated.get(name), [_row_hazard(first)], scenario)
+
+
+def _columns_window(
+    curves: Mapping[str, Any], n: int, scenario: str, column: str
+) -> int:
+    """How many members each column's window holds; 1 for plain curves.
+
+    Raises `ScenarioError` unless every column is a window over the same
+    horizons of one pathway, so that a row is one horizon in every column, or
+    none is. It runs before any column is drawn.
+    """
+    windows = {
+        name: _checked_members(curve, scenario)
+        for name, curve in curves.items()
+        if _is_window(curve)
+    }
+    if not windows:
+        return 1
+    plain = [name for name in curves if name not in windows]
+    if plain:
+        raise ScenarioError(
+            f"every {column}'s curve must be a window of the same horizons, so that "
+            f"a row is one horizon in every {column}, but {plain} are single curves"
+        )
+    first_name = next(iter(windows))
+    first = windows[first_name]
+    for name, members in windows.items():
+        if [member.horizon for member in members] != [
+            member.horizon for member in first
+        ] or not pathways_equivalent(members[0].pathway, first[0].pathway):
+            raise ScenarioError(
+                f"every {column}'s window must hold the same (pathway, horizon) "
+                f"pairs, but {first_name!r} holds "
+                f"{[(member.pathway, member.horizon) for member in first]} and "
+                f"{name!r} holds "
+                f"{[(member.pathway, member.horizon) for member in members]}"
+            )
+    _check_window_draws(n, len(first))
+    return len(first)
+
+
+def _window_model_record(
+    model: Any, n: int, m: int, columns: Sequence[str], between: str
+) -> tuple[dict[str, Any], str]:
+    """`_model_record` for `m` members of `n // m` rows each; `m` is 1 for a curve."""
+    if m == 1:
+        return _model_record(model, n, columns, between)
+    if isinstance(model, EmpiricalCopula):
+        step = m * len(model.reference)
+        if n % step:
+            lower = max(n // step, 1) * step
+            raise ScenarioError(
+                f"a window of {m} horizons under EmpiricalCopula needs n_draws to be "
+                f"a whole multiple of {step}, its members times the reference's "
+                f"{len(model.reference)} rows, got {n}; the nearest valid counts are "
+                f"{lower} and {lower + step}"
+            )
+    document, sentence = _model_record(model, n // m, columns, between)
+    return (
+        document,
+        f"{sentence} The model reorders within each of the window's {m} members, so "
+        "a row reads one horizon in every column.",
+    )
+
+
+def _member_order(
+    model: DependenceModel,
+    kind: str,
+    uniforms: FloatArray,
+    columns: Sequence[str],
+    m: int,
+) -> IntArray:
+    """The model's reorder of `uniforms`, within each member's rows of a window."""
+    if m == 1:
+        return _checked_order(model, kind, uniforms, columns)
+    order = np.empty(uniforms.shape, dtype=np.int64)
+    for j in range(m):
+        rows = np.arange(j, uniforms.shape[0], m, dtype=np.int64)
+        order[rows] = rows[_checked_order(model, kind, uniforms[rows], columns)]
+    return order
+
+
+@dataclass(frozen=True, eq=False)
 class _CurveDraws:
     """One curve's draws, in draw order, and what a sample records of them.
 
@@ -591,13 +793,16 @@ def sample_curve(
     assume_semantics: AnnualSemantics | None = None,
     outside_support: OutsideSupport = "raise",
     details: Mapping[str, Any] | None = None,
+    scenario: str = "baseline",
+    hazard_name: str | None = None,
 ) -> OutcomeSample:
-    """Draw `n_draws` simulated years from a fitted curve.
+    """Draw `n_draws` simulated years from a fitted curve, or from a window of them.
 
     `curve` is a crc-framework distribution (for example from
     `distribution_from_hazard_row`), `CurveParameters`, or a canonical row
     mapping with the curve columns, whose key (hazard, horizon, pathway,
-    cell, source id) is then recorded. `metadata` is the curve's dataset
+    cell, source id) is then recorded. A sequence of two or more canonical
+    rows is a window of horizons, below. `metadata` is the curve's dataset
     metadata (`HazardDatasetMetadata`): its probability semantics, tail,
     fitted support, unit and source. `details` adds caller information to
     the provenance, for example the file's SHA-256.
@@ -608,17 +813,41 @@ def sample_curve(
     at the asset that a model with `apply_hazard` gives. `rng` is required: the
     uniforms are drawn first, then the basis-risk model draws.
 
+    `scenario` is the caller's name for the rows, as in `sample_annual`. It
+    reaches `to_table`, `content_hash` and the comparison's `scenario` column,
+    and the lineage leaves it out. `hazard_name` states the hazard the loss
+    reads, for a curve that names none: a distribution or `CurveParameters`.
+    A canonical row names its own, and a `hazard_name` it contradicts raises.
+
+    **A window of horizons.** The rows are one asset's curves of one hazard,
+    cell, pathway and dataset, and differ in `horizon` alone; the order they are
+    given in doesn't matter. The window is an equal-weight mixture of them. With
+    `m` members, in horizon order, row `d` reads member `d mod m` at its
+    uniform, from one stream of `n_draws` uniforms with the one `hazard`
+    generator record of a single curve. `n_draws` must be a whole multiple of
+    `m`. The provenance's `sources` hold one `hazard` entry per member, in
+    horizon order. `details.window` holds the members as `[pathway, horizon]`
+    pairs and `"assignment": "cycle"`, and `support`, `outside_support`, `atom`
+    and `tabulated` hold one entry per member. The comparison's `horizon` column
+    is `(first + last) // 2` of the members' horizons: it names the centre,
+    and no row need be read there. Nothing interpolates between two horizons.
+
     Raises `ProbabilitySemanticsError` under the semantics rules of the
     module docstring; `SampleError` for a `value_unit` the loss model's
     impact is not calibrated for (checked before any draw), a `no_data`
     curve, a non-finite quantile, a tabulated curve sampled outside its
-    knots with `outside_support="raise"`, or invalid arguments; `TypeError`
-    for wrong types. Warns with `ReturnPeriodExtrapolationWarning` for draws rarer than
-    the fitted support, and with `ComonotoneIndexWarning` for
-    `NoBasisRisk()` and `HazardNoise(0)`.
+    knots with `outside_support="raise"`, or invalid arguments; `ScenarioError`
+    for a `hazard_name` the row contradicts, and for a window of fewer than two
+    rows, with several pathways, an unknown pathway, a member that differs in
+    more than `horizon` or that isn't a canonical row, or an `n_draws` that is
+    not a whole multiple of the members, which names the two nearest valid
+    counts (all before any draw); `TypeError` for wrong types. Warns with
+    `ReturnPeriodExtrapolationWarning` for draws rarer than the fitted support,
+    and with `ComonotoneIndexWarning` for `NoBasisRisk()` and `HazardNoise(0)`.
     """
     asset = _identifier("asset_id", asset_id)
     _check_models(loss_model, basis_risk, asset)
+    scenario = _identifier("scenario", scenario)
     draws = _draw_curve(
         curve,
         metadata=metadata,
@@ -630,6 +859,8 @@ def sample_curve(
         assume_semantics=assume_semantics,
         outside_support=outside_support,
         details=details,
+        scenario=scenario,
+        hazard_name=hazard_name,
     )
     assert draws.loss is not None
     n = draws.hazard.shape[0]
@@ -644,6 +875,7 @@ def sample_curve(
         loss_unit=loss_model.value_unit,
         semantics="annual",
         provenance=draws.provenance,
+        scenario=scenario,
     )
     _warn_rarer(draws.rarer, n)
     _warn_comonotone(basis_risk, separate_index=False)
@@ -666,53 +898,32 @@ def _warn_rarer(count: int, n: int, whose: str = "") -> None:
     )
 
 
-def _draw_curve(
-    curve: Any,
+@dataclass(frozen=True, eq=False)
+class _CurveValues:
+    """One curve read at its draws' uniforms, and what its record counts."""
+
+    hazard: FloatArray
+    tabulated: dict[str, Any] | None
+    atom: dict[str, Any] | None
+    counts: dict[str, int] | None
+    notes: tuple[str, ...]
+
+
+def _curve_values(
+    distribution: Any,
+    uniforms: FloatArray,
     *,
     metadata: HazardDatasetMetadata,
-    n_draws: int,
-    rng: np.random.Generator,
-    loss_model: LossModel | None,
-    basis_risk: BasisRisk,
-    asset: str,
-    assume_semantics: AnnualSemantics | None,
+    support: Mapping[str, Any] | None,
     outside_support: OutsideSupport,
-    details: Mapping[str, Any] | None,
-) -> _CurveDraws:
-    """`sample_curve`'s draws and records, without its sample and its warnings.
+    whose: str = "",
+) -> _CurveValues:
+    """The curve's quantiles at `uniforms`, and the counts a sample records.
 
-    The caller has checked `loss_model` and `basis_risk`. With `loss_model=None`
-    the hazard has no impact and the draws have no impact and no loss. Only a
-    model with `apply_hazard` acts on it or draws for it, then, so the other
-    hazards' draws don't depend on which of them has an impact.
+    `whose` names the member of a window in an error.
     """
-    if not isinstance(metadata, HazardDatasetMetadata):
-        raise TypeError(
-            f"metadata must be HazardDatasetMetadata, got {type(metadata).__name__}"
-        )
-    n = _draw_count(n_draws)
-    rng = _require_generator(rng)
-    # Before any draw, so a refused call leaves the generator untouched.
-    if loss_model is not None:
-        loss_model.check_hazard_unit(metadata.value_unit)
-    if outside_support not in get_args(OutsideSupport):
-        raise SampleError(
-            f"outside_support must be one of {get_args(OutsideSupport)}, "
-            f"got {outside_support!r}"
-        )
-    semantics, semantics_source = _semantics(metadata, assume_semantics)
-    distribution, row = _resolve_curve(curve)
-    caller_details = _source_document(details)
-    curve_document = _curve_document(distribution)
+    n = uniforms.shape[0]
     notes: list[str] = []
-    if semantics_source == "caller":
-        notes.append(
-            f"The dataset declares no probability semantics; the caller stated "
-            f"{semantics!r}."
-        )
-
-    rng_records = [_generator_record(rng, "hazard")]
-    uniforms = rng.random(n)
     evaluated = uniforms
     tabulated: dict[str, Any] | None = None
     if isinstance(distribution, TabulatedDistribution) and not distribution.extrapolate:
@@ -731,7 +942,7 @@ def _draw_curve(
         if outside and outside_support == "raise":
             them = "it" if outside == 1 else "them"
             raise SampleError(
-                f"{outside} of {n} draws {falls} outside the tabulated curve's "
+                f"{whose}{outside} of {n} draws {falls} outside the tabulated curve's "
                 f"knots [{lowest}, {highest}]; pass outside_support='extrapolate' "
                 f"or 'clamp' to evaluate {them}"
             )
@@ -756,10 +967,12 @@ def _draw_curve(
         hazard = np.asarray(distribution.quantiles(evaluated), dtype=np.float64)
     except ValueError as error:
         raise SampleError(
-            f"the curve cannot be evaluated at a draw: {error}"
+            f"{whose}the curve cannot be evaluated at a draw: {error}"
         ) from error
     if hazard.shape != (n,) or not np.isfinite(hazard).all():
-        raise SampleError("the curve returned non-finite or misshaped quantiles")
+        raise SampleError(
+            f"{whose}the curve returned non-finite or misshaped quantiles"
+        )
 
     atom: dict[str, Any] | None = None
     if isinstance(distribution, HurdleDistribution):
@@ -769,13 +982,8 @@ def _draw_curve(
             "draws": int((uniforms <= distribution.atom_probability).sum()),
         }
 
-    support = _support(metadata)
     counts: dict[str, int] | None = None
-    if support is None:
-        notes.append(
-            "The curve declares no fitted support, so draws outside it are not counted."
-        )
-    else:
+    if support is not None:
         frequent = support["frequent_probability"]
         rare = support["rare_probability"]
         if metadata.return_period_tail == "upper":
@@ -800,6 +1008,100 @@ def _draw_curve(
                 f"longest fitted return period{longest}: the curve is extrapolated "
                 "there."
             )
+    return _CurveValues(hazard, tabulated, atom, counts, tuple(notes))
+
+
+def _draw_curve(
+    curve: Any,
+    *,
+    metadata: HazardDatasetMetadata,
+    n_draws: int,
+    rng: np.random.Generator,
+    loss_model: LossModel | None,
+    basis_risk: BasisRisk,
+    asset: str,
+    assume_semantics: AnnualSemantics | None,
+    outside_support: OutsideSupport,
+    details: Mapping[str, Any] | None,
+    scenario: str,
+    hazard_name: Any,
+) -> _CurveDraws:
+    """`sample_curve`'s draws and records, without its sample and its warnings.
+
+    The caller has checked `loss_model` and `basis_risk`. With `loss_model=None`
+    the hazard has no impact and the draws have no impact and no loss. Only a
+    model with `apply_hazard` acts on it or draws for it, then, so the other
+    hazards' draws don't depend on which of them has an impact.
+    """
+    if not isinstance(metadata, HazardDatasetMetadata):
+        raise TypeError(
+            f"metadata must be HazardDatasetMetadata, got {type(metadata).__name__}"
+        )
+    n = _draw_count(n_draws)
+    rng = _require_generator(rng)
+    # Before any draw, so a refused call leaves the generator untouched.
+    if loss_model is not None:
+        loss_model.check_hazard_unit(metadata.value_unit)
+    if outside_support not in get_args(OutsideSupport):
+        raise SampleError(
+            f"outside_support must be one of {get_args(OutsideSupport)}, "
+            f"got {outside_support!r}"
+        )
+    semantics, semantics_source = _semantics(metadata, assume_semantics)
+    members: tuple[_Member, ...] | None = None
+    curves: list[tuple[Any, dict[str, Any] | None]]
+    if _is_window(curve):
+        members = _checked_members(curve, scenario)
+        _check_window_draws(n, len(members))
+        curves = [(member.distribution, member.row) for member in members]
+    else:
+        curves = [_resolve_curve(curve)]
+    hazard_record = _hazard_record(hazard_name, [_row_hazard(curves[0][1])], scenario)
+    caller_details = _source_document(details)
+    curve_documents = [_curve_document(distribution) for distribution, _ in curves]
+    notes: list[str] = []
+    if semantics_source == "caller":
+        notes.append(
+            f"The dataset declares no probability semantics; the caller stated "
+            f"{semantics!r}."
+        )
+
+    rng_records = [_generator_record(rng, "hazard")]
+    uniforms = rng.random(n)
+    support = _support(metadata)
+    values: list[_CurveValues] = []
+    if members is None:
+        values.append(
+            _curve_values(
+                curves[0][0],
+                uniforms,
+                metadata=metadata,
+                support=support,
+                outside_support=outside_support,
+            )
+        )
+        hazard = values[0].hazard
+        notes += values[0].notes
+    else:
+        # The cycle: a row's member is its draw number modulo the members.
+        hazard = np.empty(n, dtype=np.float64)
+        for j, member in enumerate(members):
+            rows = np.arange(j, n, len(members), dtype=np.int64)
+            read = _curve_values(
+                member.distribution,
+                uniforms[rows],
+                metadata=metadata,
+                support=support,
+                outside_support=outside_support,
+                whose=f"horizon {member.horizon}: ",
+            )
+            hazard[rows] = read.hazard
+            notes += [_member_note(member.horizon, note) for note in read.notes]
+            values.append(read)
+    if support is None:
+        notes.append(
+            "The curve declares no fitted support, so draws outside it are not counted."
+        )
     pooling = metadata.ensemble.pooling if metadata.ensemble is not None else None
     if pooling == "pooled":
         notes.append(
@@ -824,18 +1126,48 @@ def _draw_curve(
             basis_risk, hazard, hazard, rng
         )
 
-    source = {
-        "role": "hazard",
-        "kind": "curve",
-        "metadata": metadata.model_dump(mode="json"),
-        "curve": curve_document,
-        "row": row,
-        "details": caller_details,
+    sources = [
+        {
+            "role": "hazard",
+            "kind": "curve",
+            "metadata": metadata.model_dump(mode="json"),
+            "curve": document,
+            "row": row,
+            "details": caller_details,
+        }
+        for document, (_, row) in zip(curve_documents, curves, strict=True)
+    ]
+    for source in sources:
+        _check_json("the curve's source", source)
+    identity: dict[str, Any] = {
+        "kind": "monte_carlo",
+        "asset_id": asset,
+        "rng": rng_records[0],
     }
-    _check_json("the curve's source", source)
+    recorded: dict[str, Any]
+    if members is None:
+        identity["source"] = sources[0]
+        recorded = {
+            "support": support,
+            "outside_support": values[0].counts,
+            "atom": values[0].atom,
+            "tabulated": values[0].tabulated,
+        }
+    else:
+        identity["sources"] = sources
+        recorded = {
+            "support": [support] * len(members),
+            "outside_support": [read.counts for read in values],
+            "atom": [read.atom for read in values],
+            "tabulated": [read.tabulated for read in values],
+            "window": {
+                "assignment": "cycle",
+                "members": [[member.pathway, member.horizon] for member in members],
+            },
+        }
     provenance = SampleProvenance(
         source_kind="monte_carlo",
-        sources=(source,),
+        sources=tuple(sources),
         semantics_source=semantics_source,
         probability_semantics=semantics,
         loss_model=None if loss_model is None else loss_model._document(asset),
@@ -845,22 +1177,13 @@ def _draw_curve(
         details={
             "draws": n,
             "tail": metadata.return_period_tail,
-            "support": support,
-            "outside_support": counts,
-            "atom": atom,
-            "tabulated": tabulated,
+            **recorded,
             "ensemble_pooling": pooling,
             "basis_risk": basis_summary,
         },
         notes=tuple(notes),
-        lineage=content_hash(
-            {
-                "kind": "monte_carlo",
-                "asset_id": asset,
-                "source": source,
-                "rng": rng_records[0],
-            }
-        ),
+        lineage=content_hash(identity),
+        hazard=hazard_record,
     )
     return _CurveDraws(
         uniforms=uniforms,
@@ -869,7 +1192,9 @@ def _draw_curve(
         impact=impact,
         loss=loss,
         provenance=provenance,
-        rarer=0 if counts is None else counts["above"],
+        rarer=sum(
+            0 if read.counts is None else read.counts["above"] for read in values
+        ),
     )
 
 
@@ -915,6 +1240,9 @@ def _column_fields(
     if any(each and "hazard_mean_ratio" in each for each in summaries.values()):
         # The setup holds this sample's details, not its columns'.
         details["basis_risk"] = summaries
+    window = next(iter(documents.values()))["details"].get("window")
+    if window is not None:
+        details["window"] = window
     return {
         "source_kind": "monte_carlo",
         "sources": tuple(
@@ -1012,6 +1340,8 @@ def sample_curves(
     assume_semantics: AnnualSemantics | None = None,
     outside_support: OutsideSupport = "raise",
     details: Mapping[str, Any] | None = None,
+    scenario: str = "baseline",
+    hazard_name: str | None = None,
 ) -> OutcomeSample:
     """Draw simulated years for several assets under a stated dependence.
 
@@ -1022,8 +1352,9 @@ def sample_curves(
     `EmpiricalCopula(reference)`, `GaussianCopula(correlation)` or a
     `DependenceModel` of the caller's, which passes the gate described in
     `crc_sdk.parametric.dependence`. `basis_risk` is one model for every asset;
-    `details` is added to every asset's provenance; the other arguments are
-    those of `sample_curve`.
+    `details` is added to every asset's provenance; `scenario` is the caller's
+    name for the rows; the other arguments are those of `sample_curve`.
+    `hazard_name` is one name for every asset, for curves that name none.
 
     Each asset is drawn by `sample_curve` with its own generator: the uniforms
     first, then the basis-risk model, so the factors of `HazardNoise` are
@@ -1033,6 +1364,12 @@ def sample_curves(
     random number is used. So each column holds the rows of `sample_curve`
     with the same generator, and under `Independent()` in the same order.
     `period` is the row number, 0 to `n_draws - 1`.
+
+    An asset's curve may be a window of horizons, as in `sample_curve`, with the
+    same horizons of one pathway for every asset. A row then reads one horizon
+    for every asset, because the model reorders within each member's rows.
+    `EmpiricalCopula` needs `n_draws` to be a whole multiple of the members
+    times the reference's rows.
 
     The provenance's `dependence` holds the model's document: for an
     `EmpiricalCopula`, the reference's content hash, sources, licences, first
@@ -1047,9 +1384,11 @@ def sample_curves(
     assets, two assets with the same generator state, assets in different
     units, an `n_draws` or a reference the model cannot use (all before any
     draw), a model that doesn't pass the gate, a generator whose bit generator
-    is not one of numpy's, and for what `sample_curve` raises for; `TypeError`
-    for a missing dependence model, a bare callable as one and wrong types.
-    Warns as `sample_curve` does, for each asset.
+    is not one of numpy's, and for what `sample_curve` raises for;
+    `ScenarioError` for a `hazard_name` a row contradicts and for windows that
+    differ between the assets (before any draw); `TypeError` for a missing
+    dependence model, a bare callable as one and wrong types. Warns as
+    `sample_curve` does, for each asset.
     """
     if not isinstance(curves, Mapping):
         raise TypeError(
@@ -1062,6 +1401,7 @@ def sample_curves(
             "use sample_curve for one"
         )
     _require_model(dependence, "assets")
+    scenario = _identifier("scenario", scenario)
     metadata = _by_asset("metadata", metadata, assets)
     rngs = _by_asset("rngs", rngs, assets)
     loss_models = _by_asset("loss_models", loss_models, assets)
@@ -1082,7 +1422,9 @@ def sample_curves(
     )
     _check_own_generators(rngs, "asset")
     # Before any draw, so a refused call leaves the generators untouched.
-    document, sentence = _model_record(dependence, n, assets, "assets")
+    _check_stated_hazards(curves, dict.fromkeys(assets, hazard_name), scenario)
+    members = _columns_window(curves, n, scenario, "asset")
+    document, sentence = _window_model_record(dependence, n, members, assets, "assets")
 
     parts = {
         asset: sample_curve(
@@ -1096,6 +1438,8 @@ def sample_curves(
             assume_semantics=assume_semantics,
             outside_support=outside_support,
             details=details,
+            scenario=scenario,
+            hazard_name=hazard_name,
         )
         for asset in assets
     }
@@ -1103,7 +1447,7 @@ def sample_curves(
     uniforms = np.column_stack(
         [parts[asset].provenance.generator(0).random(n) for asset in assets]
     )
-    order = _checked_order(dependence, document["kind"], uniforms, assets)
+    order = _member_order(dependence, document["kind"], uniforms, assets, members)
 
     def reordered(values: Mapping[str, FloatArray]) -> FloatArray:
         return np.column_stack(
@@ -1129,6 +1473,9 @@ def sample_curves(
         ),
         dependence=document,
         parts=_moved_documents(documents, order, document["kind"]),
+        hazard=_agreed_hazard(
+            [parts[asset].provenance.hazard for asset in assets], scenario
+        ),
     )
     hazards = {
         asset: part.index if part.hazard is None else part.hazard
@@ -1149,6 +1496,7 @@ def sample_curves(
         loss_unit=loss_unit,
         semantics="annual",
         provenance=provenance,
+        scenario=scenario,
     )
 
 
@@ -1170,6 +1518,7 @@ def sample_curve_hazards(
     outside_support: OutsideSupport = "raise",
     details: Mapping[str, Any] | None = None,
     scenario: str = "baseline",
+    hazard_names: Mapping[str, str] | None = None,
 ) -> OutcomeSample:
     """Draw simulated years of several hazards at one asset, under a stated dependence.
 
@@ -1180,7 +1529,14 @@ def sample_curve_hazards(
     component's unit is its dataset's `value_unit` and its tail the dataset's
     `return_period_tail`. `details` is added to every component's provenance;
     `scenario` is the caller's name for the rows; the other arguments are those
-    of `sample_curve`.
+    of `sample_curve`. `hazard_names` maps a component to its `hazard_name`, for
+    a curve that names none. A component's name isn't taken for a hazard name,
+    and the sample's own `hazard` record stays null: each component holds one.
+
+    A component's curve may be a window of horizons, as in `sample_curve`, with
+    the same horizons of one pathway for every component. A row then reads one
+    horizon for every component, because the model reorders within each
+    member's rows.
 
     **The dependence.** `dependence` is required: fitted curves carry no
     dependence between hazards, so it is an assumption the caller states with
@@ -1226,7 +1582,9 @@ def sample_curve_hazards(
     value columns, a missing or invalid rule, two components with the same
     generator state, an `n_draws` or a reference the model cannot use (all
     before any draw), a model that doesn't pass the gate, a rule's invalid
-    result, and for what `sample_curve` raises for. Raises `TypeError` for a
+    result, and for what `sample_curve` raises for. Raises `ScenarioError` for
+    a name in `hazard_names` a row contradicts and for windows that differ
+    between the components (before any draw). Raises `TypeError` for a
     missing dependence model, a bare callable as one or as `combine`, and wrong
     types. Warns as `sample_curve` does: for each component with draws rarer than
     its fitted support, and once for `NoBasisRisk()` and `HazardNoise(0)`.
@@ -1266,8 +1624,11 @@ def sample_curve_hazards(
     )
     rule_record = _combine_record(combine, [name for name in names if name in models])
     _check_own_generators(generators, "component")
+    stated_names = _by_component("hazard_names", hazard_names, names, every=False)
     # Before any draw, so a refused call leaves the generators untouched.
-    document, sentence = _model_record(dependence, n, names, "hazards")
+    _check_stated_hazards(curves, stated_names, scenario)
+    members = _columns_window(curves, n, scenario, "component")
+    document, sentence = _window_model_record(dependence, n, members, names, "hazards")
 
     draws = {
         name: _draw_curve(
@@ -1281,14 +1642,17 @@ def sample_curve_hazards(
             assume_semantics=assume_semantics,
             outside_support=outside_support,
             details=details,
+            scenario=scenario,
+            hazard_name=stated_names.get(name),
         )
         for name in names
     }
-    order = _checked_order(
+    order = _member_order(
         dependence,
         document["kind"],
         np.column_stack([each.uniforms for each in draws.values()]),
         names,
+        members,
     )
     components: dict[str, IndexComponent] = {}
     impacts: dict[str, FloatArray] = {}
@@ -1853,6 +2217,21 @@ def _series_licence(role: str, series: AnnualSeries) -> dict[str, Any]:
     return entry
 
 
+def _series_hazard(series: AnnualSeries) -> tuple[str, HazardFrom] | None:
+    """The hazard a series' record names: its source, or its one recipe."""
+    provenance = _thaw(series.provenance)
+    source = provenance.get("source")
+    named = _named_in_source(source) if isinstance(source, Mapping) else None
+    if named is not None:
+        return named, "source_plan"
+    recorded = provenance.get("table_columns")
+    column = recorded.get("recipe") if isinstance(recorded, Mapping) else None
+    if not isinstance(column, Mapping) or column.get("distinct") != 1:
+        return None
+    named = _named_in_source({"recipe": column["values"][0]})
+    return None if named is None else (named, "table_column")
+
+
 def sample_annual(
     hazard: AnnualSeries,
     *,
@@ -1864,6 +2243,7 @@ def sample_annual(
     missing: MissingYears = "raise",
     trend: Trend = AsRecorded(),
     scenario: str = "baseline",
+    hazard_name: str | None = None,
 ) -> OutcomeSample:
     """Build a sample whose rows are the years of a per-year series.
 
@@ -1899,13 +2279,19 @@ def sample_annual(
     another thing) and the lineage leaves it out, so a relabelled sample still
     counts as sharing its rows.
 
+    `hazard_name` states the hazard the loss reads, the `hazard` series, and is
+    optional where its source names one in its `recipe` or `hazard_name`, or its
+    table has a one-valued `recipe` column: then the two must agree. Only a
+    scenario set needs a name, so a sample without one stays valid.
+
     Raises `SampleError` for a hazard unit the loss model's impact is not
     calibrated for (checked before any draw; the `index` series is not
     checked, as the loss does not read it), missing years, mismatched years,
     a trend the series cannot take (`RecentYears` above its length, too few
     fit years, fit years it does not hold, a non-finite or newly negative
     adjusted value), `HazardNoise` with an `index` series or a negative hazard,
-    or invalid arguments, and `TypeError` for wrong types. Warns with
+    or invalid arguments, `ScenarioError` for a `hazard_name` the source
+    contradicts, and `TypeError` for wrong types. Warns with
     `ComonotoneIndexWarning` for `NoBasisRisk()` and `HazardNoise(0)` without
     an `index` series.
     """
@@ -1919,6 +2305,7 @@ def sample_annual(
         missing=missing,
         trend=trend,
         scenario=scenario,
+        hazard_name=hazard_name,
     )
     _warn_comonotone(basis_risk, separate_index=index is not None)
     return sample
@@ -1972,6 +2359,7 @@ def _annual_rows(
     missing: MissingYears,
     trend: Trend,
     scenario: str,
+    hazard_name: str | None = None,
 ) -> OutcomeSample:
     """`sample_annual`, without its warning: a plan rebuilds a sample per fold."""
     if not isinstance(hazard, AnnualSeries):
@@ -1996,6 +2384,7 @@ def _annual_rows(
         )
     trend = _require_trend(trend)
     scenario = _identifier("scenario", scenario)
+    hazard_record = _hazard_record(hazard_name, [_series_hazard(hazard)], scenario)
     years = hazard.years
     if index is not None and not np.array_equal(index.years, years):
         only_hazard = np.setdiff1d(years, index.years)[:10].tolist()
@@ -2077,6 +2466,7 @@ def _annual_rows(
                 "index": _annual_lineage(asset, index, None),
             }
         ),
+        hazard=hazard_record,
     )
     return OutcomeSample(
         asset_ids=(asset,),
@@ -2281,6 +2671,7 @@ def sample_annual_hazards(
     missing: MissingYears = "raise",
     trend: Trend = AsRecorded(),
     scenario: str = "baseline",
+    hazard_names: Mapping[str, str] | None = None,
 ) -> OutcomeSample:
     """Build a sample of one asset whose rows are the same years of several hazards.
 
@@ -2320,7 +2711,10 @@ def sample_annual_hazards(
 
     A year without a value in any series raises, unless `missing="drop_year"`
     drops it from all of them and lists it in the provenance. `scenario` is
-    the caller's name for the rows, as in `sample_annual`.
+    the caller's name for the rows, as in `sample_annual`. `hazard_names` maps a
+    component to its `hazard_name`, under the rule of `sample_annual`, per
+    series. A component's name isn't taken for a hazard name, and the sample's
+    own `hazard` record stays null: each component holds one.
 
     `sample.component(name)` is that hazard's own sample. On the same years,
     with no basis-risk draws or for the first component, it has the content
@@ -2333,8 +2727,9 @@ def sample_annual_hazards(
     different years (listing each one's), a hazard unit a component's impact is
     not calibrated for, loss models with different values, units or value
     columns, a missing or invalid rule, missing years, a trend the series cannot
-    take or invalid arguments, and `TypeError` for wrong types, a bare callable
-    as `combine` included. These are checked before any draw, apart from a
+    take or invalid arguments, `ScenarioError` for a name in `hazard_names` a
+    series contradicts, and `TypeError` for wrong types, a bare callable as
+    `combine` included. These are checked before any draw, apart from a
     rule's result. Warns with `ComonotoneIndexWarning` for `NoBasisRisk()` and
     `HazardNoise(0)`.
     """
@@ -2349,6 +2744,7 @@ def sample_annual_hazards(
         missing=missing,
         trend=trend,
         scenario=scenario,
+        hazard_names=hazard_names,
     )
     _warn_comonotone(basis_risk, separate_index=False)
     return sample
@@ -2405,6 +2801,7 @@ def _annual_hazard_rows(
     missing: MissingYears,
     trend: Trend,
     scenario: str,
+    hazard_names: Mapping[str, str] | None = None,
 ) -> OutcomeSample:
     """`sample_annual_hazards`, without its warning: a plan rebuilds per fold."""
     asset = _identifier("asset_id", asset_id)
@@ -2418,6 +2815,13 @@ def _annual_hazard_rows(
     trend = _require_trend(trend)
     scenario = _identifier("scenario", scenario)
     rule_record = _combine_record(combine, inputs.impacted)
+    stated_names = _by_component(
+        "hazard_names", hazard_names, list(inputs.series), every=False
+    )
+    hazard_records = {
+        name: _hazard_record(stated_names.get(name), [_series_hazard(each)], scenario)
+        for name, each in inputs.series.items()
+    }
     kept_years, hazards, dropped, trend_made = _kept_hazards(
         inputs.series, missing, trend
     )
@@ -2482,6 +2886,7 @@ def _annual_hazard_rows(
             rule_record=rule_record,
             summaries=summaries,
             rng_records=rng_records,
+            hazard_records=hazard_records,
         ),
         scenario=scenario,
         index_components=components,
@@ -2500,6 +2905,7 @@ def _hazards_provenance(
     rule_record: Mapping[str, Any],
     summaries: Mapping[str, Mapping[str, Any]],
     rng_records: Mapping[str, Mapping[str, Any]],
+    hazard_records: Mapping[str, Mapping[str, Any] | None],
 ) -> SampleProvenance:
     """The provenance of a per-year sample of several hazards, and each one's own."""
     series, models = inputs.series, inputs.models
@@ -2578,6 +2984,7 @@ def _hazards_provenance(
                 details={**details, "basis_risk": summaries.get(name)},
                 notes=(*shared_notes, *own_notes.get(name, ())),
                 trend=own_trends.get(name, trend_record),
+                hazard=hazard_records[name],
             ).to_document()
             for name in series
         },
@@ -2748,6 +3155,7 @@ def sample_annual_pool(
     missing: MissingYears = "raise",
     trend: Trend = AsRecorded(),
     scenario: str = "baseline",
+    hazard_name: str | None = None,
 ) -> OutcomeSample:
     """Pool the model-years of several runs into one asset's sample.
 
@@ -2768,7 +3176,8 @@ def sample_annual_pool(
     `missing="drop_year"` drops it from every run and lists it with the run
     that lacked it. `rng` is needed only by a basis-risk model that draws:
     `HazardNoise` and `ImpactNoise` draw one factor per row, in row order.
-    `trend` and `scenario` are those of `sample_annual`.
+    `trend`, `scenario` and `hazard_name` are those of `sample_annual`, and a
+    name in the runs' records must be one.
 
     `holdout` and `year_block_kfold` split a pool by its years, so every run
     holds out the same latest years, and the leakage check compares (run
@@ -2786,7 +3195,8 @@ def sample_annual_pool(
     model twice, whatever the member; runs that do not hold the same years; a
     missing year (unless `missing="drop_year"`); a hazard unit the loss model's
     impact is not calibrated for; a trend a run cannot take; and invalid
-    arguments. Raises `TypeError` for wrong types. Warns with
+    arguments. Raises `ScenarioError` for a `hazard_name` a run contradicts and
+    `TypeError` for wrong types. Warns with
     `ComonotoneIndexWarning` for `NoBasisRisk()` and `HazardNoise(0)`, as for
     one series.
     """
@@ -2799,6 +3209,7 @@ def sample_annual_pool(
         missing=missing,
         trend=trend,
         scenario=scenario,
+        hazard_name=hazard_name,
     )
     _warn_comonotone(basis_risk, separate_index=False)
     return sample
@@ -2814,6 +3225,7 @@ def _pool_rows(
     missing: MissingYears,
     trend: Trend,
     scenario: str,
+    hazard_name: str | None = None,
 ) -> OutcomeSample:
     """`sample_annual_pool`, without its warning: a plan rebuilds it per fold."""
     ordered = _checked_runs(runs)
@@ -2829,6 +3241,9 @@ def _pool_rows(
         )
     trend = _require_trend(trend)
     scenario = _identifier("scenario", scenario)
+    hazard_record = _hazard_record(
+        hazard_name, [_series_hazard(run.series) for run in ordered], scenario
+    )
     all_years, kept, on_kept, lacked, dropped = _pool_years(ordered, trend, missing)
     series = [
         _Series(f"hazard of run {run._name}", unit, np.array(values))
@@ -2919,6 +3334,7 @@ def _pool_rows(
             "year": np.repeat(kept, len(ordered)).tolist(),
             "run": np.tile(np.arange(len(ordered)), kept.shape[0]).tolist(),
         },
+        hazard=hazard_record,
     )
     return OutcomeSample(
         asset_ids=(asset,),

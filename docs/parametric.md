@@ -532,6 +532,14 @@ its pathway, another thing, and the setup text states both, so state a label
 whenever you use a pathway: without one, rows under `ssp245` are labelled
 `"baseline"`. The leakage check sees through a relabelling.
 
+**`hazard_name=`** names the hazard the loss reads. Every sample builder takes
+it, as `hazard_names=` by component on the builders of several hazards, and a
+table with several index columns takes a mapping. It is optional where the source
+names a hazard: a canonical row's `hazard_name`, a source document's `recipe` or
+`hazard_name`, or a one-valued `recipe` column. Then the two must agree, or
+`ScenarioError` names both. `sample.provenance.hazard` records the name and what
+states it, and the hashes and the lineage leave it out.
+
 ### An index read elsewhere
 
 The covers can pay on a series read elsewhere than the loss, such as a station
@@ -1068,11 +1076,21 @@ sample of several ([joint design](#joint-design-over-several-assets)), and
 
 | Source | Function | One draw is | Probability |
 | --- | --- | --- | --- |
-| A fitted curve | `sample_curve(curve, *, metadata, n_draws, rng, loss_model, basis_risk, asset_id)` | a simulated year | `1/n` |
-| Fitted curves of several assets | `sample_curves(curves, *, dependence, metadata, n_draws, rngs, loss_models, basis_risk)` | a simulated year | `1/n` |
-| Per-year values | `sample_annual(AnnualSeries, *, loss_model, basis_risk, asset_id, index=None, trend=AsRecorded(), scenario="baseline")` | an observed or modelled year | `1/n` |
-| Pooled model-years | `sample_annual_pool(runs, *, loss_model, basis_risk, asset_id, trend=AsRecorded(), scenario="baseline")` | one run's year | `1/N` |
-| A user table | `OutcomeSample.from_table(table, *, period, asset_id, index, loss, semantics="annual", ...)` | a table row | its `probability` column, or `1/n` |
+| A fitted curve | `sample_curve(curve, *, metadata, n_draws, rng, loss_model, basis_risk, asset_id, scenario="baseline", hazard_name=None)` | a simulated year | `1/n` |
+| Fitted curves of several assets | `sample_curves(curves, *, dependence, metadata, n_draws, rngs, loss_models, basis_risk, scenario="baseline", hazard_name=None)` | a simulated year | `1/n` |
+| Per-year values | `sample_annual(AnnualSeries, *, loss_model, basis_risk, asset_id, index=None, trend=AsRecorded(), scenario="baseline", hazard_name=None)` | an observed or modelled year | `1/n` |
+| Pooled model-years | `sample_annual_pool(runs, *, loss_model, basis_risk, asset_id, trend=AsRecorded(), scenario="baseline", hazard_name=None)` | one run's year | `1/N` |
+| A user table | `OutcomeSample.from_table(table, *, period, asset_id, index, loss, semantics="annual", ..., scenario="baseline", hazard_name=None)` | a table row | its `probability` column, or `1/n` |
+
+A curve may also be a **window of horizons**: a sequence of two or more
+canonical rows of one hazard, cell, pathway and dataset, which differ in `horizon`
+alone. It is an equal-weight mixture of those curves. One stream of `n_draws`
+uniforms is drawn, as for one curve, and with `m` members in horizon order, row
+`d` reads member `d mod m` at its uniform, so `n_draws` must be a whole multiple
+of `m`. Every row is a draw from a curve the dataset holds, and nothing is
+computed between two horizons. The provenance holds one `hazard` source per
+member and the members in `details.window`, and the `horizon` column names their
+centre, `(first + last) // 2`, where no row need be read.
 
 ```python
 import numpy as np
@@ -1446,9 +1464,12 @@ between the two.
 | `level` | string | `"asset"`: an asset's own cover. `"total"`: the sum over the assets of one owner, draw by draw. `"asset_by_value"`, `"asset_by_loss"`: an asset's share of a joint design's total payout, under the rule in the name. `"package"`: the sum of one asset's separate contracts (`CoverPackage`), draw by draw, against the combined loss, with the sum of their premiums; `cover_hash` is the package's hash and `design_id` is null |
 | `scope` | string | `"individual"`, each cover standing on its own, or `"joint"`, one objective and one budget on the owner's total |
 | `scenario` | string | The sample's scenario, `"baseline"` by default |
+| `design_scenario` | string, nullable | The `scenario` of the design's own design sample. Null for a cover given as is, and on a `"total"` or `"package"` row whose designs don't share one |
+| `pathway`, `horizon`, `product` | string, int32, string; nullable | What the sample's source records state, never its label, and null where they state none: the canonical row's `pathway` and `horizon` and the dataset's provider; for a window of horizons, the members' pathway and the centre of their horizons; for per-year rows, the pathway of the series or the pool, the centre `(first + last) // 2` of its years, and the provider of its source; for a table, its source's `pathway` and `provider`. On a sample of several hazards `product` holds every provider, joined by `+` |
 | `split` | string | `"in_sample"` or `"out_of_sample"` |
 | `fold` | int32 | 0 for a holdout and fresh draws; the fold for k-fold. Null on a pooled row of `compare_pooled`, and only there |
 | `sample_hash` | string | The evaluation sample's `content_hash` |
+| `n_rows` | int32 | The number of rows of the evaluation sample |
 | `premium_basis` | string, nullable | `"stated"`, `"design"` or `"evaluation"`; null exactly on allocated rows |
 | `unique`, `ties`, `degenerate_tail` | bool, int32, string; nullable | The design's non-uniqueness report; null for a cover given as is |
 | `components` | string, nullable | What the row's cover reads of a sample with index components, joined by `+`; null on a sample of one hazard |
@@ -1458,8 +1479,14 @@ between the two.
 A comparison on one asset has `level` `"asset"` and `scope` `"individual"`
 on every row, apart from a package's `"package"` row. [Joint design](#the-rows-of-a-joint-design) says what the other
 values hold. The key (`cover_hash`, `design_id`, `asset_id`, `level`,
-`scenario`, `split`, `fold`) is unique; `compare` raises `EvaluationError` for
-the same cover twice. Invalid evaluation arguments, metric options and comparison metadata
+`scenario`, `design_scenario`, `split`, `fold`) is unique; `compare` raises
+`EvaluationError` for the same cover twice. A table written without
+`design_scenario`, `pathway`, `horizon`, `product` or `n_rows` reads as null
+there. A sample with a `scenario=` label of yours raises `ScenarioError` if its
+records state a pathway that `crc_sdk.pathways` doesn't know
+(`register_pathway` adds a private one), or if its sources disagree on
+`pathway`, `horizon` or `product`. On an unlabelled sample the pathway stands as
+spelled and a field the sources disagree on is null. Invalid evaluation arguments, metric options and comparison metadata
 raise `EvaluationError`, a `ValueError`; arguments of the wrong type raise
 `TypeError`.
 `to_long(table)` gives the tidy form: the identity columns, then `column`,
@@ -1522,6 +1549,8 @@ fold. The rows have the levels `compare` gives them and these values:
 | `ties`, `degenerate_tail` | The sum of the folds', and the folds' flag if they all agree, else `"mixed"` |
 | `unidentified_share` | Each row by its own fold's design |
 | `design_budget` | The mean over the rows of each fold's bound, null if any has none |
+| `n_rows` | The sum of the blocks' rows |
+| `design_scenario`, `pathway`, `horizon`, `product` | The blocks' one value |
 
 `compare_pooled` raises `EvaluationError` for pairs that aren't the k folds of
 one split in fold order, held-out blocks that repeat or miss a year, a design

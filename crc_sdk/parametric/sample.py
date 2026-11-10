@@ -69,13 +69,21 @@ from numpy.typing import ArrayLike, NDArray
 from pydantic import BaseModel
 
 from crc_sdk.parametric._canonical import content_hash
-from crc_sdk.parametric.errors import ComonotoneIndexWarning, LeakageError, SampleError
+from crc_sdk.parametric.errors import (
+    ComonotoneIndexWarning,
+    EvaluationError,
+    LeakageError,
+    SampleError,
+    ScenarioError,
+)
 from crc_sdk.parametric.index import (
     CompositeIndex,
     IndexDefinition,
     Tail,
     _component_name,
 )
+from crc_sdk.parametric.metadata import _series_pathway
+from crc_sdk.pathways import pathways_equivalent, resolve_pathway
 
 __all__ = [
     "SAMPLE_COMPONENTS_SCHEMA_VERSION",
@@ -83,6 +91,7 @@ __all__ = [
     "SAMPLE_SCHEMA_VERSION",
     "SAMPLE_SEMANTICS_VERSION",
     "ComponentLoss",
+    "HazardFrom",
     "IndexComponent",
     "OutcomeSample",
     "SampleProvenance",
@@ -116,9 +125,15 @@ SemanticsSource = Literal["dataset", "caller", "data"]
 ComponentLoss = Literal["own", "combined"]
 """The loss of a component's view: its hazard's own, or the combined loss."""
 
+HazardFrom = Literal["curve_row", "source_plan", "table_column", "stated"]
+"""What names the hazard a sample's loss reads: its record, or the caller."""
+
+_INT32_MAX = 2**31 - 1
 _PROBABILITY_TOLERANCE = 1e-12
 _HOLDOUT_TOLERANCE = 1e-9
 _IDENTIFIER = re.compile(r"^\S(?:[\s\S]*\S)?$")
+_DEFAULT_SCENARIO = "baseline"
+"""The label of a sample nobody named: what a read of it refuses is left to a set."""
 
 COMONOTONE_MESSAGE = (
     "the index and the loss are comonotone: the loss is a function of the "
@@ -465,6 +480,20 @@ def _check_pool(pool: Mapping[str, Any]) -> None:
         raise SampleError(f"the rows of a pool name runs outside its {len(runs)} runs")
 
 
+def _check_hazard(hazard: Mapping[str, Any]) -> None:
+    """Raise `SampleError` unless `hazard` says what names the hazard, and what."""
+    if set(hazard) != {"name", "from"}:
+        raise SampleError(
+            f"hazard must hold a name and where it comes from, got {sorted(hazard)}"
+        )
+    _identifier("hazard's name", hazard["name"])
+    if hazard["from"] not in get_args(HazardFrom):
+        raise SampleError(
+            f"hazard's from must be one of {get_args(HazardFrom)}, "
+            f"got {hazard['from']!r}"
+        )
+
+
 @dataclass(frozen=True, eq=False)
 class SampleProvenance:
     """Where a sample's rows come from, and how they were made.
@@ -535,11 +564,19 @@ class SampleProvenance:
       has in a sample of its own, so a leakage check sees a year of one source
       through any sample that holds it. A component's view keeps the sources it
       reads. `None` on every other sample.
+    - `hazard`: the hazard the sample's loss reads, as `{"name": name, "from":
+      where}`, `where` being a `HazardFrom`: `"curve_row"` (the canonical row),
+      `"source_plan"` (a source document's `recipe` or `hazard_name`),
+      `"table_column"` (a one-valued `recipe` column) or `"stated"`
+      (`hazard_name=`, for a source that names none). It is the series the loss
+      reads, not a separate index series, and it stays out of `content_hash`,
+      `design_id` and the lineage. `None` when nothing names it, and on a
+      sample of several hazards, whose `components` hold one each.
 
     Mappings and sequences are stored read-only; `to_document()` returns
     plain JSON types, without the three fields of a sample with components and
-    without `source_lineages` when they are `None`. Raises `SampleError` for
-    unknown kinds or values that are not plain JSON.
+    without `source_lineages` and `hazard` when they are `None`. Raises
+    `SampleError` for unknown kinds or values that are not plain JSON.
     """
 
     source_kind: SourceKind
@@ -563,6 +600,7 @@ class SampleProvenance:
     combine: Mapping[str, Any] | None = None
     components: Mapping[str, Mapping[str, Any]] | None = None
     source_lineages: Mapping[str, str] | None = None
+    hazard: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.source_kind not in get_args(SourceKind):
@@ -601,6 +639,7 @@ class SampleProvenance:
             "combine",
             "components",
             "source_lineages",
+            "hazard",
         ):
             value = getattr(self, name)
             if value is not None and not isinstance(value, Mapping):
@@ -609,6 +648,8 @@ class SampleProvenance:
             value = getattr(self, name)
             if value is not None and "kind" not in value:
                 raise SampleError(f"{name} must name its kind")
+        if self.hazard is not None:
+            _check_hazard(self.hazard)
         if self.pool is not None:
             _check_pool(self.pool)
         if self.parts is not None and not all(
@@ -648,6 +689,7 @@ class SampleProvenance:
             "combine",
             "components",
             "source_lineages",
+            "hazard",
         ):
             value = getattr(self, name)
             _check_json(name, value)
@@ -657,9 +699,9 @@ class SampleProvenance:
     def to_document(self) -> dict[str, Any]:
         """Return every field as plain JSON types.
 
-        The fields of a sample with index components, and `source_lineages`,
-        are left out when they are `None`, so the document of a sample that
-        reads one source does not change.
+        The fields of a sample with index components, `source_lineages` and
+        `hazard` are left out when they are `None`, so the document of a sample
+        that reads one source and names no hazard does not change.
         """
         return {
             item.name: _thaw(getattr(self, item.name))
@@ -716,7 +758,7 @@ class SampleProvenance:
 _COMPONENT_FIELDS = frozenset({"hazard_dependence", "combine", "components"})
 """The provenance fields of a sample with index components."""
 
-_LEFT_OUT_WHEN_NONE = _COMPONENT_FIELDS | {"source_lineages"}
+_LEFT_OUT_WHEN_NONE = _COMPONENT_FIELDS | {"source_lineages", "hazard"}
 """The provenance fields a document holds only when they are set."""
 
 
@@ -1266,7 +1308,9 @@ class OutcomeSample:
 
         The provenance records `dependence` as `{"kind": "data"}`, the data's
         own, because the rows are the same years of the data, and holds each
-        part's provenance in `parts`. Its sources, licences, generator records
+        part's provenance in `parts`. Its `hazard` is the one the parts name, or
+        none if any is silent; two names raise `ScenarioError` if the samples
+        carry a `scenario` label. Its sources, licences, generator records
         and notes are the parts', each source, record and note naming its
         asset. Its lineage is new, built from the parts' lineages, and a
         leakage check reads each part's own in `parts` too, so a year of a part
@@ -1384,6 +1428,9 @@ class OutcomeSample:
             },
             trend=trend,
             pool=pool,
+            hazard=_agreed_hazard(
+                [part.provenance.hazard for part in parts], first.scenario
+            ),
         )
         hazard = (
             None
@@ -1635,6 +1682,8 @@ class OutcomeSample:
         loss_unit: str,
         tails: Mapping[str, Tail] | None = None,
         source: Any = None,
+        scenario: str = "baseline",
+        hazard_name: str | Mapping[str, str] | None = None,
     ) -> OutcomeSample:
         """Build a sample from a user table, one row per period and asset.
 
@@ -1656,12 +1705,19 @@ class OutcomeSample:
         an asset's loss is a monotone function of its index, this warns with
         `ComonotoneIndexWarning`.
 
+        `scenario` is the caller's name for the rows, as in `sample_annual`.
+        `hazard_name` states the hazard the loss reads, and is optional where
+        `source` names one in its `recipe` or `hazard_name`, or a `recipe` column
+        holds one value: then the two must agree. Only a scenario set needs a
+        name, so a sample without one stays valid.
+
         With a mapping from component name to column as `index`, two or more,
         the table builds a multi-hazard sample of one asset, whose first
         component is the primary. `index_unit` is then a mapping by name too,
         `tails` is required and maps each name to `"upper"` or `"lower"`, and
-        `hazard` and `own_loss` map any of the names to a column. `loss` is the
-        combined loss as the caller states it: `combine` records
+        `hazard` and `own_loss` map any of the names to a column, as
+        `hazard_name` does to a name. `loss` is the combined loss as the caller
+        states it: `combine` records
         `{"kind": "table"}`, and `hazard_dependence` `{"kind": "data"}`, as
         the rows are what the caller states. If a component's index determines
         the combined loss or its own loss monotonically, this warns with
@@ -1670,14 +1726,16 @@ class OutcomeSample:
         Raises `SampleError` for a missing column, nulls, non-integer
         periods, repeated or missing (period, asset) pairs, or invalid
         values, for arguments that don't suit the form of `index`, and for
-        several assets with several index columns, and `TypeError` for a file
-        path or a non-table.
+        several assets with several index columns; `ScenarioError` for a
+        `hazard_name` the source contradicts; and `TypeError` for a file path
+        or a non-table.
         """
         if semantics != "annual":
             raise SampleError(
                 f"semantics must be 'annual' (one row is one year), got "
                 f"{semantics!r}; 'event' is reserved"
             )
+        scenario = _identifier("scenario", scenario)
         if isinstance(index, Mapping):
             return cls._from_components_table(
                 table,
@@ -1693,9 +1751,15 @@ class OutcomeSample:
                 loss_unit=loss_unit,
                 tails=tails,
                 source=source,
+                scenario=scenario,
+                hazard_name=hazard_name,
             )
         _refuse_component_arguments(
-            tails=tails, own_loss=own_loss, hazard=hazard, index_unit=index_unit
+            tails=tails,
+            own_loss=own_loss,
+            hazard=hazard,
+            index_unit=index_unit,
+            hazard_name=hazard_name,
         )
         assert not isinstance(hazard, Mapping) and not isinstance(index_unit, Mapping)
         data = _arrow_table(table, "a sample table")
@@ -1757,7 +1821,11 @@ class OutcomeSample:
                 )
             per_period = probabilities[:, 0]
         source_document = _source_document(source)
-        # Validate every field first; the provenance needs the content hash.
+        hazard_record = _hazard_record(
+            hazard_name, [_table_hazard(source_document, data)], scenario
+        )
+        # Validate every field first; the provenance needs the content hash. It
+        # has the default label, so the lineage below leaves `scenario` out.
         bare = cls(
             asset_ids=tuple(distinct),
             period=all_periods,
@@ -1825,6 +1893,7 @@ class OutcomeSample:
                 else tuple(_asset_note(a, _TABLE_COMONOTONE_NOTE) for a in comonotone)
             ),
             lineage=content_hash(identity),
+            hazard=hazard_record,
         )
         if n_assets > 1:
             parts = {
@@ -1837,7 +1906,7 @@ class OutcomeSample:
             provenance = dataclasses.replace(
                 provenance, dependence={"kind": "data"}, parts=parts
             )
-        return dataclasses.replace(bare, provenance=provenance)
+        return dataclasses.replace(bare, provenance=provenance, scenario=scenario)
 
     @classmethod
     def _from_components_table(
@@ -1856,6 +1925,8 @@ class OutcomeSample:
         loss_unit: str,
         tails: Any,
         source: Any,
+        scenario: str,
+        hazard_name: Any,
     ) -> OutcomeSample:
         """Build a multi-hazard sample from a user table; see `from_table`."""
         names = list(index)
@@ -1870,6 +1941,7 @@ class OutcomeSample:
         severe = _by_component("tails", tails, names, every=True)
         hazards = _by_component("hazard", hazard, names, every=False)
         own_losses = _by_component("own_loss", own_loss, names, every=False)
+        stated_names = _by_component("hazard_name", hazard_name, names, every=False)
         data = _arrow_table(table, "a sample table")
         what = "the sample table"
         periods = _integer_values(_column(data, period, what), period)
@@ -2016,15 +2088,16 @@ class OutcomeSample:
                     licences=licences,
                     details=details,
                     notes=(_TABLE_COMONOTONE_NOTE,) if name in comonotone else (),
+                    hazard=_hazard_record(stated_names.get(name), [None], scenario),
                 ).to_document()
                 for name in names
             },
         )
-        return dataclasses.replace(bare, provenance=provenance)
+        return dataclasses.replace(bare, provenance=provenance, scenario=scenario)
 
 
 def _refuse_component_arguments(
-    *, tails: Any, own_loss: Any, hazard: Any, index_unit: Any
+    *, tails: Any, own_loss: Any, hazard: Any, index_unit: Any, hazard_name: Any
 ) -> None:
     """Raise `SampleError` for arguments that go with several index columns."""
     if tails is not None or own_loss is not None:
@@ -2036,6 +2109,11 @@ def _refuse_component_arguments(
         raise SampleError(
             "hazard and index_unit are mappings only with several index columns: "
             "a mapping from component name to column as index"
+        )
+    if isinstance(hazard_name, Mapping):
+        raise SampleError(
+            "hazard_name is a mapping only with several index columns: a mapping "
+            "from component name to column as index"
         )
 
 
@@ -2145,6 +2223,299 @@ def _written_provenance(document: Any) -> SampleProvenance:
         return SampleProvenance(**document)
     except TypeError as error:
         raise SampleError(f"the written provenance is incomplete: {error}") from error
+
+
+# -- what a sample reads -------------------------------------------------------
+
+
+def _is_labelled(sample: OutcomeSample) -> bool:
+    """Whether a caller named the sample's scenario, which makes a read strict."""
+    return sample.scenario != _DEFAULT_SCENARIO
+
+
+def _named_in_source(document: Mapping[str, Any]) -> str | None:
+    """The hazard a source document names: its `recipe`, else its `hazard_name`."""
+    for key in ("recipe", "hazard_name"):
+        value = document.get(key)
+        if isinstance(value, str) and _IDENTIFIER.fullmatch(value):
+            return value
+    return None
+
+
+def _table_hazard(
+    document: Mapping[str, Any], table: Any
+) -> tuple[str, HazardFrom] | None:
+    """The hazard a table's source document or one-valued `recipe` column names."""
+    named = _named_in_source(document)
+    if named is not None:
+        return named, "source_plan"
+    if "recipe" not in table.column_names:
+        return None
+    values = {
+        value
+        for value in table.column("recipe").unique().to_pylist()
+        if value is not None
+    }
+    if len(values) != 1:
+        return None
+    value = values.pop()
+    if isinstance(value, str) and _IDENTIFIER.fullmatch(value):
+        return value, "table_column"
+    return None
+
+
+def _hazard_record(
+    stated: Any,
+    found: Sequence[tuple[str, HazardFrom] | None],
+    scenario: str,
+) -> dict[str, str] | None:
+    """What a sample records of the hazard its loss reads.
+
+    `found` holds what each of its sources names, `None` for a silent one, and
+    `stated` is `hazard_name=`. A stated name never overrides the record: it
+    must agree with every source that names one, and only stands for a source
+    that is silent. Sources that name two hazards record none, and raise on a
+    sample with a `scenario` label.
+    """
+    if stated is not None:
+        stated = _identifier("hazard_name", stated)
+    named = [each for each in found if each is not None]
+    names = list(dict.fromkeys(name for name, _ in named))
+    if stated is not None:
+        for name in names:
+            if name != stated:
+                raise ScenarioError(
+                    f"scenario {scenario!r}: hazard_name={stated!r} contradicts the "
+                    f"source, which names {name!r}; a stated name never overrides "
+                    "the record"
+                )
+    if len(names) > 1:
+        if scenario != _DEFAULT_SCENARIO:
+            raise ScenarioError(
+                f"scenario {scenario!r}: the sources of one sample must read one "
+                f"hazard, but they name {names}"
+            )
+        return None
+    if names and len(named) == len(found):
+        origins = {origin for _, origin in named}
+        return {
+            "name": names[0],
+            "from": "stated" if "stated" in origins else named[0][1],
+        }
+    return None if stated is None else {"name": stated, "from": "stated"}
+
+
+def _agreed_hazard(
+    records: Sequence[Mapping[str, Any] | None], scenario: str
+) -> dict[str, str] | None:
+    """One hazard record for the assets of a sample, from each asset's own."""
+    return _hazard_record(
+        None,
+        [
+            None if record is None else (record["name"], record["from"])
+            for record in records
+        ],
+        scenario,
+    )
+
+
+@dataclass(frozen=True)
+class _SourceRead:
+    """What one hazard source of a sample states, and whose it is."""
+
+    pathway: str | None
+    horizon: int | None
+    product: str | None
+    owner: str
+
+
+@dataclass(frozen=True)
+class _SourceColumns:
+    """The `pathway`, `horizon` and `product` of a sample's comparison rows."""
+
+    pathway: str | None = None
+    horizon: int | None = None
+    product: str | None = None
+
+
+def _text(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _year(value: Any) -> int | None:
+    """`value` as a year the `int32` column holds; `None` for anything else."""
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        return None
+    year = int(value)
+    return year if abs(year) <= _INT32_MAX else None
+
+
+def _centre(years: Any) -> int | None:
+    """`(first + last) // 2` of two years, as `TemporalWindow.horizon` has it."""
+    if not isinstance(years, Sequence) or len(years) != 2:
+        return None
+    first, last = _year(years[0]), _year(years[1])
+    return None if first is None or last is None else (first + last) // 2
+
+
+def _source_read(
+    source: Mapping[str, Any], details: Mapping[str, Any], owner: str
+) -> _SourceRead:
+    """What one source's record says a row reads; a field it lacks is null."""
+    if source.get("kind") == "curve":
+        row = source.get("row") or {}
+        dataset = (source.get("metadata") or {}).get("source") or {}
+        return _SourceRead(
+            _text(row.get("pathway")),
+            _year(row.get("horizon")),
+            _text(dataset.get("provider")),
+            owner,
+        )
+    if "series" in source:
+        series = source["series"] or {}
+        stated = series.get("source")
+        document = stated if isinstance(stated, Mapping) else {}
+        # A record setup_text would refuse states no pathway here.
+        try:
+            pathway = _text(source.get("pathway")) or _series_pathway(
+                series, document, "the series"
+            )
+        except EvaluationError:
+            pathway = None
+        return _SourceRead(
+            pathway,
+            _centre(details.get("years")),
+            _text(document.get("provider")),
+            owner,
+        )
+    if source.get("role") == "table":
+        document = source.get("source") or {}
+        return _SourceRead(
+            _text(document.get("pathway")),
+            None,
+            _text(document.get("provider")),
+            owner,
+        )
+    return _SourceRead(None, None, None, owner)
+
+
+def _hazard_reads(document: Mapping[str, Any], owner: str) -> list[_SourceRead]:
+    """What every source the loss reads states, the index series left out."""
+    for key, kind in (("parts", "asset"), ("components", "component")):
+        nested = document.get(key)
+        if nested:
+            return [
+                read
+                for name, own in nested.items()
+                for read in _hazard_reads(own, f"{kind} {name!r}")
+            ]
+    details = document.get("details") or {}
+    sources = [
+        source
+        for source in document.get("sources") or ()
+        if source.get("role") in ("hazard", "table")
+    ]
+    window = details.get("window")
+    if window is not None and sources:
+        members = window["members"]
+        first = _source_read(sources[0], details, owner)
+        return [
+            _SourceRead(
+                _text(members[0][0]),
+                _centre([members[0][1], members[-1][1]]),
+                first.product,
+                owner,
+            )
+        ]
+    return [_source_read(source, details, owner) for source in sources]
+
+
+def _agreed_field(
+    reads: Sequence[_SourceRead],
+    field_name: str,
+    *,
+    scenario: str,
+    strict: bool,
+    same: Any = None,
+) -> Any:
+    """The one value of `field_name` that every read states; null if they differ.
+
+    Null equals null. On a strict read a difference raises `ScenarioError`,
+    naming the two sources.
+    """
+    compare = same or (lambda a, b: a == b)
+    first = reads[0]
+    ours = getattr(first, field_name)
+    for read in reads[1:]:
+        theirs = getattr(read, field_name)
+        if (ours is None and theirs is None) or (
+            ours is not None and theirs is not None and compare(ours, theirs)
+        ):
+            continue
+        if strict:
+            raise ScenarioError(
+                f"scenario {scenario!r} reads one {field_name}, but its sources "
+                f"differ: {first.owner} states {ours!r} and {read.owner} states "
+                f"{theirs!r}"
+            )
+        return None
+    return ours
+
+
+def _source_columns(sample: OutcomeSample, *, strict: bool) -> _SourceColumns:
+    """The `pathway`, `horizon` and `product` that a sample's source records state.
+
+    They come from the records, never from the sample's label, and each is
+    null where the records state none. `pathway` keeps the source's spelling,
+    compared across sources with `pathways_equivalent`. A window of curves reads
+    its members' one pathway and the centre of their horizons, a per-year series
+    or a pool the centre of its whole window, so a split doesn't change it. The
+    sources of a sample must agree. On a sample of several hazards `product` is
+    instead every provider, sorted, joined by `+`.
+
+    On a strict read an unknown pathway and sources that disagree raise
+    `ScenarioError`. Otherwise the pathway stands as spelled and a field the
+    sources disagree on is null.
+    """
+    document = sample.provenance.to_document()
+    reads = _hazard_reads(document, "the sample")
+    if not reads:
+        return _SourceColumns()
+    scenario = sample.scenario
+    if strict:
+        for read in reads:
+            if read.pathway is not None:
+                _check_known_pathway(read.pathway, scenario)
+    several_products = sample.index_components is not None
+    product: str | None
+    if several_products:
+        products = sorted({read.product for read in reads if read.product is not None})
+        product = "+".join(products) if products else None
+    else:
+        product = _agreed_field(reads, "product", scenario=scenario, strict=strict)
+    return _SourceColumns(
+        pathway=_agreed_field(
+            reads,
+            "pathway",
+            scenario=scenario,
+            strict=strict,
+            same=pathways_equivalent,
+        ),
+        horizon=_agreed_field(reads, "horizon", scenario=scenario, strict=strict),
+        product=product,
+    )
+
+
+def _check_known_pathway(label: str, scenario: str) -> None:
+    """Raise `ScenarioError` unless `crc_sdk.pathways` knows the label."""
+    try:
+        resolve_pathway(label, strict=True)
+    except ValueError as error:
+        raise ScenarioError(
+            f"scenario {scenario!r} reads the pathway {label!r}, which "
+            "crc_sdk.pathways does not know; add a private one with "
+            "crc_sdk.pathways.register_pathway"
+        ) from error
 
 
 # -- splits ------------------------------------------------------------------
