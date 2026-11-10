@@ -753,7 +753,8 @@ stations.
 ```text
 ModelRun(series, *, model, member, pathway)
 sample_annual_pool(runs, *, loss_model, basis_risk, asset_id, rng=None,
-                   missing="raise", trend=AsRecorded(), scenario="baseline")
+                   missing="raise", trend=AsRecorded(), scenario="baseline",
+                   hazard_name=None)
 ```
 
 To hold out a block under `LinearTrend`, state the design years with

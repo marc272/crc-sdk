@@ -53,10 +53,11 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import operator
 import os
 import re
 import warnings
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import KW_ONLY, dataclass, field
 from functools import cached_property
 from numbers import Real
@@ -2436,20 +2437,19 @@ def _agreed_field(
     *,
     scenario: str,
     strict: bool,
-    same: Any = None,
+    same: Callable[[Any, Any], bool] = operator.eq,
 ) -> Any:
     """The one value of `field_name` that every read states; null if they differ.
 
     Null equals null. On a strict read a difference raises `ScenarioError`,
     naming the two sources.
     """
-    compare = same or (lambda a, b: a == b)
     first = reads[0]
     ours = getattr(first, field_name)
     for read in reads[1:]:
         theirs = getattr(read, field_name)
         if (ours is None and theirs is None) or (
-            ours is not None and theirs is not None and compare(ours, theirs)
+            ours is not None and theirs is not None and same(ours, theirs)
         ):
             continue
         if strict:
@@ -2486,9 +2486,8 @@ def _source_columns(sample: OutcomeSample, *, strict: bool) -> _SourceColumns:
         for read in reads:
             if read.pathway is not None:
                 _check_known_pathway(read.pathway, scenario)
-    several_products = sample.index_components is not None
     product: str | None
-    if several_products:
+    if sample.index_components is not None:
         products = sorted({read.product for read in reads if read.product is not None})
         product = "+".join(products) if products else None
     else:
