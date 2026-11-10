@@ -1977,8 +1977,10 @@ with the template's hash, the objective, the budgets, their designs, the design
 sample and the block read. One template and one objective per call: to put several
 in one file, concatenate the tables and pass `EvaluationMetadata.merge` of their
 metadata to `write_comparison`. Two calls that make the same designs, such as one
-frontier read on two blocks, hold two records of each design that differ in their
-solve time, and `merge` raises `EvaluationError` for that, so they stay in two files.
+frontier read on two blocks, hold two records of each design that differ only in
+their solve time. `merge` keeps the first one given, and raises `EvaluationError` if
+two records of a design differ in anything else. The rows of the two reads need
+different values of `split` or `fold`, because a file can't repeat a row key.
 
 ## Joint design over several assets
 

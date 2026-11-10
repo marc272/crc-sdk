@@ -29,9 +29,10 @@ stated.
 
 One template and one objective per call: several go through several calls and
 `EvaluationMetadata.merge`. Two calls that make the same designs, such as one
-frontier read on two blocks, hold two records of each design that differ in their
-solve time, and `merge` refuses that, so they stay in two files. The function works
-in memory and does no I/O. Its LP and QP routes need the optional extra
+frontier read on two blocks, hold two records of each design that differ only in
+their solve time, and `merge` keeps the first one given. Their rows need different
+values of `split` or `fold`, because a file can't repeat a row key. The function
+works in memory and does no I/O. Its LP and QP routes need the optional extra
 `crc-sdk[parametric]`, as `design` does.
 """
 
@@ -200,7 +201,8 @@ def design_frontier(
     the tables with `pyarrow.concat_tables` and pass `EvaluationMetadata.merge` of
     their metadata to `write_comparison`. Two calls that make the same designs, such
     as one frontier read on two blocks, hold two records of each design that differ
-    in their solve time, and `merge` raises `EvaluationError` for that.
+    only in their solve time, and `merge` keeps the first one given. Their rows need
+    different values of `split` or `fold`, because a file can't repeat a row key.
 
     Needs the optional extra `crc-sdk[parametric]` on the LP and QP routes, as
     `design` does. Raises `EvaluationError` for an empty `budgets`, a budget stated

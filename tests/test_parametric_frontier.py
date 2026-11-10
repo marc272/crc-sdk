@@ -939,6 +939,74 @@ def test_several_objectives_go_through_several_calls_and_merge(tmp_path: Path) -
     assert setup_text(read).count("Frontier: one design per budget") == 2
 
 
+def _read_on(block: OutcomeSample, split: Any, *, fold: int = 0) -> Any:
+    # The same frontier each time: only the block it is read on changes.
+    train, _ = holdout(_years())
+    return design_frontier(
+        _template(),
+        train,
+        OBJECTIVES[0],
+        budgets=_ratios((0.5, 1.0)),
+        evaluate_on=block,
+        split=split,
+        fold=fold,
+        metric_options=FEW,
+    )
+
+
+def _block(kind: str) -> tuple[OutcomeSample, str, int]:
+    train, test = holdout(_years())
+    if kind == "in_sample":
+        return train, "in_sample", 0
+    # Another held-out block, of synthetic years no design sample holds.
+    later = _small(test.index.tolist(), test.loss.tolist(), start=1000)
+    return later, "out_of_sample", 1
+
+
+@pytest.mark.parametrize("kind", ["in_sample", "another_fold"])
+def test_one_frontier_read_on_two_blocks_goes_to_one_file(
+    kind: str, tmp_path: Path
+) -> None:
+    _, test = holdout(_years())
+    outside = _read_on(test, "out_of_sample")
+    block, split, fold = _block(kind)
+    other = _read_on(block, split, fold=fold)
+    assert other.column("design_id").to_pylist() == (
+        outside.column("design_id").to_pylist()
+    )
+
+    merged = EvaluationMetadata.merge(_metadata(other), _metadata(outside))
+
+    assert merged.designs == _metadata(other).designs
+    assert merged.setup.frontier is not None
+    assert [record["split"] for record in merged.setup.frontier] == [
+        split,
+        "out_of_sample",
+    ]
+    assert [record["fold"] for record in merged.setup.frontier] == [fold, 0]
+    table = pa.concat_tables([other, outside])
+    path = tmp_path / "frontier_on_two_blocks.parquet"
+    write_comparison(table, path, metadata=merged)
+    read = pq.read_table(path)
+    assert read.num_rows == 4
+    assert read.equals(table)
+    assert EvaluationMetadata.from_table(read) == merged
+    assert setup_text(read).count("Frontier: one design per budget") == 2
+
+
+def test_one_frontier_read_twice_with_one_row_key_is_refused_when_written(
+    tmp_path: Path,
+) -> None:
+    _, test = holdout(_years())
+    first = _read_on(test, "out_of_sample")
+    second = _read_on(_block("another_fold")[0], "out_of_sample")
+    merged = EvaluationMetadata.merge(_metadata(first), _metadata(second))
+    path = tmp_path / "repeated_key.parquet"
+    with pytest.raises(EvaluationError, match="repeats a row key"):
+        write_comparison(pa.concat_tables([first, second]), path, metadata=merged)
+    assert not path.exists()
+
+
 def test_filtered_rows_of_a_merge_keep_one_frontier() -> None:
     first, second = _two_objectives()
     merged = EvaluationMetadata.merge(_metadata(first), _metadata(second))

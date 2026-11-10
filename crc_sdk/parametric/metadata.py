@@ -325,6 +325,14 @@ def _unique(entries: Iterable[Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
     return tuple(kept)
 
 
+def _without_solve_time(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    """A design record with its wall-clock `solve.seconds` blanked, to compare it."""
+    solve = record.get("solve")
+    if not isinstance(solve, Mapping) or "seconds" not in solve:
+        return record
+    return {**record, "solve": {**solve, "seconds": None}}
+
+
 def _replaced(model: Any, **fields: Any) -> Any:
     """`model` with `fields` replaced, validated again."""
     return type(model)(**{**dict(model), **fields})
@@ -634,7 +642,9 @@ class EvaluationMetadata(_EvaluationModel):
         one file. The environments, the basis and the metric options must
         agree, and a column or design id must mean the same in each; samples,
         evaluations, covers, designs, sources, source records, licences and
-        generator states are combined without repeats. Intervals of several
+        generator states are combined without repeats. Records of one design
+        may differ only in `solve.seconds`, the wall-clock time of a solve, and
+        the first one given is the one kept. Intervals of several
         tables must have one method, unit, number of resamples and level, and
         their flagged columns are combined. Tables of `compare_scenarios` must
         state one set of scenarios, of which only the blocks may differ, and
@@ -684,8 +694,8 @@ class EvaluationMetadata(_EvaluationModel):
             for record in item.designs:
                 design_id = record["design_id"]
                 if design_id in designs and _json_text(
-                    designs[design_id]
-                ) != _json_text(record):
+                    _without_solve_time(designs[design_id])
+                ) != _json_text(_without_solve_time(record)):
                     raise EvaluationError(
                         f"design {design_id!r} has two different records"
                     )
