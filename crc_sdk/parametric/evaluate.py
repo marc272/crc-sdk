@@ -48,6 +48,13 @@ year's total payout against the combined loss and the sum of the contracts'
 premiums. `split_budget` splits one budget between the contracts, by stated
 shares. Each row is a measurement of a stated setup, and `compare` ranks nothing.
 
+**What a row read.** `scenario` is the caller's label of the sample the row is
+evaluated on, and `design_scenario` that of the design's own design sample, null
+for a cover given as is. `pathway`, `horizon` and `product` come from that
+sample's source records, never from its label, and are null where they state
+none. `n_rows` is the number of rows of the sample. Nothing in these columns ranks
+a pathway, a horizon or a product.
+
 **In and out of sample.** In sample means the design sample. Out of sample
 means a held-out block of years (`holdout`, `year_block_kfold`), fresh Monte
 Carlo draws, or any other sample that shares no year with the design sample.
@@ -114,7 +121,9 @@ from crc_sdk.parametric.index import CompositeIndex, _component_name
 from crc_sdk.parametric.joint import JointDesignResult, covers_hash
 from crc_sdk.parametric.metadata import (
     _ADDED_METRIC_COLUMNS,
+    _ADDED_SCENARIO_COLUMNS,
     EVALUATION_METADATA_KEY,
+    IDENTITY_COLUMNS,
     KEY_COLUMNS,
     ColumnEntry,
     CoverEntry,
@@ -137,8 +146,11 @@ from crc_sdk.parametric.sample import (
     _check_cover_index,
     _check_out_of_sample,
     _cover_index_values,
+    _is_labelled,
     _pool_entry,
     _require_one_asset,
+    _source_columns,
+    _SourceColumns,
 )
 
 __all__ = [
@@ -286,6 +298,7 @@ class _Run:
     options: MetricOptions
     allocation: Allocation | None
     values: Mapping[str, float] | None
+    read: _SourceColumns
 
 
 # -- argument checks ---------------------------------------------------------
@@ -924,8 +937,13 @@ def _identity(
     basis: PremiumBasis | None,
     components: str | None = None,
     budget: float | None = None,
+    design_scenario: str | None = None,
 ) -> dict[str, Any]:
-    """The columns of a row before its metrics."""
+    """The columns of a row before its metrics.
+
+    `design_scenario` is for a row with no design of its own, the sum of
+    separate contracts; a row with a design takes its design sample's label.
+    """
     return {
         "cover_label": label,
         "cover_hash": cover_hash,
@@ -934,9 +952,16 @@ def _identity(
         "level": level,
         "scope": scope,
         "scenario": run.sample.scenario,
+        "design_scenario": (
+            design_scenario if design is None else design.design_sample.scenario
+        ),
+        "pathway": run.read.pathway,
+        "horizon": run.read.horizon,
+        "product": run.read.product,
         "split": run.split,
         "fold": run.fold,
         "sample_hash": run.sample.content_hash,
+        "n_rows": len(run.sample),
         "premium_basis": basis,
         "unique": None if design is None else design.unique,
         "ties": None if design is None or design.ties is None else int(design.ties),
@@ -944,6 +969,18 @@ def _identity(
         "components": components,
         "design_budget": budget,
     }
+
+
+def _shared_design_scenario(items: Iterable[_Item]) -> str | None:
+    """The label the design samples of separate contracts share, if they do.
+
+    Null for covers given as is, and for designs made on different labels.
+    """
+    labels = {
+        None if item.design is None else item.design.design_sample.scenario
+        for item in items
+    }
+    return labels.pop() if len(labels) == 1 else None
 
 
 def _reads(cover: Cover, sample: OutcomeSample) -> str | None:
@@ -1173,6 +1210,7 @@ def _set_rows(entry: _CoverSet, run: _Run) -> list[dict[str, Any]]:
         scope="individual",
         basis=basis,
         budget=_summed_budget(rows),
+        design_scenario=_shared_design_scenario(entry.items.values()),
     )
     total.update(
         metric_values(
@@ -1332,6 +1370,7 @@ def _package_identity(
         basis=basis,
         components="+".join(entry.index.names),
         budget=budget,
+        design_scenario=_shared_design_scenario(entry._items.values()),
     )
 
 
@@ -1390,9 +1429,14 @@ def _schema(
         pa.field("level", pa.string(), nullable=False),
         pa.field("scope", pa.string(), nullable=False),
         pa.field("scenario", pa.string(), nullable=False),
+        pa.field("design_scenario", pa.string()),
+        pa.field("pathway", pa.string()),
+        pa.field("horizon", pa.int32()),
+        pa.field("product", pa.string()),
         pa.field("split", pa.string(), nullable=False),
         pa.field("fold", pa.int32(), nullable=False),
         pa.field("sample_hash", pa.string(), nullable=False),
+        pa.field("n_rows", pa.int32(), nullable=False),
         pa.field("premium_basis", pa.string()),
         pa.field("unique", pa.bool_()),
         pa.field("ties", pa.int32()),
@@ -1431,6 +1475,7 @@ def _parts_entry(provenance: Mapping[str, Any]) -> dict[str, Any] | None:
 
 def _sample_entry(sample: OutcomeSample, roles: set[str]) -> dict[str, Any]:
     provenance = sample.provenance.to_document()
+    read = _source_columns(sample, strict=False)
     entry: dict[str, Any] = {
         "asset_ids": list(sample.asset_ids),
         "basis_risk": provenance["basis_risk"],
@@ -1456,6 +1501,15 @@ def _sample_entry(sample: OutcomeSample, roles: set[str]) -> dict[str, Any]:
         "source_kind": provenance["source_kind"],
         "trend": provenance["trend"],
     }
+    if read != _SourceColumns():
+        entry |= {
+            "horizon": read.horizon,
+            "pathway": read.pathway,
+            "product": read.product,
+        }
+    window = provenance["details"].get("window")
+    if window is not None:
+        entry["members"] = window["members"]
     if sample.index_components is not None:
         entry["components"] = [
             {
@@ -1663,6 +1717,7 @@ def _prepared(
         options=checked_options,
         allocation=rule,
         values=checked_values,
+        read=_source_columns(sample, strict=_is_labelled(sample)),
     )
     return run, evaluation, tuple(design_samples.values())
 
@@ -1949,10 +2004,18 @@ def evaluate(
     to its value in the loss unit. Only the hash of the values is written.
 
     The table has the identity columns (`cover_label`, `cover_hash`,
-    `design_id`, `asset_id`, `level`, `scope`, `scenario`, `split`, `fold`,
-    `sample_hash`, `premium_basis`, `unique`, `ties`, `degenerate_tail`,
-    `components`, `design_budget`) and one float64 column per metric, null
-    where the metric is undefined. `components` is what the row's cover reads,
+    `design_id`, `asset_id`, `level`, `scope`, `scenario`, `design_scenario`,
+    `pathway`, `horizon`, `product`, `split`, `fold`, `sample_hash`, `n_rows`,
+    `premium_basis`, `unique`, `ties`, `degenerate_tail`, `components`,
+    `design_budget`) and one float64 column per metric, null where the metric
+    is undefined. `design_scenario` is the label of the design's own design
+    sample: null for a cover given as is, and on a `"total"` or `"package"` row
+    whose designs don't share one. `pathway`, `horizon` and `product` are what
+    the sample's source records state, never its label, and null where they
+    state none: the centre of a window of horizons or of a per-year series'
+    years, and on a sample of several hazards every provider, joined by `+`.
+    `n_rows` is the number of rows of the sample. `components` is what the row's
+    cover reads,
     joined by `+`, and null on a sample of one hazard. `design_budget` is the
     design's budget bound in payout units, the sum on a package or a total of
     separate covers, and null for a cover given as is. `payout_frequency` is
@@ -1972,7 +2035,10 @@ def evaluate(
     `sample.asset(asset_id)`), if a set of covers or a joint design doesn't
     hold exactly the sample's assets, if a cover's units or asset differ from
     the sample's or a design sample is missing or wrong, `LeakageError` for a
-    shared period, `EvaluationError` (a `ValueError`) for invalid arguments,
+    shared period, `ScenarioError` on a sample a caller labelled with
+    `scenario=` whose records state a pathway `crc_sdk.pathways` doesn't know
+    or whose sources disagree on `pathway`, `horizon` or `product`,
+    `EvaluationError` (a `ValueError`) for invalid arguments,
     such as an unknown split or allocation, a negative fold or premium, a
     fold that contradicts the sample's k-fold step, an invalid design record,
     a set mixing covers and designs, an allocation without a joint design or
@@ -2017,10 +2083,10 @@ def compare(
 
     The table has covers as rows and metrics as columns, in the order of
     `covers`. Its key (`cover_hash`, `design_id`, `asset_id`, `level`,
-    `scenario`, `split`, `fold`) is unique: the same cover twice raises
-    `EvaluationError`. To put rows of several samples, splits or folds in one
-    file, concatenate the tables with `pyarrow.concat_tables` and pass
-    `EvaluationMetadata.merge` of their metadata to `write_comparison`.
+    `scenario`, `design_scenario`, `split`, `fold`) is unique: the same cover
+    twice raises `EvaluationError`. To put rows of several samples, splits or
+    folds in one file, concatenate the tables with `pyarrow.concat_tables` and
+    pass `EvaluationMetadata.merge` of their metadata to `write_comparison`.
 
     Raises as `evaluate` does, and `EvaluationError` for an empty `covers`.
     """
@@ -2289,6 +2355,35 @@ def _with_added_metrics(table: Any) -> Any:
     return table
 
 
+_SCENARIO_COLUMN_TYPES: Mapping[str, Any] = {
+    "design_scenario": pa.string(),
+    "pathway": pa.string(),
+    "horizon": pa.int32(),
+    "product": pa.string(),
+    "n_rows": pa.int32(),
+}
+"""The types of the identity columns that read as null in an earlier table."""
+
+
+def _with_added_identity(table: Any) -> Any:
+    """`table` with the scenario columns it was written without, all null.
+
+    Each goes after the identity column that comes before it, which it has or
+    has just been given.
+    """
+    for name in _ADDED_SCENARIO_COLUMNS:
+        if name in table.column_names:
+            continue
+        previous = IDENTITY_COLUMNS[IDENTITY_COLUMNS.index(name) - 1]
+        kind = _SCENARIO_COLUMN_TYPES[name]
+        table = table.add_column(
+            table.column_names.index(previous) + 1,
+            pa.field(name, kind),
+            pa.nulls(table.num_rows, kind),
+        )
+    return table
+
+
 def to_long(table: Any) -> Any:
     """Return the tidy form of a comparison table: one row per metric.
 
@@ -2298,7 +2393,9 @@ def to_long(table: Any) -> Any:
     `value`. Rows are ordered by metric column, then by the wide rows'
     order. The table's metadata is kept. A comparison written before
     `payout_frequency` and `unidentified_share` existed reads as null: its
-    long form holds them with a null `value`.
+    long form holds them with a null `value`. So does one written before
+    `design_scenario`, `pathway`, `horizon`, `product` and `n_rows` existed: its
+    long form holds those columns, null.
 
     Raises `EvaluationError` for a table without comparison metadata or
     with metadata that does not describe it, and `TypeError` for a table
@@ -2309,7 +2406,7 @@ def to_long(table: Any) -> Any:
     metadata = EvaluationMetadata.from_table(table)
     metadata.check_table(table)
     schema_metadata = table.schema.metadata
-    table = _with_added_metrics(table)
+    table = _with_added_identity(_with_added_metrics(table))
     described = {**_added_entries(), **metadata.columns}
     columns = _identity_columns(table.column_names)
     identity = table.select(columns)

@@ -12,10 +12,11 @@ with sorted keys. It holds:
   draw is one year), the metric options, every sample (source kind, draws
   and periods, semantics and who stated them, the basis-risk and loss
   models, units, lineage and split steps, the dependence between its assets,
-  its trend record and its pool of model-years, without the row arrays; a
-  sample with index components also its `components`, each with its name,
-  unit, tail and whether it has a loss of its own, its `combine` and its
-  `hazard_dependence`)
+  its trend record and its pool of model-years, without the row arrays, and
+  the `pathway`, `horizon` and `product` its source records state; a window of
+  horizons also its `members`; a sample with index components also its
+  `components`, each with its name, unit, tail and whether it has a loss of its
+  own, its `combine` and its `hazard_dependence`)
   and every evaluation (sample, split, fold, how the split was made, the
   design samples checked for leakage, the pricing, the levels and scopes of
   its rows and the allocation rule). `compare_pooled` adds each block and one
@@ -50,8 +51,9 @@ or without an evaluation's `level`, `scope` and `allocation` or a sample's
 `["individual"]`, no allocation, no dependence and no component. A sample
 without `trend` has none recorded, which on per-year values reads as the years
 as recorded, and a sample without `pool` is no pool. A comparison without the
-metric column `payout_frequency` or `unidentified_share` reads as null there, and
-a document without `intervals` has no intervals.
+metric column `payout_frequency` or `unidentified_share` reads as null there, as
+does one without the column `design_scenario`, `pathway`, `horizon`, `product` or
+`n_rows`, and a document without `intervals` has no intervals.
 
 The module claims no licence of its own for a comparison: it is derived data
 under its inputs' terms, which `licences` lists.
@@ -102,9 +104,14 @@ IDENTITY_COLUMNS = (
     "level",
     "scope",
     "scenario",
+    "design_scenario",
+    "pathway",
+    "horizon",
+    "product",
     "split",
     "fold",
     "sample_hash",
+    "n_rows",
     "premium_basis",
     "unique",
     "ties",
@@ -114,7 +121,21 @@ IDENTITY_COLUMNS = (
 )
 """The columns of a comparison table before its metric columns."""
 
-_ADDED_IDENTITY_COLUMNS = ("scope", "components", "design_budget")
+_ADDED_SCENARIO_COLUMNS = (
+    "design_scenario",
+    "pathway",
+    "horizon",
+    "product",
+    "n_rows",
+)
+"""The identity columns of scenario analysis, null in a table written without them."""
+
+_ADDED_IDENTITY_COLUMNS = (
+    "scope",
+    "components",
+    "design_budget",
+    *_ADDED_SCENARIO_COLUMNS,
+)
 """The identity columns that a table written earlier doesn't have."""
 
 _ADDED_METRIC_COLUMNS = ("payout_frequency", "unidentified_share")
@@ -145,6 +166,7 @@ KEY_COLUMNS = (
     "asset_id",
     "level",
     "scenario",
+    "design_scenario",
     "split",
     "fold",
 )
@@ -520,15 +542,17 @@ class EvaluationMetadata(_EvaluationModel):
         """Check that this metadata describes `table`, a comparison table.
 
         The table must have the identity columns and exactly the metric
-        columns of `columns`; a table written before `scope`, `components` or
-        `design_budget` was added may lack them, and a comparison written
-        before `payout_frequency` or `unidentified_share` was added may lack
-        that column. An intervals table has one row per wide row and metric
-        column instead, and its `column` holds metric columns of `columns`. Its key
-        (`cover_hash`, `design_id`, `asset_id`, `level`, `scenario`, `split`,
-        `fold`, `part` on a payout breakdown and `column` on an intervals
-        table) must be unique; and every cover, design, sample and evaluation
-        it names must be described here. Raises `EvaluationError` otherwise.
+        columns of `columns`; a table written before `scope`, `components`,
+        `design_budget`, `design_scenario`, `pathway`, `horizon`, `product` or
+        `n_rows` was added may lack them, and a comparison written before
+        `payout_frequency` or `unidentified_share` was added may lack that
+        column. An intervals table has one row per wide row and metric column
+        instead, and its `column` holds metric columns of `columns`. Its key
+        (`cover_hash`, `design_id`, `asset_id`, `level`, `scenario`,
+        `design_scenario`, `split`, `fold`, `part` on a payout breakdown and
+        `column` on an intervals table, a column it lacks reading as null) must
+        be unique; and every cover, design, sample and evaluation it names must
+        be described here. Raises `EvaluationError` otherwise.
         """
         names = list(getattr(table, "column_names", ()))
         identity = _identity_columns(names)
@@ -564,7 +588,7 @@ class EvaluationMetadata(_EvaluationModel):
         key_columns = (*KEY_COLUMNS, "part") if "part" in names else KEY_COLUMNS
         if intervals:
             key_columns = (*key_columns, "column")
-        keys = [tuple(row[name] for name in key_columns) for row in rows]
+        keys = [tuple(row.get(name) for name in key_columns) for row in rows]
         if len(set(keys)) != len(keys):
             raise EvaluationError("the comparison table repeats a row key")
         covers = {entry.hash for entry in self.covers}

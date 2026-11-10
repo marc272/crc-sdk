@@ -17,6 +17,7 @@ __all__ = [
     "ParametricError",
     "ProbabilitySemanticsError",
     "SampleError",
+    "ScenarioError",
     "SolverUnavailableError",
     "UnboundedDesignError",
     "UnknownPayoutKindError",
@@ -60,6 +61,17 @@ class ProbabilitySemanticsError(SampleError):
 
 class LeakageError(SampleError):
     """An out-of-sample evaluation shares periods with its design sample."""
+
+
+class ScenarioError(SampleError):
+    """What a scenario reads is invalid, or scenarios can't stand side by side.
+
+    Raised for a window of horizons whose members aren't one curve at several
+    horizons, an `n_draws` that isn't a whole multiple of its members, a
+    `hazard_name=` that the source contradicts, and, on a sample a caller has
+    labelled with `scenario=`, an unknown pathway or sources that disagree on
+    what the row reads.
+    """
 
 
 class EvaluationError(ParametricError, ValueError):
