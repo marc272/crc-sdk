@@ -658,6 +658,13 @@ def _basis_risk(sample: Mapping[str, Any], where: str) -> str:
     kind = model.get("kind")
     if kind == "no_basis_risk":
         return "no model"
+    if kind == "hazard_noise":
+        sigma = _number(model.get("sigma"), f"{where}.basis_risk.sigma")
+        return (
+            "hazard noise, the hazard at the asset being the index times a mean-one "
+            f"lognormal factor with sigma {sigma}, one per year and asset, as an "
+            "assumption the caller states"
+        )
     if kind == "impact_noise":
         sigma = _number(model.get("sigma"), f"{where}.basis_risk.sigma")
         text = f"impact noise, a mean-one lognormal factor with sigma {sigma}"
@@ -671,6 +678,85 @@ def _basis_risk(sample: Mapping[str, Any], where: str) -> str:
         if key != "kind"
     ]
     return str(kind) + (f" ({', '.join(terms)})" if terms else "")
+
+
+def _states_hazard_noise(sample: Mapping[str, Any]) -> bool:
+    """Whether the sample, or one of its assets, states `HazardNoise`."""
+    parts = sample.get("parts") or {}
+    models = [sample.get("basis_risk"), *(p.get("basis_risk") for p in parts.values())]
+    return any(
+        isinstance(model, Mapping) and model.get("kind") == "hazard_noise"
+        for model in models
+    )
+
+
+def _hazard_noise_scope(sample: Mapping[str, Any]) -> str:
+    """How the factors of `HazardNoise` relate across assets or components."""
+    if not _states_hazard_noise(sample):
+        return ""
+    if sample.get("parts"):
+        return ", the factors independent between assets"
+    if sample.get("components"):
+        return ", each component with factors of its own"
+    return ""
+
+
+def _mean_ratios(sample: Mapping[str, Any], where: str) -> str:
+    """What a model that acts on the hazard did to the means, in words.
+
+    `details.basis_risk` holds the two ratios of a sample, or of each of its
+    assets or components by name. A joined sample's details don't, as its
+    setup entry keeps each asset's models only, so the text says where they
+    are. Blocks of one sample carry its ratios, which are over the rows as
+    built. Above `_MANY_ASSETS` names the text gives the ranges.
+    """
+    details = _get(sample, "details", Mapping, where) or {}
+    place = f"{where}.details"
+    recorded = _get(details, "basis_risk", Mapping, place) or {}
+    place += ".basis_risk"
+    if "hazard_mean_ratio" in recorded:
+        named = {"": recorded}
+    else:
+        named = {
+            str(name): each
+            for name, each in recorded.items()
+            if isinstance(each, Mapping) and "hazard_mean_ratio" in each
+        }
+    if not named:
+        if details and "basis_risk" not in details and _states_hazard_noise(sample):
+            return (
+                "; the mean hazard and mean impact, with the factor over without "
+                "it, are recorded per asset, in each asset's own provenance"
+            )
+        return ""
+
+    def say(value: Any, at: str) -> str:
+        return "not defined" if value is None else _number(value, at)
+
+    lead = "; over the rows as built, with the model over without it, "
+    if "" in named:
+        hazard = say(recorded["hazard_mean_ratio"], f"{place}.hazard_mean_ratio")
+        impact = say(recorded["impact_mean_ratio"], f"{place}.impact_mean_ratio")
+        return f"{lead}the mean hazard is {hazard} and the mean impact {impact}"
+    if len(named) <= _MANY_ASSETS:
+        each = [
+            f"{say(entry['hazard_mean_ratio'], f'{place}.{name}')} and "
+            f"{say(entry['impact_mean_ratio'], f'{place}.{name}')} for {name}"
+            for name, entry in named.items()
+        ]
+        return f"{lead}the mean hazard and the mean impact are {', '.join(each)}"
+
+    def ranged(key: str) -> str:
+        values = [entry[key] for entry in named.values() if entry.get(key) is not None]
+        if not values:
+            return "not defined"
+        return _span(values, lambda value: _number(value, f"{place}.{key}"))
+
+    who = "assets" if sample.get("parts") else "components"
+    return (
+        f"{lead}the mean hazard is {ranged('hazard_mean_ratio')} and the mean impact "
+        f"{ranged('impact_mean_ratio')} across {len(named)} {who}"
+    )
 
 
 def _loss(sample: Mapping[str, Any], where: str) -> str:
@@ -826,9 +912,11 @@ def _components(sample: Mapping[str, Any], where: str) -> str | None:
 
 
 def _sample_text(sample: Mapping[str, Any], where: str) -> str:
+    basis_risk = _for_each_part(sample, where, _basis_risk)
     text = (
         f"{_source(sample, where)}. "
-        f"Basis risk: {_for_each_part(sample, where, _basis_risk)}. "
+        f"Basis risk: {basis_risk}{_hazard_noise_scope(sample)}"
+        f"{_mean_ratios(sample, where)}. "
         f"Loss: {_for_each_part(sample, where, _loss)}."
     )
     dependence = _dependence(sample, where)

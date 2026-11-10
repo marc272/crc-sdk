@@ -81,8 +81,8 @@ asset column or 1 (the damage ratio), and the basis-risk model is required:
 `numpy.random.SeedSequence(seed)` and spawns one child generator per asset,
 in asset order; each draws the hazard uniforms first, then the basis-risk
 model. Fresh draws use `SeedSequence(FreshDraws.seed)` the same way. On the
-per-year route only the basis-risk model draws, so `ImpactNoise` needs a
-seed there.
+per-year route only the basis-risk model draws, so `HazardNoise` and
+`ImpactNoise` need a seed there.
 
 **Covers and designs.** A cover written for no asset (`asset_id=None`)
 applies to every asset, as a copy written for that asset; one written for an
@@ -188,7 +188,7 @@ from numpy.typing import NDArray
 from crc_sdk.impacts.calibration import units_equivalent
 from crc_sdk.impacts.expression import ImpactExpression
 from crc_sdk.parametric._canonical import content_hash
-from crc_sdk.parametric.basis_risk import BasisRisk, ImpactNoise
+from crc_sdk.parametric.basis_risk import BasisRisk, HazardNoise, ImpactNoise
 from crc_sdk.parametric.constraints import Budget, Limit
 from crc_sdk.parametric.cover import Cover
 from crc_sdk.parametric.dependence import (
@@ -1661,21 +1661,26 @@ class ParametricPlan:
 
         `NoBasisRisk()` (the index is the hazard at the asset; samples warn
         with `ComonotoneIndexWarning`, except with `.index(...)`, where the
-        index is another series), `ImpactNoise(sigma, upper=...)` or a
-        user model that implements `BasisRisk`. Required before execution.
-        Raises `TypeError` for another type, and `ValueError` for
-        `ImpactNoise` on a plan on per-year values without a seed (on fitted
-        curves, `monte_carlo` states the seed).
+        index is another series), `HazardNoise(sigma)`, `ImpactNoise(sigma,
+        upper=...)` or a user model that implements `BasisRisk`. Required
+        before execution. Raises `TypeError` for another type, and `ValueError`
+        for `HazardNoise` or `ImpactNoise`, at every sigma, on a plan on
+        per-year values without a seed (on fitted curves, `monte_carlo` states
+        the seed).
         """
         if not isinstance(model, BasisRisk):
             raise TypeError(
                 "model must be a BasisRisk model such as NoBasisRisk() or "
                 f"ImpactNoise(sigma), got {type(model).__name__}"
             )
-        if isinstance(model, ImpactNoise) and self.seed is None and not self._on_curves:
+        if (
+            isinstance(model, (HazardNoise, ImpactNoise))
+            and self.seed is None
+            and not self._on_curves
+        ):
             raise ValueError(
-                "ImpactNoise draws one factor per year; give the plan a seed "
-                "(for_annual_extremes(..., seed=...))"
+                f"{type(model).__name__} draws one factor per year; give the plan "
+                "a seed (for_annual_extremes(..., seed=...))"
             )
         return dataclasses.replace(self, basis_risk_model=model)
 

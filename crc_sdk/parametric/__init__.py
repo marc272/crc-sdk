@@ -52,7 +52,13 @@ plan reads its source and assets only at its execution points (`samples`,
 `docs/parametric.md`.
 """
 
-from crc_sdk.parametric.basis_risk import BasisRisk, ImpactNoise, NoBasisRisk
+from crc_sdk.parametric.basis_risk import (
+    BasisRisk,
+    HazardBasisRisk,
+    HazardNoise,
+    ImpactNoise,
+    NoBasisRisk,
+)
 from crc_sdk.parametric.combine import CappedSum, CombineRule, CompoundDamage
 from crc_sdk.parametric.constraints import Budget, Limit
 from crc_sdk.parametric.cover import Cover
@@ -188,6 +194,8 @@ __all__ = [
     "FreshDraws",
     "GaussianCopula",
     "H3Cell",
+    "HazardBasisRisk",
+    "HazardNoise",
     "Holdout",
     "ImpactNoise",
     "Independent",
