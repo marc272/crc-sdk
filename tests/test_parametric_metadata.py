@@ -190,9 +190,7 @@ def _with_designs(*records: dict[str, Any]) -> EvaluationMetadata:
     return base.model_copy(update={"designs": records})
 
 
-def test_merge_keeps_the_first_record_of_a_design_that_differs_in_its_solve_time() -> (
-    None
-):
+def test_merge_keeps_the_first_of_two_records_differing_in_solve_time() -> None:
     early = _with_designs(_design_record())
     late = _with_designs(_design_record(solve={"seconds": 9.5}))
     assert EvaluationMetadata.merge(early, late).designs == early.designs
@@ -258,9 +256,7 @@ def test_merge_rejects_a_record_that_states_no_solve_time_beside_one_that_does(
         EvaluationMetadata.merge(_with_designs(other), _with_designs(timed))
 
 
-def test_merge_rejects_a_third_record_after_two_that_differ_in_their_solve_time() -> (
-    None
-):
+def test_merge_rejects_a_third_record_differing_in_more_than_time() -> None:
     one = _with_designs(_design_record())
     two = _with_designs(_design_record(solve={"seconds": 9.5}))
     three = _with_designs(_design_record(solve={"status": "time_limit"}))
