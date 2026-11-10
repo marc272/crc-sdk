@@ -252,6 +252,7 @@ def test_for_evaluation_runs_end_to_end_offline(dataset: Path, tmp_path: Path) -
     assert setup_text(read) == text
     assert "on fresh Monte Carlo draws: evaluated on 1000 simulated years" in text
     assert "designed on 1500 simulated years" in text
+    assert "so these rows test the design's sampling error, not the curve." in text
     assert "with annual_exceedance semantics, as the dataset declares" in text
     assert "more frequent than the shortest fitted return period (2 years)" in text
     assert "\nSeeds: the plan's seed 42; the fresh draws' seed 7.\n" in text
@@ -714,6 +715,7 @@ def test_builders_and_explain_do_no_io(tmp_path: Path) -> None:
     ]
     text = setup_text(setup)
     assert "Split: out of sample, fold 0, on fresh Monte Carlo draws" in text
+    assert "so these rows test the design's sampling error, not the curve." in text
     assert "with the probability semantics the dataset declares, not known yet" in text
     assert "impact noise, a mean-one lognormal factor with sigma 0.3" in text
     # The whole document adds the dataset's path and selection, still without I/O.
