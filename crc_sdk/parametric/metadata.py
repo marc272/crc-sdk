@@ -18,7 +18,12 @@ with sorted keys. It holds:
   `hazard_dependence`)
   and every evaluation (sample, split, fold, how the split was made, the
   design samples checked for leakage, the pricing, the levels and scopes of
-  its rows and the allocation rule);
+  its rows and the allocation rule). `compare_pooled` adds each block and one
+  sample entry for the pooled rows, and writes one evaluation with `fold` null,
+  `method` `"kfold_pooled"` and `details` with `k` and the held-out blocks'
+  hashes in fold order. `bootstrap_intervals` adds `intervals`: the method, the
+  resampling unit, the number of resamples, the level and the columns whose
+  level reaches the block's worst row. `intervals` is null otherwise;
 - `columns`: for every metric column, its metric, parameter, unit and a
   one-line definition;
 - `covers`: every cover's label, hash and full document, the hash of every
@@ -26,10 +31,12 @@ with sorted keys. It holds:
   cover hashes it is made of, and the hash of every package a `"package"` row
   names, with the component names and cover hashes it is made of;
 - `designs`: the record of every design evaluated, with the label of its
-  cover as evaluated (`cover_label`);
+  cover as evaluated (`cover_label`), and for a pooled row an entry of `kind`
+  `"pooled"` under the row's `design_id` that lists the folds' designs, as
+  `covers` lists the folds' covers;
 - `sources`, `licences` and `rng`: the samples' source documents, their
   licences and attributions, and the generator state before every random
-  step, each tagged with its sample's hash;
+  step, each tagged with its sample's hash, the step `"bootstrap"` included;
 - `source_records`: what a plan read, once for all its samples (the
   canonical file, or the annual table), empty for a comparison that
   `compare` or `evaluate` builds;
@@ -43,7 +50,8 @@ or without an evaluation's `level`, `scope` and `allocation` or a sample's
 `["individual"]`, no allocation, no dependence and no component. A sample
 without `trend` has none recorded, which on per-year values reads as the years
 as recorded, and a sample without `pool` is no pool. A comparison without the
-metric column `payout_frequency` or `unidentified_share` reads as null there.
+metric column `payout_frequency` or `unidentified_share` reads as null there, and
+a document without `intervals` has no intervals.
 
 The module claims no licence of its own for a comparison: it is derived data
 under its inputs' terms, which `licences` lists.
@@ -114,6 +122,22 @@ _ADDED_METRIC_COLUMNS = ("payout_frequency", "unidentified_share")
 
 _BREAKDOWN_COLUMNS = ("part", "part_kind")
 """The columns of a payout breakdown beside the identity columns."""
+
+_INTERVAL_COLUMNS = (
+    "column",
+    "metric",
+    "parameter",
+    "parameter_value",
+    "unit",
+    "value",
+    "ci_low",
+    "ci_high",
+    "ci_level",
+    "n_bootstrap",
+    "n_undefined",
+    "short_block",
+)
+"""The columns of an intervals table beside the identity columns."""
 
 KEY_COLUMNS = (
     "cover_hash",
@@ -198,6 +222,34 @@ def _unique(entries: Iterable[Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
     return tuple(kept)
 
 
+def _replaced(model: Any, **fields: Any) -> Any:
+    """`model` with `fields` replaced, validated again."""
+    return type(model)(**{**dict(model), **fields})
+
+
+def _merged_intervals(
+    records: Sequence[dict[str, Any] | None],
+) -> dict[str, Any] | None:
+    """One `setup.intervals` for several tables; `None` if none has any."""
+    stated = [record for record in records if record is not None]
+    if not stated:
+        return None
+    first = stated[0]
+    agreed = ("ci_level", "method", "n_bootstrap", "unit")
+    for record in stated[1:]:
+        if any(record.get(key) != first.get(key) for key in agreed):
+            raise EvaluationError(
+                "the metadata differ in their intervals: their method, unit, number "
+                "of resamples or level"
+            )
+    flagged = dict.fromkeys(
+        column
+        for record in stated
+        for column in record.get("short_block_columns") or ()
+    )
+    return {**first, "short_block_columns": list(flagged)}
+
+
 class ColumnEntry(_EvaluationModel):
     """One metric column: its metric, parameter, unit and definition."""
 
@@ -227,13 +279,16 @@ class EvaluationSetup(_EvaluationModel):
     and `roles`, `"evaluation"` and/or `"design"`), and `evaluations` one per
     evaluation run (each with its `sample_hash`, `split` and `fold`, and, in
     what `compare` and `evaluate` write, the `level` and `scope` of its rows
-    and its `allocation`). Raises `EvaluationError` otherwise.
+    and its `allocation`). `intervals` is what `bootstrap_intervals` records,
+    and null on any other table. Raises `EvaluationError` for a sample or an
+    evaluation without those keys.
     """
 
     basis: Literal["annual"] = "annual"
     metric_options: dict[str, Any]
     samples: tuple[dict[str, Any], ...]
     evaluations: tuple[dict[str, Any], ...]
+    intervals: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def _check(self) -> Self:
@@ -341,8 +396,9 @@ class EvaluationMetadata(_EvaluationModel):
         one file. The environments, the basis and the metric options must
         agree, and a column or design id must mean the same in each; samples,
         evaluations, covers, designs, sources, source records, licences and
-        generator states are combined without repeats. `created_at` is the
-        latest one.
+        generator states are combined without repeats. Intervals of several
+        tables must have one method, unit, number of resamples and level, and
+        their flagged columns are combined. `created_at` is the latest one.
 
         Raises `EvaluationError` if the items disagree, and `TypeError` for an
         item that is not `EvaluationMetadata`.
@@ -440,6 +496,7 @@ class EvaluationMetadata(_EvaluationModel):
                 evaluations=_unique(
                     entry for item in items for entry in item.setup.evaluations
                 ),
+                intervals=_merged_intervals([item.setup.intervals for item in items]),
             ),
             columns=columns,
             covers=tuple(
@@ -466,28 +523,47 @@ class EvaluationMetadata(_EvaluationModel):
         columns of `columns`; a table written before `scope`, `components` or
         `design_budget` was added may lack them, and a comparison written
         before `payout_frequency` or `unidentified_share` was added may lack
-        that column. Its key (`cover_hash`,
-        `design_id`, `asset_id`, `level`, `scenario`, `split`, `fold`, and
-        `part` on a payout breakdown) must be unique; and every cover, design,
-        sample and evaluation it names must be described here. Raises
-        `EvaluationError` otherwise.
+        that column. An intervals table has one row per wide row and metric
+        column instead, and its `column` holds metric columns of `columns`. Its key
+        (`cover_hash`, `design_id`, `asset_id`, `level`, `scenario`, `split`,
+        `fold`, `part` on a payout breakdown and `column` on an intervals
+        table) must be unique; and every cover, design, sample and evaluation
+        it names must be described here. Raises `EvaluationError` otherwise.
         """
         names = list(getattr(table, "column_names", ()))
         identity = _identity_columns(names)
         missing = [name for name in identity if name not in names]
         if missing:
             raise EvaluationError(f"the comparison table lacks the columns {missing}")
-        metrics = [name for name in names if name not in identity]
+        intervals = "ci_low" in names
+        if intervals:
+            lacking = [name for name in _INTERVAL_COLUMNS if name not in names]
+            if lacking:
+                raise EvaluationError(
+                    f"the intervals table lacks the columns {lacking}"
+                )
+            metrics = table.column("column").unique().to_pylist()
+        else:
+            metrics = [name for name in names if name not in identity]
         optional = () if "part" in names else _ADDED_METRIC_COLUMNS
         unknown = sorted(set(metrics) - set(self.columns))
-        absent = sorted(set(self.columns) - set(metrics) - set(optional))
+        # The rows of an intervals table may be filtered by metric.
+        absent = (
+            []
+            if intervals
+            else sorted(set(self.columns) - set(metrics) - set(optional))
+        )
         if unknown or absent:
             raise EvaluationError(
                 "the table's metric columns differ from the metadata's: "
                 f"undescribed {unknown}, absent {absent}"
             )
-        rows = table.select(identity).to_pylist()
+        rows = table.select(
+            [*identity, "column"] if intervals else identity
+        ).to_pylist()
         key_columns = (*KEY_COLUMNS, "part") if "part" in names else KEY_COLUMNS
+        if intervals:
+            key_columns = (*key_columns, "column")
         keys = [tuple(row[name] for name in key_columns) for row in rows]
         if len(set(keys)) != len(keys):
             raise EvaluationError("the comparison table repeats a row key")
@@ -1496,11 +1572,14 @@ def _of_rows(
 
     A row names its evaluation by its sample hash, split and fold, and its
     design by its design id. The samples kept are those the evaluations kept
-    are evaluated or designed on, and the source records those of the
-    samples kept. A table without those columns, or without rows, names no
-    evaluation: then the setup is that of the whole comparison, and the last
-    item says so. Raises `EvaluationError` for a row that names an
-    evaluation or a design the metadata does not describe.
+    are evaluated or designed on, the held-out blocks of a pooled evaluation
+    among them, and the source records those of the samples kept. A pooled
+    row's design lists the designs of its folds, which are kept too. An
+    intervals table's flagged columns are those of the rows it still holds. A
+    table without those columns, or without rows, names no evaluation: then
+    the setup is that of the whole comparison, and the last item says so.
+    Raises `EvaluationError` for a row that names an evaluation or a design
+    the metadata does not describe.
     """
     setup = metadata.setup.model_dump(mode="json")
     missing = [name for name in _ROW_KEYS if name not in table.column_names]
@@ -1572,6 +1651,12 @@ def _of_rows(
             "(EvaluationMetadata.merge)"
         )
     wanted = {row["design_id"] for row in rows if row["design_id"] is not None}
+    wanted |= {
+        design_id
+        for record in metadata.designs
+        if record["design_id"] in wanted and record.get("kind") == "pooled"
+        for design_id in record["designs"]
+    }
     designs = tuple(r for r in metadata.designs if r["design_id"] in wanted)
     absent = wanted - {record["design_id"] for record in designs}
     if absent:
@@ -1583,14 +1668,29 @@ def _of_rows(
     for i, entry in enumerate(evaluations):
         where = f"setup.evaluations[{i}]"
         hashes.update(str(value) for value in _list(entry, "design_samples", where))
+        details = _get(entry, "details", Mapping, where) or {}
+        hashes.update(str(value) for value in _list(details, "blocks", where))
     samples = [s for s in setup["samples"] if str(s["sample_hash"]) in hashes]
     sources = tuple(
         entry
         for entry in metadata.sources
         if entry.get("sample_hash") is None or str(entry["sample_hash"]) in hashes
     )
+    intervals = setup.get("intervals")
+    if intervals is not None and {"column", "short_block"} <= set(table.column_names):
+        flagged = _first_seen(
+            row["column"]
+            for row in table.select(["column", "short_block"]).to_pylist()
+            if row["short_block"]
+        )
+        intervals = {**intervals, "short_block_columns": flagged}
     return (
-        {**setup, "samples": samples, "evaluations": evaluations},
+        {
+            **setup,
+            "samples": samples,
+            "evaluations": evaluations,
+            "intervals": intervals,
+        },
         designs,
         sources,
         None,
@@ -1922,6 +2022,39 @@ def _pricing(pricing: Any, where: str) -> str:
     return str(pricing.get("kind"))
 
 
+def _pooled_split(
+    evaluation: Mapping[str, Any],
+    evaluated: str,
+    where: str,
+) -> str:
+    """The `Split` line of a pooled evaluation."""
+    details = _get(evaluation, "details", Mapping, where) or {}
+    k = _get(details, "k", int, f"{where}.details")
+    designed = bool(_list(evaluation, "design_samples", where))
+    how = []
+    if designed:
+        how.append(
+            "each year is evaluated by the design made without it and pays that "
+            "fold's design premium"
+        )
+    if details.get("given_covers"):
+        how.append(
+            "a cover given as is applies on every fold and is priced once on the "
+            "pooled rows"
+        )
+    checked = (
+        "the leakage check passed on every fold"
+        if evaluation.get("leakage_check") == "passed"
+        else "no design, so no leakage check"
+    )
+    return (
+        f"Split: out of sample, the {k or 'k'} folds of a {k or 'k'}-fold split over "
+        f"blocks of years, pooled: evaluated on {evaluated}; {'; '.join(how)}; each "
+        "metric is computed once over all those rows, with the same probability on "
+        f"each, and is not a mean over the folds; {checked}."
+    )
+
+
 def _split(
     evaluation: Mapping[str, Any],
     samples: Mapping[str, Mapping[str, Any]],
@@ -1946,6 +2079,8 @@ def _split(
         )
     if split != "out_of_sample":
         return f"Split: {split or 'not stated'}, {folded}: evaluated on {evaluated}."
+    if method == "kfold_pooled":
+        return _pooled_split(evaluation, evaluated, where)
     if method == "holdout":
         fraction = details.get("train_fraction")
         how = f"{folded}, a holdout" + (
@@ -2225,17 +2360,21 @@ def _draws_from_one_curve(
 ) -> bool:
     """Whether an out-of-sample evaluation's blocks are draws from one curve.
 
-    Those are fresh draws, and a holdout or k-fold of draws. Before execution a
-    plan's evaluations name no sample, and its samples are all of one kind. Where
-    the metadata records the curves, a design block whose curve the evaluation
-    block does not read is not one curve, whatever the method.
+    Those are fresh draws, and a holdout or k-fold of draws, pooled or not. Before
+    execution a plan's evaluations name no sample, and its samples are all of one
+    kind. Where the metadata records the curves, a design block whose curve the
+    evaluation block does not read is not one curve, whatever the method. A pooled
+    evaluation of covers given as is has no design block.
     """
     method = evaluation.get("method")
     if evaluation.get("split") != "out_of_sample" or method not in (
         "fresh_draws",
         "holdout",
         "kfold",
+        "kfold_pooled",
     ):
+        return False
+    if method == "kfold_pooled" and not evaluation.get("design_samples"):
         return False
     sample_hash = evaluation.get("sample_hash")
     read = [
@@ -2255,7 +2394,8 @@ def _draws_from_one_curve(
             if source.get("sample_hash") == block and source.get("curve") is not None
         }
 
-    held = curves(sample_hash)
+    details = evaluation.get("details") or {}
+    held = set().union(*map(curves, details.get("blocks") or [sample_hash]))
     return all(
         curves(block) <= held for block in evaluation.get("design_samples") or ()
     )
@@ -2441,6 +2581,38 @@ def _package_lines(evaluations: Sequence[Mapping[str, Any]], unit: str) -> list[
     return _first_seen(lines)
 
 
+def _intervals(intervals: Mapping[str, Any]) -> str:
+    """The `Intervals` line: how the bounds are made and what they leave out."""
+    where = "setup.intervals"
+    resamples = _number(intervals.get("n_bootstrap"), f"{where}.n_bootstrap")
+    level = _number(intervals.get("ci_level"), f"{where}.ci_level")
+    unit = _get(intervals, "unit", str, where)
+    redrawn = (
+        "the evaluated rows, as the reference of an EmpiricalCopula is part of the "
+        "stated model"
+        if unit == "row"
+        else "the evaluated years, each with every row of that year"
+    )
+    text = (
+        f"Intervals: {_get(intervals, 'method', str, where)}, level {level}, from "
+        f"{resamples} resamples of {redrawn}, with replacement and with the designs "
+        f"held fixed. An interval is the middle {level} of the recomputed values. It "
+        "describes how much a number moves with the years drawn. It leaves out "
+        "uncertainty in the hazard data, the impact function and the design, and on "
+        "a curve block it is the Monte Carlo error of the draws and says nothing "
+        "about the curve. Two rows' intervals are not a test of a difference between "
+        "them."
+    )
+    short = [str(name) for name in _list(intervals, "short_block_columns", where)]
+    if short:
+        text += (
+            f" The level of these columns reaches the block's worst row, so their "
+            "bounds cannot reach beyond the block's largest rows and understate how "
+            f"far the number could move: {', '.join(short)}."
+        )
+    return text
+
+
 def _is_document(value: Any) -> TypeGuard[Mapping[str, Any]]:
     """Whether `value` is a whole document, such as `explain()`'s, not a setup."""
     return isinstance(value, Mapping) and "setup" in value and "samples" not in value
@@ -2465,7 +2637,9 @@ def setup_text(
       fresh draws, a separate sample), the evaluation and design samples
       (years, periods, blocks) and the leakage check; and, where the design and
       evaluation blocks are draws from one curve, that these rows test the
-      design's sampling error, not the curve;
+      design's sampling error, not the curve. A pooled evaluation has one line,
+      with k, the rows and that each year is evaluated by the design made
+      without it;
     - `Seeds`: the plan's seed (`plan_seed`) and the fresh draws' seed
       (`fresh_draws_seed`) that the evaluations' `details` record, if any;
     - `Sample`: the source kind, the probability semantics and who stated
@@ -2533,6 +2707,10 @@ def setup_text(
       is not additive across contracts;
     - `Payout breakdown`, for a breakdown holding a `MaxOf` cover: that its rows
       are an attribution;
+    - `Intervals`, for a table of `bootstrap_intervals`: the resamples, the
+      level, the unit, what an interval leaves out, that two rows' intervals
+      are not a test of a difference between them, and the columns whose level
+      reaches the block's worst row;
     - `Metrics`: the levels beta, the return periods and the loss and payout
       thresholds.
 
@@ -2743,6 +2921,14 @@ def setup_text(
             " The package row holds the sum of its contracts' premiums, one per "
             "contract, unless a total premium is stated."
         )
+    if any(
+        evaluation.get("method") == "kfold_pooled" and evaluation.get("design_samples")
+        for evaluation in evaluations
+    ):
+        priced += (
+            " On a pooled row each year pays its own fold's design premium, and "
+            "premium is their mean."
+        )
     part_kinds = [
         str(kind)
         for i, evaluation in enumerate(evaluations)
@@ -2755,7 +2941,11 @@ def setup_text(
             "Pricing: a payout breakdown holds no premiums; a design's line states "
             "its pricing."
         )
-    lines += [_design(record, labels, unit, by_hash) for record in designs]
+    lines += [
+        _design(record, labels, unit, by_hash)
+        for record in designs
+        if record.get("kind") != "pooled"
+    ]
     lines += _row_lines(evaluations, designs, by_hash, unit)
     lines += _package_lines(evaluations, unit)
     if "attribution" in part_kinds:
@@ -2766,6 +2956,9 @@ def setup_text(
         )
     if explained is not None:
         lines += _planned_designs(explained, assets, unit)
+    intervals = _get(setup, "intervals", Mapping, "setup")
+    if intervals is not None:
+        lines.append(_intervals(intervals))
     options = setup.get("metric_options")
     if isinstance(options, Mapping):
         lines.append(_metrics(options, unit))

@@ -255,3 +255,68 @@ def test_invalid_inputs_raise(
         metric_values(
             loss, payout, probability, premium=premium, options=MetricOptions()
         )
+
+
+# -- a premium per draw -------------------------------------------------------
+
+
+def test_a_premium_per_draw_enters_the_net_loss_year_by_year() -> None:
+    loss = np.array([0.0, 10.0, 20.0, 30.0])
+    payout = np.array([0.0, 5.0, 0.0, 40.0])
+    premium = np.array([1.0, 1.0, 3.0, 3.0])
+    values = metric_values(
+        loss,
+        payout,
+        np.full(4, 0.25),
+        premium=premium,
+        options=MetricOptions(betas=(0.5,), return_periods=(2.0,)),
+    )
+    # The net losses are (1, 6, 23, -7); sorted (-7, 1, 6, 23).
+    assert values["premium"] == pytest.approx(2.0)
+    assert values["var_net_loss_b0_5"] == pytest.approx(1.0)
+    assert values["cvar_net_loss_b0_5"] == pytest.approx((6.0 + 23.0) / 2.0)
+    assert values["net_loss_rp2"] == pytest.approx(1.0)
+
+
+def test_a_constant_premium_per_draw_is_the_same_as_one_premium() -> None:
+    one = _values(7.0)
+    per_draw = metric_values(
+        LOSS,
+        PAYOUT,
+        PROBABILITY,
+        premium=np.full(N, 7.0),
+        options=MetricOptions(),
+    )
+    for name, value in one.items():
+        if value is None:
+            assert per_draw[name] is None, name
+        else:
+            assert per_draw[name] == pytest.approx(value, rel=1e-12), name
+
+
+def test_a_premium_per_draw_may_be_a_list() -> None:
+    values = metric_values(
+        LOSS,
+        PAYOUT,
+        PROBABILITY,
+        premium=[2.0] * N,
+        options=MetricOptions(),
+    )
+    assert values["premium"] == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize(
+    "premium",
+    [
+        np.full(N - 1, 1.0),
+        np.array([np.nan] * N),
+        np.array([np.inf] * N),
+        np.zeros((N, 2)),
+        ["a"] * N,
+    ],
+)
+def test_a_premium_per_draw_is_checked(premium: Any) -> None:
+    with pytest.raises(EvaluationError, match="one finite number per draw"):
+        metric_values(
+            LOSS, PAYOUT, PROBABILITY, premium=premium, options=MetricOptions()
+        )
