@@ -142,6 +142,7 @@ from crc_sdk.parametric.index import Tail, _component_name
 from crc_sdk.parametric.loss import LossModel
 from crc_sdk.parametric.metadata import _year_spans
 from crc_sdk.parametric.sample import (
+    _DEFAULT_SCENARIO,
     COMONOTONE_MESSAGE,
     HazardFrom,
     IndexComponent,
@@ -162,6 +163,7 @@ from crc_sdk.parametric.sample import (
     _integer_values,
     _licence_entry,
     _named_in_source,
+    _pathway_statements,
     _require_generator,
     _source_document,
     _thaw,
@@ -3089,6 +3091,24 @@ def _checked_runs(runs: Any) -> tuple[ModelRun, ...]:
     )
 
 
+def _check_run_pathways(runs: Sequence[ModelRun], scenario: str) -> None:
+    """Raise `ScenarioError`, on a labelled pool, for a run its series contradicts.
+
+    A pool without a label keeps its rows, as `_hazard_record` does its name.
+    """
+    if scenario == _DEFAULT_SCENARIO:
+        return
+    for run in runs:
+        record = {"pathway": run.pathway, "series": _thaw(run.series.provenance)}
+        for place, label in _pathway_statements(record)[1:]:
+            if not pathways_equivalent(run.pathway, label):
+                raise ScenarioError(
+                    f"scenario {scenario!r}: run {run._name} states the pathway "
+                    f"{run.pathway!r}, but {place} states {label!r}; a stated pathway "
+                    "must agree with its source"
+                )
+
+
 def _pool_years(
     runs: Sequence[ModelRun], trend: Trend, missing: MissingYears
 ) -> tuple[IntArray, IntArray, list[FloatArray], list[list[int]], list[int]]:
@@ -3180,7 +3200,9 @@ def sample_annual_pool(
     that lacked it. `rng` is needed only by a basis-risk model that draws:
     `HazardNoise` and `ImpactNoise` draw one factor per row, in row order.
     `trend`, `scenario` and `hazard_name` are those of `sample_annual`, and a
-    name in the runs' records must be one.
+    name in the runs' records must be one. On a pool with a `scenario` label,
+    each run's `pathway` must agree, by `pathways_equivalent`, with every
+    pathway its series' record states.
 
     `holdout` and `year_block_kfold` split a pool by its years, so every run
     holds out the same latest years, and the leakage check compares (run
@@ -3198,8 +3220,9 @@ def sample_annual_pool(
     model twice, whatever the member; runs that do not hold the same years; a
     missing year (unless `missing="drop_year"`); a hazard unit the loss model's
     impact is not calibrated for; a trend a run cannot take; and invalid
-    arguments. Raises `ScenarioError` for a `hazard_name` a run contradicts and
-    `TypeError` for wrong types. Warns with
+    arguments. Raises `ScenarioError` for a `hazard_name` a run contradicts and,
+    on a pool with a `scenario` label, for a run's `pathway` its series
+    contradicts, and `TypeError` for wrong types. Warns with
     `ComonotoneIndexWarning` for `NoBasisRisk()` and `HazardNoise(0)`, as for
     one series.
     """
@@ -3244,6 +3267,7 @@ def _pool_rows(
         )
     trend = _require_trend(trend)
     scenario = _identifier("scenario", scenario)
+    _check_run_pathways(ordered, scenario)
     hazard_record = _hazard_record(
         hazard_name, [_series_hazard(run.series) for run in ordered], scenario
     )

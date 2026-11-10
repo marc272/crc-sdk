@@ -1524,6 +1524,105 @@ def test_a_pool_of_two_hazard_names_records_none_unless_labelled() -> None:
         _pool(runs, scenario="x")
 
 
+def _runs_stating(
+    source: Any = "a table", *, run_pathway: str = "ssp245", **provenance: Any
+) -> list[ModelRun]:
+    """Two runs under `run_pathway` whose series state `source` and `provenance`."""
+    return [
+        ModelRun(
+            _series(source, seed=seed, **provenance),
+            model=model,
+            member="r1i1p1f1",
+            pathway=run_pathway,
+        )
+        for seed, model in enumerate(("M1", "M2"), start=3)
+    ]
+
+
+def _cmip_columns(pathway: str) -> dict[str, Any]:
+    """A series' `table_columns` whose one-valued `scenario` is `pathway`."""
+    one = {"values": ["x"], "distinct": 1}
+    return {
+        "model": one,
+        "member": one,
+        "scenario": {"values": [pathway], "distinct": 1},
+    }
+
+
+def _stating(pathway: str) -> list[tuple[Any, dict[str, Any], str]]:
+    """The places a series' record states `pathway`: source, record, record's name."""
+    return [
+        ({"pathway": pathway}, {}, "the series' source"),
+        ("a table", {"pathway": pathway}, "the series"),
+        (
+            "a table",
+            {"table_columns": _cmip_columns(pathway)},
+            "the table's scenario column",
+        ),
+    ]
+
+
+@pytest.mark.parametrize(("source", "provenance", "place"), _stating("ssp585"))
+def test_a_labelled_pool_refuses_a_run_its_series_contradicts(
+    source: Any, provenance: dict[str, Any], place: str
+) -> None:
+    runs = _runs_stating(source, **provenance)
+    with pytest.raises(
+        ScenarioError, match=f"'x'.*M1 r1i1p1f1.*'ssp245'.*{place}.*'ssp585'"
+    ):
+        _pool(runs, scenario="x")
+
+
+def test_every_run_of_a_labelled_pool_is_compared() -> None:
+    first, second = _runs_stating({"pathway": "ssp245"})
+    contradicted = ModelRun(
+        _series({"pathway": "ssp585"}, seed=4),
+        model=second.model,
+        member=second.member,
+        pathway=second.pathway,
+    )
+    with pytest.raises(ScenarioError, match="M2 r1i1p1f1.*'ssp585'"):
+        _pool([first, contradicted], scenario="x")
+
+
+@pytest.mark.parametrize(("source", "provenance", "place"), _stating("historic"))
+def test_a_labelled_pool_compares_pathways_by_equivalence(
+    source: Any, provenance: dict[str, Any], place: str
+) -> None:
+    runs = _runs_stating(source, run_pathway="historical", **provenance)
+    assert _source_columns(_pool(runs, scenario="x"), strict=True).pathway == (
+        "historical"
+    ), place
+
+
+def test_a_labelled_pool_of_silent_series_reads_the_runs_pathway() -> None:
+    sample = _pool(_runs_stating(), scenario="x")
+    assert _source_columns(sample, strict=True).pathway == "ssp245"
+
+
+@pytest.mark.parametrize(("source", "provenance", "place"), _stating("ssp245"))
+def test_a_labelled_pool_whose_runs_agree_keeps_the_unlabelled_rows(
+    source: Any, provenance: dict[str, Any], place: str
+) -> None:
+    runs = _runs_stating(source, **provenance)
+    labelled, unlabelled = _pool(runs, scenario="x"), _pool(runs)
+    assert labelled.lineage == unlabelled.lineage, place
+    assert labelled.index.tobytes() == unlabelled.index.tobytes()
+    assert labelled.loss.tobytes() == unlabelled.loss.tobytes()
+
+
+@pytest.mark.parametrize(("source", "provenance", "place"), _stating("ssp585"))
+def test_a_pool_without_a_label_still_reads_the_runs_pathway(
+    source: Any, provenance: dict[str, Any], place: str
+) -> None:
+    runs = _runs_stating(source, **provenance)
+    sample = _pool(runs)
+    silent = _pool(_runs_stating())
+    assert _source_columns(sample, strict=False).pathway == "ssp245", place
+    assert sample.provenance.to_document()["pool"]["pathway"] == "ssp245"
+    assert sample.loss.tobytes() == silent.loss.tobytes()
+
+
 @pytest.mark.parametrize(
     ("data", "options", "expected"),
     [

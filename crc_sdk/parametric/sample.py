@@ -2400,6 +2400,35 @@ def _source_read(
     return _SourceRead(None, None, None, owner)
 
 
+def _pathway_statements(source: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """Every place a hazard source's record states a pathway, and what it states."""
+    places: list[tuple[str, Any]]
+    if source.get("kind") == "curve":
+        places = [
+            ("the canonical row", (source.get("row") or {}).get("pathway")),
+            ("details=", (source.get("details") or {}).get("pathway")),
+        ]
+    elif "series" in source:
+        series = source["series"] or {}
+        document = series.get("source")
+        stated = document if isinstance(document, Mapping) else {}
+        try:
+            column = _series_pathway(
+                {"table_columns": series.get("table_columns")}, {}, "the series"
+            )
+        except EvaluationError:
+            column = None
+        places = [
+            ("the model run", source.get("pathway")),
+            ("the series' source", stated.get("pathway")),
+            ("the series", series.get("pathway")),
+            ("the table's scenario column", column),
+        ]
+    else:
+        places = []
+    return [(place, label) for place, label in places if _text(label) is not None]
+
+
 def _hazard_reads(document: Mapping[str, Any], owner: str) -> list[_SourceRead]:
     """What every source the loss reads states, the index series left out."""
     for key, kind in (("parts", "asset"), ("components", "component")):

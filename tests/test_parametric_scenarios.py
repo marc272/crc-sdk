@@ -901,7 +901,14 @@ def test_a_model_run_that_contradicts_its_series_raises() -> None:
         member="r1i1p1f1",
         pathway="ssp245",
     )
-    _refused([_pool("a", [run, other])], "'a'", "pathway", "ssp245", "ssp585")
+    # A pool with a label is refused at the builder; this one reaches the set.
+    _refused(
+        [_pool("baseline", [run, other])],
+        "'baseline'",
+        "pathway",
+        "ssp245",
+        "ssp585",
+    )
 
 
 def test_a_table_scenario_column_that_contradicts_its_source_raises() -> None:
