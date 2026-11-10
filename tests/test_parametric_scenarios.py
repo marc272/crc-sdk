@@ -1464,6 +1464,30 @@ def test_units_differ_for_a_window() -> None:
     )
 
 
+def test_loss_models_differ_for_a_window() -> None:
+    other = LossModel(RAMP, value=2e6, value_unit="EUR")
+    _refused(
+        [_window("a", (2045, 2050)), _window("b", (2055, 2060), loss_model=other)],
+        *BOTH,
+        "loss_model",
+    )
+
+
+def test_basis_risk_models_differ_for_a_window() -> None:
+    _refused(
+        [
+            _window("a", (2045, 2050)),
+            _window("b", (2055, 2060), basis_risk=ImpactNoise(0.2)),
+        ],
+        *BOTH,
+        "basis_risk",
+    )
+
+
+def test_a_window_that_names_no_hazard_raises() -> None:
+    _refused([_window("a", fields={"hazard_name": None})], "'a'", "hazard_name")
+
+
 def test_two_products_raise_for_a_window() -> None:
     entries = [
         _window("a"),
