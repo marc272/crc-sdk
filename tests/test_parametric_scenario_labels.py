@@ -1466,6 +1466,11 @@ def test_a_recipe_column_with_several_values_names_no_hazard() -> None:
     assert stated.provenance.hazard == {"name": "rx1day", "from": "stated"}
 
 
+def test_a_recipe_record_without_a_value_names_no_hazard() -> None:
+    columns = {"recipe": {"distinct": 1}}
+    assert _annual(series=_series(table_columns=columns)).provenance.hazard is None
+
+
 def test_the_index_series_does_not_name_the_hazard() -> None:
     index = _series({"recipe": "other"}, seed=8)
     sample = _annual(series=_series(), index=index)

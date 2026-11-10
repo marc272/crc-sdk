@@ -2228,7 +2228,10 @@ def _series_hazard(series: AnnualSeries) -> tuple[str, HazardFrom] | None:
     column = recorded.get("recipe") if isinstance(recorded, Mapping) else None
     if not isinstance(column, Mapping) or column.get("distinct") != 1:
         return None
-    named = _named_in_source({"recipe": column["values"][0]})
+    values = column.get("values")
+    if not values:
+        return None
+    named = _named_in_source({"recipe": values[0]})
     return None if named is None else (named, "table_column")
 
 
