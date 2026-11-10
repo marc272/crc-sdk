@@ -4,10 +4,12 @@ On a sample of draws d (one draw is one year) with probabilities p_d, a
 cover's payout pi_d and the loss L_d, write U_d = max(L_d - pi_d, 0) for the
 uncovered loss, R_d = L_d - pi_d for the residual, P for the premium and
 N_d = L_d - pi_d + P for the net loss, the owner's cost of the year with the
-cover. `metric_values` returns, in this order:
+cover. The premium may differ per draw, P_d, as on a pooled k-fold row, where
+each year pays its own fold's design premium. `metric_values` returns, in this
+order:
 
-- `expected_loss` E[L], `expected_payout` E[pi], `premium` P,
-  `expected_uncovered` E[U];
+- `expected_loss` E[L], `expected_payout` E[pi], `premium` P (with a premium
+  per draw, E[P_d]), `expected_uncovered` E[U];
 - `coverage_ratio`: E[min(pi, L)] / E[L], the share of the expected loss
   that payouts cover (payouts above the loss do not count); null when
   E[L] = 0;
@@ -361,12 +363,38 @@ def _correlation(
     return min(1.0, max(-1.0, covariance / math.sqrt(variance))) + 0.0
 
 
+def _premium_used(
+    premium: Any, probability: FloatArray
+) -> tuple[float | FloatArray, float]:
+    """The premium in the net loss, and the premium a row reports."""
+    if isinstance(premium, (np.ndarray, list, tuple)):
+        try:
+            per_draw = np.asarray(premium, dtype=np.float64)
+        except (TypeError, ValueError) as error:
+            raise EvaluationError(
+                "a premium per draw must hold one finite number per draw"
+            ) from error
+        if per_draw.shape != probability.shape or not np.isfinite(per_draw).all():
+            raise EvaluationError(
+                "a premium per draw must hold one finite number per draw"
+            )
+        return per_draw, _fsum(probability * per_draw) + 0.0
+    if (
+        isinstance(premium, bool)
+        or not isinstance(premium, (int, float, np.number))
+        or not math.isfinite(float(premium))
+    ):
+        raise EvaluationError(f"premium must be a finite number, got {premium!r}")
+    used = float(premium) + 0.0
+    return used, used
+
+
 def metric_values(
     loss: ArrayLike,
     payout: ArrayLike,
     probability: ArrayLike,
     *,
-    premium: float,
+    premium: ArrayLike,
     options: MetricOptions,
     unidentified: ArrayLike | None = None,
 ) -> dict[str, float | None]:
@@ -375,13 +403,15 @@ def metric_values(
     `loss`, `payout` and `probability` hold one value per draw: the loss
     (>= 0), the cover's payout (>= 0) and the draw's probability (> 0,
     summing to 1 within 1e-12). `premium` is the premium used, in the loss
-    unit. `unidentified` holds one boolean per draw, true where the payout
-    reads an amount a design's fill rule set; without it `unidentified_share`
-    is `None`. A value is `None` where the metric is undefined (see the module
-    docstring). Raises `EvaluationError` (a `ValueError`) for arrays of
-    different shapes, non-finite or negative values, probabilities that do
-    not sum to 1, a premium that is not a finite number, or `unidentified`
-    that is not one boolean per draw.
+    unit: one number, or an array with one per draw, whose probability-weighted
+    mean is then the `premium` returned. `unidentified` holds one boolean per
+    draw, true where the payout reads an amount a design's fill rule set;
+    without it `unidentified_share` is `None`. A value is `None` where the
+    metric is undefined (see the module docstring). Raises `EvaluationError`
+    (a `ValueError`) for arrays of different shapes, non-finite or negative
+    values, probabilities that do not sum to 1, a premium that is neither a
+    finite number nor one finite number per draw, or `unidentified` that is
+    not one boolean per draw.
     """
     try:
         loss_draws = Draws(loss, probability)
@@ -393,12 +423,7 @@ def metric_values(
         raise EvaluationError("loss and payout must have one value per draw")
     if abs(_fsum(p) - 1.0) > _PROBABILITY_SUM_TOLERANCE:
         raise EvaluationError("probability must sum to 1 within 1e-12")
-    if (
-        isinstance(premium, bool)
-        or not isinstance(premium, (int, float, np.number))
-        or not math.isfinite(float(premium))
-    ):
-        raise EvaluationError(f"premium must be a finite number, got {premium!r}")
+    P, premium_used = _premium_used(premium, p)
     filled = None if unidentified is None else np.asarray(unidentified)
     if filled is not None and (filled.dtype != np.bool_ or filled.shape != p.shape):
         raise EvaluationError("unidentified must hold one boolean per draw")
@@ -406,7 +431,6 @@ def metric_values(
     pi = payout_draws.values
     if (L < 0.0).any() or (pi < 0.0).any():
         raise EvaluationError("loss and payout must be non-negative")
-    P = float(premium) + 0.0
     covered = np.minimum(pi, L)
     residual = L - pi
     uncovered_draws = Draws(np.maximum(residual, 0.0), p)
@@ -417,7 +441,7 @@ def metric_values(
     values: dict[str, float | None] = {
         "expected_loss": expected_loss,
         "expected_payout": payout_draws.mean(),
-        "premium": P,
+        "premium": premium_used,
         "expected_uncovered": uncovered_draws.mean(),
         "coverage_ratio": _ratio(_fsum(p * covered), expected_loss),
         "payout_to_loss_ratio": _ratio(payout_draws.mean(), expected_loss),

@@ -36,6 +36,9 @@ owner's total. `evaluate` and `compare` assess covers and designs, and
 `payout_breakdown` splits each one's expected payout into its parts. A
 `CoverPackage` is separately designed contracts on one asset's hazards, as one
 row of a comparison, and `split_budget` splits one budget between them.
+`compare_pooled` computes each metric once over all the held-out years of a
+k-fold split, and `bootstrap_intervals` gives each metric an interval from
+redrawing the evaluated years.
 
 `ParametricPlan` chains these steps as a lazy plan, to a written
 comparison: `ParametricPlan.for_evaluation(request)` from the fitted hazard
@@ -102,6 +105,7 @@ from crc_sdk.parametric.index import (
     CompositeIndex,
     IndexDefinition,
 )
+from crc_sdk.parametric.intervals import bootstrap_intervals, compare_pooled
 from crc_sdk.parametric.joint import (
     Individual,
     Joint,
@@ -241,7 +245,9 @@ __all__ = [
     "UnresolvedParameterError",
     "UserObjective",
     "WeightedCVaR",
+    "bootstrap_intervals",
     "compare",
+    "compare_pooled",
     "design",
     "design_joint",
     "evaluate",
