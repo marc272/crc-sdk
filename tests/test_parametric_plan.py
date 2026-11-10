@@ -32,6 +32,7 @@ from crc_sdk.parametric import (
     ExpectedUncovered,
     Free,
     H3Cell,
+    HazardNoise,
     Holdout,
     ImpactNoise,
     IndexDefinition,
@@ -1073,6 +1074,26 @@ def test_assets_without_a_usable_cell_raise(tmp_path: Path) -> None:
         _no_noise(plan(assets, H3Cell(3)))
 
 
+def test_hazard_noise_runs_through_a_per_year_plan() -> None:
+    plan = (
+        _plan()
+        .basis_risk(HazardNoise(0.3))
+        .covers(_step(), _linear())
+        .objective(MSE(), budget=Budget(ratio=1.0))
+        .split(Holdout(0.7))
+        .metrics(OPTIONS)
+    )
+    samples = plan.samples()
+    for sample in samples.values():
+        assert sample.hazard is not None
+        assert sample.provenance.basis_risk == {"kind": "hazard_noise", "sigma": 0.3}
+    assert not np.array_equal(
+        samples["warehouse-a"].hazard, samples["depot-b"].hazard
+    ), "each asset draws from its own generator"
+    text = setup_text(plan.explain(format="json"))
+    assert "hazard noise, the hazard at the asset being the index times" in text
+
+
 def test_basis_risk_is_required_and_noise_needs_a_seed() -> None:
     plan = _plan().covers(_linear())
     with pytest.raises(ValueError, match="basis-risk"):
@@ -1081,6 +1102,9 @@ def test_basis_risk_is_required_and_noise_needs_a_seed() -> None:
         plan.write_parquet("never.parquet")
     with pytest.raises(ValueError, match="seed"):
         _plan(seed=None).basis_risk(ImpactNoise(0.3))
+    for sigma in (0.0, 0.3):
+        with pytest.raises(ValueError, match="HazardNoise.*seed"):
+            _plan(seed=None).basis_risk(HazardNoise(sigma))
     with pytest.raises(TypeError, match="BasisRisk"):
         UNTYPED_PLAN.basis_risk(plan, "none")
 

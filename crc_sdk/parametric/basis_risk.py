@@ -241,10 +241,7 @@ class HazardNoise:
             )
         sigma = self.sigma
         log_factor = rng.normal(loc=-0.5 * sigma * sigma, scale=sigma, size=index.shape)
-        # The samplers' gate raises for a factor too large to be finite.
-        with np.errstate(over="ignore", invalid="ignore"):
-            at_asset = np.asarray(index, dtype=np.float64) * np.exp(log_factor)
-        return index, at_asset
+        return index, np.asarray(index, dtype=np.float64) * np.exp(log_factor)
 
 
 @dataclass(frozen=True)

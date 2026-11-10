@@ -33,7 +33,7 @@ There are two ways to use the module:
 | Template | a `Cover` with `Free` parameters | Terms a design chooses within stated bounds |
 | Outcome sample | `OutcomeSample` | Years (or simulated years), each with a probability, an index value and a loss |
 | Loss model | `LossModel` | loss = impact(hazard) × asset value |
-| Basis-risk model | `NoBasisRisk`, `ImpactNoise`, or an index series read elsewhere | How the index and the loss differ |
+| Basis-risk model | `HazardNoise`, `ImpactNoise`, `NoBasisRisk`, or an index series read elsewhere | How the index and the loss differ |
 | Objective | `MSE`, `ExpectedUncovered`, `WeightedCVaR`, `UserObjective` | What a design minimises |
 | Pricing and constraints | `PurePremium`, `CostOfCapitalLoad`, `Budget`, `Limit` | The premium of a payout, and what a design must respect |
 | Design | `design`, `DesignResult` | A template's resolved cover and its design record |
@@ -62,7 +62,7 @@ from crc_framework import PiecewiseLinearImpact
 from crc_sdk.connectors import hazard_arrow_schema, write_hazard_dataset
 from crc_sdk.geometry import point_to_cell
 from crc_sdk.parametric import (
-    MSE, Budget, Cover, ExpectedUncovered, Free, FreshDraws, ImpactNoise,
+    MSE, Budget, Cover, ExpectedUncovered, Free, FreshDraws, HazardNoise,
     IndexDefinition, LinearPayout, MetricOptions, ParametricPlan, StepPayout,
     WeightedCVaR, setup_text,
 )
@@ -110,7 +110,7 @@ plan = (
     ParametricPlan.for_evaluation(request, value_column="value_eur",
                                   value_unit="EUR")
     .monte_carlo(5_000, seed=42)               # simulated years from the curve
-    .basis_risk(ImpactNoise(0.3, upper=1.0))   # stated, never assumed
+    .basis_risk(HazardNoise(0.3))              # stated, never assumed
     .covers(step, linear)                      # a template and a fixed cover
     .objective(MSE(), ExpectedUncovered(), WeightedCVaR(alpha=0.9, beta=0.9),
                budget=Budget(ratio=0.8))
@@ -218,7 +218,7 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
 | Builder | What it states |
 | --- | --- |
 | `.monte_carlo(n_draws, *, seed, ...)` | Fitted curves only, and required there: the simulated years per asset, the plan's seed, the semantics the caller states for a dataset that declares none, and `outside_support` |
-| `.basis_risk(model)` | How index and loss differ: `NoBasisRisk()` (warns with `ComonotoneIndexWarning`), `ImpactNoise(sigma, upper=...)` or a `BasisRisk` of your own. Required: no model is assumed |
+| `.basis_risk(model)` | How index and loss differ: `HazardNoise(sigma)`, `ImpactNoise(sigma, upper=...)`, `NoBasisRisk()` (warns with `ComonotoneIndexWarning`) or a `BasisRisk` of your own ([what each can change](#basis-risk-models)). Required: no model is assumed |
 | `.covers(*covers)` | The covers to compare. A template is designed; a resolved cover is evaluated as it is. A cover written for no asset applies to every asset, as a copy written for that asset; one written for an asset applies to it only. Each cover pays in the loss unit, on an index read at the asset (`AtAsset()`), in the hazard's unit, or as [`.index(...)`](#an-index-read-elsewhere) states |
 | `.objective(*objectives, pricing, budget, limit, options)` | Designs every template under each objective, with `design`'s terms. `pricing` is the plan's pricing, below |
 | `.pricing(pricing)` | The plan's pricing, `PurePremium()` or `CostOfCapitalLoad(rate, q)`, for a plan of resolved covers that has no `.objective(...)` |
@@ -285,7 +285,8 @@ asset, in asset order, so adding an asset at the end leaves the others'
 samples as they were. Each child draws the hazard first, then the basis-risk
 model. Fresh draws spawn their children from `SeedSequence(FreshDraws.seed)`
 in the same way. On per-year values only the basis-risk model draws, so
-`ImpactNoise` needs a seed there. Each sample's provenance records its
+`HazardNoise` and `ImpactNoise` need a seed there, at every sigma. Each
+sample's provenance records its
 generator's state before each draw. With `Joint()` on fitted curves,
 `sample_curves` takes those same children, one per asset, and its dependence
 model reorders the rows without any further random number.
@@ -610,7 +611,8 @@ between index and loss is the data's own.
   checks the covers again and raises on a mismatch.
 - **Basis risk.** `.basis_risk(model)` stays required. `NoBasisRisk()` does not
   warn with a separate index series, as in `sample_annual`, and `ImpactNoise`
-  may be added on top.
+  may be added on top. `HazardNoise` raises `SampleError` at execution: the
+  index and the hazard already differ, and the hazard at the asset is then data.
 - **What is recorded.** `explain()` shows the covers as stated and the location
   rule, in the `sources` entry with role `"index"`. In the written metadata,
   `covers` holds the bound documents; `sources` has an entry with role
@@ -712,8 +714,8 @@ sides, between pools of different runs or between a pool and one of its runs.
 with the same reference year, the last of the pool's years. `RecentYears(n)`
 takes the last `n` years of each run. `NoBasisRisk()` warns with
 `ComonotoneIndexWarning`, as for one series: pooling puts no difference between
-index and loss. `ImpactNoise` draws one factor per row, in row order, from the
-asset's generator.
+index and loss. `HazardNoise` and `ImpactNoise` draw one factor per row, in row
+order, from the asset's generator.
 
 **The source.** With `pool=`, `source` is one table, file or plan whose rows
 carry the columns `ModelPool(model="model", member="member",
@@ -1062,7 +1064,7 @@ sample of several ([joint design](#joint-design-over-several-assets)), and
 
 ```python
 import numpy as np
-from crc_sdk.parametric import ImpactNoise, LossModel, sample_curve
+from crc_sdk.parametric import HazardNoise, LossModel, sample_curve
 from crc_sdk.impacts import PiecewiseLinearImpact
 from crc_sdk.workflows import distribution_from_hazard_row
 
@@ -1071,7 +1073,7 @@ loss_model = LossModel(PiecewiseLinearImpact([40.0, 100.0], [0.0, 1.0]),
                        value=2e6, value_unit="EUR")
 sample = sample_curve(distribution_from_hazard_row(row), metadata=metadata,
                       n_draws=10_000, rng=np.random.default_rng(42),
-                      loss_model=loss_model, basis_risk=ImpactNoise(0.3, upper=1.0),
+                      loss_model=loss_model, basis_risk=HazardNoise(0.3),
                       asset_id="warehouse-a")
 ```
 
@@ -1142,17 +1144,9 @@ series' unit against it and raise `SampleError` when they differ (compared as
 `loss_model.check_hazard_unit(unit)`, or `hazard_unit=` in `evaluate`, is the
 same check by hand. Other impacts declare no unit and are not checked.
 
-**Basis risk** is a required argument:
-
-| Model | Index | Loss |
-| --- | --- | --- |
-| `NoBasisRisk()` | the hazard at the asset | `impact(hazard) × value`; warns with `ComonotoneIndexWarning`, as the loss is then a function of the index |
-| `ImpactNoise(sigma, *, upper=None)` | the hazard at the asset | each year's impact times `exp(sigma·Z − sigma²/2)`, capped at `upper` |
-| `index=` series in `sample_annual` | another cell, station or hazard | from the hazard series; the dependence is the data's own |
-
-A user model implements the `BasisRisk` protocol (`name`, `to_document()`,
-`apply(index, hazard, impact, rng)`). With one generator per call, the hazard
-draws come first, then the basis-risk model.
+**Basis risk** is a required argument: every sample states how its index and
+its loss differ. [Basis-risk models](#basis-risk-models) says what each model
+can and can't change.
 
 **Splits.** `holdout(sample, train_fraction=0.7)` designs on the first
 `floor(train_fraction · n)` periods and holds out the rest, so a per-year
@@ -1177,6 +1171,67 @@ Parquet key `crc.parametric.sample`, and `OutcomeSample.from_written_table(table
 reads it back, in memory or from `pyarrow.parquet.read_table`, with its
 provenance and lineage; a table whose rows no longer match the recorded
 content hash raises `SampleError`.
+
+### Basis-risk models
+
+The basis-risk model is a required argument: every sample states how its index
+and its loss differ. The module does not say which model suits an asset.
+
+| Model | Index | Loss | What it can and can't change |
+| --- | --- | --- | --- |
+| `HazardNoise(sigma)` | the hazard, unchanged | `impact(h) × value`, where the hazard at the asset is `h = index · exp(sigma·Z − sigma²/2)`, one `Z` per year and asset | A year can pay with no loss and a loss can occur with no payout, so the false-negative and false-positive rates respond to `sigma`. The index does not change |
+| `ImpactNoise(sigma, *, upper=None)` | the hazard, unchanged | each year's impact times `exp(sigma·Z − sigma²/2)`, capped at `upper` | The size of a loss the index has already fixed. It can't change whether a year pays or whether a loss occurs, so `false_negative_rate_l0` and `false_positive_rate_l0` don't move with `sigma`. With a loss threshold above zero they can, because the factor can carry a loss across the threshold |
+| `NoBasisRisk()` | the hazard at the asset | `impact(hazard) × value`; warns with `ComonotoneIndexWarning` | Nothing: the loss is a function of the index, so a cover can track it almost exactly |
+| `index=` series in `sample_annual` | another cell, station or hazard | from the hazard series | The dependence between index and loss is the data's own, not a stated factor |
+
+**`HazardNoise`.**
+
+- The cover pays on the index and the loss model reads `h`, which the sample's
+  `hazard` holds. `sigma` is an assumption you state, and the module does not
+  estimate it.
+- It suits a hazard on a ratio scale, where zero means none (rain, wind, depth).
+  A negative hazard raises `SampleError`, and a zero stays zero. The module can't
+  tell that a temperature in °C is not on such a scale.
+- The mean is on the hazard, not on the loss. With a damage function that is
+  convex or has a threshold, the mean impact moves with `sigma`. The provenance's
+  `details["basis_risk"]` records `hazard_mean_ratio` and `impact_mean_ratio`,
+  each the mean with the factor over the mean without it, and the setup text
+  gives both.
+- Its `sigma` and the `sigma` of `ImpactNoise` act at different places, one on
+  the hazard and one on the impact, and are not the same physical quantity.
+- It draws at every `sigma`, so a sweep over `sigma` from one generator state
+  reads one set of draws. It needs a generator at every `sigma`.
+- With `sigma=0` the factor is exactly 1: the index, the loss and `content_hash`
+  equal those of `NoBasisRisk()`, `hazard` is `None`, and it warns as
+  `NoBasisRisk()` does.
+- A separate index series (`index=`, or the plan's `.index(...)`) raises
+  `SampleError`, because the hazard at the asset is then data.
+- Under `LinearTrend` the factor multiplies the adjusted hazard. In
+  `sample_curves` each asset draws its factors from its own generator, so they
+  are independent between assets, and a dependence model moves a row's index,
+  hazard and loss together. On a sample of several hazards one model serves
+  every component, each with factors of its own. A component with no impact
+  still draws its factors, so the others' draws don't depend on it, and a
+  negative value on it raises as on any other.
+
+**A model of your own** implements the `BasisRisk` protocol (`name`,
+`to_document()`, `apply(index, hazard, impact, rng)`). To act before the impact is
+computed it also implements `HazardBasisRisk`, which adds
+`apply_hazard(index, hazard, rng)` returning the index and the hazard at the
+asset, so the model never holds the damage function. It may have both methods.
+
+With one generator per call the order is fixed:
+
+1. the hazard: a curve's uniforms and quantiles, or a series' years with its
+   trend;
+2. `apply_hazard(index, hazard, rng)`, if the model has it, which gives the index
+   and the hazard at the asset;
+3. `loss_model.impact_values(hazard at the asset)`, which draws nothing;
+4. `apply(index, hazard, impact, rng)`, which gives the index and the impact;
+5. the loss, impact × value.
+
+A model without `apply_hazard` skips step 2. `apply_hazard` must return a tuple of
+two arrays of the input's shape, finite, or the sampler raises `SampleError`.
 
 ### Several assets from fitted curves
 

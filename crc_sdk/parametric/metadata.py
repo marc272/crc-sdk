@@ -735,13 +735,13 @@ def _mean_ratios(sample: Mapping[str, Any], where: str) -> str:
 
     lead = "; over the rows as built, with the model over without it, "
     if "" in named:
-        hazard = say(recorded["hazard_mean_ratio"], f"{place}.hazard_mean_ratio")
-        impact = say(recorded["impact_mean_ratio"], f"{place}.impact_mean_ratio")
+        hazard = say(recorded.get("hazard_mean_ratio"), f"{place}.hazard_mean_ratio")
+        impact = say(recorded.get("impact_mean_ratio"), f"{place}.impact_mean_ratio")
         return f"{lead}the mean hazard is {hazard} and the mean impact {impact}"
     if len(named) <= _MANY_ASSETS:
         each = [
-            f"{say(entry['hazard_mean_ratio'], f'{place}.{name}')} and "
-            f"{say(entry['impact_mean_ratio'], f'{place}.{name}')} for {name}"
+            f"{say(entry.get('hazard_mean_ratio'), f'{place}.{name}')} and "
+            f"{say(entry.get('impact_mean_ratio'), f'{place}.{name}')} for {name}"
             for name, entry in named.items()
         ]
         return f"{lead}the mean hazard and the mean impact are {', '.join(each)}"
@@ -2401,7 +2401,9 @@ def setup_text(
     - `Seeds`: the plan's seed (`plan_seed`) and the fresh draws' seed
       (`fresh_draws_seed`) that the evaluations' `details` record, if any;
     - `Sample`: the source kind, the probability semantics and who stated
-      them, the basis-risk model and its parameters, the loss model (of each
+      them, the basis-risk model and its parameters, and for a model that acts
+      on the hazard the mean hazard and the mean impact with it over without
+      it (above five assets, their ranges), the loss model (of each
       asset, when the assets differ, and of each component on a sample of
       several hazards), the dependence between the assets, and on a sample
       with index components each component's name, unit, tail and whether it
@@ -2624,10 +2626,13 @@ def setup_text(
     elif len(set(descriptions)) == 1:
         lines.append(f"Sample: {descriptions[0]}")
     else:
-        lines += [
-            f"Sample of {span}: {text}"
-            for span, text in zip(years, descriptions, strict=True)
-        ]
+        for i, (span, text) in enumerate(zip(years, descriptions, strict=True)):
+            # Design draws and fresh draws of one size read the same by their years.
+            roles = _list(samples[i], "roles", f"setup.samples[{i}]")
+            role = (
+                f", the {' and '.join(roles)} sample" if years.count(span) > 1 else ""
+            )
+            lines.append(f"Sample of {span}{role if roles else ''}: {text}")
     if any(
         sample.get("components") and "evaluation" in _list(sample, "roles", "sample")
         for sample in samples

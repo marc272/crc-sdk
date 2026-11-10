@@ -39,6 +39,8 @@ PUBLIC = [
     "FreshDraws",
     "GaussianCopula",
     "H3Cell",
+    "HazardBasisRisk",
+    "HazardNoise",
     "Holdout",
     "ImpactNoise",
     "Independent",
