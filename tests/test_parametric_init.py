@@ -93,6 +93,7 @@ PUBLIC = [
     "compare_pooled",
     "compare_scenarios",
     "design",
+    "design_frontier",
     "design_joint",
     "evaluate",
     "holdout",
