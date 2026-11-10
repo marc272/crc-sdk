@@ -63,6 +63,7 @@ from crc_sdk.parametric.evaluate import (
     EvaluationEntry,
     Split,
     _allocated_payout,
+    _check_keys,
     _component_values,
     _component_view,
     _CoverSet,
@@ -872,7 +873,7 @@ def _pooled(
             probability=probability,
             collected=collected,
         )
-    _check_rows(collected.rows)
+    _check_keys(collected.rows, KEY_COLUMNS)
     columns = metric_columns(runs[0].options)
     metadata = _pooled_metadata(
         per_fold,
@@ -896,14 +897,6 @@ def _pooled(
         unit="year",
         options=runs[0].options,
     )
-
-
-def _check_rows(rows: Sequence[Mapping[str, Any]]) -> None:
-    keys = [tuple(row[name] for name in KEY_COLUMNS) for row in rows]
-    if len(set(keys)) != len(keys):
-        raise EvaluationError(
-            "entries repeat a pooled row (the same covers and designs twice)"
-        )
 
 
 # -- one block -----------------------------------------------------------------
@@ -1349,8 +1342,8 @@ def bootstrap_intervals(
             given.append("fold")
         if given:
             raise EvaluationError(
-                f"{', '.join(given)} are for one block; with folds, every row reads "
-                "all the held-out years"
+                f"these arguments are for one block, and with folds every row reads "
+                f"all the held-out years: {', '.join(given)}"
             )
         evaluated = _pooled(
             entries,

@@ -243,7 +243,9 @@ def _merged_intervals(
                 "of resamples or level"
             )
     flagged = dict.fromkeys(
-        column for record in stated for column in record["short_block_columns"]
+        column
+        for record in stated
+        for column in record.get("short_block_columns") or ()
     )
     return {**first, "short_block_columns": list(flagged)}
 
@@ -278,7 +280,8 @@ class EvaluationSetup(_EvaluationModel):
     evaluation run (each with its `sample_hash`, `split` and `fold`, and, in
     what `compare` and `evaluate` write, the `level` and `scope` of its rows
     and its `allocation`). `intervals` is what `bootstrap_intervals` records,
-    and null otherwise. Raises `EvaluationError` otherwise.
+    and null on any other table. Raises `EvaluationError` for a sample or an
+    evaluation without those keys.
     """
 
     basis: Literal["annual"] = "annual"
@@ -521,7 +524,7 @@ class EvaluationMetadata(_EvaluationModel):
         `design_budget` was added may lack them, and a comparison written
         before `payout_frequency` or `unidentified_share` was added may lack
         that column. An intervals table has one row per wide row and metric
-        column instead, and its `column` holds the metric columns. Its key
+        column instead, and its `column` holds metric columns of `columns`. Its key
         (`cover_hash`, `design_id`, `asset_id`, `level`, `scenario`, `split`,
         `fold`, `part` on a payout breakdown and `column` on an intervals
         table) must be unique; and every cover, design, sample and evaluation
@@ -539,13 +542,17 @@ class EvaluationMetadata(_EvaluationModel):
                 raise EvaluationError(
                     f"the intervals table lacks the columns {lacking}"
                 )
-            identity = [name for name in identity if name not in _INTERVAL_COLUMNS]
             metrics = table.column("column").unique().to_pylist()
         else:
             metrics = [name for name in names if name not in identity]
         optional = () if "part" in names else _ADDED_METRIC_COLUMNS
         unknown = sorted(set(metrics) - set(self.columns))
-        absent = sorted(set(self.columns) - set(metrics) - set(optional))
+        # The rows of an intervals table may be filtered by metric.
+        absent = (
+            []
+            if intervals
+            else sorted(set(self.columns) - set(metrics) - set(optional))
+        )
         if unknown or absent:
             raise EvaluationError(
                 "the table's metric columns differ from the metadata's: "
@@ -1670,7 +1677,7 @@ def _of_rows(
         if entry.get("sample_hash") is None or str(entry["sample_hash"]) in hashes
     )
     intervals = setup.get("intervals")
-    if intervals is not None and "short_block" in table.column_names:
+    if intervals is not None and {"column", "short_block"} <= set(table.column_names):
         flagged = _first_seen(
             row["column"]
             for row in table.select(["column", "short_block"]).to_pylist()

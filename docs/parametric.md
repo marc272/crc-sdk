@@ -39,6 +39,7 @@ There are two ways to use the module:
 | Design | `design`, `DesignResult` | A template's resolved cover and its design record |
 | Scope | `Individual()`, `Joint()` | Whether each asset's cover is designed on its own or several together, for one objective on the owner's total ([joint design](#joint-design-over-several-assets)) |
 | Comparison | `compare`, a `pyarrow.Table` | Covers as rows, metrics as columns, in and out of sample |
+| Pooled folds and intervals | `compare_pooled`, `bootstrap_intervals` | Metrics computed once over all the held-out years of a k-fold split, and how much a number moves with the years drawn ([pooled folds and intervals](#pooled-folds-and-intervals)) |
 | Plan | `ParametricPlan`, `ParametricResult` | The lazy workflow from a portfolio evaluation's curves (or per-year values) to a written comparison |
 
 "Impact" is crc-sdk's impact value, usually a damage ratio; "loss" is impact ×
@@ -859,6 +860,9 @@ the held-out years.
   ([non-unique optima](#non-unique-optima)).
 - A comparison holds for its stated setup. The module makes no claim that one
   objective, payout family, cover or scope performs better in general.
+- An interval from [`bootstrap_intervals`](#pooled-folds-and-intervals) says how
+  much a number moves with the years drawn. Two rows' intervals are not a test of
+  a difference between them.
 
 ### Stating the setup
 
@@ -866,11 +870,16 @@ Every number in a comparison rests on a setup: the asset, the basis, the
 split, the samples' source and basis-risk model, the pricing and, for a design,
 its objective and constraints. `setup_text(result.metadata)` states that setup
 in plain text, one statement per line (`Level`, `Split`, `Seeds`, `Sample`,
-`Source`, `Location`, `Trend`, `Sample notes`, `Pricing`, `Design`, `Metrics`),
-for a notebook or a report to print next to the numbers. The text reads only the
-metadata, so the same metadata always gives the same text, and statements that
-every split or sample shares are written once.
+`Source`, `Location`, `Trend`, `Sample notes`, `Pricing`, `Design`, `Intervals`,
+`Metrics`), for a notebook or a report to print next to the numbers. The text
+reads only the metadata, so the same metadata always gives the same text, and
+statements that every split or sample shares are written once.
 
+- `Split` says, on rows whose design block and evaluation block are draws from
+  one curve (fresh draws, or a holdout or k-fold of draws), that out of sample
+  there means new draws from the same curve, so these rows test the design's
+  sampling error, not the curve. A pooled evaluation has one `Split` line, with
+  k, the rows and that each year is evaluated by the design made without it.
 - `Seeds` states the plan's seed, which every evaluation's `details` holds
   under `"plan_seed"`, and the fresh draws' seed, which every fresh-draw
   evaluation's holds under `"fresh_draws_seed"`. When merged evaluations
@@ -896,6 +905,10 @@ every split or sample shares are written once.
   where a `LinearTrend` has one fit per asset and run, the line gives the range
   of the slopes and of the intercepts, and counts the assets; the sample's
   `trend` record holds each series' fit.
+- `Intervals`, for a table of `bootstrap_intervals`, states the resamples, the
+  level and the unit, what an interval leaves out, that two rows' intervals are
+  not a test of a difference between them, and the columns whose level reaches
+  the block's worst row.
 - `Sample notes` writes a note that counts draws once, with each sample's own
   counts. In the quick start, the draws beyond the curve's fitted support
   read "2527 of 5000 draws in the design sample and 2464 of 5000 in the fresh
@@ -1434,7 +1447,7 @@ between the two.
 | `scope` | string | `"individual"`, each cover standing on its own, or `"joint"`, one objective and one budget on the owner's total |
 | `scenario` | string | The sample's scenario, `"baseline"` by default |
 | `split` | string | `"in_sample"` or `"out_of_sample"` |
-| `fold` | int32 | 0 for a holdout and fresh draws; the fold for k-fold |
+| `fold` | int32 | 0 for a holdout and fresh draws; the fold for k-fold. Null on a pooled row of `compare_pooled`, and only there |
 | `sample_hash` | string | The evaluation sample's `content_hash` |
 | `premium_basis` | string, nullable | `"stated"`, `"design"` or `"evaluation"`; null exactly on allocated rows |
 | `unique`, `ties`, `degenerate_tail` | bool, int32, string; nullable | The design's non-uniqueness report; null for a cover given as is |
@@ -1472,6 +1485,94 @@ rows of several calls (in and out of sample, several folds) to one file,
 concatenate the tables with `pyarrow.concat_tables` and pass
 `metadata=EvaluationMetadata.merge(*(EvaluationMetadata.from_table(t) for t in
 tables))`.
+
+### Pooled folds and intervals
+
+```python
+from crc_sdk.parametric import bootstrap_intervals, compare_pooled
+
+folds = year_block_kfold(sample, 5)
+designs = [design(template, train, objective, budget=budget) for train, _ in folds]
+table = compare_pooled([designs], folds)
+intervals = bootstrap_intervals([designs], folds, rng=numpy.random.default_rng(7))
+```
+
+`compare_pooled` evaluates every held-out year with the design made without it,
+and computes each metric once over all those years. The held-out blocks of a
+k-fold split partition the years, so every year is evaluated once, each row with
+probability 1/N and its payout from its own fold's design. A pooled row is not
+the mean of the folds' numbers: the mean of k CVaRs is the CVaR of no
+distribution.
+
+Each entry is a sequence of k of what `compare` takes that hold designs, in fold
+order (designs, `JointDesignResult`s, mappings of designs or packages of
+designs), or one resolved `Cover` or mapping of covers, which applies on every
+fold. The rows have the levels `compare` gives them and these values:
+
+| Column | On a pooled row |
+| --- | --- |
+| `split`, `fold` | `"out_of_sample"`, and null |
+| `cover_hash` | The `sha256:` hash of the canonical JSON of the per-fold cover hashes, in fold order. For a cover given as is, its own hash |
+| `cover_label` | The covers' label if they share one, else the first 12 hex digits of the hash |
+| `design_id` | The same hash of the design ids; null where `compare`'s is |
+| `sample_hash` | The same hash of the held-out blocks' `content_hash` |
+| `premium`, `premium_basis` | The probability-weighted mean of each row's premium. Each year pays the contract in force for it, that fold's design premium (`"design"`). A cover given as is has one contract, priced once on the pooled rows (`"evaluation"`) |
+| The net-loss columns | L_d - payout_d + P_d, with P_d the premium of row d's own fold |
+| `unique` | True if every fold's is true, false if any fold's is false, otherwise null |
+| `ties`, `degenerate_tail` | The sum of the folds', and the folds' flag if they all agree, else `"mixed"` |
+| `unidentified_share` | Each row by its own fold's design |
+| `design_budget` | The mean over the rows of each fold's bound, null if any has none |
+
+`compare_pooled` raises `EvaluationError` for pairs that aren't the k folds of
+one split in fold order, held-out blocks that repeat or miss a year, a design
+whose design sample isn't its fold's design block, a block with unequal
+probabilities (which only a stated `probability` column can give), and blocks of
+different `scenario` labels. A holdout and fresh draws have one block, so they
+have nothing to pool.
+
+`bootstrap_intervals(entries, on, *, rng, n_bootstrap=1000, ci_level=0.9, ...)`
+redraws the evaluated years with replacement and recomputes each metric with the
+designs held fixed. `on` is one block, read as `compare` reads it and with a
+required `split`, or the folds, read as `compare_pooled` reads them. An interval
+is the middle `ci_level` of those values, the percentile interval
+(`numpy.quantile`, linear interpolation). It describes how much a number moves
+with the years drawn. It leaves out uncertainty in the hazard data, the impact
+function and the design, and on a curve block it is the Monte Carlo error of the
+draws and says nothing about the curve. Two rows' intervals are not a test of a
+difference between them.
+
+- **The unit** is a year with every row of that year: one row of a series or a
+  curve sample, and every run's row of one calendar year in a pool. Rows of
+  several assets or hazards in a year stay together. An `EmpiricalCopula` block
+  is resampled by row, because its reference is part of the stated model.
+- **Replicates.** One call `rng.integers(0, Y, size=(n_bootstrap, Y))` draws the
+  block's Y years. A replicate reweights the rows by how often their year was
+  drawn, which gives the metrics of the concatenated years. One set of replicates
+  serves every entry and every metric of a call. Nothing is solved again.
+- **The premium.** A design's premium is a fixed price, so on one block its
+  interval is the value itself. On pooled folds, the mean of the years' premiums
+  moves with the years drawn. A cover priced on the block is priced again on each
+  replicate. `premiums=` maps a `cover_label` to a stated premium, on one block.
+- **The generator** is a required keyword, and no global state is read. Its state
+  at entry is in the metadata's `rng`, step `"bootstrap"`, so the table can be
+  rebuilt.
+
+The result is a separate long table with `to_long`'s columns, one row per wide
+row and metric column, and these. `value` is the wide table's number: resampling
+never changes a point estimate.
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `ci_low`, `ci_high` | float64, nullable | The bounds. Null when the metric is undefined in a replicate, or null in the wide table |
+| `ci_level`, `n_bootstrap` | float64, int32 | As stated |
+| `n_undefined` | int32 | The replicates in which the metric is undefined, such as those with no expected loss |
+| `short_block` | bool, nullable | True when the column's level reaches the block's worst row: (1 - beta) n <= 1 for a beta column, T > n for a return-period column, with n the rows the metric reads. Null for a column with no level |
+
+The bounds of a `short_block` row are computed like any other. They cannot reach
+beyond the block's largest rows, so they understate how far the number could
+move, and the setup text names those columns. The table holds the metadata under
+the same key as a comparison's, with `setup.intervals`, and `write_comparison`
+writes it. Neither function ranks anything.
 
 ## Design a cover
 
@@ -1836,4 +1937,6 @@ them.
   the index at each asset: an index elsewhere needs a joint distribution of two
   curves, which the curves do not give. On per-year values,
   [`.index(...)`](#an-index-read-elsewhere) reads it elsewhere.
-- **Pooled k-fold metrics, bootstrap intervals.** Each fold has its own rows.
+- **Pooled folds and intervals on the plan.** A plan's `KFold` writes rows per
+  fold; `compare_pooled` and `bootstrap_intervals` are functions. An interval on
+  the difference between two rows is not offered.
