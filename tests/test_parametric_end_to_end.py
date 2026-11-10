@@ -360,8 +360,9 @@ def test_the_docs_comparison_table_lists_every_identity_column() -> None:
     page = DOCS.read_text(encoding="utf-8")
     section = page[page.index("### The comparison table") :]
     section = section[: section.index("\n## ")]
-    for column in IDENTITY_COLUMNS:
+    for column in (*IDENTITY_COLUMNS, "copula_reference_years"):
         assert f"`{column}`" in section
+    assert "`copula_block_tail_b<β>`" in section
     for level in ("asset", "total", "asset_by_value", "asset_by_loss", "package"):
         assert f'`"{level}"`' in section
     assert '`"individual"`' in section and '`"joint"`' in section

@@ -37,7 +37,11 @@ from crc_sdk.parametric import (
     year_block_kfold,
 )
 from crc_sdk.parametric.evaluate import DesignedCover
-from crc_sdk.parametric.metadata import EVALUATION_METADATA_KEY, IDENTITY_COLUMNS
+from crc_sdk.parametric.metadata import (
+    EVALUATION_METADATA_KEY,
+    IDENTITY_COLUMNS,
+    _identity_columns,
+)
 
 UNTYPED_EVALUATE: Any = evaluate
 UNTYPED_COMPARE: Any = compare
@@ -184,7 +188,8 @@ def test_options_change_the_columns() -> None:
         split="in_sample",
         options=MetricOptions(betas=(0.8,), return_periods=(20,), loss_thresholds=(1,)),
     )
-    metrics = table.column_names[len(IDENTITY_COLUMNS) :]
+    identity = _identity_columns(table.column_names)
+    metrics = table.column_names[len(identity) :]
     assert "tail_coverage_b0_8" in metrics and "loss_rp20" in metrics
     assert "false_negative_rate_l1" in metrics and "var_loss_b0_9" not in metrics
     metadata = EvaluationMetadata.from_table(table)
@@ -572,10 +577,11 @@ def test_rows_of_several_evaluations_in_one_file(tmp_path: Path) -> None:
 def test_to_long_gives_one_row_per_cover_and_metric() -> None:
     table = compare([_linear(), _binary()], _sample(), split="in_sample")
     long = to_long(table)
-    n_metrics = table.num_columns - len(IDENTITY_COLUMNS)
+    identity = _identity_columns(table.column_names)
+    n_metrics = table.num_columns - len(identity)
     assert long.num_rows == 2 * n_metrics
     assert long.column_names == [
-        *IDENTITY_COLUMNS,
+        *identity,
         "column",
         "metric",
         "parameter",
