@@ -57,7 +57,7 @@ from crc_sdk.parametric import (
 )
 from crc_sdk.parametric.index import Tail
 from crc_sdk.parametric.joint import covers_hash
-from crc_sdk.parametric.metadata import IDENTITY_COLUMNS
+from crc_sdk.parametric.metadata import IDENTITY_COLUMNS, _identity_columns
 from crc_sdk.parametric.parameters import _resolve_values
 from crc_sdk.parametric.payouts import _REGISTRY
 
@@ -666,7 +666,8 @@ def test_to_long_keeps_the_new_columns() -> None:
     long = to_long(table)
     assert long.column_names[: len(IDENTITY_COLUMNS)] == list(IDENTITY_COLUMNS)
     assert set(_column(long, "components")) == {"rain", "heat", "rain+heat"}
-    assert long.num_rows == 3 * (table.num_columns - len(IDENTITY_COLUMNS))
+    n_identity = len(_identity_columns(table.column_names))
+    assert long.num_rows == 3 * (table.num_columns - n_identity)
 
 
 def test_a_table_without_the_new_columns_still_reads(tmp_path: Path) -> None:

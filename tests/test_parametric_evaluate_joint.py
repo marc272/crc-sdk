@@ -54,6 +54,7 @@ from crc_sdk.parametric.metadata import (
     EVALUATION_METADATA_KEY,
     IDENTITY_COLUMNS,
     EvaluationSetup,
+    _identity_columns,
 )
 from crc_sdk.parametric.metrics import MetricOptions, metric_columns, metric_values
 from crc_sdk.parametric.objectives import objective_from_document
@@ -353,7 +354,7 @@ def test_premium_and_net_loss_columns_are_null_on_allocated_rows(rule: Any) -> N
     for row in allocated:
         assert row["premium_basis"] is None
         assert all(row[name] is None for name in NO_PREMIUM)
-        others = set(row) - set(IDENTITY_COLUMNS) - NO_PREMIUM
+        others = set(row) - set(_identity_columns(row)) - NO_PREMIUM
         assert all(row[name] is not None for name in others - {"correlation"})
 
 
@@ -652,7 +653,7 @@ def test_to_long_keeps_the_null_asset_of_a_total() -> None:
         [_joint()], BOOK, split="in_sample", allocation="value", values=VALUES
     )
     long = to_long(table)
-    n_metrics = table.num_columns - len(IDENTITY_COLUMNS)
+    n_metrics = table.num_columns - len(_identity_columns(table.column_names))
     assert long.num_rows == n_metrics * table.num_rows
     assert long.column_names[: len(IDENTITY_COLUMNS)] == list(IDENTITY_COLUMNS)
     premiums = long.filter(pc.equal(long["column"], "premium")).to_pylist()

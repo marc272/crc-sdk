@@ -78,6 +78,19 @@ union over the contracts, and it is null if any of them has no report: for a
 cover given as is, a design record without the key and a design on the numpy
 grid, where no fill rule ran.
 
+**Rank blocks.** Inside one reference year's block an `EmpiricalCopula` treats
+the columns as independent. When `(1 - beta) * m <= 1`, for the reference's m
+years, the tail at beta holds at most one such block, so a tail metric of a sum
+over the reordered columns lies inside that assumption. Beside the identity
+columns each row records `copula_reference_years`, m, and one boolean
+`copula_block_tail_b<beta>` per beta of the metric options, with the tolerance of
+`degenerate_tail` (1e-9). They are filled on the `"total"` and allocated rows of a
+sample of several assets under that model, and on every row of a sample of
+several hazards under it, where each row reads the combined loss. Any other row
+reads null there: one asset's draws are the same under every model, and other
+dependence models, per-year samples and a `component(name)` view have no rank
+blocks. A flag says where a number lies inside an assumption, nothing more.
+
 **The breakdown.** `payout_breakdown(covers, sample, *, split, ...)` returns a
 separate table with one row per entry and part: the part's expected payout, its
 share of the entry's and how often it pays. The rows of one entry add up to its
@@ -122,6 +135,8 @@ from crc_sdk.parametric.joint import JointDesignResult, covers_hash
 from crc_sdk.parametric.metadata import (
     _ADDED_METRIC_COLUMNS,
     _ADDED_SCENARIO_COLUMNS,
+    _BLOCK_TAIL_PREFIX,
+    _REFERENCE_YEARS_COLUMN,
     EVALUATION_METADATA_KEY,
     IDENTITY_COLUMNS,
     KEY_COLUMNS,
@@ -130,6 +145,8 @@ from crc_sdk.parametric.metadata import (
     EvaluationMetadata,
     EvaluationSetup,
     _identity_columns,
+    _reference_years,
+    _tail_in_one_block,
 )
 from crc_sdk.parametric.metrics import (
     MetricColumn,
@@ -138,6 +155,9 @@ from crc_sdk.parametric.metrics import (
     breakdown_values,
     metric_columns,
     metric_values,
+)
+from crc_sdk.parametric.metrics import (
+    _label as _metric_label,
 )
 from crc_sdk.parametric.payouts import LinearInAmounts, MaxOf, StepGrid, SumOf
 from crc_sdk.parametric.pricing import CostOfCapitalLoad, Pricing, PurePremium
@@ -1405,7 +1425,7 @@ def _package_rows(entry: CoverPackage, run: _Run) -> list[dict[str, Any]]:
     return [*rows, package]
 
 
-def _rows(entry: _Entry, run: _Run) -> list[dict[str, Any]]:
+def _entry_rows(entry: _Entry, run: _Run) -> list[dict[str, Any]]:
     if isinstance(entry, _Item):
         return [_asset_row(entry, run.sample.asset_ids[0], run, premium=run.premium)]
     if isinstance(entry, _CoverSet):
@@ -1413,6 +1433,46 @@ def _rows(entry: _Entry, run: _Run) -> list[dict[str, Any]]:
     if isinstance(entry, CoverPackage):
         return _package_rows(entry, run)
     return _joint_rows(entry, run)
+
+
+def _block_tail_name(beta: float) -> str:
+    """The rank-block flag's column at `beta`, with the metrics' label of beta."""
+    return f"{_BLOCK_TAIL_PREFIX}{_metric_label(beta)}"
+
+
+def _block_values(run: _Run, level: str) -> dict[str, Any]:
+    """The rank-block columns of a row at `level`, all null without rank blocks."""
+    provenance = run.sample.provenance
+    years = _reference_years(
+        level,
+        dependence=provenance.dependence,
+        hazard_dependence=provenance.hazard_dependence,
+        components=run.sample.index_components is not None,
+    )
+    return {
+        _REFERENCE_YEARS_COLUMN: years,
+        **{
+            _block_tail_name(beta): (
+                None if years is None else _tail_in_one_block(beta, years)
+            )
+            for beta in run.options.betas
+        },
+    }
+
+
+def _rows(entry: _Entry, run: _Run) -> list[dict[str, Any]]:
+    """The rows of one entry, with their rank-block columns."""
+    return [
+        {**row, **_block_values(run, row["level"])} for row in _entry_rows(entry, run)
+    ]
+
+
+def _block_fields(betas: Iterable[float]) -> list[Any]:
+    """The fields of the rank-block columns, for `betas`."""
+    return [
+        pa.field(_REFERENCE_YEARS_COLUMN, pa.int32()),
+        *(pa.field(_block_tail_name(beta), pa.bool_()) for beta in betas),
+    ]
 
 
 def _schema(
@@ -1827,7 +1887,8 @@ def _table(
         columns=columns,
         values_sha256=None if run.values is None else _values_hash(run.values),
     )
-    return pa.Table.from_pylist(rows, schema=_schema(columns, metadata))
+    schema = _schema(columns, metadata, extra=_block_fields(run.options.betas))
+    return pa.Table.from_pylist(rows, schema=schema)
 
 
 # -- the breakdown -----------------------------------------------------------
@@ -2384,6 +2445,19 @@ def _with_added_identity(table: Any) -> Any:
     return table
 
 
+def _with_added_blocks(table: Any, betas: Iterable[float]) -> Any:
+    """`table` with the rank-block columns it was written without, all null.
+
+    A payout breakdown has none, so it is returned as it is.
+    """
+    if "payout_to_loss_ratio" not in table.column_names:
+        return table
+    for column in _block_fields(betas):
+        if column.name not in table.column_names:
+            table = table.append_column(column, pa.nulls(table.num_rows, column.type))
+    return table
+
+
 def to_long(table: Any) -> Any:
     """Return the tidy form of a comparison table: one row per metric.
 
@@ -2394,19 +2468,29 @@ def to_long(table: Any) -> Any:
     order. The table's metadata is kept. A comparison written before
     `payout_frequency` and `unidentified_share` existed reads as null: its
     long form holds them with a null `value`. So does one written before
-    `design_scenario`, `pathway`, `horizon`, `product` and `n_rows` existed: its
-    long form holds those columns, null.
+    `design_scenario`, `pathway`, `horizon`, `product` and `n_rows` existed, or
+    before the rank-block columns existed: its long form holds those columns,
+    null.
 
     Raises `EvaluationError` for a table without comparison metadata or
-    with metadata that does not describe it, and `TypeError` for a table
-    that is not a `pyarrow.Table`.
+    with metadata that does not describe it, or for a table of
+    `bootstrap_intervals`, which is in the long form already, and `TypeError`
+    for a table that is not a `pyarrow.Table`.
     """
     if not isinstance(table, pa.Table):
         raise TypeError(f"table must be a pyarrow.Table, got {type(table).__name__}")
+    if "ci_low" in table.column_names:
+        raise EvaluationError(
+            "to_long takes a wide comparison table, but this is a table of "
+            "bootstrap_intervals, already one row per wide row and metric column"
+        )
     metadata = EvaluationMetadata.from_table(table)
     metadata.check_table(table)
     schema_metadata = table.schema.metadata
-    table = _with_added_identity(_with_added_metrics(table))
+    table = _with_added_blocks(
+        _with_added_identity(_with_added_metrics(table)),
+        metadata.setup.metric_options.get("betas") or (),
+    )
     described = {**_added_entries(), **metadata.columns}
     columns = _identity_columns(table.column_names)
     identity = table.select(columns)

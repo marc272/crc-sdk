@@ -1475,6 +1475,8 @@ between the two.
 | `unique`, `ties`, `degenerate_tail` | bool, int32, string; nullable | The design's non-uniqueness report; null for a cover given as is |
 | `components` | string, nullable | What the row's cover reads of a sample with index components, joined by `+`; null on a sample of one hazard |
 | `design_budget` | float64, nullable | The design's budget bound in payout units. On a `"package"` row, or the `"total"` row of a set of covers, the sum of the covers' bounds, null if any has none. Null for a cover given as is |
+| `copula_reference_years` | int32, nullable | m, the reference's rows, on a row that reads a sum over the columns an `EmpiricalCopula` reordered: the `"total"` and allocated rows of a sample of several assets, and every row of a sample of several hazards. Null on any other row: an `"asset"` row of a sample of several assets, other dependence models and per-year samples |
+| `copula_block_tail_b<β>` | bool, nullable | One per β of `MetricOptions.betas`, labelled as the metrics are, and null where `copula_reference_years` is: true when (1 − β)·m ≤ 1, with the tolerance of `degenerate_tail` (1e-9), so that the tail at β holds at most one reference year's block, inside which the columns are independent by assumption; else false |
 | one column per metric | float64, nullable | As defined above; null where undefined |
 
 A comparison on one asset has `level` `"asset"` and `scope` `"individual"`

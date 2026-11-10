@@ -53,7 +53,8 @@ without `trend` has none recorded, which on per-year values reads as the years
 as recorded, and a sample without `pool` is no pool. A comparison without the
 metric column `payout_frequency` or `unidentified_share` reads as null there, as
 does one without the column `design_scenario`, `pathway`, `horizon`, `product` or
-`n_rows`, and a document without `intervals` has no intervals.
+`n_rows`, or without the rank-block columns `copula_reference_years` and
+`copula_block_tail_b<beta>`, and a document without `intervals` has no intervals.
 
 The module claims no licence of its own for a comparison: it is derived data
 under its inputs' terms, which `licences` lists.
@@ -119,7 +120,11 @@ IDENTITY_COLUMNS = (
     "components",
     "design_budget",
 )
-"""The columns of a comparison table before its metric columns."""
+"""The columns of a comparison table before its metric columns.
+
+A comparison's rank-block columns (`_is_block_column`) follow them, and are
+identity columns too.
+"""
 
 _ADDED_SCENARIO_COLUMNS = (
     "design_scenario",
@@ -173,18 +178,71 @@ KEY_COLUMNS = (
 """The columns whose values identify a row of a comparison table."""
 
 
+_REFERENCE_YEARS_COLUMN = "copula_reference_years"
+"""The column of m, the rows of an `EmpiricalCopula` reference."""
+
+_BLOCK_TAIL_PREFIX = "copula_block_tail_b"
+"""The start of a rank-block flag's name; the metrics' label of beta follows."""
+
+_BLOCK_TAIL_TOLERANCE = 1e-9
+"""The rounding allowance of the rank-block flag, the one of `degenerate_tail`."""
+
+_SUMMED_LEVELS = frozenset({"total", "asset_by_value", "asset_by_loss"})
+"""The levels whose rows read a sum over a sample's reordered columns."""
+
+
+def _is_block_column(name: str) -> bool:
+    """Whether `name` is `copula_reference_years` or a rank-block flag."""
+    return name == _REFERENCE_YEARS_COLUMN or name.startswith(_BLOCK_TAIL_PREFIX)
+
+
+def _tail_in_one_block(beta: float, years: int) -> bool:
+    """Whether the tail at `beta` holds at most one of `years` reference blocks."""
+    return (1.0 - beta) * years <= 1.0 + _BLOCK_TAIL_TOLERANCE
+
+
+def _reference_years(
+    level: str, *, dependence: Any, hazard_dependence: Any, components: bool
+) -> int | None:
+    """m where a row at `level` reads a sum over rank blocks, else `None`.
+
+    Every row of a sample of several hazards reads the combined loss, and on a
+    sample of several assets the `"total"` and allocated rows read a sum. A
+    record of an `EmpiricalCopula` without `m` has none to state. Raises
+    `EvaluationError` for an `m` that is not a positive whole number.
+    """
+    if components:
+        model = hazard_dependence
+    else:
+        model = dependence if level in _SUMMED_LEVELS else None
+    if not isinstance(model, Mapping) or model.get("kind") != "empirical_copula":
+        return None
+    years = model.get("m")
+    if years is None:
+        return None
+    if isinstance(years, bool) or not isinstance(years, int) or years < 1:
+        raise EvaluationError(
+            f"an EmpiricalCopula's record must state m as a positive whole number, "
+            f"got {years!r}"
+        )
+    return years
+
+
 def _identity_columns(names: Iterable[str]) -> list[str]:
     """The identity columns among `names`, those added since optional.
 
-    A payout breakdown's `part` and `part_kind` are identity columns too.
+    A comparison's rank-block flags and a payout breakdown's `part` and
+    `part_kind` are identity columns too.
     """
-    present = set(names)
+    listed = list(names)
+    present = set(listed)
     return [
         *(
             name
             for name in IDENTITY_COLUMNS
             if name in present or name not in _ADDED_IDENTITY_COLUMNS
         ),
+        *(name for name in listed if _is_block_column(name)),
         *(name for name in _BREAKDOWN_COLUMNS if name in present),
     ]
 
@@ -543,11 +601,12 @@ class EvaluationMetadata(_EvaluationModel):
 
         The table must have the identity columns and exactly the metric
         columns of `columns`; a table written before `scope`, `components`,
-        `design_budget`, `design_scenario`, `pathway`, `horizon`, `product` or
-        `n_rows` was added may lack them, and a comparison written before
-        `payout_frequency` or `unidentified_share` was added may lack that
-        column. An intervals table has one row per wide row and metric column
-        instead, and its `column` holds metric columns of `columns`. Its key
+        `design_budget`, `design_scenario`, `pathway`, `horizon`, `product`,
+        `n_rows` or the rank-block columns were added may lack them, and a
+        comparison written before `payout_frequency` or `unidentified_share` was
+        added may lack that column. An intervals table has one row per wide row
+        and metric column instead, and its `column` holds metric columns of
+        `columns`. Its key
         (`cover_hash`, `design_id`, `asset_id`, `level`, `scenario`,
         `design_scenario`, `split`, `fold`, `part` on a payout breakdown and
         `column` on an intervals table, a column it lacks reading as null) must
@@ -2637,6 +2696,126 @@ def _intervals(intervals: Mapping[str, Any]) -> str:
     return text
 
 
+def _rank_block_designs(
+    evaluation: Mapping[str, Any],
+    sample: Mapping[str, Any],
+    designs: Sequence[Mapping[str, Any]],
+    where: str,
+) -> list[Mapping[str, Any]]:
+    """The designs of an evaluation's rows that read rank blocks.
+
+    On a sample of several hazards those are the designs its rows name. On a
+    sample of several assets a set of covers has no design on its `"total"` row,
+    so they are the joint designs made on the evaluation's design samples.
+    """
+    if sample.get("components"):
+        named = {
+            str(row.get("design_id")) for row in _objects(evaluation, "rows", where)
+        }
+        return [record for record in designs if str(record["design_id"]) in named]
+    made_on = {str(value) for value in _list(evaluation, "design_samples", where)}
+    return [
+        record
+        for record in designs
+        if (record.get("scope") or {}).get("kind") == "joint"
+        and str(record.get("sample_hash")) in made_on
+    ]
+
+
+def _rank_block_text(
+    evaluation: Mapping[str, Any],
+    sample: Mapping[str, Any],
+    designs: Sequence[Mapping[str, Any]],
+    labels: Mapping[str, str | None],
+    betas: Any,
+    where: str,
+) -> str | None:
+    """The `Rank blocks` line of one evaluation, if a row reads rank blocks.
+
+    A payout breakdown has no tail metric and no such columns, so it has none.
+    """
+    if _list(evaluation, "part_kinds", where):
+        return None
+    levels = _named(evaluation, "level", "asset", where)
+    components = bool(sample.get("components"))
+    read = {
+        level: _reference_years(
+            level,
+            dependence=sample.get("dependence"),
+            hazard_dependence=sample.get("hazard_dependence"),
+            components=components,
+        )
+        for level in levels
+    }
+    filled = [level for level in levels if read[level] is not None]
+    if not filled:
+        return None
+    years = read[filled[0]]
+    assert years is not None
+    key = "hazard_dependence" if components else "dependence"
+    model = _get(sample, key, Mapping, where) or {}
+    row = "year" if model.get("pool") is None else "model-year"
+    place = "setup.metric_options.betas"
+    _numbers(betas, place)
+    flagged = [beta for beta in betas if _tail_in_one_block(float(beta), years)]
+    text = (
+        f"Rank blocks: the {_join(filled)} rows read columns in the ranks of {years} "
+        f"reference {row}s (m = {years}), and inside one {row}'s block the columns are "
+        "independent by assumption. Where (1 - beta) * m <= 1 the tail holds at most "
+        "one block, so a tail metric at that beta lies inside the assumption. Flagged "
+        f"betas of the metric options: {_numbers(flagged, place)}. Not flagged: "
+        f"{_numbers([beta for beta in betas if beta not in flagged], place)}."
+    )
+    stated: list[str] = []
+    for record in _rank_block_designs(evaluation, sample, designs, where):
+        objective = record.get("objective") or {}
+        if objective.get("kind") != "weighted_cvar":
+            continue
+        design_id = _short(record["design_id"])
+        beta = _number(objective.get("beta"), f"designs[{design_id}].objective.beta")
+        label = labels.get(str(record["design_id"]))
+        name = f"{label} ({design_id})" if label else design_id
+        answer = (
+            "flagged too"
+            if _tail_in_one_block(float(objective["beta"]), years)
+            else "not flagged"
+        )
+        stated.append(f"{name}: beta {beta}, {answer}")
+    if stated:
+        text += f" Weighted-CVaR beta of each row's design: {'; '.join(stated)}."
+    return text
+
+
+def _rank_block_lines(
+    evaluations: Sequence[Mapping[str, Any]],
+    samples: Sequence[Mapping[str, Any]],
+    by_hash: Mapping[str, Mapping[str, Any]],
+    designs: Sequence[Mapping[str, Any]],
+    labels: Mapping[str, str | None],
+    options: Any,
+) -> list[str]:
+    """One `Rank blocks` line per evaluation whose rows read rank blocks.
+
+    Before execution a plan's evaluations name no sample, and its samples are
+    all of one kind.
+    """
+    betas = (options or {}).get("betas") or []
+    records = [record for record in designs if record.get("kind") != "pooled"]
+    lines: list[str] = []
+    for i, evaluation in enumerate(evaluations):
+        sample_hash = evaluation.get("sample_hash")
+        read = samples if sample_hash is None else [by_hash.get(str(sample_hash))]
+        for sample in read:
+            if sample is None:
+                continue
+            text = _rank_block_text(
+                evaluation, sample, records, labels, betas, f"setup.evaluations[{i}]"
+            )
+            if text is not None:
+                lines.append(text)
+    return _first_seen(lines)
+
+
 def _is_document(value: Any) -> TypeGuard[Mapping[str, Any]]:
     """Whether `value` is a whole document, such as `explain()`'s, not a setup."""
     return isinstance(value, Mapping) and "setup" in value and "samples" not in value
@@ -2729,6 +2908,10 @@ def setup_text(
     - `Package`, one line per package row: each contract's budget, premium and
       limit, their sums, that each cover keeps its own limit and that a loading
       is not additive across contracts;
+    - `Rank blocks`, for rows that read a sum over the columns an
+      `EmpiricalCopula` reordered: the number of reference years m, the betas of
+      the metric options flagged by `(1 - beta) * m <= 1` and those not, and
+      whether the weighted-CVaR beta of a row's design is flagged too;
     - `Payout breakdown`, for a breakdown holding a `MaxOf` cover: that its rows
       are an attribution;
     - `Intervals`, for a table of `bootstrap_intervals`: the resamples, the
@@ -2972,6 +3155,15 @@ def setup_text(
     ]
     lines += _row_lines(evaluations, designs, by_hash, unit)
     lines += _package_lines(evaluations, unit)
+    options = setup.get("metric_options")
+    lines += _rank_block_lines(
+        evaluations,
+        samples,
+        by_hash,
+        designs,
+        labels,
+        options if isinstance(options, Mapping) else None,
+    )
     if "attribution" in part_kinds:
         lines.append(
             "Payout breakdown: the rows of a MaxOf cover are an attribution: each "
@@ -2983,7 +3175,6 @@ def setup_text(
     intervals = _get(setup, "intervals", Mapping, "setup")
     if intervals is not None:
         lines.append(_intervals(intervals))
-    options = setup.get("metric_options")
     if isinstance(options, Mapping):
         lines.append(_metrics(options, unit))
     else:

@@ -63,6 +63,7 @@ from crc_sdk.parametric.evaluate import (
     EvaluationEntry,
     Split,
     _allocated_payout,
+    _block_fields,
     _check_keys,
     _component_values,
     _component_view,
@@ -98,6 +99,7 @@ from crc_sdk.parametric.metadata import (
     CoverEntry,
     EvaluationMetadata,
     EvaluationSetup,
+    _is_block_column,
     _replaced,
 )
 from crc_sdk.parametric.metrics import (
@@ -581,6 +583,7 @@ def _pooled_identity(
             / sum(sizes)
             + 0.0
         ),
+        **{name: value for name, value in first.items() if _is_block_column(name)},
     }
 
 
@@ -889,7 +892,7 @@ def _pooled(
         collected=collected,
         columns=columns,
     )
-    schema = _schema(columns, metadata)
+    schema = _schema(columns, metadata, extra=_block_fields(runs[0].options.betas))
     schema = schema.set(schema.get_field_index("fold"), pa.field("fold", pa.int32()))
     year = np.concatenate([_row_years(test) for test in tests])
     distinct, positions = np.unique(year, return_inverse=True)
