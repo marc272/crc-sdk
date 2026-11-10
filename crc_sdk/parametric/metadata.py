@@ -25,6 +25,9 @@ with sorted keys. It holds:
   hashes in fold order. `bootstrap_intervals` adds `intervals`: the method, the
   resampling unit, the number of resamples, the level and the columns whose
   level reaches the block's worst row. `intervals` is null otherwise.
+  `design_frontier` adds `frontier`, one entry per call: the template's hash, the
+  objective, the budgets as stated and each one's design, the design sample and
+  the block read, with its split and fold.
   `compare_scenarios` adds `scenarios`: the reference, the labels,
   `mixed_products`, `design_on`, which scenarios share draws and the generator
   record they share, and per scenario its source kind, `hazard`, `pathway`,
@@ -33,8 +36,9 @@ with sorted keys. It holds:
   was made, a window's rows per member and the columns whose level reaches its
   worst row. Each of its evaluations also has `scenario`, `design_scenario` and
   `premium_bases`, and `method` may be `"other_scenario"` and `leakage_check`
-  `"different_sources"`. `to_drift` adds `drift`, with the reference used. Both
-  are absent, and read as null, on any other table;
+  `"different_sources"`. `to_drift` adds `drift`, with the reference used.
+  `scenarios`, `drift` and `frontier` are absent, and read as null, on any other
+  table;
 - `columns`: for every metric column, its metric, parameter, unit and a
   one-line definition;
 - `covers`: every cover's label, hash and full document, the hash of every
@@ -164,6 +168,9 @@ _ADDED_METRIC_COLUMNS = ("payout_frequency", "unidentified_share")
 _BREAKDOWN_COLUMNS = ("part", "part_kind")
 """The columns of a payout breakdown beside the identity columns."""
 
+_FRONTIER_COLUMNS = ("budget_ratio", "budget_amount", "budget_use", "objective_value")
+"""The columns of a budget frontier beside the identity columns."""
+
 _INTERVAL_COLUMNS = (
     "column",
     "metric",
@@ -246,8 +253,8 @@ def _reference_years(
 def _identity_columns(names: Iterable[str]) -> list[str]:
     """The identity columns among `names`, those added since optional.
 
-    A comparison's rank-block flags and a payout breakdown's `part` and
-    `part_kind` are identity columns too.
+    A comparison's rank-block flags, a budget frontier's four columns and a
+    payout breakdown's `part` and `part_kind` are identity columns too.
     """
     listed = list(names)
     present = set(listed)
@@ -258,6 +265,7 @@ def _identity_columns(names: Iterable[str]) -> list[str]:
             if name in present or name not in _ADDED_IDENTITY_COLUMNS
         ),
         *(name for name in listed if _is_block_column(name)),
+        *(name for name in _FRONTIER_COLUMNS if name in present),
         *(name for name in _BREAKDOWN_COLUMNS if name in present),
     ]
 
@@ -343,6 +351,40 @@ def _merged_intervals(
         for column in record.get("short_block_columns") or ()
     )
     return {**first, "short_block_columns": list(flagged)}
+
+
+_FRONTIER_KEYS = frozenset(
+    {
+        "budgets",
+        "design_ids",
+        "design_sample",
+        "fold",
+        "objective",
+        "sample_hash",
+        "split",
+        "template_hash",
+    }
+)
+"""The keys of one entry of `setup.frontier`."""
+
+
+def _check_frontier_record(record: Mapping[str, Any]) -> None:
+    """Raise `ValueError` unless a `setup.frontier` entry has what is read."""
+    missing = sorted(_FRONTIER_KEYS - set(record))
+    if missing:
+        raise ValueError(f"a setup.frontier entry lacks {missing}")
+    budgets, designs = record["budgets"], record["design_ids"]
+    if not isinstance(budgets, list) or not isinstance(designs, list):
+        raise ValueError("a setup.frontier entry's budgets and design_ids are lists")
+    if len(budgets) != len(designs):
+        raise ValueError("a setup.frontier entry needs one design per budget")
+
+
+def _merged_frontier(
+    records: Sequence[tuple[dict[str, Any], ...] | None],
+) -> tuple[dict[str, Any], ...] | None:
+    """One `setup.frontier` for several tables; `None` if none has any."""
+    return _unique(entry for record in records for entry in record or ()) or None
 
 
 _BLOCK_FIELDS = ("n_rows", "blocks")
@@ -458,11 +500,11 @@ class EvaluationSetup(_EvaluationModel):
     evaluation run (each with its `sample_hash`, `split` and `fold`, and, in
     what `compare` and `evaluate` write, the `level` and `scope` of its rows
     and its `allocation`). `intervals` is what `bootstrap_intervals` records,
-    and null on any other table. `scenarios` is what `compare_scenarios` records
-    and `drift` what `to_drift` records; each is null on any other table and left
-    out of its document, so such a table's document is what it was before they
-    existed. Raises `EvaluationError` for a sample or an evaluation without those
-    keys.
+    and null on any other table. `scenarios` is what `compare_scenarios` records,
+    `drift` what `to_drift` records and `frontier` what `design_frontier` records,
+    one entry per call; each is null on any other table and left out of its
+    document, so such a table's document is what it was before they existed.
+    Raises `EvaluationError` for a sample or an evaluation without those keys.
     """
 
     basis: Literal["annual"] = "annual"
@@ -472,11 +514,12 @@ class EvaluationSetup(_EvaluationModel):
     intervals: dict[str, Any] | None = None
     scenarios: dict[str, Any] | None = None
     drift: dict[str, Any] | None = None
+    frontier: tuple[dict[str, Any], ...] | None = None
 
     @model_serializer(mode="wrap")
     def _without_absent(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         document: dict[str, Any] = handler(self)
-        for key in ("scenarios", "drift"):
+        for key in ("scenarios", "drift", "frontier"):
             if document.get(key) is None:
                 document.pop(key, None)
         return document
@@ -494,6 +537,8 @@ class EvaluationSetup(_EvaluationModel):
                 )
         if self.scenarios is not None:
             _check_scenarios_record(self.scenarios)
+        for record in self.frontier or ():
+            _check_frontier_record(record)
         return self
 
 
@@ -593,7 +638,8 @@ class EvaluationMetadata(_EvaluationModel):
         tables must have one method, unit, number of resamples and level, and
         their flagged columns are combined. Tables of `compare_scenarios` must
         state one set of scenarios, of which only the blocks may differ, and
-        those are combined. `created_at` is the latest one.
+        those are combined. The entries of `setup.frontier` are combined without
+        repeats. `created_at` is the latest one.
 
         Raises `EvaluationError` if the items disagree, and `TypeError` for an
         item that is not `EvaluationMetadata`.
@@ -694,6 +740,7 @@ class EvaluationMetadata(_EvaluationModel):
                 intervals=_merged_intervals([item.setup.intervals for item in items]),
                 scenarios=_merged_scenarios([item.setup.scenarios for item in items]),
                 drift=_merged_drift([item.setup.drift for item in items]),
+                frontier=_merged_frontier([item.setup.frontier for item in items]),
             ),
             columns=columns,
             covers=tuple(
@@ -1779,6 +1826,38 @@ def _kept_scenarios(
     return {**scenarios, "labels": list(kept), "scenarios": kept}
 
 
+def _kept_frontier(
+    records: Sequence[Mapping[str, Any]], rows: Sequence[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    """The entries of `setup.frontier` with the budgets the `rows` still name.
+
+    A row names a budget by its design id on the block the entry reads.
+    """
+    named = {
+        (row["sample_hash"], row["split"], row["fold"], row["design_id"])
+        for row in rows
+    }
+    kept: list[dict[str, Any]] = []
+    for record in records:
+        block = (record["sample_hash"], record["split"], record["fold"])
+        pairs = [
+            (budget, design_id)
+            for budget, design_id in zip(
+                record["budgets"], record["design_ids"], strict=True
+            )
+            if (*block, design_id) in named
+        ]
+        if pairs:
+            kept.append(
+                {
+                    **record,
+                    "budgets": [budget for budget, _ in pairs],
+                    "design_ids": [design_id for _, design_id in pairs],
+                }
+            )
+    return kept
+
+
 def _of_rows(
     metadata: EvaluationMetadata, table: Any
 ) -> tuple[
@@ -1791,9 +1870,10 @@ def _of_rows(
     are evaluated or designed on, the held-out blocks of a pooled evaluation
     among them, and the source records those of the samples kept. A pooled
     row's design lists the designs of its folds, which are kept too. An
-    intervals table's flagged columns are those of the rows it still holds. A
-    table without those columns, or without rows, names no evaluation: then
-    the setup is that of the whole comparison, and the last item says so.
+    intervals table's flagged columns are those of the rows it still holds, and
+    a frontier's budgets those its rows still name. A table without those
+    columns, or without rows, names no evaluation: then the setup is that of the
+    whole comparison, and the last item says so.
     Raises `EvaluationError` for a row that names an evaluation or a design
     the metadata does not describe.
     """
@@ -1928,6 +2008,11 @@ def _of_rows(
                 {}
                 if setup.get("scenarios") is None
                 else {"scenarios": _kept_scenarios(setup["scenarios"], evaluations)}
+            ),
+            **(
+                {}
+                if setup.get("frontier") is None
+                else {"frontier": _kept_frontier(setup["frontier"], rows)}
             ),
         },
         designs,
@@ -2895,6 +2980,36 @@ def _intervals(intervals: Mapping[str, Any]) -> str:
     return text
 
 
+def _frontier_budget(budget: Mapping[str, Any], unit: str, where: str) -> str:
+    """One budget of a frontier, as the `Design` lines state a budget."""
+    if budget.get("ratio") is not None:
+        return f"{_number(budget['ratio'], f'{where}.ratio')} x E[L]"
+    return f"{_number(budget.get('amount'), f'{where}.amount')} {unit}"
+
+
+def _frontier(
+    record: Mapping[str, Any],
+    samples: Mapping[str, Mapping[str, Any]],
+    unit: str,
+    where: str,
+) -> str:
+    """The `Frontier` line: what each row is, and that no budget is named best."""
+    objective = _get(record, "objective", Mapping, where) or {}
+    budgets = [
+        _frontier_budget(budget, unit, f"{where}.budgets[{i}]")
+        for i, budget in enumerate(_objects(record, "budgets", where))
+    ]
+    designed = _years(samples.get(str(record.get("design_sample"))), where)
+    evaluated = _years(samples.get(str(record.get("sample_hash"))), where)
+    split = str(record.get("split")).replace("_", " ")
+    return (
+        f"Frontier: one design per budget ({_join(budgets)}) of template "
+        f"{_short(record.get('template_hash'))} for {_objective(objective, where)}, "
+        f"each solved on its own on {designed}; each row is read on {evaluated} "
+        f"({split}, fold {record.get('fold')}). The table names no best budget."
+    )
+
+
 def _rank_block_designs(
     evaluation: Mapping[str, Any],
     sample: Mapping[str, Any],
@@ -3515,6 +3630,10 @@ def setup_text(
       whether the weighted-CVaR beta of a row's design is flagged too;
     - `Payout breakdown`, for a breakdown holding a `MaxOf` cover: that its rows
       are an attribution;
+    - `Frontier`, one line per call of `design_frontier`: the budgets, the
+      template and the objective, that there is one design per budget on the
+      stated design block and each row is read on the stated block, and that the
+      table names no best budget;
     - `Intervals`, for a table of `bootstrap_intervals`: the resamples, the
       level, the unit, what an interval leaves out, that two rows' intervals
       are not a test of a difference between them, and the columns whose level
@@ -3787,6 +3906,10 @@ def setup_text(
         )
     if explained is not None:
         lines += _planned_designs(explained, assets, unit)
+    lines += [
+        _frontier(record, by_hash, unit, f"setup.frontier[{i}]")
+        for i, record in enumerate(_objects(setup, "frontier", "setup"))
+    ]
     intervals = _get(setup, "intervals", Mapping, "setup")
     if intervals is not None:
         lines.append(_intervals(intervals))

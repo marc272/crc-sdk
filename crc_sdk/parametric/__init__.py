@@ -38,7 +38,8 @@ owner's total. `evaluate` and `compare` assess covers and designs, and
 row of a comparison, and `split_budget` splits one budget between them.
 `compare_pooled` computes each metric once over all the held-out years of a
 k-fold split, and `bootstrap_intervals` gives each metric an interval from
-redrawing the evaluated years.
+redrawing the evaluated years. `design_frontier` designs one template once per
+budget, and reads the designs on one block, one row per budget.
 `ScenarioSet` holds one evaluation block per scenario under a named reference,
 and refuses a set in which anything but the hazard differs. `compare_scenarios`
 puts every cover or design on every scenario's block in one table, and `to_drift`
@@ -102,6 +103,7 @@ from crc_sdk.parametric.evaluate import (
     to_long,
     write_comparison,
 )
+from crc_sdk.parametric.frontier import design_frontier
 from crc_sdk.parametric.index import (
     AtAsset,
     AtCell,
@@ -258,6 +260,7 @@ __all__ = [
     "compare_pooled",
     "compare_scenarios",
     "design",
+    "design_frontier",
     "design_joint",
     "evaluate",
     "holdout",

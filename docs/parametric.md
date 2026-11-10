@@ -40,6 +40,7 @@ There are two ways to use the module:
 | Scope | `Individual()`, `Joint()` | Whether each asset's cover is designed on its own or several together, for one objective on the owner's total ([joint design](#joint-design-over-several-assets)) |
 | Comparison | `compare`, a `pyarrow.Table` | Covers as rows, metrics as columns, in and out of sample |
 | Pooled folds and intervals | `compare_pooled`, `bootstrap_intervals` | Metrics computed once over all the held-out years of a k-fold split, and how much a number moves with the years drawn ([pooled folds and intervals](#pooled-folds-and-intervals)) |
+| Budget frontier | `design_frontier` | One design per budget, read on one block, one row per budget ([a budget frontier](#a-budget-frontier)) |
 | Plan | `ParametricPlan`, `ParametricResult` | The lazy workflow from a portfolio evaluation's curves (or per-year values) to a written comparison |
 
 "Impact" is crc-sdk's impact value, usually a damage ratio; "loss" is impact ×
@@ -880,7 +881,7 @@ split, the samples' source and basis-risk model, the pricing and, for a design,
 its objective and constraints. `setup_text(result.metadata)` states that setup
 in plain text, one statement per line (`Level`, `Split`, `Seeds`, `Scenario`,
 `Sample`, `Source`, `Location`, `Trend`, `Sample notes`, `Pricing`, `Design`,
-`Intervals`, `Metrics`), for a notebook or a report to print next to the numbers. The text
+`Frontier`, `Intervals`, `Metrics`), for a notebook or a report to print next to the numbers. The text
 reads only the metadata, so the same metadata always gives the same text, and
 statements that every split or sample shares are written once.
 
@@ -915,6 +916,11 @@ statements that every split or sample shares are written once.
   where a `LinearTrend` has one fit per asset and run, the line gives the range
   of the slopes and of the intercepts, and counts the assets; the sample's
   `trend` record holds each series' fit.
+- `Frontier`, for a table of [`design_frontier`](#a-budget-frontier), states the
+  budgets, the template and the objective, that there is one design per budget on
+  the stated design block and that each row is read on the stated block, and that
+  the table names no best budget. Rows filtered from the table state their own
+  budgets.
 - `Intervals`, for a table of `bootstrap_intervals`, states the resamples, the
   level and the unit, what an interval leaves out, that two rows' intervals are
   not a test of a difference between them, and the columns whose level reaches
@@ -1911,6 +1917,69 @@ metadata's `designs`, with the solver in `solvers`. In-sample rows of a design
 measure its fit on the years it was chosen on; out-of-sample rows, on held-out
 years or fresh draws, are the ones to report.
 
+### A budget frontier
+
+```python
+from crc_sdk.parametric import Budget, design_frontier, holdout
+
+train, test = holdout(sample)
+frontier = design_frontier(template, train, objective,
+                           budgets=[Budget(ratio=r) for r in (0.5, 1.0, 1.5)],
+                           evaluate_on=test, split="out_of_sample")
+```
+
+`design_frontier(template, sample, objective, *, budgets, evaluate_on, split,
+fold=0, pricing=PurePremium(), limit=None, design_options=DesignOptions(),
+metric_options=MetricOptions())` designs one template for one objective on
+`sample` once per budget, and reads every design on the block `evaluate_on`. It
+returns one table with one row per budget, in the order given.
+
+Row b is `design(template, sample, objective, pricing=pricing, budget=b,
+limit=limit, options=design_options)`, read by `compare` on `evaluate_on` with
+`split`, `fold` and `metric_options`, so its premium is the design premium. `split`
+has no default, as in `compare`, so a table states whether its rows are in or out
+of sample. Numbers to report come from out-of-sample rows.
+
+The table has `compare`'s columns, in `compare`'s order, and these between the
+identity columns and the metric columns. `to_long` keeps them as identity columns.
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `budget_ratio`, `budget_amount` | float64, nullable | The budget as stated: exactly one is non-null |
+| `budget_use` | float64, nullable | The design premium's share of the bound; null when the bound is 0 |
+| `objective_value` | float64 | The design's objective on the design sample, in payout units (squared for MSE; a user objective's own units) |
+
+`design_budget`, `compare`'s own column, is the bound in payout units on the design
+sample.
+
+- **Each row is solved on its own**, so it is `design` at that budget and doesn't
+  depend on the other budgets or on their order. Amounts may jump between
+  neighbouring budgets where a row isn't unique.
+- **Non-uniqueness and degenerate tails are reported on each row**: `unique`,
+  `ties`, `degenerate_tail` and `unidentified_share`, as on any design's row.
+  `DesignOptions(ranges=True)` applies to every row, at four more LPs per amount and
+  per budget; without it `unique` is null on the LP route and the setup text says
+  "not checked" ([non-unique optima](#non-unique-optima)).
+- **The table names no best budget.** It has no rank, no best flag, no marginal
+  column and no ordering by a metric. A difference between two rows describes that
+  pair of budgets, on the block stated.
+- **On the design sample** the objective doesn't rise with the bound, because the
+  feasible sets are nested. On another block nothing guarantees that, for the
+  objective or for any metric.
+
+An empty list raises `EvaluationError`, and so does a budget stated twice, because
+two rows would repeat a key. A budget the template can't meet raises `design`'s
+error, naming that budget, so no row is dropped quietly. A sample of several assets
+raises `SampleError`, as `design` does.
+
+The table's metadata holds every design's record and, in `setup.frontier`, one entry
+with the template's hash, the objective, the budgets, their designs, the design
+sample and the block read. One template and one objective per call: to put several
+in one file, concatenate the tables and pass `EvaluationMetadata.merge` of their
+metadata to `write_comparison`. Two calls that make the same designs, such as one
+frontier read on two blocks, hold two records of each design that differ in their
+solve time, and `merge` raises `EvaluationError` for that, so they stay in two files.
+
 ## Joint design over several assets
 
 A risk owner with several sites may ask for one objective on the total: what
@@ -2111,6 +2180,8 @@ them.
   the index at each asset: an index elsewhere needs a joint distribution of two
   curves, which the curves do not give. On per-year values,
   [`.index(...)`](#an-index-read-elsewhere) reads it elsewhere.
+- **A budget frontier over a joint design, or on the plan.** `design_frontier`
+  takes one template on one asset, and it is a function.
 - **Pooled folds and intervals on the plan.** A plan's `KFold` writes rows per
   fold; `compare_pooled` and `bootstrap_intervals` are functions. An interval on
   the difference between two rows is not offered.
