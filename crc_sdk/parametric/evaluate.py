@@ -61,7 +61,8 @@ Carlo draws, or any other sample that shares no year with the design sample.
 Every row says which, in `split` and `fold`, and the metadata says how the
 split was made. An out-of-sample evaluation needs the design sample (a
 design's own, or `design_sample=` for a cover given as is) and raises
-`LeakageError` when the two share a period of the same source.
+`LeakageError` when the two share a period of the same source, or when two
+Monte Carlo samples of any curves reuse one generator state on a common period.
 
 **The premium used** is the `premium=` argument if given (`premium_basis`
 `"stated"`); otherwise, for a design, the design premium, the contract price
@@ -168,7 +169,9 @@ from crc_sdk.parametric.sample import (
     _cover_index_values,
     _is_labelled,
     _pool_entry,
+    _reads_the_curves_of,
     _require_one_asset,
+    _share_a_source,
     _source_columns,
     _SourceColumns,
 )
@@ -192,8 +195,8 @@ __all__ = [
 Split = Literal["in_sample", "out_of_sample"]
 """Whether a row is on the design sample or on a sample held out from it."""
 
-PremiumBasis = Literal["stated", "design", "evaluation"]
-"""Which premium a row uses: the stated one, the design's, or one priced on it."""
+PremiumBasis = Literal["stated", "design", "evaluation", "reference"]
+"""Which premium a row uses: stated, the design's, priced on it or on the reference."""
 
 Allocation = Literal["value", "loss"]
 """How a joint design's total payout is shared out over its assets."""
@@ -319,6 +322,8 @@ class _Run:
     allocation: Allocation | None
     values: Mapping[str, float] | None
     read: _SourceColumns
+    price_on: OutcomeSample | None = None
+    """Where a cover given as is is priced, if not on the sample evaluated."""
 
 
 # -- argument checks ---------------------------------------------------------
@@ -906,9 +911,13 @@ def _split_document(
     elif step is not None and step.get("block") == "test":
         method = str(step["kind"])
         details = {key: step[key] for key in ("train_fraction", "k") if key in step}
-    elif all(design.lineage != view.lineage for design, view in pairs):
+    elif not any(_share_a_source(design, view) for design, view in pairs):
+        # A source is compared by its own lineage, whichever samples hold it, so
+        # years of one series seen through another kind of sample are of one source.
         both_drawn = sample.provenance.source_kind == "monte_carlo" and all(
-            design.provenance.source_kind == "monte_carlo" for design in design_samples
+            design.provenance.source_kind == "monte_carlo"
+            and _reads_the_curves_of(design, view)
+            for design, view in pairs
         )
         method = "fresh_draws" if both_drawn else "separate_sample"
     else:
@@ -1151,6 +1160,22 @@ def _item_identity(
     )
 
 
+def _reference_price(
+    item: _Item, asset: str, run: _Run, component: str | None
+) -> float:
+    """`run.pricing` on the payouts of `item` over the block a price is made on."""
+    block = run.price_on
+    assert block is not None
+    index = (
+        _cover_index_values(
+            item.cover.index_definition, block, block.asset_ids.index(asset)
+        )
+        if component is None
+        else _component_values(block, component)
+    )
+    return run.pricing.premium(item.cover.payout_values(index), block.probability)
+
+
 def _asset_row(
     item: _Item,
     asset: str,
@@ -1178,6 +1203,8 @@ def _asset_row(
         basis, used = "stated", premium
     elif item.design is not None:
         basis, used = "design", float(item.design.premium) + 0.0
+    elif run.price_on is not None:
+        basis, used = "reference", _reference_price(item, asset, run, component)
     else:
         basis, used = "evaluation", run.pricing.premium(payout, probability)
     row = _item_identity(item, asset, run, basis=basis, component=component)
@@ -1734,8 +1761,13 @@ def _prepared(
     design_sample: Any,
     allocation: Any,
     values: Any,
+    price_on: OutcomeSample | None = None,
 ) -> tuple[_Run, dict[str, Any], tuple[OutcomeSample, ...]]:
-    """Check an evaluation; return its run, its record and its design samples."""
+    """Check an evaluation; return its run, its record and its design samples.
+
+    `price_on` is where a cover given as is is priced, for `compare_scenarios`:
+    on the reference's design block and not on the block evaluated.
+    """
     sample = _sample(sample, "sample")
     checked_split = _split(split)
     checked_fold = _fold(fold)
@@ -1778,6 +1810,7 @@ def _prepared(
         allocation=rule,
         values=checked_values,
         read=_source_columns(sample, strict=_is_labelled(sample)),
+        price_on=price_on,
     )
     return run, evaluation, tuple(design_samples.values())
 
@@ -1837,6 +1870,28 @@ def _package_record(
     }
 
 
+def _describe_rows(
+    evaluation: dict[str, Any],
+    run: _Run,
+    entries: Sequence[_Entry],
+    by_entry: Sequence[Sequence[Mapping[str, Any]]],
+) -> None:
+    """Add to `evaluation` what the setup text says of the rows of `entries`."""
+    rows = [row for group in by_entry for row in group]
+    evaluation["level"] = list(dict.fromkeys(row["level"] for row in rows))
+    evaluation["scope"] = list(dict.fromkeys(row["scope"] for row in rows))
+    evaluation["allocation"] = run.allocation
+    if run.sample.index_components is not None:
+        evaluation["rows"] = [_row_record(row) for row in rows]
+    packages = [
+        _package_record(entry, group)
+        for entry, group in zip(entries, by_entry, strict=True)
+        if isinstance(entry, CoverPackage)
+    ]
+    if packages:
+        evaluation["packages"] = packages
+
+
 def _table(
     entries: Sequence[_Entry],
     sample: OutcomeSample,
@@ -1864,18 +1919,7 @@ def _table(
     )
     by_entry = [_rows(entry, run) for entry in entries]
     rows = [row for group in by_entry for row in group]
-    evaluation["level"] = list(dict.fromkeys(row["level"] for row in rows))
-    evaluation["scope"] = list(dict.fromkeys(row["scope"] for row in rows))
-    evaluation["allocation"] = run.allocation
-    if run.sample.index_components is not None:
-        evaluation["rows"] = [_row_record(row) for row in rows]
-    packages = [
-        _package_record(entry, group)
-        for entry, group in zip(entries, by_entry, strict=True)
-        if isinstance(entry, CoverPackage)
-    ]
-    if packages:
-        evaluation["packages"] = packages
+    _describe_rows(evaluation, run, entries, by_entry)
     _check_keys(rows, KEY_COLUMNS)
     columns = metric_columns(run.options)
     metadata = _metadata(

@@ -3024,6 +3024,79 @@ def _rows_by_source(sample: OutcomeSample) -> dict[str, _SourceRows]:
     )
 
 
+def _share_a_source(first: OutcomeSample, second: OutcomeSample) -> bool:
+    """Whether a source of one sample's rows feeds the other's, by its own lineage."""
+    return not _rows_by_source(first).keys().isdisjoint(_rows_by_source(second))
+
+
+def _curves_read(document: Mapping[str, Any]) -> set[str]:
+    """The curve documents a Monte Carlo sample reads, as canonical text."""
+    found = {
+        json.dumps(source["curve"], sort_keys=True, default=_json_default)
+        for source in document.get("sources") or ()
+        if source.get("role") == "hazard" and source.get("curve") is not None
+    }
+    for key in ("parts", "components"):
+        for own in (document.get(key) or {}).values():
+            found |= _curves_read(own)
+    return found
+
+
+def _reads_the_curves_of(design: OutcomeSample, evaluation: OutcomeSample) -> bool:
+    """Whether `evaluation` reads every curve of `design`, window for window.
+
+    A curve the record can't describe (`"kind": "other"`) reads as equal to
+    another of its type, as nothing tells them apart. Draws from a window are
+    from its members together, so a window and anything but the same members are
+    different curves, even when one holds a curve of the other.
+    """
+    ours = design.provenance.to_document()
+    theirs = evaluation.provenance.to_document()
+    if (ours.get("details") or {}).get("window") != (theirs.get("details") or {}).get(
+        "window"
+    ):
+        return False
+    return _curves_read(ours) <= _curves_read(theirs)
+
+
+def _hazard_generators(document: Mapping[str, Any]) -> set[tuple[str, str]]:
+    """The generator record of every `hazard` step of a provenance document."""
+    found = {
+        (str(record["bit_generator"]), str(record["state"]))
+        for record in document.get("rng") or ()
+        if record.get("step") == "hazard"
+    }
+    for key in ("parts", "components"):
+        for own in (document.get(key) or {}).values():
+            found |= _hazard_generators(own)
+    return found
+
+
+def _check_generators_not_reused(
+    design: OutcomeSample, evaluation: OutcomeSample
+) -> None:
+    """Raise `LeakageError` for Monte Carlo samples that reuse one generator state."""
+    if (
+        design.provenance.source_kind != "monte_carlo"
+        or evaluation.provenance.source_kind != "monte_carlo"
+    ):
+        return
+    reused = _hazard_generators(design.provenance.to_document()) & _hazard_generators(
+        evaluation.provenance.to_document()
+    )
+    if not reused:
+        return
+    periods = np.intersect1d(design.period, evaluation.period)
+    if periods.size:
+        raise LeakageError(
+            f"the evaluation sample and the design sample share {periods.size} "
+            f"draw{'' if periods.size == 1 else 's'} (e.g. {periods[:5].tolist()}): a "
+            "hazard step of each has one generator record, so row d of each holds "
+            "one uniform, whatever the curve; build each block with a new generator "
+            "from one seed sequence, as reusing one generator state repeats its draws"
+        )
+
+
 def _check_out_of_sample(design: OutcomeSample, evaluation: OutcomeSample) -> None:
     """Raise `LeakageError` if `evaluation` shares rows with `design`.
 
@@ -3037,6 +3110,13 @@ def _check_out_of_sample(design: OutcomeSample, evaluation: OutcomeSample) -> No
     of a sample of several hazards, or an asset of a joined or drawn sample.
     The error names the shared sources and years. A linear trend fitted on a
     year the evaluation sample holds, by either sample, leaks that year too.
+
+    Two Monte Carlo samples share a draw when a `hazard` step of one has the
+    generator record of a `hazard` step of the other and they have a period in
+    common, whatever the curve: row d of each then holds one uniform. Two
+    different curves have no source in common, so this is what shows that a
+    block reuses the design's draws; the blocks of one holdout have disjoint
+    periods and pass.
     """
     design = _require_sample(design)
     evaluation = _require_sample(evaluation)
@@ -3044,6 +3124,7 @@ def _check_out_of_sample(design: OutcomeSample, evaluation: OutcomeSample) -> No
     held = _rows_by_source(evaluation)
     common = [lineage for lineage in held if lineage in designed]
     if not common:
+        _check_generators_not_reused(design, evaluation)
         return
     design_years = _row_years(design)
     held_years = _row_years(evaluation)
