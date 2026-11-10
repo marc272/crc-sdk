@@ -164,7 +164,7 @@ def test_the_docs_quick_start_runs_as_written(
     assert "with annual_exceedance semantics, as the dataset declares" in after
     assert "more frequent than the shortest fitted return period (2 years)" in after
     assert "Design step (expected_uncovered) (" in after
-    assert "Basis risk: impact noise" in after
+    assert "Basis risk: hazard noise" in after
     for text in (before, after):
         assert "\nSeeds: the plan's seed 42; the fresh draws' seed 7.\n" in text
     # Before execution, the dataset's path and selection; its metadata is read

@@ -71,8 +71,11 @@ calibrated for another unit raises `SampleError`. Impacts that declare no
 unit are not checked; the loss model's document records `exposure_unit: None`.
 
 Draw order, with one generator per call: the hazard uniforms first, then the
-basis-risk model. The provenance records the generator's state before each
-step, so a sample can be rebuilt exactly.
+basis-risk model. A model with `apply_hazard` (`HazardBasisRisk`) runs it before
+the impact is computed, so the steps are the hazard, `apply_hazard` if the model
+has it, the impact from the hazard at the asset, which draws nothing, and
+`apply`. The provenance records the generator's state before each step, so a
+sample can be rebuilt exactly.
 """
 
 from __future__ import annotations
@@ -99,7 +102,13 @@ from numpy.typing import NDArray
 from pydantic import BaseModel
 
 from crc_sdk.parametric._canonical import content_hash
-from crc_sdk.parametric.basis_risk import BasisRisk, ImpactNoise, NoBasisRisk
+from crc_sdk.parametric.basis_risk import (
+    BasisRisk,
+    HazardBasisRisk,
+    HazardNoise,
+    ImpactNoise,
+    NoBasisRisk,
+)
 from crc_sdk.parametric.combine import (
     CombineRule,
     _combined_impact,
@@ -296,11 +305,8 @@ def _apply_basis_risk(
         raise SampleError(
             f"basis-risk model {model.name!r} returned negative or non-finite impacts"
         )
-    before = math.fsum(impact.tolist())
     summary: dict[str, Any] = {
-        "impact_mean_ratio": (
-            math.fsum(new_impact.tolist()) / before if before > 0 else None
-        ),
+        "impact_mean_ratio": _mean_ratio(new_impact, impact),
         "index_changed": not np.array_equal(new_index, index),
     }
     if isinstance(model, ImpactNoise) and model.upper is not None:
@@ -308,16 +314,119 @@ def _apply_basis_risk(
     return new_index, new_impact, summary
 
 
+def _mean_ratio(after: FloatArray, before: FloatArray) -> float | None:
+    """The mean of `after` over the mean of `before`; `None` if that isn't positive."""
+    total = math.fsum(before.tolist())
+    return math.fsum(after.tolist()) / total if total > 0 else None
+
+
+def _hazard_at_asset(
+    model: HazardBasisRisk,
+    index: FloatArray,
+    hazard: FloatArray,
+    rng: np.random.Generator | None,
+) -> tuple[FloatArray, FloatArray]:
+    """Run a model's `apply_hazard`, check its output, return the two arrays."""
+    result = model.apply_hazard(index.copy(), hazard.copy(), rng)
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise SampleError(
+            f"basis-risk model {model.name!r} must return (index, hazard) from "
+            "apply_hazard"
+        )
+    try:
+        new_index = np.asarray(result[0], dtype=np.float64)
+        new_hazard = np.asarray(result[1], dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise SampleError(
+            f"basis-risk model {model.name!r} returned non-numbers from apply_hazard"
+        ) from error
+    if new_index.shape != index.shape or new_hazard.shape != hazard.shape:
+        raise SampleError(
+            f"basis-risk model {model.name!r} changed the shape of the index or hazard"
+        )
+    if not np.isfinite(new_index).all() or not np.isfinite(new_hazard).all():
+        raise SampleError(
+            f"basis-risk model {model.name!r} returned non-finite indices or hazards"
+        )
+    return new_index, new_hazard
+
+
+def _through_basis_risk(
+    model: BasisRisk,
+    loss_model: LossModel,
+    index: FloatArray,
+    hazard: FloatArray,
+    rng: np.random.Generator | None,
+) -> tuple[FloatArray, FloatArray, FloatArray, dict[str, Any]]:
+    """From the hazard to the impact: `apply_hazard`, the impact, then `apply`.
+
+    Returns the index, the hazard at the asset, the impact and the summary. A
+    model without `apply_hazard` skips that step, and computing the impact
+    draws nothing, so its draws and rows are those of `apply` alone. The
+    generator's record is the caller's, taken before this call.
+
+    On a model with `apply_hazard` the summary compares the result with the
+    hazard and the impact the model found.
+    """
+    if not isinstance(model, HazardBasisRisk):
+        new_index, new_impact, summary = _apply_basis_risk(
+            model, index, hazard, loss_model.impact_values(hazard), rng
+        )
+        return new_index, hazard, new_impact, summary
+    moved_index, at_asset = _hazard_at_asset(model, index, hazard, rng)
+    new_index, new_impact, summary = _apply_basis_risk(
+        model, moved_index, at_asset, loss_model.impact_values(at_asset), rng
+    )
+    summary |= {
+        "hazard_mean_ratio": _mean_ratio(at_asset, hazard),
+        "impact_mean_ratio": _mean_ratio(new_impact, loss_model.impact_values(hazard)),
+        "index_changed": not np.array_equal(new_index, index),
+    }
+    return new_index, at_asset, new_impact, summary
+
+
+def _hazard_without_impact(
+    model: HazardBasisRisk,
+    index: FloatArray,
+    hazard: FloatArray,
+    rng: np.random.Generator | None,
+) -> tuple[FloatArray, FloatArray, dict[str, Any]]:
+    """`apply_hazard` on a component with no impact, which still draws.
+
+    So the other components' draws don't depend on which of them has an
+    impact. Returns the index, the hazard at the asset and the summary.
+    """
+    new_index, at_asset = _hazard_at_asset(model, index, hazard, rng)
+    return (
+        new_index,
+        at_asset,
+        {
+            "hazard_mean_ratio": _mean_ratio(at_asset, hazard),
+            "impact_mean_ratio": None,
+            "index_changed": not np.array_equal(new_index, index),
+        },
+    )
+
+
+def _is_comonotone(model: BasisRisk) -> bool:
+    """Whether the model leaves the loss a function of the index."""
+    return isinstance(model, NoBasisRisk) or (
+        isinstance(model, HazardNoise) and model.sigma == 0.0
+    )
+
+
 def _basis_risk_notes(model: BasisRisk, separate_index: bool) -> list[str]:
     if separate_index:
         return ["The index is read from another series than the loss."]
     if isinstance(model, NoBasisRisk):
         return ["No basis-risk model: the index and the loss are comonotone."]
+    if _is_comonotone(model):
+        return ["HazardNoise with sigma 0: the index and the loss are comonotone."]
     return []
 
 
 def _warn_comonotone(model: BasisRisk, separate_index: bool) -> None:
-    if isinstance(model, NoBasisRisk) and not separate_index:
+    if _is_comonotone(model) and not separate_index:
         warnings.warn(COMONOTONE_MESSAGE, ComonotoneIndexWarning, stacklevel=3)
 
 
@@ -495,8 +604,9 @@ def sample_curve(
 
     Each draw is one year with probability `1/n_draws`; `period` is the draw
     number. The index is the drawn hazard in the dataset's `value_unit`; the
-    loss is `loss_model` applied to it, after `basis_risk`. `rng` is
-    required: the uniforms are drawn first, then the basis-risk model draws.
+    loss is `loss_model` applied to it, after `basis_risk`, or to the hazard
+    at the asset that a model with `apply_hazard` gives. `rng` is required: the
+    uniforms are drawn first, then the basis-risk model draws.
 
     Raises `ProbabilitySemanticsError` under the semantics rules of the
     module docstring; `SampleError` for a `value_unit` the loss model's
@@ -505,7 +615,7 @@ def sample_curve(
     knots with `outside_support="raise"`, or invalid arguments; `TypeError`
     for wrong types. Warns with `ReturnPeriodExtrapolationWarning` for draws rarer than
     the fitted support, and with `ComonotoneIndexWarning` for
-    `NoBasisRisk()`.
+    `NoBasisRisk()` and `HazardNoise(0)`.
     """
     asset = _identifier("asset_id", asset_id)
     _check_models(loss_model, basis_risk, asset)
@@ -572,8 +682,9 @@ def _draw_curve(
     """`sample_curve`'s draws and records, without its sample and its warnings.
 
     The caller has checked `loss_model` and `basis_risk`. With `loss_model=None`
-    the hazard has no impact: the basis-risk model doesn't act on it or draw
-    for it, and the draws have no impact and no loss.
+    the hazard has no impact and the draws have no impact and no loss. Only a
+    model with `apply_hazard` acts on it or draws for it, then, so the other
+    hazards' draws don't depend on which of them has an impact.
     """
     if not isinstance(metadata, HazardDatasetMetadata):
         raise TypeError(
@@ -701,13 +812,17 @@ def _draw_curve(
     loss: FloatArray | None = None
     basis_summary: dict[str, Any] | None = None
     if loss_model is not None:
-        impact = loss_model.impact_values(hazard)
         rng_records.append(_generator_record(rng, "basis_risk"))
-        index, impact, basis_summary = _apply_basis_risk(
-            basis_risk, hazard, hazard, impact, rng
+        index, hazard, impact, basis_summary = _through_basis_risk(
+            basis_risk, loss_model, hazard, hazard, rng
         )
         loss = loss_model.loss_values(impact)
         notes += _basis_risk_notes(basis_risk, separate_index=False)
+    elif isinstance(basis_risk, HazardBasisRisk):
+        rng_records.append(_generator_record(rng, "basis_risk"))
+        index, hazard, basis_summary = _hazard_without_impact(
+            basis_risk, hazard, hazard, rng
+        )
 
     source = {
         "role": "hazard",
@@ -793,6 +908,13 @@ def _column_fields(
     """
     declared = sorted({own["probability_semantics"] for own in documents.values()})
     stated = {own["semantics_source"] for own in documents.values()}
+    summaries = {
+        column: own["details"]["basis_risk"] for column, own in documents.items()
+    }
+    details: dict[str, Any] = {"draws": n, "periods": [0, n - 1]}
+    if any(each and "hazard_mean_ratio" in each for each in summaries.values()):
+        # The setup holds this sample's details, not its columns'.
+        details["basis_risk"] = summaries
     return {
         "source_kind": "monte_carlo",
         "sources": tuple(
@@ -819,7 +941,7 @@ def _column_fields(
                 ]
             )
         ),
-        "details": {"draws": n, "periods": [0, n - 1]},
+        "details": details,
         "notes": (
             sentence,
             *(
@@ -904,7 +1026,8 @@ def sample_curves(
     those of `sample_curve`.
 
     Each asset is drawn by `sample_curve` with its own generator: the uniforms
-    first, then the basis-risk model. The dependence model then puts that
+    first, then the basis-risk model, so the factors of `HazardNoise` are
+    independent between assets. The dependence model then puts that
     asset's rows in another order, by the ranks of the uniforms; a row's
     hazard, index and loss stay together, no value changes and no further
     random number is used. So each column holds the rows of `sample_curve`
@@ -1080,14 +1203,15 @@ def sample_curve_hazards(
     `n_draws - 1`, and each row has probability `1/n_draws`.
 
     **The loss.** A component's impact comes from its `LossModel`, on its
-    hazard, after the basis-risk model, and its `own_loss` is that impact times
-    the value. After the reorder, `combine` takes the impacts of each row, and
-    the sample's `loss` is its result times the value. It is required when two
-    or more components have an impact, and refused with fewer. A component left
-    out of `loss_models` has no impact: it needs no rule, has no `own_loss`, and
-    the basis-risk model doesn't act on it or draw for it. With one impact the
-    sample's loss is that component's own, and `combine` records that. The loss
-    models must have one value, one `value_unit` and one `value_column`.
+    hazard at the asset, after the basis-risk model, and its `own_loss` is that
+    impact times the value. After the reorder, `combine` takes the impacts of
+    each row, and the sample's `loss` is its result times the value. It is
+    required when two or more components have an impact, and refused with
+    fewer. A component left out of `loss_models` has no impact: it needs no
+    rule, has no `own_loss`, and only a basis-risk model with `apply_hazard`
+    acts on it or draws for it. With one impact the sample's loss is that
+    component's own, and `combine` records that. The loss models must have one
+    value, one `value_unit` and one `value_column`.
 
     The lineage is built from the components' lineages and not from the model,
     as the same generators give the same draws under every model: a design and
@@ -1105,7 +1229,7 @@ def sample_curve_hazards(
     result, and for what `sample_curve` raises for. Raises `TypeError` for a
     missing dependence model, a bare callable as one or as `combine`, and wrong
     types. Warns as `sample_curve` does: for each component with draws rarer than
-    its fitted support, and once for `NoBasisRisk()`.
+    its fitted support, and once for `NoBasisRisk()` and `HazardNoise(0)`.
     """
     if not isinstance(curves, Mapping):
         raise TypeError(
@@ -1753,19 +1877,21 @@ def sample_annual(
     Each year is one row with probability `1/n`, and `period` is the year.
     A year without a value (in either series) raises, unless
     `missing="drop_year"`; dropped years are listed in the provenance. `rng`
-    is needed only by a basis-risk model that draws, such as `ImpactNoise`.
+    is needed only by a basis-risk model that draws, such as `HazardNoise` or
+    `ImpactNoise`.
 
     `trend` states how the climate trend is treated: `AsRecorded()` (the
     default), `RecentYears(n)` or `LinearTrend(...)`
     (`crc_sdk.parametric.trend`). The steps come in this order: the window of
     `RecentYears`; the missing years; the fit and the adjustment of the hazard
     and of the index, one fit each, on the same years with the same reference
-    year; the impact on the adjusted hazard; the basis-risk model. The
-    sample's `index` and `hazard` hold the adjusted values, and the
-    provenance's `trend` records what was done. A sample whose `LinearTrend`
-    was fitted on years it is later tested on is refused at evaluation
-    (`LeakageError`): to hold out a block, state the design years with
-    `LinearTrend(fit_years=...)`.
+    year; the `apply_hazard` of a basis-risk model that has it; the impact on
+    the adjusted hazard at the asset; the model's `apply`. The sample's `index`
+    and `hazard` hold the adjusted values, so `HazardNoise` multiplies the
+    adjusted hazard, and the provenance's `trend` records what was done. A
+    sample whose `LinearTrend` was fitted on years it is later tested on is
+    refused at evaluation (`LeakageError`): to hold out a block, state the
+    design years with `LinearTrend(fit_years=...)`.
 
     `scenario` is the caller's name for the rows, in `to_table`,
     `content_hash` and the comparison's `scenario` column. It is not derived
@@ -1778,9 +1904,10 @@ def sample_annual(
     checked, as the loss does not read it), missing years, mismatched years,
     a trend the series cannot take (`RecentYears` above its length, too few
     fit years, fit years it does not hold, a non-finite or newly negative
-    adjusted value) or invalid arguments, and `TypeError` for wrong types.
-    Warns with `ComonotoneIndexWarning` for `NoBasisRisk()` without an `index`
-    series.
+    adjusted value), `HazardNoise` with an `index` series or a negative hazard,
+    or invalid arguments, and `TypeError` for wrong types. Warns with
+    `ComonotoneIndexWarning` for `NoBasisRisk()` and `HazardNoise(0)` without
+    an `index` series.
     """
     sample = _annual_rows(
         hazard,
@@ -1853,6 +1980,12 @@ def _annual_rows(
         raise TypeError(f"index must be an AnnualSeries, got {type(index).__name__}")
     asset = _identifier("asset_id", asset_id)
     _check_models(loss_model, basis_risk, asset)
+    if index is not None and isinstance(basis_risk, HazardNoise):
+        raise SampleError(
+            "HazardNoise takes the index as the hazard at the asset, so it can't "
+            "be used with a separate index series, where the hazard at the asset "
+            "is data; state ImpactNoise, NoBasisRisk() or a BasisRisk of your own"
+        )
     # The loss reads the hazard series; the index series may be in another unit.
     loss_model.check_hazard_unit(hazard.unit)
     if rng is not None:
@@ -1900,10 +2033,9 @@ def _annual_rows(
     index_values = adjusted[1] if index is not None else hazard_values.copy()
     n = kept_years.shape[0]
 
-    impact = loss_model.impact_values(hazard_values)
     rng_records = [] if rng is None else [_generator_record(rng, "basis_risk")]
-    new_index, impact, basis_summary = _apply_basis_risk(
-        basis_risk, index_values, hazard_values, impact, rng
+    new_index, at_asset, impact, basis_summary = _through_basis_risk(
+        basis_risk, loss_model, index_values, hazard_values, rng
     )
     loss = loss_model.loss_values(impact)
 
@@ -1952,7 +2084,7 @@ def _annual_rows(
         probability=np.full(n, 1.0 / n),
         index=new_index,
         loss=loss,
-        hazard=None if np.array_equal(new_index, hazard_values) else hazard_values,
+        hazard=None if np.array_equal(new_index, at_asset) else at_asset,
         index_unit=hazard.unit if index is None else index.unit,
         loss_unit=loss_model.value_unit,
         semantics="annual",
@@ -2166,23 +2298,25 @@ def sample_annual_hazards(
 
     The steps come in this order: the window of `RecentYears`; the missing
     years; the fit and the adjustment of every series, one fit each, on the
-    same fit years with the same reference year; each component's impact on its
-    adjusted hazard; the basis-risk model; the rule. `trend` is one option for
+    same fit years with the same reference year; the `apply_hazard` of a
+    basis-risk model that has it; each component's impact on its adjusted hazard
+    at the asset; the model's `apply`; the rule. `trend` is one option for
     every series. `basis_risk` is one model for every component, and it draws
     from `rng` in component order, so the first component's draws are those of
     `sample_annual` with the same generator. The provenance's `rng` records the
     generator's state before each component's step.
 
     **The loss.** A component's impact comes from its `LossModel`, on its
-    hazard, after the basis-risk model, and its `own_loss` is that impact times
-    the value. `combine` takes the impacts, and the sample's `loss` is its
-    result times the value: `CappedSum(cap)`, `CompoundDamage()` or a
-    `CombineRule` of the caller's. It is required when two or more components
+    hazard at the asset, after the basis-risk model, and its `own_loss` is that
+    impact times the value. `combine` takes the impacts, and the sample's
+    `loss` is its result times the value: `CappedSum(cap)`, `CompoundDamage()`
+    or a `CombineRule` of the caller's. It is required when two or more components
     have an impact, and refused with fewer. A component left out of
-    `loss_models` has no impact: it needs no rule, has no `own_loss`, and the
-    basis-risk model doesn't act on it or draw for it. With one impact the
-    sample's loss is that component's own, and `combine` records that. The loss
-    models must have one value, one `value_unit` and one `value_column`.
+    `loss_models` has no impact: it needs no rule, has no `own_loss`, and only
+    a basis-risk model with `apply_hazard` acts on it or draws for it, so the
+    others' draws don't depend on which of them has an impact. With one impact
+    the sample's loss is that component's own, and `combine` records that. The
+    loss models must have one value, one `value_unit` and one `value_column`.
 
     A year without a value in any series raises, unless `missing="drop_year"`
     drops it from all of them and lists it in the provenance. `scenario` is
@@ -2201,7 +2335,8 @@ def sample_annual_hazards(
     columns, a missing or invalid rule, missing years, a trend the series cannot
     take or invalid arguments, and `TypeError` for wrong types, a bare callable
     as `combine` included. These are checked before any draw, apart from a
-    rule's result. Warns with `ComonotoneIndexWarning` for `NoBasisRisk()`.
+    rule's result. Warns with `ComonotoneIndexWarning` for `NoBasisRisk()` and
+    `HazardNoise(0)`.
     """
     sample = _annual_hazard_rows(
         series,
@@ -2294,26 +2429,33 @@ def _annual_hazard_rows(
     for name, values in hazards.items():
         unit = inputs.series[name].unit
         model = inputs.models.get(name)
-        if model is None:
+        if model is None and not isinstance(basis_risk, HazardBasisRisk):
             components[name] = IndexComponent(
                 values, unit=unit, tail=inputs.tails[name]
             )
             continue
-        impact = model.impact_values(values)
         if rng is not None:
             rng_records[name] = {
                 **_generator_record(rng, "basis_risk"),
                 "component": name,
             }
-        new_index, impacts[name], summaries[name] = _apply_basis_risk(
-            basis_risk, values, values, impact, rng
-        )
+        own_loss = None
+        if model is None:
+            assert isinstance(basis_risk, HazardBasisRisk)
+            new_index, at_asset, summaries[name] = _hazard_without_impact(
+                basis_risk, values, values, rng
+            )
+        else:
+            new_index, at_asset, impacts[name], summaries[name] = _through_basis_risk(
+                basis_risk, model, values, values, rng
+            )
+            own_loss = model.loss_values(impacts[name])
         components[name] = IndexComponent(
             new_index,
             unit=unit,
             tail=inputs.tails[name],
-            hazard=None if np.array_equal(new_index, values) else values,
-            own_loss=model.loss_values(impacts[name]),
+            hazard=None if np.array_equal(new_index, at_asset) else at_asset,
+            own_loss=own_loss,
         )
     one_model = inputs.models[inputs.impacted[0]]
     loss = _combined_loss(inputs.models, combine, rule_record, impacts)
@@ -2620,12 +2762,13 @@ def sample_annual_pool(
     The steps come in this order: the window of `RecentYears`, taken from each
     run; the missing years; the check that every run holds the same years; the
     fit and the adjustment, one fit per run on the same years, with the same
-    reference year, the last of the pool's years; the impact on the adjusted
-    hazard; the basis-risk model. A year without a value in a run raises,
-    unless `missing="drop_year"` drops it from every run and lists it with the
-    run that lacked it. `rng` is needed only by a basis-risk model that draws:
-    `ImpactNoise` draws one factor per row, in row order. `trend` and
-    `scenario` are those of `sample_annual`.
+    reference year, the last of the pool's years; the `apply_hazard` of a
+    basis-risk model that has it; the impact on the adjusted hazard at the
+    asset; the model's `apply`. A year without a value in a run raises, unless
+    `missing="drop_year"` drops it from every run and lists it with the run
+    that lacked it. `rng` is needed only by a basis-risk model that draws:
+    `HazardNoise` and `ImpactNoise` draw one factor per row, in row order.
+    `trend` and `scenario` are those of `sample_annual`.
 
     `holdout` and `year_block_kfold` split a pool by its years, so every run
     holds out the same latest years, and the leakage check compares (run
@@ -2644,7 +2787,8 @@ def sample_annual_pool(
     missing year (unless `missing="drop_year"`); a hazard unit the loss model's
     impact is not calibrated for; a trend a run cannot take; and invalid
     arguments. Raises `TypeError` for wrong types. Warns with
-    `ComonotoneIndexWarning` for `NoBasisRisk()`, as for one series.
+    `ComonotoneIndexWarning` for `NoBasisRisk()` and `HazardNoise(0)`, as for
+    one series.
     """
     sample = _pool_rows(
         runs,
@@ -2700,10 +2844,9 @@ def _pool_rows(
     hazard_values = np.column_stack(adjusted).reshape(-1)
     count = hazard_values.shape[0]
 
-    impact = loss_model.impact_values(hazard_values)
     rng_records = [] if rng is None else [_generator_record(rng, "basis_risk")]
-    new_index, impact, basis_summary = _apply_basis_risk(
-        basis_risk, hazard_values.copy(), hazard_values, impact, rng
+    new_index, at_asset, impact, basis_summary = _through_basis_risk(
+        basis_risk, loss_model, hazard_values.copy(), hazard_values, rng
     )
     loss = loss_model.loss_values(impact)
 
@@ -2783,7 +2926,7 @@ def _pool_rows(
         probability=np.full(count, 1.0 / count),
         index=new_index,
         loss=loss,
-        hazard=None if np.array_equal(new_index, hazard_values) else hazard_values,
+        hazard=None if np.array_equal(new_index, at_asset) else at_asset,
         index_unit=unit,
         loss_unit=loss_model.value_unit,
         semantics="annual",

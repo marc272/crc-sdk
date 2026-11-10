@@ -28,6 +28,7 @@ from crc_sdk.parametric import (
     ComonotoneIndexWarning,
     Cover,
     Free,
+    HazardNoise,
     Holdout,
     ImpactNoise,
     IndexDefinition,
@@ -447,6 +448,13 @@ def test_impact_noise_may_be_added_on_top() -> None:
         np.testing.assert_array_equal(sample.index, plain[asset_id].index)
         assert not np.array_equal(sample.loss, plain[asset_id].loss)
         assert sample.provenance.rng != ()
+
+
+@pytest.mark.parametrize("sigma", [0.0, 0.3])
+def test_hazard_noise_is_refused_with_a_separate_index(sigma: float) -> None:
+    plan = _at_stations(_plan()).basis_risk(HazardNoise(sigma))
+    with pytest.raises(SampleError, match="separate index"):
+        plan.samples()
 
 
 def test_the_index_unit_is_not_checked_against_the_impact() -> None:

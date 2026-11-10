@@ -658,6 +658,13 @@ def _basis_risk(sample: Mapping[str, Any], where: str) -> str:
     kind = model.get("kind")
     if kind == "no_basis_risk":
         return "no model"
+    if kind == "hazard_noise":
+        sigma = _number(model.get("sigma"), f"{where}.basis_risk.sigma")
+        return (
+            "hazard noise, the hazard at the asset being the index times a mean-one "
+            f"lognormal factor with sigma {sigma}, one per year and asset, as an "
+            "assumption the caller states"
+        )
     if kind == "impact_noise":
         sigma = _number(model.get("sigma"), f"{where}.basis_risk.sigma")
         text = f"impact noise, a mean-one lognormal factor with sigma {sigma}"
@@ -671,6 +678,94 @@ def _basis_risk(sample: Mapping[str, Any], where: str) -> str:
         if key != "kind"
     ]
     return str(kind) + (f" ({', '.join(terms)})" if terms else "")
+
+
+def _states_hazard_noise(sample: Mapping[str, Any]) -> bool:
+    """Whether the sample, or one of its assets, states `HazardNoise`."""
+    parts = sample.get("parts") or {}
+    models = [sample.get("basis_risk"), *(p.get("basis_risk") for p in parts.values())]
+    return any(
+        isinstance(model, Mapping) and model.get("kind") == "hazard_noise"
+        for model in models
+    )
+
+
+def _hazard_noise_scope(sample: Mapping[str, Any]) -> str:
+    """How the factors of `HazardNoise` relate across assets or components."""
+    if not _states_hazard_noise(sample):
+        return ""
+    if sample.get("parts"):
+        return ", the factors independent between assets"
+    if sample.get("components"):
+        return ", each component with factors of its own"
+    return ""
+
+
+def _has_mean_ratios(record: Any) -> bool:
+    return isinstance(record, Mapping) and "hazard_mean_ratio" in record
+
+
+def _recorded_mean_ratios(
+    sample: Mapping[str, Any], where: str
+) -> dict[str, Mapping[str, Any]]:
+    """The records of the two mean ratios by name; `""` for a sample's own.
+
+    `details.basis_risk` holds the record of a sample, or of each of its assets
+    or components by name. A joined sample holds each asset's in that part.
+    """
+    details = _get(sample, "details", Mapping, where) or {}
+    recorded = _get(details, "basis_risk", Mapping, f"{where}.details") or {}
+    if _has_mean_ratios(recorded):
+        return {"": recorded}
+    named = {str(k): each for k, each in recorded.items() if _has_mean_ratios(each)}
+    if named:
+        return named
+    for asset, part in (_get(sample, "parts", Mapping, where) or {}).items():
+        own = _get(part, "details", Mapping, f"{where}.parts.{asset}") or {}
+        if _has_mean_ratios(own.get("basis_risk")):
+            named[str(asset)] = own["basis_risk"]
+    return named
+
+
+def _mean_ratios(sample: Mapping[str, Any], where: str) -> str:
+    """What a model that acts on the hazard did to the means, in words.
+
+    Blocks of one sample carry its ratios, which are over the rows as built.
+    Above `_MANY_ASSETS` names the text gives the ranges.
+    """
+    named = _recorded_mean_ratios(sample, where)
+    if not named:
+        return ""
+    place = f"{where}.details.basis_risk"
+
+    def say(value: Any, at: str) -> str:
+        return "not defined" if value is None else _number(value, at)
+
+    lead = "; over the rows as built, with the model over without it, "
+    if "" in named:
+        own = named[""]
+        hazard = say(own.get("hazard_mean_ratio"), f"{place}.hazard_mean_ratio")
+        impact = say(own.get("impact_mean_ratio"), f"{place}.impact_mean_ratio")
+        return f"{lead}the mean hazard is {hazard} and the mean impact {impact}"
+    if len(named) <= _MANY_ASSETS:
+        each = [
+            f"{say(entry.get('hazard_mean_ratio'), f'{place}.{name}')} and "
+            f"{say(entry.get('impact_mean_ratio'), f'{place}.{name}')} for {name}"
+            for name, entry in named.items()
+        ]
+        return f"{lead}the mean hazard and the mean impact are {', '.join(each)}"
+
+    def ranged(key: str) -> str:
+        values = [entry[key] for entry in named.values() if entry.get(key) is not None]
+        if not values:
+            return "not defined"
+        return _span(values, lambda value: _number(value, f"{place}.{key}"))
+
+    who = "assets" if sample.get("parts") else "components"
+    return (
+        f"{lead}the mean hazard is {ranged('hazard_mean_ratio')} and the mean impact "
+        f"{ranged('impact_mean_ratio')} across {len(named)} {who}"
+    )
 
 
 def _loss(sample: Mapping[str, Any], where: str) -> str:
@@ -826,9 +921,11 @@ def _components(sample: Mapping[str, Any], where: str) -> str | None:
 
 
 def _sample_text(sample: Mapping[str, Any], where: str) -> str:
+    basis_risk = _for_each_part(sample, where, _basis_risk)
     text = (
         f"{_source(sample, where)}. "
-        f"Basis risk: {_for_each_part(sample, where, _basis_risk)}. "
+        f"Basis risk: {basis_risk}{_hazard_noise_scope(sample)}"
+        f"{_mean_ratios(sample, where)}. "
         f"Loss: {_for_each_part(sample, where, _loss)}."
     )
     dependence = _dependence(sample, where)
@@ -2313,7 +2410,9 @@ def setup_text(
     - `Seeds`: the plan's seed (`plan_seed`) and the fresh draws' seed
       (`fresh_draws_seed`) that the evaluations' `details` record, if any;
     - `Sample`: the source kind, the probability semantics and who stated
-      them, the basis-risk model and its parameters, the loss model (of each
+      them, the basis-risk model and its parameters, and for a model that acts
+      on the hazard the mean hazard and the mean impact with it over without
+      it (above five assets, their ranges), the loss model (of each
       asset, when the assets differ, and of each component on a sample of
       several hazards), the dependence between the assets, and on a sample
       with index components each component's name, unit, tail and whether it
@@ -2536,10 +2635,13 @@ def setup_text(
     elif len(set(descriptions)) == 1:
         lines.append(f"Sample: {descriptions[0]}")
     else:
-        lines += [
-            f"Sample of {span}: {text}"
-            for span, text in zip(years, descriptions, strict=True)
-        ]
+        for i, (span, text) in enumerate(zip(years, descriptions, strict=True)):
+            # Design draws and fresh draws of one size read the same by their years.
+            roles = _list(samples[i], "roles", f"setup.samples[{i}]")
+            role = (
+                f", the {' and '.join(roles)} sample" if years.count(span) > 1 else ""
+            )
+            lines.append(f"Sample of {span}{role if roles else ''}: {text}")
     if any(
         sample.get("components") and "evaluation" in _list(sample, "roles", "sample")
         for sample in samples

@@ -28,6 +28,7 @@ from crc_sdk.parametric import (
     ExpectedUncovered,
     Free,
     FreshDraws,
+    HazardNoise,
     Holdout,
     ImpactNoise,
     IndexDefinition,
@@ -738,6 +739,30 @@ def test_builders_and_explain_do_no_io(tmp_path: Path) -> None:
         lines[-1],
     ]
     assert not absent.exists()
+
+
+def test_hazard_noise_runs_through_a_plan_on_curves(
+    dataset: Path, tmp_path: Path
+) -> None:
+    plan = (
+        _plan(dataset)
+        .monte_carlo(1_000, seed=42)
+        .basis_risk(HazardNoise(0.3))
+        .covers(_linear())
+        .split(FreshDraws(1_000, seed=43))
+        .metrics(MetricOptions(betas=(0.9,), return_periods=(10,)))
+    )
+    result = plan.write_parquet(tmp_path / "noise.parquet")
+    # The plan's seeds give the two blocks their own factors, and each states its own.
+    entries = result.metadata.setup.samples
+    drawn = [e for e in entries if e["asset_ids"] == ["warehouse-a"]]
+    assert [e["roles"] for e in drawn] == [["design", "evaluation"], ["evaluation"]]
+    ratios = [e["details"]["basis_risk"]["impact_mean_ratio"] for e in drawn]
+    assert ratios[0] != ratios[1]
+    assert all(e["basis_risk"] == {"kind": "hazard_noise", "sigma": 0.3} for e in drawn)
+    text = setup_text(result.metadata)
+    assert "hazard noise, the hazard at the asset being the index times" in text
+    assert "the mean hazard is" in text
 
 
 def test_for_evaluation_checks_its_request(dataset: Path, tmp_path: Path) -> None:

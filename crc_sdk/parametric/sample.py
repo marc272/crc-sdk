@@ -118,10 +118,10 @@ _HOLDOUT_TOLERANCE = 1e-9
 _IDENTIFIER = re.compile(r"^\S(?:[\s\S]*\S)?$")
 
 COMONOTONE_MESSAGE = (
-    "the index and the loss are comonotone: without a basis-risk model the "
-    "loss is a function of the index, so a cover can track the loss almost "
-    "exactly. State a basis-risk model (ImpactNoise, or an index series read "
-    "elsewhere than the loss) to measure basis risk"
+    "the index and the loss are comonotone: the loss is a function of the "
+    "index, so a cover can track the loss almost exactly. State a basis-risk "
+    "model (HazardNoise, ImpactNoise, or an index series read elsewhere than "
+    "the loss) to measure basis risk"
 )
 
 _TABLE_COMONOTONE_NOTE = (
@@ -739,9 +739,11 @@ class IndexComponent:
     `values` is the component's index, `(n, 1)`, finite; a 1-D array is read
     as one column. `unit` is its unit, and `tail` the severe side, `"upper"`
     or `"lower"`. `hazard` is the value the loss model read, kept when it
-    differs from the index, else `None`. `own_loss` is the loss of this hazard
-    alone, finite and non-negative, in the sample's loss unit, and `None` for
-    a component with no impact. The arrays are read-only copies.
+    differs from the index, else `None`. On a component with no impact, which
+    no loss reads, it is the hazard at the asset that a basis-risk model with
+    `apply_hazard`, such as `HazardNoise`, gave. `own_loss` is the loss of
+    this hazard alone, finite and non-negative, in the sample's loss unit, and
+    `None` for a component with no impact. The arrays are read-only copies.
 
     Raises `SampleError` for any invalid field.
     """
