@@ -392,9 +392,6 @@ def test_a_design_per_scenario_and_a_drifting_cover_are_slices_of_one_table() ->
 
 
 def test_two_sets_designed_on_two_scenarios_keep_their_keys() -> None:
-    covers = _book_covers()
-    given_a, given_b = covers["a"], covers["b"]
-    assert given_a.label and given_b.label
     early = _book("early", (11, 12))
     late = _book("late", (11, 12), horizon=2080, location=95.0)
     train_early = _book("early", (1, 2))
@@ -1015,14 +1012,9 @@ def test_a_package_given_as_is_sums_its_premiums_and_is_repriced_per_contract() 
 # -- what the setup text says --------------------------------------------------
 
 
-def _ten_statements(table: Any) -> str:
-    text = setup_text(table)
-    return text
-
-
 def test_the_setup_text_states_every_scenario() -> None:
     train, scenarios, designed = _pair_set()
-    text = _ten_statements(compare_scenarios([designed], scenarios))
+    text = setup_text(compare_scenarios([designed], scenarios))
     assert (
         "Scenario early (the reference): hazard rx1day, as its source names it" in text
     )
