@@ -68,7 +68,8 @@ Monte Carlo samples of any curves reuse one generator state on a common period.
 `"stated"`); otherwise, for a design, the design premium, the contract price
 priced on the design sample (`"design"`), so out-of-sample rows use the price
 agreed at design; otherwise the premium priced on the evaluation sample with
-`pricing` (`"evaluation"`).
+`pricing` (`"evaluation"`). `compare_scenarios` prices a cover given as is once,
+on the reference's design block (`"reference"`).
 
 **Amounts no design year reached.** `unidentified_share` is the probability of
 the evaluation block's draws whose payout reads an amount the design's fill rule

@@ -349,6 +349,22 @@ _BLOCK_FIELDS = ("n_rows", "blocks")
 """The fields of a scenario in `setup.scenarios` that differ between folds."""
 
 
+def _check_scenarios_record(record: Mapping[str, Any]) -> None:
+    """Raise `ValueError` unless `setup.scenarios` has the keys that are read."""
+    entries = record.get("scenarios")
+    if not isinstance(record.get("reference"), str) or not isinstance(entries, Mapping):
+        raise ValueError("setup.scenarios needs a reference and its scenarios")
+    if record["reference"] not in entries:
+        raise ValueError("setup.scenarios must describe its reference")
+    for label, entry in entries.items():
+        blocks = entry.get("blocks") if isinstance(entry, Mapping) else None
+        if not isinstance(blocks, list) or not all(
+            isinstance(block, Mapping) and {"n_rows", "sample_hash"} <= set(block)
+            for block in blocks
+        ):
+            raise ValueError(f"setup.scenarios[{label!r}] needs its blocks")
+
+
 def _without_blocks(record: Mapping[str, Any]) -> dict[str, Any]:
     """`record` without what differs between the folds of one set."""
     return {
@@ -476,6 +492,8 @@ class EvaluationSetup(_EvaluationModel):
                 raise ValueError(
                     "every setup evaluation needs a sample_hash, a split and a fold"
                 )
+        if self.scenarios is not None:
+            _check_scenarios_record(self.scenarios)
         return self
 
 
@@ -3072,7 +3090,7 @@ def _hazard_read(entry: Mapping[str, Any]) -> str:
         )
         return f"{record.get('name')}, {said}"
 
-    if "name" in hazard:
+    if isinstance(hazard.get("name"), str):
         return name(hazard)
     return _join(
         [
@@ -3150,8 +3168,8 @@ def _fixed_line(evaluations: Sequence[Mapping[str, Any]]) -> str:
 
 def _products_differ(scenarios: Mapping[str, Any], reference: str) -> list[str]:
     """Statement 4: the scenarios whose product differs from the reference's."""
-    entries = scenarios["scenarios"]
-    ours = entries[reference].get("product")
+    entries = _get(scenarios, "scenarios", Mapping, "setup.scenarios") or {}
+    ours = (entries.get(reference) or {}).get("product")
     return [
         (
             f"Products: scenario {label} reads "
@@ -3200,9 +3218,10 @@ def _read_at(places: Sequence[Mapping[str, Any]], where: str) -> str:
 
 def _index_line(scenarios: Mapping[str, Any]) -> str:
     """Statement 5: where each scenario reads the index."""
+    entries = _get(scenarios, "scenarios", Mapping, "setup.scenarios") or {}
     parts = [
         f"scenario {label} at {_read_at(_objects(entry, 'index_read', label), label)}"
-        for label, entry in scenarios["scenarios"].items()
+        for label, entry in entries.items()
     ]
     return f"Index: {'; '.join(parts)}. Each scenario reads its own index there."
 
@@ -3290,13 +3309,16 @@ def _tail_lines(scenarios: Mapping[str, Any], options: Any) -> list[str]:
         else []
     )
     by_block: dict[tuple[int, tuple[str, ...]], list[str]] = {}
-    for label, entry in scenarios["scenarios"].items():
-        for block in entry["blocks"]:
+    entries = _get(scenarios, "scenarios", Mapping, "setup.scenarios") or {}
+    for label, entry in entries.items():
+        for j, block in enumerate(_objects(entry, "blocks", label)):
+            where = f"setup.scenarios.{label}.blocks[{j}]"
             columns = tuple(
-                str(name) for name in block.get("short_block_columns") or ()
+                str(name) for name in _list(block, "short_block_columns", where)
             )
             if columns:
-                names = by_block.setdefault((int(block["n_rows"]), columns), [])
+                count = _get(block, "n_rows", int, where) or 0
+                names = by_block.setdefault((count, columns), [])
                 if label not in names:
                     names.append(label)
     for (rows, columns), labels in by_block.items():
@@ -3310,7 +3332,7 @@ def _tail_lines(scenarios: Mapping[str, Any], options: Any) -> list[str]:
 
 def _widths_line(scenarios: Mapping[str, Any]) -> str | None:
     """Statement 10: windows of different widths, or one beside a single horizon."""
-    entries = scenarios["scenarios"]
+    entries = _get(scenarios, "scenarios", Mapping, "setup.scenarios") or {}
     widths = {
         label: len(entry["members"])
         for label, entry in entries.items()
