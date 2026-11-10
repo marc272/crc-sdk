@@ -163,11 +163,11 @@ from crc_sdk.parametric.sample import (
     _integer_values,
     _licence_entry,
     _named_in_source,
+    _pathway_statements,
     _require_generator,
     _source_document,
     _thaw,
 )
-from crc_sdk.parametric.scenarios import _pathway_statements
 from crc_sdk.parametric.trend import AsRecorded, Trend, _require_trend, _Series
 from crc_sdk.pathways import pathways_equivalent
 from crc_sdk.providers.era5 import ERA5_ATTRIBUTION, ERA5_LICENCE
