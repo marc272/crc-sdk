@@ -118,5 +118,8 @@ class SolverUnavailableError(ParametricError, ImportError):
 class ComonotoneIndexWarning(UserWarning):
     """The index and the loss move together, so a cover can track the loss.
 
-    Emitted when a sample has no basis-risk model between index and loss.
+    Emitted when a sample's loss is a function of its index: under
+    `NoBasisRisk()`, and under `HazardNoise(0)`, whose factor is exactly 1.
+    A separate index series emits none, because the index then differs from
+    what the loss reads.
     """

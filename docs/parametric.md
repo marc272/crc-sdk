@@ -1351,6 +1351,8 @@ the net loss N = L − π + P (the owner's cost of the year with the cover):
 | `premium` | P, the premium used (below) | — |
 | `coverage_ratio` | E[min(π, L)] / E[L]: the share of the expected loss that payouts cover; payouts above the loss don't count | E[L] = 0 |
 | `payout_to_loss_ratio` | E[π] / E[L]: payouts above the loss count too | E[L] = 0 |
+| `payout_frequency` | P(π > ε): the probability that the cover pays | — |
+| `unidentified_share` | Σ p · 1{B_j(x) ≠ 0 for some j in A}, with B the basis of the resolved cover on this block's index and A the amounts the fill rule set: the block's probability whose payout reads an amount that no design year reached. Any non-zero basis entry counts in full. It is 0 on the design block, and above 0 only on a block that reaches where the design had no year. On a `"total"`, `"package"` or allocated row it is the union over the contracts | A cover given as is; a design on the numpy grid, where no fill rule ran; a `"total"` or `"package"` row with such a contract |
 | `tail_coverage_b<β>` | Σ w min(π, L) / Σ w L, with w the CVaR_β weights of L: the share of the loss covered in the worst 1 − β of loss years | Σ w L = 0 |
 | `cvar_uncovered_to_loss_b<β>` | CVaR_β(U) / CVaR_β(L): the tail of the uncovered loss against the tail of the uninsured loss | CVaR_β(L) = 0 |
 | `false_negative_rate_l<ℓ>` | P(π ≤ ε, L > ℓ) / P(L > ℓ): years with a loss above ℓ and no payout | P(L > ℓ) = 0 |
