@@ -13,20 +13,57 @@ better; it only keeps the comparison to what was stated.
 the samples run at construction here, and at execution on a plan, through
 `_check_scenarios`. Those that need only the labels run at construction.
 
+`compare_scenarios(covers, scenarios, ...)` puts every cover or design on every
+scenario's block in one table, out of sample only: how a fixed cover drifts
+across scenarios, and a design per scenario, are slices of it. `scenario` says
+where a row is evaluated and `design_scenario` where it was designed.
+`to_drift(table, reference=)` adds each row's difference and ratio against the
+row of the same cover or design on a reference scenario. Neither ranks anything:
+a row is a measurement of a stated setup, and `setup_text` states it.
+
 This module does no I/O.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
 import numpy as np
+import pyarrow as pa  # type: ignore[import-untyped]
 
 from crc_sdk.parametric.cover import Cover
 from crc_sdk.parametric.errors import EvaluationError, SampleError, ScenarioError
+from crc_sdk.parametric.evaluate import (
+    Allocation,
+    CoverPackage,
+    EvaluationEntry,
+    _allocation,
+    _block_fields,
+    _check_keys,
+    _CoverSet,
+    _describe_rows,
+    _entries,
+    _Entry,
+    _fold,
+    _Item,
+    _JointEntry,
+    _metadata,
+    _options,
+    _prepared,
+    _pricing,
+    _rows,
+    _Run,
+    _sample,
+    _schema,
+    _split_step,
+    _values,
+    _values_hash,
+    to_long,
+)
 from crc_sdk.parametric.index import (
     AtAsset,
     AtCell,
@@ -34,12 +71,35 @@ from crc_sdk.parametric.index import (
     AtStation,
     CompositeIndex,
 )
-from crc_sdk.parametric.metadata import _series_pathway
+from crc_sdk.parametric.intervals import (
+    _apply_premiums,
+    _Arrays,
+    _arrays,
+    _block_read,
+    _metrics,
+    _no_premium_names,
+    _short_block,
+)
+from crc_sdk.parametric.metadata import (
+    EVALUATION_METADATA_KEY,
+    KEY_COLUMNS,
+    EvaluationMetadata,
+    _replaced,
+    _series_pathway,
+)
+from crc_sdk.parametric.metrics import (
+    MetricColumn,
+    MetricOptions,
+    _with_repriced,
+    metric_columns,
+)
+from crc_sdk.parametric.pricing import Pricing, PurePremium
 from crc_sdk.parametric.sample import (
     OutcomeSample,
     _check_cover_index,
     _check_known_pathway,
     _identifier,
+    _share_a_source,
     _source_columns,
     _text,
     _trend_of,
@@ -49,7 +109,7 @@ from crc_sdk.pathways import pathways_equivalent
 from crc_sdk.types import TemporalWindow
 from crc_sdk.workflows.distributions import warn_if_outside_window
 
-__all__ = ["ScenarioSet"]
+__all__ = ["ScenarioSet", "compare_scenarios", "to_drift"]
 
 _Pair = tuple[str | None, int | None]
 """A (pathway, horizon) as a record states it; either may be null."""
@@ -987,3 +1047,597 @@ class ScenarioSet:
             f"ScenarioSet({described}, reference={self.reference!r}, "
             f"mixed_products={self.mixed_products})"
         )
+
+
+# -- one table -------------------------------------------------------------------
+
+
+def _design_label_of(entry: _Entry) -> list[str]:
+    """The labels of the design samples of `entry`; empty for covers given as is."""
+    if isinstance(entry, _JointEntry):
+        return [entry.design.design_sample.scenario]
+    if isinstance(entry, _Item):
+        return [] if entry.design is None else [entry.design.design_sample.scenario]
+    items = (
+        entry._items.values()
+        if isinstance(entry, CoverPackage)
+        else entry.items.values()
+    )
+    return [
+        item.design.design_sample.scenario for item in items if item.design is not None
+    ]
+
+
+def _checked_design_label(entry: _Entry, labels: Sequence[str]) -> str | None:
+    """The scenario `entry` was designed on, or `None` for covers given as is.
+
+    `ScenarioError` for a design sample whose label isn't one of the set's, and
+    for designs of one mapping or package with different labels.
+    """
+    found = list(dict.fromkeys(_design_label_of(entry)))
+    if not found:
+        return None
+    if len(found) > 1:
+        raise ScenarioError(
+            f"the designs of one mapping or package must be made on one scenario, but "
+            f"their design samples are labelled {found}"
+        )
+    if found[0] not in labels:
+        raise ScenarioError(
+            f"a design's design sample is labelled {found[0]!r}, which is not one of "
+            f"the set's scenarios, {list(labels)}"
+        )
+    return found[0]
+
+
+def _checked_design_block(
+    design_sample: Any, labels_of: Sequence[str | None], reference: str
+) -> OutcomeSample | None:
+    """`design_sample=`, the reference's design block, if any entry needs one."""
+    if design_sample is None:
+        if None in labels_of:
+            raise SampleError(
+                "a cover given as is needs design_sample=, the reference's design "
+                "block: the sample its terms were chosen on, and where it is priced"
+            )
+        return None
+    given = _sample(design_sample, "design_sample")
+    if given.scenario != reference:
+        raise ScenarioError(
+            f"design_sample= is labelled {given.scenario!r}, but it is the reference's "
+            f"design block, so its label must be {reference!r}"
+        )
+    return given
+
+
+def _covers_of(entry: _Entry) -> tuple[Cover, ...]:
+    """What each cover of `entry` reads, for the bound-location check."""
+    if isinstance(entry, _Item):
+        return (entry.cover,)
+    if isinstance(entry, _CoverSet):
+        return tuple(entry.covers.values())
+    if isinstance(entry, CoverPackage):
+        return (entry.as_cover(),)
+    return tuple(entry.design.covers.values())
+
+
+def _repriced(
+    row: Mapping[str, Any], arrays: _Arrays, pricing: Pricing, probability: Any
+) -> float | None:
+    """`pricing` on this block's payouts, per contract; null on an allocated row."""
+    if row["premium_basis"] is None:
+        return None
+    return (
+        math.fsum(pricing.premium(payout, probability) for payout in arrays.contracts)
+        + 0.0
+    )
+
+
+@dataclass(frozen=True, eq=False)
+class _Terms:
+    """What every block of `compare_scenarios` shares."""
+
+    entries: tuple[_Entry, ...]
+    design_labels: tuple[str | None, ...]
+    reference: str
+    given: OutcomeSample | None
+    fold: int
+    pricing: Pricing
+    premiums: Any
+    options: MetricOptions
+    allocation: Allocation | None
+    values: Mapping[str, float] | None
+    columns: tuple[MetricColumn, ...]
+
+
+def _other_scenario(
+    evaluation: dict[str, Any],
+    sample: OutcomeSample,
+    designs: Sequence[OutcomeSample],
+    made: Mapping[str, Any],
+) -> None:
+    """Make `evaluation` that of a block read with another scenario's terms.
+
+    The method says so whatever the block's own split, which `details` keeps under
+    `block`. `"different_sources"` is for per-year sources with no lineage or run
+    in common: no row could be compared.
+    """
+    evaluation["method"] = "other_scenario"
+    evaluation["details"] = {"block": dict(made)}
+    if sample.provenance.source_kind != "monte_carlo" and not any(
+        _share_a_source(design, sample) for design in designs
+    ):
+        evaluation["leakage_check"] = "different_sources"
+
+
+def _made(sample: OutcomeSample) -> dict[str, Any]:
+    """How a scenario's block was made: its split step, or that it has none."""
+    step = _split_step(sample)
+    if step is None:
+        return {"kind": "as_built"}
+    return {
+        key: step[key]
+        for key in ("kind", "block", "train_fraction", "k", "fold")
+        if key in step
+    }
+
+
+def _premium_bases(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Each row's cover and premium basis, for the setup text."""
+    return [
+        {
+            key: row[key]
+            for key in ("cover_hash", "cover_label", "level", "premium_basis")
+        }
+        for row in rows
+    ]
+
+
+def _block_rows(
+    terms: _Terms, sample: OutcomeSample
+) -> tuple[list[dict[str, Any]], list[EvaluationMetadata]]:
+    """One scenario's rows, and the metadata of each of its evaluations."""
+    positions: dict[str | None, list[int]] = {}
+    for i, label in enumerate(terms.design_labels):
+        positions.setdefault(label, []).append(i)
+    runs: dict[int, _Run] = {}
+    prepared: dict[str | None, tuple[dict[str, Any], tuple[OutcomeSample, ...]]] = {}
+    for label, chosen in positions.items():
+        drawn_up = [terms.entries[i] for i in chosen]
+        joint = any(isinstance(entry, _JointEntry) for entry in drawn_up)
+        run, evaluation, designs = _prepared(
+            drawn_up,
+            sample,
+            split="out_of_sample",
+            fold=terms.fold,
+            pricing=terms.pricing,
+            premium=None,
+            options=terms.options,
+            # A design on another scenario brings a design block of its own.
+            design_sample=(terms.given if label in (None, terms.reference) else None),
+            allocation=terms.allocation if joint else None,
+            values=terms.values if joint else None,
+            price_on=terms.given if label is None else None,
+        )
+        runs.update(dict.fromkeys(chosen, run))
+        prepared[label] = (evaluation, designs)
+        for entry in drawn_up:
+            for cover in _covers_of(entry):
+                _check_bound_cover(cover, sample)
+    groups = _apply_premiums(
+        terms.premiums,
+        [_rows(entry, runs[i]) for i, entry in enumerate(terms.entries)],
+    )
+    every_row = np.ones(len(sample), dtype=np.bool_)
+    without = _no_premium_names(terms.options)
+    for i, (entry, group) in enumerate(zip(terms.entries, groups, strict=True)):
+        for row, arrays in zip(group, _arrays(entry, runs[i]), strict=True):
+            if row["premium_basis"] == "stated":
+                read = _block_read(row, arrays, terms.pricing)
+                row.update(
+                    _metrics(
+                        read, every_row, sample.probability, terms.options, without
+                    )
+                )
+            row["premium_repriced"] = _repriced(
+                row, arrays, terms.pricing, sample.probability
+            )
+    made = _made(sample)
+    items: list[EvaluationMetadata] = []
+    for label, chosen in positions.items():
+        evaluation, designs = prepared[label]
+        run = runs[chosen[0]]
+        entries = [terms.entries[i] for i in chosen]
+        by_entry = [groups[i] for i in chosen]
+        _describe_rows(evaluation, run, entries, by_entry)
+        evaluation["premium_bases"] = _premium_bases(
+            row for group in by_entry for row in group
+        )
+        evaluation["scenario"] = sample.scenario
+        evaluation["design_scenario"] = label
+        if (terms.reference if label is None else label) != sample.scenario:
+            _other_scenario(evaluation, sample, designs, made)
+        items.append(
+            _metadata(
+                entries,
+                sample,
+                evaluation=evaluation,
+                design_samples=designs,
+                options=terms.options,
+                columns=terms.columns,
+                values_sha256=None if run.values is None else _values_hash(run.values),
+            )
+        )
+    return [row for group in groups for row in group], items
+
+
+def _hazard_record(scenario: _Scenario) -> Any:
+    """The hazard a scenario reads: its record, or each component's."""
+    components = scenario.document.get("components")
+    if components is None:
+        return scenario.document.get("hazard")
+    return {
+        name: own.get("hazard")
+        for name, own in components.items()
+        if not _reads_no_loss(own)
+    }
+
+
+def _index_place(owner: str, leaf: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Where a leaf's index is read: its index source, or else its hazard source."""
+    held = leaf.get("sources") or ()
+    sources = [source for source in held if source.get("role") == "index"] or [
+        source for source in held if source.get("role") == "hazard"
+    ]
+    places: list[dict[str, Any]] = []
+    for source in sources:
+        series = source.get("series")
+        place: dict[str, Any] = {"owner": owner, "kind": "stated"}
+        if source.get("kind") == "curve":
+            place |= {
+                "kind": "h3_cell",
+                "cell": (source.get("row") or {}).get("cell_index"),
+            }
+        elif isinstance(series, Mapping):
+            cell = series.get("cell")
+            stations = sorted(_series_stations(series))
+            if isinstance(cell, Mapping):
+                place |= {
+                    "kind": "nearest_cell",
+                    "latitude": float(cell["latitude"]),
+                    "longitude": float(cell["longitude"]),
+                }
+            elif stations:
+                place |= {"kind": "station", "station": ", ".join(stations)}
+        if place not in places:
+            places.append(place)
+    return places or [{"owner": owner, "kind": "stated"}]
+
+
+def _member_rows(sample: OutcomeSample, members: Sequence[Any]) -> list[int] | None:
+    """A window's rows per member on this block; row d reads member d mod m."""
+    if len(members) < 2:
+        return None
+    counts = np.bincount(np.mod(sample.period, len(members)), minlength=len(members))
+    return [int(count) for count in counts]
+
+
+def _scenario_document(
+    scenario: _Scenario, columns: Sequence[MetricColumn], fold: int
+) -> dict[str, Any]:
+    """One scenario's entry of `setup.scenarios`, for one block."""
+    sample = scenario.sample
+    read = _source_columns(sample, strict=True)
+    curves = sample.provenance.source_kind == "monte_carlo"
+    members = [list(pair) for pair in scenario.members] if curves else None
+    block: dict[str, Any] = {
+        "fold": fold,
+        "made": _made(sample),
+        "member_rows": _member_rows(sample, members or ()),
+        "n_rows": len(sample),
+        "sample_hash": sample.content_hash,
+        "short_block_columns": [
+            column.name for column in columns if _short_block(column, len(sample))
+        ],
+    }
+    return {
+        "blocks": [block],
+        "hazard": _hazard_record(scenario),
+        "horizon": read.horizon,
+        "index_read": [
+            place
+            for owner, leaf in scenario.leaves
+            for place in _index_place(owner, leaf)
+        ],
+        "members": members,
+        "n_rows": len(sample),
+        "pathway": read.pathway,
+        "product": read.product,
+        "source_kind": sample.provenance.source_kind,
+    }
+
+
+def _scenarios_document(
+    scenarios: ScenarioSet,
+    labels: Sequence[str],
+    columns: Sequence[MetricColumn],
+    fold: int,
+) -> dict[str, Any]:
+    """What `setup.scenarios` records of a set."""
+    read = [_read(scenarios.sample(label)) for label in labels]
+    shared: dict[str, Any] | None = None
+    if read[0].sample.provenance.source_kind == "monte_carlo":
+        shared = {
+            "labels": list(labels),
+            "rng": {
+                owner: [list(record) for record in records]
+                for owner, records in _hazard_generators(read[0]).items()
+            },
+        }
+    return {
+        "design_on": None,
+        "labels": list(labels),
+        "mixed_products": scenarios.mixed_products,
+        "reference": scenarios.reference,
+        "scenarios": {
+            scenario.label: _scenario_document(scenario, columns, fold)
+            for scenario in read
+        },
+        "shared_draws": shared,
+    }
+
+
+def compare_scenarios(
+    covers: Sequence[EvaluationEntry],
+    scenarios: ScenarioSet,
+    *,
+    fold: int = 0,
+    pricing: Pricing = PurePremium(),
+    premiums: Mapping[str, float] | None = None,
+    options: MetricOptions = MetricOptions(),
+    design_sample: OutcomeSample | None = None,
+    allocation: Allocation | None = None,
+    values: Mapping[str, float] | None = None,
+) -> Any:
+    """Evaluate every cover or design on every scenario's block; return one table.
+
+    `covers` is what `compare` takes on the set's samples. Every entry is evaluated
+    on every scenario's block, the reference first and then as the set gives them,
+    and every row has `split="out_of_sample"`. `scenario` says where a row is
+    evaluated and `design_scenario` where it was designed: null for a cover given
+    as is, which wasn't designed on any scenario. How a fixed cover drifts across
+    scenarios and a design per scenario are slices of this table. Nothing in it
+    ranks a pathway, a horizon, a product or a design.
+
+    With one scenario, the reference alone, the rows are `compare`'s on that block,
+    except that a cover given as is takes the premium below. The columns are those
+    of `compare`, with the metric column `premium_repriced` after `premium`.
+
+    `design_sample` is the reference's design block, and is required when an entry
+    is a cover given as is: its terms were chosen there, and it is priced there. Its
+    label must be the reference's. A design brings its own, whose label must be one
+    of the set's, and the designs of one mapping must share that label.
+
+    `premium` and the net-loss columns stay at the contract price: a design's
+    premium (`premium_basis` `"design"`), the premium `premiums=` states for a
+    cover given as is, keyed by `cover_label`, a set or package stated whole or not
+    at all (`"stated"`), or else `pricing` once, on the reference's design block, not
+    on the block evaluated (`"reference"`). `premium_repriced` is what a renewal on
+    this block would cost: `pricing` on this block's payouts, the sum of the
+    contracts' on a set's `"total"` row or a package's row, on the total payout on a
+    joint design's `"total"` row. Under `PurePremium` it equals `expected_payout`.
+    Allocated rows have neither.
+
+    A budget is the design's: `Budget(ratio=k)` is a share of each design block's
+    expected loss, so it moves with the scenario, and `Budget(amount=B)` doesn't.
+    `setup_text` says which, and states every scenario next to the numbers.
+
+    A row whose design sample has another label than its block is a cross row, with
+    the terms read on that block as they stand: nothing rescales a threshold set on
+    another scenario's values. Its evaluation's `method` is `"other_scenario"`.
+    Curves share one set of evaluation draws, separate from the design's, which
+    `ScenarioSet` and the leakage check of `compare` enforce; per-year blocks keep
+    their own held-out years, and a cross row between per-year sources with no
+    lineage or run in common records `leakage_check` `"different_sources"`.
+
+    `fold` is the fold of a k-fold split, one at a time: concatenate folds with
+    `pyarrow.concat_tables` and pass `EvaluationMetadata.merge` of their metadata to
+    `write_comparison`. `allocation` and `values` are `compare`'s.
+
+    Raises `TypeError` for a `scenarios` that isn't a `ScenarioSet` or that
+    describes what a plan reads, and for arguments of the wrong type;
+    `ScenarioError` on an empty set, for a design sample labelled outside the set,
+    and for a cover bound to a location a scenario's index doesn't read; `SampleError`
+    without the `design_sample` a cover given as is needs; `EvaluationError` for a
+    `premiums=` key that matches no cover given as is; `LeakageError` for a shared
+    period or a reused generator state; and otherwise as `compare` does.
+    """
+    if not isinstance(scenarios, ScenarioSet):
+        raise TypeError(
+            f"scenarios must be a ScenarioSet, got {type(scenarios).__name__}"
+        )
+    labels = scenarios.labels
+    entries = tuple(_entries(covers))
+    design_labels = tuple(_checked_design_label(entry, labels) for entry in entries)
+    reference = scenarios.reference
+    given = _checked_design_block(design_sample, design_labels, reference)
+    checked_fold = _fold(fold)
+    checked_options = _options(options)
+    checked_pricing = _pricing(pricing)
+    rule = _allocation(allocation)
+    reference_block = scenarios.sample(reference)
+    checked_values = _values(values, rule, reference_block)
+    if rule is not None and not any(isinstance(e, _JointEntry) for e in entries):
+        raise EvaluationError(
+            "allocation= shares out a joint design's total payout, but no entry is "
+            "a joint design"
+        )
+    columns = _with_repriced(metric_columns(checked_options))
+    terms = _Terms(
+        entries=entries,
+        design_labels=design_labels,
+        reference=reference,
+        given=given,
+        fold=checked_fold,
+        pricing=checked_pricing,
+        premiums=premiums,
+        options=checked_options,
+        allocation=rule,
+        values=checked_values,
+        columns=columns,
+    )
+    rows: list[dict[str, Any]] = []
+    items: list[EvaluationMetadata] = []
+    for label in labels:
+        block_rows, block_items = _block_rows(terms, scenarios.sample(label))
+        rows += block_rows
+        items += block_items
+    _check_keys(rows, KEY_COLUMNS)
+    merged = EvaluationMetadata.merge(*items)
+    metadata = _replaced(
+        merged,
+        setup=_replaced(
+            merged.setup,
+            scenarios=_scenarios_document(scenarios, labels, columns, checked_fold),
+        ),
+    )
+    schema = _schema(columns, metadata, extra=_block_fields(checked_options.betas))
+    return pa.Table.from_pylist(rows, schema=schema)
+
+
+# -- differences from a reference --------------------------------------------------
+
+
+_PAIR_COLUMNS = (
+    "cover_hash",
+    "design_id",
+    "design_scenario",
+    "asset_id",
+    "level",
+    "split",
+    "fold",
+)
+"""The columns a row is paired on: one cover or design with itself."""
+
+_DRIFT_FIELDS = (
+    pa.field("reference_scenario", pa.string(), nullable=False),
+    pa.field("reference_product", pa.string()),
+    pa.field("reference_n_rows", pa.int32()),
+    pa.field("reference_value", pa.float64()),
+    pa.field("difference", pa.float64()),
+    pa.field("ratio", pa.float64()),
+)
+"""The columns `to_drift` adds to the long form."""
+
+
+def _drift_reference(reference: Any, metadata: EvaluationMetadata) -> str:
+    """The scenario differences are taken from: stated, or the set's."""
+    if reference is not None:
+        if not isinstance(reference, str):
+            raise TypeError(
+                f"reference must be a string, got {type(reference).__name__}"
+            )
+        return reference
+    stated = metadata.setup.scenarios
+    if stated is None:
+        raise EvaluationError(
+            "this table states no set's reference: pass reference= with one of its "
+            "scenarios"
+        )
+    return str(stated["reference"])
+
+
+def to_drift(table: Any, *, reference: str | None = None) -> Any:
+    """Add each row's difference and ratio against a reference scenario.
+
+    `table` is a comparison table, such as one `compare_scenarios` returns. The
+    result is its long form (`to_long`), one row per metric, with the columns
+    `reference_scenario`, `reference_product`, `reference_n_rows`,
+    `reference_value`, `difference` (`value - reference_value`, in the row's `unit`)
+    and `ratio` (`value / reference_value`, in unit `"1"`). Both are null where
+    either value is null, and `ratio` too where `reference_value` is 0.
+
+    A row is paired with the row of the same (`cover_hash`, `design_id`,
+    `design_scenario`, `asset_id`, `level`, `split`, `fold`) on the reference, so it
+    compares one cover or design with itself across scenarios, never two covers, two
+    designs or two scopes. Rows on the reference itself are left out, since their
+    differences are 0. Every metric column is carried, `payout_frequency` and
+    `unidentified_share` among them.
+
+    `reference=None` takes the set's reference from the metadata. Any label in the
+    table may be stated instead. The result has no rank, no best flag and no ordering
+    by a metric. It keeps the table's metadata and adds `setup.drift`, with the
+    reference used.
+
+    Raises `TypeError` for a table that isn't a `pyarrow.Table` or a `reference` that
+    isn't a string, and `EvaluationError` for a table `to_long` refuses, a table that
+    states no reference when none is given, a reference that isn't in the table, or a
+    row with no row to pair with on the reference.
+    """
+    long = to_long(table)
+    metadata = EvaluationMetadata.from_table(table)
+    chosen = _drift_reference(reference, metadata)
+    names = long.column("scenario").unique().to_pylist()
+    if chosen not in names:
+        raise EvaluationError(
+            f"the table holds no scenario {chosen!r}, so it has no reference rows; it "
+            f"holds {names}"
+        )
+    rows = long.select(
+        [*_PAIR_COLUMNS, "scenario", "product", "n_rows", "column", "value"]
+    ).to_pylist()
+
+    def key_of(row: Mapping[str, Any]) -> tuple[Any, ...]:
+        return (*(row[name] for name in _PAIR_COLUMNS), row["column"])
+
+    on_reference = {key_of(row): row for row in rows if row["scenario"] == chosen}
+    keep = [row["scenario"] != chosen for row in rows]
+    paired: list[Mapping[str, Any]] = []
+    for row, kept in zip(rows, keep, strict=True):
+        if not kept:
+            continue
+        found = on_reference.get(key_of(row))
+        if found is None:
+            raise EvaluationError(
+                f"the row of cover {row['cover_hash']} on scenario {row['scenario']!r} "
+                f"(design {row['design_id']}, level {row['level']!r}, fold "
+                f"{row['fold']}) has no row on the reference {chosen!r}"
+            )
+        paired.append(found)
+    values = [row["value"] for row, kept in zip(rows, keep, strict=True) if kept]
+    differences: list[float | None] = []
+    ratios: list[float | None] = []
+    for value, found in zip(values, paired, strict=True):
+        base = found["value"]
+        known = value is not None and base is not None
+        differences.append(None if not known else float(value) - float(base) + 0.0)
+        ratios.append(
+            None if not known or base == 0.0 else float(value) / float(base) + 0.0
+        )
+    result = long.filter(pa.array(keep, pa.bool_()))
+    additions = (
+        [chosen] * len(paired),
+        [found["product"] for found in paired],
+        [found["n_rows"] for found in paired],
+        [found["value"] for found in paired],
+        differences,
+        ratios,
+    )
+    for field, column in zip(_DRIFT_FIELDS, additions, strict=True):
+        result = result.append_column(field, pa.array(column, field.type))
+    updated = _replaced(
+        metadata,
+        setup=_replaced(
+            metadata.setup,
+            drift={
+                "columns": {
+                    "difference": "value - reference_value, in the row's unit",
+                    "ratio": "value / reference_value, in unit 1",
+                },
+                "reference": chosen,
+            },
+        ),
+    )
+    stored = dict(long.schema.metadata or {})
+    stored[EVALUATION_METADATA_KEY.encode("utf-8")] = updated.to_json().encode("utf-8")
+    return result.replace_schema_metadata(stored)

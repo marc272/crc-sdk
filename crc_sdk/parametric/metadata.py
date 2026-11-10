@@ -24,7 +24,17 @@ with sorted keys. It holds:
   `method` `"kfold_pooled"` and `details` with `k` and the held-out blocks'
   hashes in fold order. `bootstrap_intervals` adds `intervals`: the method, the
   resampling unit, the number of resamples, the level and the columns whose
-  level reaches the block's worst row. `intervals` is null otherwise;
+  level reaches the block's worst row. `intervals` is null otherwise.
+  `compare_scenarios` adds `scenarios`: the reference, the labels,
+  `mixed_products`, `design_on`, which scenarios share draws and the generator
+  record they share, and per scenario its source kind, `hazard`, `pathway`,
+  `horizon`, `product`, `members` (null for a per-year scenario), where it reads
+  the index, `n_rows` and its `blocks`, one per fold: the block's rows, how it
+  was made, a window's rows per member and the columns whose level reaches its
+  worst row. Each of its evaluations also has `scenario`, `design_scenario` and
+  `premium_bases`, and `method` may be `"other_scenario"` and `leakage_check`
+  `"different_sources"`. `to_drift` adds `drift`, with the reference used. Both
+  are absent, and read as null, on any other table;
 - `columns`: for every metric column, its metric, parameter, unit and a
   one-line definition;
 - `covers`: every cover's label, hash and full document, the hash of every
@@ -76,7 +86,12 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal, Self, TypeGuard
 
 import pyarrow as pa  # type: ignore[import-untyped]
-from pydantic import ValidationError, model_validator
+from pydantic import (
+    SerializerFunctionWrapHandler,
+    ValidationError,
+    model_serializer,
+    model_validator,
+)
 
 from crc_sdk.impacts._types import ContentHash, StrictFrozenModel
 from crc_sdk.parametric.errors import EvaluationError
@@ -330,6 +345,89 @@ def _merged_intervals(
     return {**first, "short_block_columns": list(flagged)}
 
 
+_BLOCK_FIELDS = ("n_rows", "blocks")
+"""The fields of a scenario in `setup.scenarios` that differ between folds."""
+
+
+def _check_scenarios_record(record: Mapping[str, Any]) -> None:
+    """Raise `ValueError` unless `setup.scenarios` has the keys that are read."""
+    entries = record.get("scenarios")
+    if not isinstance(record.get("reference"), str) or not isinstance(entries, Mapping):
+        raise ValueError("setup.scenarios needs a reference and its scenarios")
+    if record["reference"] not in entries:
+        raise ValueError("setup.scenarios must describe its reference")
+    for label, entry in entries.items():
+        blocks = entry.get("blocks") if isinstance(entry, Mapping) else None
+        if not isinstance(blocks, list) or not all(
+            isinstance(block, Mapping) and {"n_rows", "sample_hash"} <= set(block)
+            for block in blocks
+        ):
+            raise ValueError(f"setup.scenarios[{label!r}] needs its blocks")
+
+
+def _without_blocks(record: Mapping[str, Any]) -> dict[str, Any]:
+    """`record` without what differs between the folds of one set."""
+    return {
+        **record,
+        "scenarios": {
+            label: {
+                key: value for key, value in entry.items() if key not in _BLOCK_FIELDS
+            }
+            for label, entry in record["scenarios"].items()
+        },
+    }
+
+
+def _merged_scenarios(
+    records: Sequence[dict[str, Any] | None],
+) -> dict[str, Any] | None:
+    """One `setup.scenarios` for several tables; `None` if none has any.
+
+    Every table must state one set of scenarios. The folds of a set differ in
+    their blocks only: the blocks are combined without repeats, and a scenario's
+    `n_rows` is the sum over them.
+    """
+    if all(record is None for record in records):
+        return None
+    if any(record is None for record in records):
+        raise EvaluationError(
+            "the metadata differ in their scenarios: every table of a merge states "
+            "one setup.scenarios, or none does"
+        )
+    stated = [record for record in records if record is not None]
+    if len({_json_text(_without_blocks(record)) for record in stated}) > 1:
+        raise EvaluationError(
+            "the metadata differ in their scenarios: only the blocks of one set of "
+            "scenarios may differ between tables"
+        )
+    first = stated[0]
+    merged: dict[str, Any] = {}
+    for label, entry in first["scenarios"].items():
+        blocks = list(
+            _unique(
+                block
+                for record in stated
+                for block in record["scenarios"][label]["blocks"]
+            )
+        )
+        merged[label] = {
+            **entry,
+            "blocks": blocks,
+            "n_rows": sum(int(block["n_rows"]) for block in blocks),
+        }
+    return {**first, "scenarios": merged}
+
+
+def _merged_drift(records: Sequence[dict[str, Any] | None]) -> dict[str, Any] | None:
+    """One `setup.drift` for several tables; `None` if none has any."""
+    if len({_json_text(record) for record in records}) > 1:
+        raise EvaluationError(
+            "the metadata differ in their drift: they take differences from different "
+            "references"
+        )
+    return records[0]
+
+
 class ColumnEntry(_EvaluationModel):
     """One metric column: its metric, parameter, unit and definition."""
 
@@ -360,8 +458,11 @@ class EvaluationSetup(_EvaluationModel):
     evaluation run (each with its `sample_hash`, `split` and `fold`, and, in
     what `compare` and `evaluate` write, the `level` and `scope` of its rows
     and its `allocation`). `intervals` is what `bootstrap_intervals` records,
-    and null on any other table. Raises `EvaluationError` for a sample or an
-    evaluation without those keys.
+    and null on any other table. `scenarios` is what `compare_scenarios` records
+    and `drift` what `to_drift` records; each is null on any other table and left
+    out of its document, so such a table's document is what it was before they
+    existed. Raises `EvaluationError` for a sample or an evaluation without those
+    keys.
     """
 
     basis: Literal["annual"] = "annual"
@@ -369,6 +470,16 @@ class EvaluationSetup(_EvaluationModel):
     samples: tuple[dict[str, Any], ...]
     evaluations: tuple[dict[str, Any], ...]
     intervals: dict[str, Any] | None = None
+    scenarios: dict[str, Any] | None = None
+    drift: dict[str, Any] | None = None
+
+    @model_serializer(mode="wrap")
+    def _without_absent(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        document: dict[str, Any] = handler(self)
+        for key in ("scenarios", "drift"):
+            if document.get(key) is None:
+                document.pop(key, None)
+        return document
 
     @model_validator(mode="after")
     def _check(self) -> Self:
@@ -381,6 +492,8 @@ class EvaluationSetup(_EvaluationModel):
                 raise ValueError(
                     "every setup evaluation needs a sample_hash, a split and a fold"
                 )
+        if self.scenarios is not None:
+            _check_scenarios_record(self.scenarios)
         return self
 
 
@@ -478,7 +591,9 @@ class EvaluationMetadata(_EvaluationModel):
         evaluations, covers, designs, sources, source records, licences and
         generator states are combined without repeats. Intervals of several
         tables must have one method, unit, number of resamples and level, and
-        their flagged columns are combined. `created_at` is the latest one.
+        their flagged columns are combined. Tables of `compare_scenarios` must
+        state one set of scenarios, of which only the blocks may differ, and
+        those are combined. `created_at` is the latest one.
 
         Raises `EvaluationError` if the items disagree, and `TypeError` for an
         item that is not `EvaluationMetadata`.
@@ -577,6 +692,8 @@ class EvaluationMetadata(_EvaluationModel):
                     entry for item in items for entry in item.setup.evaluations
                 ),
                 intervals=_merged_intervals([item.setup.intervals for item in items]),
+                scenarios=_merged_scenarios([item.setup.scenarios for item in items]),
+                drift=_merged_drift([item.setup.drift for item in items]),
             ),
             columns=columns,
             covers=tuple(
@@ -1646,6 +1763,22 @@ _ROW_KEYS = ("sample_hash", "split", "fold", "design_id")
 """The columns of a comparison table that name each row's evaluation and design."""
 
 
+def _kept_scenarios(
+    scenarios: Mapping[str, Any], evaluations: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """`setup.scenarios` for the evaluations a table's rows name, and the reference."""
+    named = {entry.get("scenario") for entry in evaluations}
+    hashes = {entry.get("sample_hash") for entry in evaluations}
+    kept: dict[str, Any] = {}
+    for label, entry in scenarios["scenarios"].items():
+        if label in named or label == scenarios["reference"]:
+            blocks = [
+                block for block in entry["blocks"] if block["sample_hash"] in hashes
+            ]
+            kept[label] = {**entry, "blocks": blocks}
+    return {**scenarios, "labels": list(kept), "scenarios": kept}
+
+
 def _of_rows(
     metadata: EvaluationMetadata, table: Any
 ) -> tuple[
@@ -1686,14 +1819,29 @@ def _of_rows(
         )
     described = [name for name in ("level", "scope") if name in table.column_names]
     hashed = "cover_hash" in table.column_names
+    # Across scenarios a block has one evaluation per design scenario.
+    by_design = (
+        setup.get("scenarios") is not None and "design_scenario" in table.column_names
+    )
     rows = table.select(
-        [*_ROW_KEYS, *described, *(["cover_hash"] if hashed else [])]
+        [
+            *_ROW_KEYS,
+            *described,
+            *(["cover_hash"] if hashed else []),
+            *(["design_scenario"] if by_design else []),
+        ]
     ).to_pylist()
+
+    def key_of(entry: Mapping[str, Any]) -> Any:
+        """The evaluation a row or a record of one names."""
+        first = (entry["sample_hash"], entry["split"], entry["fold"])
+        return (*first, entry.get("design_scenario")) if by_design else first
+
     # The levels and scopes of the rows the table still holds.
     named: dict[Any, dict[str, list[str]]] = {}
     covers: dict[Any, set[str]] = {}
     for row in rows:
-        key = (row["sample_hash"], row["split"], row["fold"])
+        key = key_of(row)
         entry = named.setdefault(key, {name: [] for name in described})
         for name in described:
             if row[name] not in entry[name]:
@@ -1709,24 +1857,27 @@ def _of_rows(
             name: [
                 item for item in evaluation[name] if item["cover_hash"] in covers[key]
             ]
-            for name in ("rows", "packages")
+            for name in ("rows", "packages", "premium_bases")
             if name in evaluation
         }
 
     evaluations = [
-        {
-            **entry,
-            **named[(entry["sample_hash"], entry["split"], entry["fold"])],
-            **of_covers(entry, (entry["sample_hash"], entry["split"], entry["fold"])),
-        }
+        {**entry, **named[key_of(entry)], **of_covers(entry, key_of(entry))}
         for entry in setup["evaluations"]
-        if (entry["sample_hash"], entry["split"], entry["fold"]) in named
+        if key_of(entry) in named
     ]
-    unknown = set(named) - {
-        (e["sample_hash"], e["split"], e["fold"]) for e in evaluations
-    }
+    # A drift's rows leave out the reference's, which its differences read.
+    drift = setup.get("drift")
+    reference = None if drift is None else drift.get("reference")
+    if reference is not None:
+        evaluations += [
+            entry
+            for entry in setup["evaluations"]
+            if entry.get("scenario") == reference and key_of(entry) not in named
+        ]
+    unknown = set(named) - {key_of(entry) for entry in evaluations}
     if unknown:
-        sample_hash, split, fold = min(unknown, key=str)
+        sample_hash, split, fold, *_ = min(unknown, key=str)
         raise EvaluationError(
             "a row of the table names an evaluation that its metadata does not "
             f"describe: sample {_short(sample_hash)} ({split}, fold {fold}); give "
@@ -1773,6 +1924,11 @@ def _of_rows(
             "samples": samples,
             "evaluations": evaluations,
             "intervals": intervals,
+            **(
+                {}
+                if setup.get("scenarios") is None
+                else {"scenarios": _kept_scenarios(setup["scenarios"], evaluations)}
+            ),
         },
         designs,
         sources,
@@ -2138,6 +2294,29 @@ def _pooled_split(
     )
 
 
+_LEAKAGE_CHECKS: Mapping[Any, str] = {
+    "passed": "the leakage check passed: the two share no period of one source",
+    "different_sources": (
+        "different sources: the two have no lineage or run in common, so no row could "
+        "be compared; that does not say that the sources are independent, since two "
+        "runs may share a history or a calibration, which the module can't see"
+    ),
+}
+"""What each recorded leakage check says, out of sample."""
+
+
+def _cross_row(evaluation: Mapping[str, Any], where: str) -> str:
+    """Whose terms an `other_scenario` evaluation reads, and on whose block."""
+    scenario = _get(evaluation, "scenario", str, where)
+    designed_on = _get(evaluation, "design_scenario", str, where)
+    who = (
+        "covers given as is, from the reference's design block,"
+        if designed_on is None
+        else f"designs from scenario {designed_on}"
+    )
+    return f"{who} on the block of scenario {scenario}"
+
+
 def _split(
     evaluation: Mapping[str, Any],
     samples: Mapping[str, Mapping[str, Any]],
@@ -2180,6 +2359,8 @@ def _split(
         how = f"{folded}, on a separate sample from another source"
     elif method == "disjoint_periods":
         how = f"{folded}, on periods of the same source the design sample lacks"
+    elif method == "other_scenario":
+        how = f"{folded}, on another scenario's block: {_cross_row(evaluation, where)}"
     else:
         how = f"{folded}, split method not stated"
     designs = [str(value) for value in _list(evaluation, "design_samples", where)]
@@ -2188,10 +2369,8 @@ def _split(
     )
     if "design_samples" not in evaluation:
         designed = "the design sample, not known yet"
-    checked = (
-        "the leakage check passed: the two share no period of one source"
-        if evaluation.get("leakage_check") == "passed"
-        else "no leakage check is recorded"
+    checked = _LEAKAGE_CHECKS.get(
+        evaluation.get("leakage_check"), "no leakage check is recorded"
     )
     return (
         f"Split: out of sample, {how}: evaluated on {evaluated}; designed on "
@@ -2435,6 +2614,12 @@ _ONE_CURVE = (
 )
 """What an evaluation says when its blocks are draws from one curve."""
 
+_ONE_WINDOW = (
+    "Out of sample here means new draws from the same window of horizons, so these "
+    "rows test the design's sampling error, not the curves of the window."
+)
+"""What an evaluation says when its blocks are draws from one window of horizons."""
+
 
 def _draws_from_one_curve(
     evaluation: Mapping[str, Any],
@@ -2446,7 +2631,8 @@ def _draws_from_one_curve(
     Those are fresh draws, and a holdout or k-fold of draws, pooled or not. Before
     execution a plan's evaluations name no sample, and its samples are all of one
     kind. Where the metadata records the curves, a design block whose curve the
-    evaluation block does not read is not one curve, whatever the method. A pooled
+    evaluation block does not read is not one curve, whatever the method, and
+    neither is a window of horizons beside anything but the same members. A pooled
     evaluation of covers given as is has no design block.
     """
     method = evaluation.get("method")
@@ -2477,10 +2663,23 @@ def _draws_from_one_curve(
             if source.get("sample_hash") == block and source.get("curve") is not None
         }
 
+    def members(block: Any) -> Any:
+        return next(
+            (
+                sample.get("members")
+                for sample in samples
+                if sample.get("sample_hash") == block
+            ),
+            None,
+        )
+
     details = evaluation.get("details") or {}
-    held = set().union(*map(curves, details.get("blocks") or [sample_hash]))
+    blocks = details.get("blocks") or [sample_hash]
+    held = set().union(*map(curves, blocks))
+    window = members(blocks[0])
     return all(
-        curves(block) <= held for block in evaluation.get("design_samples") or ()
+        curves(block) <= held and members(block) == window
+        for block in evaluation.get("design_samples") or ()
     )
 
 
@@ -2816,6 +3015,391 @@ def _rank_block_lines(
     return _first_seen(lines)
 
 
+def _window_lines(samples: Sequence[Mapping[str, Any]]) -> list[str]:
+    """One line per window of horizons among samples no set of scenarios states."""
+    lines: list[str] = []
+    for i, sample in enumerate(samples):
+        members = _list(sample, "members", f"setup.samples[{i}]")
+        if len(members) < 2:
+            continue
+        names = _join([f"{pathway} {horizon}" for pathway, horizon in members])
+        lines.append(
+            f"Window of horizons: {len(members)} curves ({names}), one pathway at "
+            "several horizons, mixed with equal weight on one set of uniforms: row d "
+            f"reads member d mod {len(members)}. The horizon column is the centre of "
+            "the members, a horizon no row need be read at, and nothing is "
+            "interpolated between them: every row is a draw from a curve the dataset "
+            "holds."
+        )
+    return _first_seen(lines)
+
+
+_CMIP6_CAVEAT = (
+    "a climate model is a model world, so use results as change signals, not design "
+    "values"
+)
+"""crc-sdk's own caveat on native CMIP6, from `docs/sources/cmip6.md`."""
+
+
+def _block_made(made: Mapping[str, Any], where: str) -> str:
+    """How a scenario's block was made."""
+    kind = _get(made, "kind", str, where)
+    if kind == "holdout":
+        fraction = _number(made.get("train_fraction"), f"{where}.train_fraction")
+        return f"from a holdout with train fraction {fraction}"
+    if kind == "kfold":
+        fold = _get(made, "fold", int, where)
+        return f"from fold {fold} of a {_get(made, 'k', int, where)}-fold split"
+    return "as built, with no split"
+
+
+def _scenario_block(
+    block: Mapping[str, Any],
+    members: Sequence[Any],
+    samples: Mapping[str, Mapping[str, Any]],
+    where: str,
+) -> str:
+    """A block's rows, how it was made, and its rows per member of a window."""
+    rows = _years(samples.get(str(block.get("sample_hash"))), where)
+    text = f"{rows}, {_block_made(block.get('made') or {}, where)}"
+    counts = _list(block, "member_rows", where)
+    if len(members) > 1:
+        each = ", ".join(
+            f"{member[1]}: {count}"
+            for member, count in zip(members, counts, strict=True)
+        )
+        text += f" (rows per member on this block: {each})"
+    return text
+
+
+def _named_or_silent(value: Any) -> str:
+    return "none recorded" if value is None else str(value)
+
+
+def _hazard_read(entry: Mapping[str, Any]) -> str:
+    """The hazard a scenario reads, and whether the caller stated its name."""
+    hazard = entry.get("hazard")
+    if not isinstance(hazard, Mapping):
+        return "none recorded"
+
+    def name(record: Mapping[str, Any]) -> str:
+        said = (
+            "as the caller states"
+            if record.get("from") == "stated"
+            else "as its source names it"
+        )
+        return f"{record.get('name')}, {said}"
+
+    if isinstance(hazard.get("name"), str):
+        return name(hazard)
+    return _join(
+        [
+            f"component {part}: {name(own)}"
+            for part, own in hazard.items()
+            if own is not None
+        ]
+    )
+
+
+def _scenario_line(
+    label: str,
+    entry: Mapping[str, Any],
+    reference: str,
+    samples: Mapping[str, Mapping[str, Any]],
+    where: str,
+) -> str:
+    """Statement 1: one scenario's label, role, sources, rows and block."""
+    role = " (the reference)" if label == reference else ""
+    members = _list(entry, "members", where)
+    blocks = [
+        _scenario_block(block, members, samples, f"{where}.blocks[{i}]")
+        for i, block in enumerate(_objects(entry, "blocks", where))
+    ]
+    text = (
+        f"Scenario {label}{role}: hazard {_hazard_read(entry)}; product "
+        f"{_named_or_silent(entry.get('product'))}; pathway "
+        f"{_named_or_silent(entry.get('pathway'))}; horizon "
+        f"{_named_or_silent(entry.get('horizon'))}; rows: "
+        f"{'; '.join(blocks) or 'not among these rows'}."
+    )
+    if len(members) > 1:
+        names = _join([f"{pathway} {horizon}" for pathway, horizon in members])
+        text += (
+            f" A window of {len(members)} horizons: {names}, mixed with equal weight "
+            "on one set of uniforms. The horizon column is their centre, a horizon no "
+            "row need be read at."
+        )
+    elif members:
+        pathway, horizon = members[0]
+        pair = f"{_named_or_silent(pathway)} {_named_or_silent(horizon)}"
+        text += f" A single horizon: {pair}."
+    elif entry.get("horizon") is not None:
+        text += " The horizon column is the centre of the series' whole window."
+    return text
+
+
+def _cross_rows(
+    evaluations: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Each cross row's terms and block, once, in words."""
+    return _first_seen(
+        _cross_row(evaluation, f"setup.evaluations[{i}]")
+        for i, evaluation in enumerate(evaluations)
+        if evaluation.get("method") == "other_scenario"
+    )
+
+
+def _fixed_line(evaluations: Sequence[Mapping[str, Any]]) -> str:
+    """Statement 2: what stays fixed, and what a cross row is."""
+    text = (
+        "Fixed across the scenarios: each cover's or design's terms, the loss model, "
+        "the values, the basis-risk model, the pricing and the metric options."
+    )
+    crossed = _cross_rows(evaluations)
+    if crossed:
+        text += (
+            f" A cross row is a cover or design from one scenario on another's block: "
+            f"{_join(crossed)}. Its terms are read on that block as they stand, in "
+            "index units, and nothing rescales them: a cross row says what the same "
+            "terms would pay on that block."
+        )
+    return text
+
+
+def _products_differ(scenarios: Mapping[str, Any], reference: str) -> list[str]:
+    """Statement 4: the scenarios whose product differs from the reference's."""
+    entries = _get(scenarios, "scenarios", Mapping, "setup.scenarios") or {}
+    ours = (entries.get(reference) or {}).get("product")
+    return [
+        (
+            f"Products: scenario {label} reads "
+            f"{_named_or_silent(entry.get('product'))} and the reference {reference} "
+            f"reads {_named_or_silent(ours)}, so a "
+            "difference between them includes the products: resolution, method and "
+            "pooling differ, and it can't be attributed to the scenario alone."
+        )
+        for label, entry in entries.items()
+        if entry.get("product") != ours
+    ]
+
+
+def _read_at(places: Sequence[Mapping[str, Any]], where: str) -> str:
+    """Where a scenario reads the index, for each asset or component."""
+    if len(places) > _MANY_ASSETS:
+        kinds = _first_seen(str(place.get("kind")) for place in places)
+        said = {
+            "h3_cell": "H3 cell",
+            "nearest_cell": "nearest grid cell",
+            "station": "station",
+        }
+        return (
+            f"{len(places)} assets, each at its "
+            f"{_join([said.get(kind, 'stated location') for kind in kinds])}"
+        )
+    parts: list[str] = []
+    for i, place in enumerate(places):
+        kind = place.get("kind")
+        owner = _get(place, "owner", str, f"{where}[{i}]")
+        if kind == "h3_cell":
+            parts.append(f"the H3 cell {place.get('cell')} of {owner}")
+        elif kind == "nearest_cell":
+            latitude = _degrees(float(place["latitude"]))
+            longitude = _degrees(float(place["longitude"]))
+            parts.append(
+                f"the nearest grid cell of {owner}, centred at "
+                f"({latitude}, {longitude})"
+            )
+        elif kind == "station":
+            parts.append(f"station {place.get('station')}, for {owner}")
+        else:
+            parts.append(f"where the source of {owner} states")
+    return _join(_first_seen(parts))
+
+
+def _index_line(scenarios: Mapping[str, Any]) -> str:
+    """Statement 5: where each scenario reads the index."""
+    entries = _get(scenarios, "scenarios", Mapping, "setup.scenarios") or {}
+    parts = [
+        f"scenario {label} at {_read_at(_objects(entry, 'index_read', label), label)}"
+        for label, entry in entries.items()
+    ]
+    return f"Index: {'; '.join(parts)}. Each scenario reads its own index there."
+
+
+_PREMIUM_BASES = {
+    "design": "the design premium, the contract price set on the design block",
+    "reference": "priced once, with the row's pricing, on the reference's design block",
+    "stated": "stated with premiums=",
+}
+"""What each premium basis says across scenarios."""
+
+
+def _premium_line(evaluations: Sequence[Mapping[str, Any]]) -> str | None:
+    """Statement 6: the premium basis of every cover."""
+    by_basis: dict[str, list[str]] = {}
+    for i, evaluation in enumerate(evaluations):
+        for j, entry in enumerate(
+            _objects(evaluation, "premium_bases", f"setup.evaluations[{i}]")
+        ):
+            where = f"setup.evaluations[{i}].premium_bases[{j}]"
+            basis = _get(entry, "premium_basis", str, where)
+            if basis is None:
+                continue
+            names = by_basis.setdefault(basis, [])
+            name = str(entry.get("cover_label"))
+            if name not in names:
+                names.append(name)
+    if not by_basis:
+        return None
+    parts = [
+        f"{_join(names)}: {_PREMIUM_BASES.get(basis, basis)}"
+        for basis, names in by_basis.items()
+    ]
+    return (
+        f"Premium basis: {'; '.join(parts)}. premium and the net-loss columns stay at "
+        "that contract price on every block, and premium_repriced prices the same "
+        "payouts on each block."
+    )
+
+
+def _budget_line(
+    designs: Sequence[Mapping[str, Any]],
+    labels: Mapping[str, str | None],
+    samples: Mapping[str, Mapping[str, Any]],
+    unit: str,
+) -> str | None:
+    """Statement 7: whether each design's budget moves with the scenario."""
+    records = [record for record in designs if record.get("kind") != "pooled"]
+    parts: list[str] = []
+    for record in records:
+        design_id = _short(record["design_id"])
+        where = f"designs[{design_id}]"
+        budget = _get(record, "budget", Mapping, where)
+        if budget is None:
+            continue
+        sample = samples.get(str(record.get("sample_hash"))) or {}
+        label = labels.get(str(record["design_id"]))
+        name = f"{label} ({design_id})" if label else design_id
+        on = f"{name}, designed on scenario {sample.get('scenario')}"
+        if budget.get("ratio") is not None:
+            ratio = _number(budget["ratio"], f"{where}.budget.ratio")
+            parts.append(
+                f"{on}: ratio, a premium of at most {ratio} x E[L] of its design "
+                "block, so the bound moves with the scenario"
+            )
+        elif budget.get("amount") is not None:
+            amount = _number(budget["amount"], f"{where}.budget.amount")
+            parts.append(
+                f"{on}: amount, a premium of at most {amount} {unit}, so the bound "
+                "does not move with the scenario"
+            )
+    return f"Budgets: {'; '.join(parts)}." if parts else None
+
+
+def _tail_lines(scenarios: Mapping[str, Any], options: Any) -> list[str]:
+    """Statement 9: beta is one on every scenario, and the short blocks' columns."""
+    betas = (options or {}).get("betas") if isinstance(options, Mapping) else None
+    lines = (
+        [
+            f"Tails: beta is the same on every scenario "
+            f"({_numbers(betas, 'setup.metric_options.betas')}), while the loss level "
+            "of its tail is not."
+        ]
+        if betas
+        else []
+    )
+    by_block: dict[tuple[int, tuple[str, ...]], list[str]] = {}
+    entries = _get(scenarios, "scenarios", Mapping, "setup.scenarios") or {}
+    for label, entry in entries.items():
+        for j, block in enumerate(_objects(entry, "blocks", label)):
+            where = f"setup.scenarios.{label}.blocks[{j}]"
+            columns = tuple(
+                str(name) for name in _list(block, "short_block_columns", where)
+            )
+            if columns:
+                count = _get(block, "n_rows", int, where) or 0
+                names = by_block.setdefault((count, columns), [])
+                if label not in names:
+                    names.append(label)
+    for (rows, columns), labels in by_block.items():
+        lines.append(
+            f"Short blocks: on the {rows} rows of {_join(labels)}, a beta with "
+            "(1 - beta) * n <= 1 reads the block's worst row and a return period above "
+            f"n its largest value, in these columns: {', '.join(columns)}."
+        )
+    return lines
+
+
+def _widths_line(scenarios: Mapping[str, Any]) -> str | None:
+    """Statement 10: windows of different widths, or one beside a single horizon."""
+    entries = _get(scenarios, "scenarios", Mapping, "setup.scenarios") or {}
+    widths = {
+        label: len(entry["members"])
+        for label, entry in entries.items()
+        if entry.get("members")
+    }
+    if len(set(widths.values())) <= 1:
+        return None
+    if min(widths.values()) == 1:
+        what = "a window of horizons beside a single horizon"
+    else:
+        what = "windows of different widths"
+    named = _join([f"{label} ({width})" for label, width in widths.items()])
+    return (
+        f"Widths: this set holds {what}, with these numbers of members: {named}. A "
+        "difference between them includes the difference in width."
+    )
+
+
+def _scenario_lines(
+    setup: Mapping[str, Any],
+    evaluations: Sequence[Mapping[str, Any]],
+    samples: Mapping[str, Mapping[str, Any]],
+    designs: Sequence[Mapping[str, Any]],
+    labels: Mapping[str, str | None],
+    unit: str,
+) -> list[str]:
+    """The statements of a comparison across scenarios, next to its numbers."""
+    scenarios = _get(setup, "scenarios", Mapping, "setup")
+    if scenarios is None:
+        return []
+    reference = _get(scenarios, "reference", str, "setup.scenarios") or ""
+    entries = _get(scenarios, "scenarios", Mapping, "setup.scenarios") or {}
+    lines = [
+        _scenario_line(label, entry, reference, samples, f"setup.scenarios.{label}")
+        for label, entry in entries.items()
+    ]
+    lines.append(_fixed_line(evaluations))
+    shared = scenarios.get("shared_draws")
+    if isinstance(shared, Mapping):
+        names = [str(label) for label in _list(shared, "labels", "setup.scenarios")]
+        lines.append(
+            f"Shared draws: the curve scenarios {_join(names)} share one set of "
+            "evaluation draws, separate from the design's: row d holds one uniform and "
+            "one noise factor on each."
+        )
+    lines += _products_differ(scenarios, reference)
+    lines.append(_index_line(scenarios))
+    for line in (
+        _premium_line(evaluations),
+        _budget_line(designs, labels, samples, unit),
+    ):
+        if line is not None:
+            lines.append(line)
+    native = [
+        label
+        for label, entry in entries.items()
+        if "cmip6" in str(entry.get("product") or "").split("+")
+    ]
+    if native:
+        lines.append(f"Native CMIP6 ({_join(native)}): {_CMIP6_CAVEAT}.")
+    lines += _tail_lines(scenarios, setup.get("metric_options"))
+    width = _widths_line(scenarios)
+    if width is not None:
+        lines.append(width)
+    return lines
+
+
 def _is_document(value: Any) -> TypeGuard[Mapping[str, Any]]:
     """Whether `value` is a whole document, such as `explain()`'s, not a setup."""
     return isinstance(value, Mapping) and "setup" in value and "samples" not in value
@@ -2837,14 +3421,28 @@ def setup_text(
       the scenario, and the annual basis (one draw is one year);
     - `Split`, one line per evaluation: in or out of sample, the fold, how
       the split was made (a holdout and its train fraction, k-fold and k,
-      fresh draws, a separate sample), the evaluation and design samples
-      (years, periods, blocks) and the leakage check; and, where the design and
-      evaluation blocks are draws from one curve, that these rows test the
-      design's sampling error, not the curve. A pooled evaluation has one line,
+      fresh draws, a separate sample, another scenario's block with the two
+      scenarios named), the evaluation and design samples (years, periods,
+      blocks) and the leakage check; and, where the design and evaluation blocks
+      are draws from one curve or from one window of horizons, that these rows
+      test the design's sampling error, not the curve. A pooled evaluation has one line,
       with k, the rows and that each year is evaluated by the design made
       without it;
     - `Seeds`: the plan's seed (`plan_seed`) and the fresh draws' seed
       (`fresh_draws_seed`) that the evaluations' `details` record, if any;
+    - on a table of `compare_scenarios`, in this order: one `Scenario` line each
+      (its label, whether it is the reference, the hazard it reads and whether
+      the caller stated that name, its product, pathway and horizon, its rows and
+      how each block was made, and whether it is a single horizon or a window,
+      with a window's members and each one's rows); `Fixed across the
+      scenarios` (what stays fixed, and which scenario's terms a cross row reads
+      on which block); `Shared draws`, for curves; `Products`, where a scenario's
+      differs from the reference's; `Index` (where each reads it); `Premium
+      basis`; `Budgets` (whether each design's moves with the scenario); `Native
+      CMIP6` (crc-sdk's caveat, for that product); `Tails` and `Short blocks`;
+      and `Widths`, where windows of different widths, or one beside a single
+      horizon, stand side by side. `Drift` on a table of `to_drift`: the
+      reference its differences read;
     - `Sample`: the source kind, the probability semantics and who stated
       them, the basis-risk model and its parameters, and for a model that acts
       on the hazard the mean hazard and the mean impact with it over without
@@ -2882,6 +3480,9 @@ def setup_text(
       number of rows, that every run has the same weight, and that a draw
       mixes model spread with year-to-year variability and that the number
       of rows is not an effective sample size;
+    - `Window of horizons`, outside a comparison across scenarios: a window's
+      members, that they are mixed with equal weight on one set of uniforms, and
+      that `horizon` is their centre, interpolating nothing;
     - `Sample notes`: what the sources recorded, such as draws beyond the
       fitted support, a pooled ensemble, dropped years, an index read from
       another series, a comonotone index and loss, or the assumption of a
@@ -3051,7 +3652,8 @@ def setup_text(
     for i, evaluation in enumerate(evaluations):
         text = _split(evaluation, by_hash, f"setup.evaluations[{i}]")
         if _draws_from_one_curve(evaluation, samples, recorded):
-            text += f" {_ONE_CURVE}"
+            evaluated = by_hash.get(str(evaluation.get("sample_hash"))) or {}
+            text += f" {_ONE_WINDOW if evaluated.get('members') else _ONE_CURVE}"
         if not one_seed and _seeds_text(*seeds[i]):
             text += f" Seeds: {_seeds_text(*seeds[i])}."
         if not shared:
@@ -3070,6 +3672,14 @@ def setup_text(
         plan = next(iter(plan_seeds), None)
         fresh = next(iter(fresh_seeds), None)
         lines.append(f"Seeds: {_seeds_text(plan, fresh)}.")
+    across = _get(setup, "scenarios", Mapping, "setup") is not None
+    lines += _scenario_lines(setup, evaluations, by_hash, designs, labels, unit)
+    drift = _get(setup, "drift", Mapping, "setup")
+    if drift is not None:
+        lines.append(
+            "Drift: each row's difference and ratio are against the row of the same "
+            f"cover or design on scenario {drift.get('reference')}, with no ranking."
+        )
 
     # Every sample is checked, also those the text describes only once.
     years = [_years(sample, f"setup.samples[{i}]") for i, sample in enumerate(samples)]
@@ -3103,6 +3713,8 @@ def setup_text(
     lines += _location_lines(recorded, by_hash)
     lines += _trend_lines(samples)
     lines += _pool_lines(samples)
+    if not across:
+        lines += _window_lines(samples)
     notes = _notes(samples, evaluations)
     if notes:
         lines.append(f"Sample notes: {' '.join(notes)}")
@@ -3111,8 +3723,11 @@ def setup_text(
         pricing = "not stated"
     else:
         pricing = pricings[0] if shared else "as each split states"
+    where_priced = (
+        "once on the reference's design block" if across else "on the evaluation sample"
+    )
     priced = (
-        f"Pricing: {pricing}, on the evaluation sample, for the covers given as "
+        f"Pricing: {pricing}, {where_priced}, for the covers given as "
         "is; a design keeps its design premium, and premium_basis says which "
         "premium a row uses."
     )

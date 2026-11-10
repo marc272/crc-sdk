@@ -37,6 +37,9 @@ order:
   value exceeded with probability 1/T, the lower (1 - 1/T)-quantile; T is in
   years, because a draw is a year.
 
+A table of `compare_scenarios` also has `premium_repriced`, after `premium`: the
+pricing on this block's payouts, where `premium` stays the contract price.
+
 `MetricOptions` states beta, T, the loss thresholds l and the payout
 threshold eps; nothing is hidden. Labels write the number with the point as
 an underscore, as crc-sdk's return-period columns do: beta = 0.99 gives
@@ -337,6 +340,20 @@ def metric_columns(options: MetricOptions) -> tuple[MetricColumn, ...]:
     columns += _per_period("uncovered_rp", "uncovered loss", options)
     columns += _per_period("net_loss_rp", "net loss", options)
     return tuple(columns)
+
+
+def _with_repriced(columns: tuple[MetricColumn, ...]) -> tuple[MetricColumn, ...]:
+    """`columns` with `premium_repriced` after `premium`, as across scenarios."""
+    position = next(i for i, column in enumerate(columns) if column.name == "premium")
+    repriced = MetricColumn(
+        "premium_repriced",
+        "premium_repriced",
+        {},
+        "loss",
+        "the pricing on this block's payouts: what a renewal on this block would "
+        "cost, beside premium, the contract price",
+    )
+    return (*columns[: position + 1], repriced, *columns[position + 1 :])
 
 
 def _fsum(values: FloatArray) -> float:

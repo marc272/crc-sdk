@@ -1044,7 +1044,7 @@ def test_draws_from_another_curve_do_not_say_so() -> None:
         GIVEN, _draws(2, ANOTHER), split="out_of_sample", design_sample=_draws(1)
     )
     (line,) = _split_lines(table)
-    assert "on fresh Monte Carlo draws" in line
+    assert "on a separate sample from another source" in line
     assert SAME_CURVE not in line
 
 

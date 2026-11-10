@@ -878,16 +878,17 @@ the held-out years.
 Every number in a comparison rests on a setup: the asset, the basis, the
 split, the samples' source and basis-risk model, the pricing and, for a design,
 its objective and constraints. `setup_text(result.metadata)` states that setup
-in plain text, one statement per line (`Level`, `Split`, `Seeds`, `Sample`,
-`Source`, `Location`, `Trend`, `Sample notes`, `Pricing`, `Design`, `Intervals`,
-`Metrics`), for a notebook or a report to print next to the numbers. The text
+in plain text, one statement per line (`Level`, `Split`, `Seeds`, `Scenario`,
+`Sample`, `Source`, `Location`, `Trend`, `Sample notes`, `Pricing`, `Design`,
+`Intervals`, `Metrics`), for a notebook or a report to print next to the numbers. The text
 reads only the metadata, so the same metadata always gives the same text, and
 statements that every split or sample shares are written once.
 
 - `Split` says, on rows whose design block and evaluation block are draws from
   one curve (fresh draws, or a holdout or k-fold of draws), that out of sample
   there means new draws from the same curve, so these rows test the design's
-  sampling error, not the curve. A pooled evaluation has one `Split` line, with
+  sampling error, not the curve; on a window of horizons, new draws from the same
+  window. A pooled evaluation has one `Split` line, with
   k, the rows and that each year is evaluated by the design made without it.
 - `Seeds` states the plan's seed, which every evaluation's `details` holds
   under `"plan_seed"`, and the fresh draws' seed, which every fresh-draw
@@ -918,6 +919,19 @@ statements that every split or sample shares are written once.
   level and the unit, what an interval leaves out, that two rows' intervals are
   not a test of a difference between them, and the columns whose level reaches
   the block's worst row.
+- On a table of [`compare_scenarios`](#several-scenarios-in-one-table), one
+  `Scenario` line each (its label, whether it is the reference, the hazard it
+  reads and whether the caller stated that name, its product, pathway and
+  horizon, its rows, how each block was made, and whether it is a single
+  horizon or a window, with a window's members and each one's rows); `Fixed
+  across the scenarios`, with which scenario's terms a cross row reads on which
+  block; `Shared draws`, on curves; `Products`, where a scenario's differs from
+  the reference's; `Index`, where each scenario reads it; `Premium basis`;
+  `Budgets`, whether each design's moves with the scenario; `Native CMIP6`
+  (crc-sdk's caveat, that results are change signals, not design values);
+  `Tails` and `Short blocks`; and `Widths`, where windows of different widths, or
+  one beside a single horizon, stand side by side, so that a difference includes
+  the width. A window outside a set of scenarios has a `Window of horizons` line.
 - `Sample notes` writes a note that counts draws once, with each sample's own
   counts. In the quick start, the draws beyond the curve's fitted support
   read "2527 of 5000 draws in the design sample and 2464 of 5000 in the fresh
@@ -1430,6 +1444,9 @@ The premium a row uses is, in this order:
 - otherwise the premium priced on the evaluation sample with `pricing`
   (`"evaluation"`).
 
+[`compare_scenarios`](#several-scenarios-in-one-table) prices a cover given as is
+once, on the reference's design block (`"reference"`).
+
 ### In and out of sample
 
 In sample means the design sample; out of sample means held-out year blocks
@@ -1440,16 +1457,32 @@ draws; the fold for k-fold, which must match the sample's own split).
 
 - An out-of-sample evaluation needs the design sample: a design brings its
   own; for a cover given as is, pass `design_sample=` with the sample its
-  terms were chosen on. Without one it raises `SampleError`. A design sample
-  that shares a period with the evaluation sample from the same source raises
-  `LeakageError`; on a [pool](#pooled-model-years), a (run, year) pair
-  does. So does a linear trend of either sample fitted on a year the
-  evaluation sample holds from the same source; the error names `fit_years`.
-  A trend or a `scenario` label does not make one source's rows another's.
+  terms were chosen on. Without one it raises `SampleError`.
+- A design sample that shares a row with the evaluation sample raises
+  `LeakageError`. Two samples share a row when one source feeds that row of each
+  in the same year, and each source is compared by its own lineage, whichever
+  samples hold it: the sample's own, each model run of a
+  [pool](#pooled-model-years) (a plain per-year sample counts as one run, so a
+  model-year can't be on both sides of a pool and one of its runs), a hazard or
+  an index series, a component of a sample of several hazards, or an asset of a
+  joined or drawn sample. So a (source, year) pair must not repeat, on a pool a
+  (run, year) pair. A linear trend of either sample fitted on a year the
+  evaluation sample holds from the same source raises too; the error names
+  `fit_years`. A trend or a `scenario` label does not make one source's rows
+  another's.
+- Two Monte Carlo samples also share a draw when a `hazard` step of one has the
+  generator record of a `hazard` step of the other and they have a period in
+  common, whatever the curve: row d of each then holds one uniform, and that
+  raises `LeakageError`. Build each block with a new generator from one seed
+  sequence, as reusing one generator state repeats its draws. The blocks of one
+  `holdout` have disjoint periods and pass.
 - In sample, a known design sample must be the evaluation sample itself.
 - The metadata records how the split was made: `holdout` (with the train
   fraction), `kfold` (with k), `fresh_draws` (Monte Carlo samples from
-  different generator states), `separate_sample` or `disjoint_periods`.
+  different generator states that read the design sample's curves, window for
+  window), `separate_sample` (another source, or draws from other curves),
+  `disjoint_periods` (other years of a source the design sample holds, seen
+  through any kind of sample) or, in `compare_scenarios`, `other_scenario`.
 
 Published numbers come from out-of-sample rows; in-sample rows show the gap
 between the two.
@@ -1471,7 +1504,7 @@ between the two.
 | `fold` | int32 | 0 for a holdout and fresh draws; the fold for k-fold. Null on a pooled row of `compare_pooled`, and only there |
 | `sample_hash` | string | The evaluation sample's `content_hash` |
 | `n_rows` | int32 | The number of rows of the evaluation sample |
-| `premium_basis` | string, nullable | `"stated"`, `"design"` or `"evaluation"`; null exactly on allocated rows |
+| `premium_basis` | string, nullable | `"stated"`, `"design"`, `"evaluation"` or, in `compare_scenarios`, `"reference"`; null exactly on allocated rows |
 | `unique`, `ties`, `degenerate_tail` | bool, int32, string; nullable | The design's non-uniqueness report; null for a cover given as is |
 | `components` | string, nullable | What the row's cover reads of a sample with index components, joined by `+`; null on a sample of one hazard |
 | `design_budget` | float64, nullable | The design's budget bound in payout units. On a `"package"` row, or the `"total"` row of a set of covers, the sum of the covers' bounds, null if any has none. Null for a cover given as is |
@@ -1605,6 +1638,114 @@ beyond the block's largest rows, so they understate how far the number could
 move, and the setup text names those columns. The table holds the metadata under
 the same key as a comparison's, with `setup.intervals`, and `write_comparison`
 writes it. Neither function ranks anything.
+
+### Several scenarios in one table
+
+A scenario is one block of rows a cover can be evaluated on: draws from a curve,
+usually [a window of horizons](#outcome-samples) and sometimes a single horizon, the
+held-out years of a per-year series, or the model-years of a pool. `ScenarioSet`
+holds one evaluation block per scenario under a reference you name; the module
+chooses none. `compare_scenarios` puts every cover or design on every scenario's
+block in one table, and `to_drift` adds each row's difference and ratio against a
+reference scenario. Neither says that a product, a pathway, a horizon or a design
+is better: a row is a measurement of a stated setup.
+
+```python
+from crc_sdk.parametric import ScenarioSet, compare_scenarios, sample_curve, to_drift
+
+# Each scenario's evaluation block on one set of draws: the same seed for every
+# block, a different one from the design's.
+def block(label, rows, seed):
+    return sample_curve(rows, metadata=metadata, n_draws=30_000,
+                        rng=numpy.random.default_rng(seed), loss_model=loss_model,
+                        basis_risk=ImpactNoise(0.3), asset_id="site", scenario=label)
+
+designed = design(template, block("2030s", rows_2030s, 11), MSE(), budget=budget)
+scenarios = ScenarioSet([block("2030s", rows_2030s, 22),
+                         block("2050s", rows_2050s, 22)], reference="2030s")
+
+table = compare_scenarios([designed], scenarios)
+drift = to_drift(table)
+print(setup_text(table))
+```
+
+`rows_2030s` and `rows_2050s` are lists of canonical rows, the members of a window.
+`ScenarioSet` refuses a set in which anything but the hazard's values differs.
+
+- **The rows.** One row per entry and scenario, the reference first, and every
+  row has `split="out_of_sample"`. `scenario` says where a row is evaluated and
+  `design_scenario` where it was designed, null for a cover given as is. How one
+  fixed cover drifts across scenarios and a design per scenario are slices of
+  this table. With one scenario, the rows are `compare`'s on its block, apart from
+  a given cover's premium, below.
+- **Entries.** Whatever `compare` takes on the set's samples: covers, designs, a
+  `JointDesignResult` or a mapping on samples of several assets, a `CoverPackage`
+  on samples of several hazards. A design brings its own design sample, whose
+  label must be one of the set's, and that label is the row's `design_scenario`.
+  The designs of one mapping or package must share it.
+- **`design_sample`** is the reference's design block, and is required when an
+  entry is a cover given as is. Its label must be the reference.
+- **`fold`.** One fold at a time, as `compare`. Concatenate folds with
+  `pyarrow.concat_tables` and give them `EvaluationMetadata.merge`, which requires
+  one set of scenarios.
+
+| What is shared | Curves beside curves | Years beside years |
+| --- | --- | --- |
+| Terms, loss model, values, basis-risk model, pricing, metric options | The same | The same |
+| The rows of the blocks | The same uniforms, row by row | Each scenario's own held-out years |
+| The number of rows | Equal | Each scenario's own |
+
+**The premium.** `premium` and the net-loss columns stay at the contract price.
+`premium_repriced`, a metric column only in these tables, after `premium`, is what
+a renewal on this block would cost.
+
+| Entry | `premium` and the net-loss columns | `premium_basis` | `premium_repriced` |
+| --- | --- | --- | --- |
+| A design | Its design premium | `"design"` | `pricing` on this block's payouts |
+| A cover given as is, with `premiums=` | The stated premium | `"stated"` | The same |
+| Another cover given as is | `pricing` once, on the reference's design block | `"reference"` | The same |
+| The `"total"` row of a set of covers, or a `"package"` row | The sum of its contracts' | Theirs | The sum of its contracts' |
+| The `"total"` row of a joint design | Its design premium, on the total | `"design"` | `pricing` on this block's total payout |
+| An allocated row | Null | Null | Null |
+
+Under `PurePremium`, `premium_repriced` equals `expected_payout`. `premiums=` maps a
+`cover_label` to a stated premium, and states every cover of a set or package or
+none of them, as in `bootstrap_intervals`. A budget is the design's:
+`Budget(ratio=k)` is a share of each design block's expected loss, so it moves with
+the scenario, and `Budget(amount=B)` doesn't. The setup text says which.
+
+**Cross rows.** A row whose design sample has another label than its block is a
+cross row. `setup.evaluations[*].method` is `"other_scenario"`, whatever the block's
+own split, which `details` keeps under `block`. For a cover given as is the design
+sample is the reference's design block. `design_scenario` and `scenario` name
+blocks; they don't say that the two are comparable. The terms are the resolved
+design's, in index units, and a threshold set on one scenario's values is read on
+another's as it stands: a cross row says what the same terms would pay on that
+block. Between per-year sources with no lineage or run in common, such as
+`historical` and `ssp585` pools, `leakage_check` is `"different_sources"`: no row
+could be compared. That doesn't say the sources are independent, since two runs
+may share a history or a calibration, and the module can't see that.
+
+**A short block.** On a block of n rows, CVaR at beta with (1 - beta) n <= 1 is the
+block's worst row, and a return period above n reads its largest value. `n_rows`
+shows the count and the setup text names the columns concerned.
+
+**`to_drift(table, *, reference=None)`** returns `to_long`'s columns, one row per
+metric, with `reference_scenario`, `reference_product`, `reference_n_rows`,
+`reference_value`, `difference` (`value - reference_value`) and `ratio` (`value /
+reference_value`, in unit `"1"`). Both are null where either value is null, and
+`ratio` too where `reference_value` is 0. A row is paired with the row of the same
+(`cover_hash`, `design_id`, `design_scenario`, `asset_id`, `level`, `split`, `fold`)
+on the reference, so it compares one cover or design with itself and never two
+covers, designs or scopes; a key without a reference row raises `EvaluationError`.
+Rows on the reference itself are left out. `reference=None` takes the set's
+reference, and any label in the table may be stated instead. Every metric column is
+carried, and the table has no rank, no best flag and no ordering by a metric.
+
+The metadata records the set under `setup.scenarios`, and `to_drift` the reference
+it used under `setup.drift`; `setup_text` states both next to the numbers. A joint
+design's rows are the owner's total, per scenario, as in
+[the rows of a joint design](#the-rows-of-a-joint-design).
 
 ## Design a cover
 
@@ -1955,9 +2096,10 @@ them.
 - **A `GaussianCopula` between curve samples.** The dependence models are
   `Independent()`, `Comonotonic()` and `EmpiricalCopula(reference)`.
 - **Several hazards in one index.** An index is one hazard at one location.
-- **Several scenarios at once.** A per-year plan names one `scenario` for its
-  rows, a sample on fitted curves is `"baseline"`, and a plan on fitted curves
-  samples one hazard, horizon and pathway per asset.
+- **Several scenarios at once on the plan.** A per-year plan names one
+  `scenario` for its rows, and a plan on fitted curves samples one hazard, horizon
+  and pathway per asset. `ScenarioSet`, `compare_scenarios` and `to_drift` are
+  functions.
 - **Several members of one model in a pool.** A model appears once, whatever
   its member. **An index read elsewhere on a pool**, even from the same run at
   another cell, is refused.
