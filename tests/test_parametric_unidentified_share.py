@@ -647,6 +647,16 @@ def test_a_joint_design_counts_a_year_if_any_asset_reads_a_filled_amount() -> No
     assert _row(in_sample, "total")["unidentified_share"] == 0.0
 
 
+def test_each_asset_of_a_joint_design_reads_its_own_amounts() -> None:
+    # Asset B reaches past 20 in the design block, so only A has a filled amount.
+    book = _book([0.0, 12.0, 15.0, 0.0, 5.0], [0.0, 0.0, 25.0, 15.0, 5.0])
+    templates = [_two_bands(asset=asset) for asset in book.asset_ids]
+    result = design_joint(templates, book, MSE())
+    assert dict(result.unidentified) == {"A": ("levels[1]",), "B": ()}
+    table = compare([result], _book(*BOOK_READ, start=2100), split="out_of_sample")
+    assert _row(table, "total")["unidentified_share"] == 0.5
+
+
 def _designs_of_each_asset() -> dict[str, Any]:
     book = _book(*BOOK_DESIGN)
     return {
@@ -1049,6 +1059,18 @@ def test_a_design_sample_of_another_source_does_not_say_so() -> None:
     assert SAME_CURVE not in setup_text(table)
 
 
+def test_a_design_sample_that_was_not_drawn_does_not_say_so() -> None:
+    table = evaluate(
+        GIVEN,
+        _draws(2),
+        split="out_of_sample",
+        design_sample=_sample(np.linspace(5.0, 40.0, 10), start=2100),
+    )
+    (line,) = _split_lines(table)
+    assert "on a separate sample from another source" in line
+    assert SAME_CURVE not in line
+
+
 def test_each_evaluation_says_it_for_its_own_blocks() -> None:
     draws = evaluate(GIVEN, _draws(2), split="out_of_sample", design_sample=_draws(1))
     in_sample = evaluate(GIVEN, _draws(3), split="in_sample")
@@ -1077,6 +1099,11 @@ def _setup_mapping(entries: Mapping[str, Any]) -> dict[str, Any]:
 
 def test_a_setup_alone_of_fresh_draws_says_so_with_no_sample_to_read() -> None:
     assert SAME_CURVE in setup_text(_setup_mapping({"method": "fresh_draws"}))
+
+
+def test_a_setup_alone_in_sample_does_not_say_so() -> None:
+    setup = _setup_mapping({"method": "fresh_draws", "split": "in_sample"})
+    assert SAME_CURVE not in setup_text(setup)
 
 
 def test_a_setup_alone_of_an_unknown_kind_of_holdout_does_not_say_so() -> None:
