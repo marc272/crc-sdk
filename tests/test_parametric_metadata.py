@@ -164,6 +164,106 @@ def test_merge_rejects_disagreeing_metadata() -> None:
         EvaluationMetadata.merge(base, base.model_dump())  # type: ignore[arg-type]
 
 
+def _design_record(**changes: Any) -> dict[str, Any]:
+    # A synthetic record with the keys of `DesignResult.to_record` that matter here.
+    solve_changes = changes.pop("solve", {})
+    return {
+        "design_id": "sha256:" + "1" * 64,
+        "route": "lp",
+        "objective_value": 3.5,
+        "premium": 12.0,
+        "solve": {
+            "status": "optimal",
+            "message": "Optimal",
+            "iterations": 7,
+            "solves": 1,
+            "seconds": 0.25,
+            "options": {"solve": {"threads": 1}},
+            **solve_changes,
+        },
+        **changes,
+    }
+
+
+def _with_designs(*records: dict[str, Any]) -> EvaluationMetadata:
+    base = _metadata(evaluate(COVER, _sample(), split="in_sample"))
+    return base.model_copy(update={"designs": records})
+
+
+def test_merge_keeps_the_first_of_two_records_differing_in_solve_time() -> None:
+    early = _with_designs(_design_record())
+    late = _with_designs(_design_record(solve={"seconds": 9.5}))
+    assert EvaluationMetadata.merge(early, late).designs == early.designs
+    assert EvaluationMetadata.merge(late, early).designs == late.designs
+    assert [
+        record["solve"]["seconds"]
+        for record in EvaluationMetadata.merge(late, early, early).designs
+    ] == [9.5]
+
+
+def test_merge_of_a_solve_time_leaves_the_rest_of_the_metadata_as_it_was() -> None:
+    early = _with_designs(_design_record())
+    late = _with_designs(_design_record(solve={"seconds": 9.5}))
+    assert EvaluationMetadata.merge(early, late) == EvaluationMetadata.merge(
+        early, early
+    )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"route": "qp"},
+        {"objective_value": 3.75},
+        {"premium": 12.5},
+        {"seconds": 1.0},
+        {"solve": {"status": "time_limit"}},
+        {"solve": {"message": "Time limit reached"}},
+        {"solve": {"iterations": 8}},
+        {"solve": {"solves": 2}},
+        {"solve": {"options": {"solve": {"threads": 2}}}},
+        {"solve": {"elapsed": 1.0}},
+    ],
+    ids=str,
+)
+@pytest.mark.parametrize("seconds", [0.25, 9.5], ids=["same_time", "other_time"])
+def test_merge_rejects_records_that_differ_in_anything_but_the_solve_time(
+    changes: dict[str, Any], seconds: float
+) -> None:
+    timed = {**changes, "solve": {**changes.get("solve", {}), "seconds": seconds}}
+    one = _with_designs(_design_record())
+    two = _with_designs(_design_record(**timed))
+    with pytest.raises(EvaluationError, match="two different records"):
+        EvaluationMetadata.merge(one, two)
+    with pytest.raises(EvaluationError, match="two different records"):
+        EvaluationMetadata.merge(two, one)
+
+
+@pytest.mark.parametrize("untimed", ["no_seconds", "null_solve", "no_solve"])
+def test_merge_rejects_a_record_that_states_no_solve_time_beside_one_that_does(
+    untimed: str,
+) -> None:
+    timed = _design_record()
+    other = dict(timed)
+    if untimed == "no_seconds":
+        other["solve"] = {k: v for k, v in timed["solve"].items() if k != "seconds"}
+    elif untimed == "null_solve":
+        other["solve"] = None
+    else:
+        del other["solve"]
+    with pytest.raises(EvaluationError, match="two different records"):
+        EvaluationMetadata.merge(_with_designs(timed), _with_designs(other))
+    with pytest.raises(EvaluationError, match="two different records"):
+        EvaluationMetadata.merge(_with_designs(other), _with_designs(timed))
+
+
+def test_merge_rejects_a_third_record_differing_in_more_than_time() -> None:
+    one = _with_designs(_design_record())
+    two = _with_designs(_design_record(solve={"seconds": 9.5}))
+    three = _with_designs(_design_record(solve={"status": "time_limit"}))
+    with pytest.raises(EvaluationError, match="two different records"):
+        EvaluationMetadata.merge(one, two, three)
+
+
 def test_check_table_finds_undescribed_rows() -> None:
     table = compare([COVER], _sample(), split="in_sample")
     metadata = _metadata(table)
