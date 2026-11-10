@@ -1271,14 +1271,22 @@ def _schema(
 
 
 def _parts_entry(provenance: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Each asset's loss and basis-risk models, on a sample of several assets."""
+    """Each asset's loss and basis-risk models, on a sample of several assets.
+
+    A model that acts on the hazard adds that asset's two mean ratios, which the
+    setup text states. Nothing else of a part's details is kept.
+    """
     parts = provenance["parts"]
     if parts is None:
         return None
-    return {
-        asset: {key: part[key] for key in ("basis_risk", "loss_model") if key in part}
-        for asset, part in parts.items()
-    }
+    entries: dict[str, Any] = {}
+    for asset, part in parts.items():
+        entry = {key: part[key] for key in ("basis_risk", "loss_model") if key in part}
+        summary = part["details"].get("basis_risk")
+        if summary and "hazard_mean_ratio" in summary:
+            entry["details"] = {"basis_risk": summary}
+        entries[asset] = entry
+    return entries
 
 
 def _sample_entry(sample: OutcomeSample, roles: set[str]) -> dict[str, Any]:

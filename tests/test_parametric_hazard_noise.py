@@ -819,24 +819,98 @@ def test_the_setup_text_says_the_factors_are_independent_between_assets() -> Non
         ) in line
 
 
-def test_a_joined_sample_says_where_the_ratios_are() -> None:
-    parts = [
-        sample_annual(
-            _series(_values(seed), name=asset),
-            loss_model=LOSS,
-            basis_risk=MODEL,
-            asset_id=asset,
-            rng=np.random.default_rng(seed),
-        )
-        for asset, seed in (("a", 1), ("b", 2))
-    ]
-    joined = OutcomeSample.join(parts)
-    designs = {asset: STEP for asset in ASSETS}
-    line = _sample_line(
-        setup_text(_metadata_of(evaluate(designs, joined, split="in_sample")))
+def _joined(model: Any) -> OutcomeSample:
+    return OutcomeSample.join(
+        [
+            sample_annual(
+                _series(_values(seed), name=asset),
+                loss_model=LOSS,
+                basis_risk=model,
+                asset_id=asset,
+                rng=np.random.default_rng(seed),
+            )
+            for asset, seed in (("a", 1), ("b", 2))
+        ]
     )
+
+
+def test_a_joined_sample_states_each_assets_ratios() -> None:
+    joined = _joined(MODEL)
+    metadata = _metadata_of(
+        evaluate(dict.fromkeys(ASSETS, STEP), joined, split="in_sample")
+    )
+    line = _sample_line(setup_text(metadata))
     assert f"{STATED}, the factors independent between assets" in line
-    assert "recorded per asset, in each asset's own provenance" in line
+    assert "the mean hazard and the mean impact are" in line
+    assert joined.provenance.parts is not None
+    for asset in ASSETS:
+        summary = joined.provenance.parts[asset]["details"]["basis_risk"]
+        assert (
+            f"{summary['hazard_mean_ratio']:.6g} and "
+            f"{summary['impact_mean_ratio']:.6g} for {asset}"
+        ) in line
+    assert "own provenance" not in line
+
+
+@pytest.mark.parametrize(
+    "model",
+    [NoBasisRisk(), ImpactNoise(0.3, upper=1.0), _Holds(0.2)],
+    ids=lambda m: m.name,
+)
+def test_a_joined_sample_of_another_model_keeps_its_setup_document(model: Any) -> None:
+    joined = _joined(model)
+    metadata = _metadata_of(
+        evaluate(dict.fromkeys(ASSETS, STEP), joined, split="in_sample")
+    )
+    (entry,) = metadata.setup.samples
+    documents = joined.provenance.to_document()["parts"]
+    assert entry["parts"] == {
+        asset: {
+            "basis_risk": documents[asset]["basis_risk"],
+            "loss_model": documents[asset]["loss_model"],
+        }
+        for asset in ASSETS
+    }
+    assert "mean hazard" not in _sample_line(setup_text(metadata))
+
+
+def test_a_joined_sample_above_five_assets_gives_the_ranges() -> None:
+    names = [f"a{k}" for k in range(6)]
+    setup = {
+        "samples": [
+            {
+                "asset_ids": names,
+                "details": {"draws": 40, "periods": [1981, 2020]},
+                "parts": {
+                    name: {
+                        "basis_risk": {"kind": "hazard_noise", "sigma": 0.25},
+                        "details": {
+                            "basis_risk": {
+                                "hazard_mean_ratio": 1.0 + k / 100,
+                                "impact_mean_ratio": 1.5 + k / 10,
+                            }
+                        },
+                    }
+                    for k, name in enumerate(names)
+                },
+                "source_kind": "annual",
+            }
+        ]
+    }
+    assert (
+        "the mean hazard is 1 to 1.05 and the mean impact 1.5 to 2 across 6 assets"
+    ) in _sample_line(setup_text(setup))
+
+
+def test_the_warning_is_true_of_both_models_and_names_hazard_noise_first() -> None:
+    with pytest.warns(ComonotoneIndexWarning) as plain:
+        _annual(NoBasisRisk())
+    with pytest.warns(ComonotoneIndexWarning) as zero:
+        _annual(HazardNoise(0.0))
+    assert str(plain[0].message) == str(zero[0].message)
+    message = str(zero[0].message)
+    assert "without a basis-risk model" not in message
+    assert message.index("HazardNoise") < message.index("ImpactNoise")
 
 
 def test_the_setup_text_gives_the_range_above_five_assets() -> None:

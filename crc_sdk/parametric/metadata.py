@@ -701,42 +701,51 @@ def _hazard_noise_scope(sample: Mapping[str, Any]) -> str:
     return ""
 
 
+def _has_mean_ratios(record: Any) -> bool:
+    return isinstance(record, Mapping) and "hazard_mean_ratio" in record
+
+
+def _recorded_mean_ratios(
+    sample: Mapping[str, Any], where: str
+) -> dict[str, Mapping[str, Any]]:
+    """The records of the two mean ratios by name; `""` for a sample's own.
+
+    `details.basis_risk` holds the record of a sample, or of each of its assets
+    or components by name. A joined sample holds each asset's in that part.
+    """
+    details = _get(sample, "details", Mapping, where) or {}
+    recorded = _get(details, "basis_risk", Mapping, f"{where}.details") or {}
+    if _has_mean_ratios(recorded):
+        return {"": recorded}
+    named = {str(k): each for k, each in recorded.items() if _has_mean_ratios(each)}
+    if named:
+        return named
+    for asset, part in (_get(sample, "parts", Mapping, where) or {}).items():
+        own = _get(part, "details", Mapping, f"{where}.parts.{asset}") or {}
+        if _has_mean_ratios(own.get("basis_risk")):
+            named[str(asset)] = own["basis_risk"]
+    return named
+
+
 def _mean_ratios(sample: Mapping[str, Any], where: str) -> str:
     """What a model that acts on the hazard did to the means, in words.
 
-    `details.basis_risk` holds the two ratios of a sample, or of each of its
-    assets or components by name. A joined sample's details don't, as its
-    setup entry keeps each asset's models only, so the text says where they
-    are. Blocks of one sample carry its ratios, which are over the rows as
-    built. Above `_MANY_ASSETS` names the text gives the ranges.
+    Blocks of one sample carry its ratios, which are over the rows as built.
+    Above `_MANY_ASSETS` names the text gives the ranges.
     """
-    details = _get(sample, "details", Mapping, where) or {}
-    place = f"{where}.details"
-    recorded = _get(details, "basis_risk", Mapping, place) or {}
-    place += ".basis_risk"
-    if "hazard_mean_ratio" in recorded:
-        named = {"": recorded}
-    else:
-        named = {
-            str(name): each
-            for name, each in recorded.items()
-            if isinstance(each, Mapping) and "hazard_mean_ratio" in each
-        }
+    named = _recorded_mean_ratios(sample, where)
     if not named:
-        if details and "basis_risk" not in details and _states_hazard_noise(sample):
-            return (
-                "; the mean hazard and mean impact, with the factor over without "
-                "it, are recorded per asset, in each asset's own provenance"
-            )
         return ""
+    place = f"{where}.details.basis_risk"
 
     def say(value: Any, at: str) -> str:
         return "not defined" if value is None else _number(value, at)
 
     lead = "; over the rows as built, with the model over without it, "
     if "" in named:
-        hazard = say(recorded.get("hazard_mean_ratio"), f"{place}.hazard_mean_ratio")
-        impact = say(recorded.get("impact_mean_ratio"), f"{place}.impact_mean_ratio")
+        own = named[""]
+        hazard = say(own.get("hazard_mean_ratio"), f"{place}.hazard_mean_ratio")
+        impact = say(own.get("impact_mean_ratio"), f"{place}.impact_mean_ratio")
         return f"{lead}the mean hazard is {hazard} and the mean impact {impact}"
     if len(named) <= _MANY_ASSETS:
         each = [
