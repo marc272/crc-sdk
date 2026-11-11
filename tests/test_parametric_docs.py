@@ -128,7 +128,18 @@ def test_every_python_example_on_the_page_runs(
                 }
             if quick_start is None and "result" in namespace:
                 quick_start = namespace["result"]
-    capsys.readouterr()
+    printed = capsys.readouterr().out
+
+    # The terms the page shows are what its examples print.
+    _, fenced = _code(DOCS.read_text(encoding="utf-8"))
+    shown = [
+        block.partition("\n")[2].rstrip("\n")
+        for block in fenced
+        if block.startswith("text\n") and "\nHash: sha256:" in block
+    ]
+    assert len(shown) == 2
+    for terms in shown:
+        assert f"{terms}\n" in printed
 
     # The table quick start: no semantics, no aggregation, and both rows held out.
     sample = table_start["sample"]

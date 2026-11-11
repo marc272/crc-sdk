@@ -1079,7 +1079,8 @@ cover.payout_values([45.0, 60.0, 85.0, 140.0])   # array([0., 1000., 5000., 2000
   whatever made it. Left out, the terms don't say, and the document holds `"aggregation":
   null`. The setup text states no cover's terms, so it says nothing of
   aggregation: it names a design's template by its label and the start of its
-  hash, which differs with and without one.
+  hash, which differs with and without one. `cover.terms_text()` states the
+  terms, aggregation included ([the terms in words](#the-terms-in-words)).
 - **Cover:** `Cover(index, payout, *, payout_unit, asset_id=None, label=None)`.
   The payout's `tail` must equal the index's. `label` is a display name only.
 
@@ -1140,6 +1141,65 @@ two covers with the same terms have the same hash; `asset_id` is, so the same
 terms on another asset are another contract. `Cover.from_json(text)` reads a
 cover back, and covers compare, hash and pickle by their document.
 
+## The terms in words
+
+`cover.terms_text()` states a cover's terms in plain text, one statement a line,
+for a report or for a risk owner to pass to a broker. It is a view of the
+terms: it reads and writes nothing, and the document and the hash don't change.
+
+```python
+print(cover.terms_text())
+```
+
+```text
+Asset: warehouse-a
+Index: rx1day, in mm/day, read at the asset; larger values are more severe (tail upper); aggregation: annual_maximum; source: not stated
+Payout per year, in EUR: steps, the levels never decrease (kind "step", monotone=True)
+  - nothing when rx1day is below 60 mm/day
+  - 1,000 EUR when rx1day is at or above 60 mm/day and below 80 mm/day
+  - 5,000 EUR when rx1day is at or above 80 mm/day and below 100 mm/day
+  - 20,000 EUR when rx1day is at or above 100 mm/day
+Most paid in a year: 20,000 EUR
+Free parameters: none
+Hash: sha256:d6d4fb6ee74366eb0fe226b0dcecf07f992c23e4d5051953a9b0c9ffef9cf1e5, of the cover document (schema 1.0, semantics crc-parametric-cover/1)
+```
+
+- **The lines.** `Asset`: the asset the cover is written for, or that it names
+  none. `Index`: the hazard, its unit, where it is read, its severe side, the
+  aggregation and the source, saying plainly when the terms state no
+  aggregation or source. `Payout per year`: the payout unit and the family,
+  with its `kind`, then one line per band, knot or cell, from nothing to the
+  most severe. `Most paid in a year`, `Free parameters`, and `Hash`: the
+  `definition_hash`, with the document's schema and semantics versions. A
+  cover with a label starts with a `Label` line, which says the label is not a
+  term.
+- **Bands.** A value equal to a threshold belongs to the more severe band, so
+  with `tail="upper"` a band runs from "at or above" one threshold to "below"
+  the next, and with `tail="lower"` from "at or below" one to "above" the next.
+- **Numbers** are spelled exactly as the cover document holds them, grouped by
+  thousands and without an exponent: `1e3` is `1,000`, and a designed amount
+  keeps every digit. So the text states the terms that the hash identifies. A
+  rounded amount is another contract: build the cover with it, and it has its
+  own hash.
+- **Most paid in a year** is the largest amount the terms pay, which a
+  `LinearPayout` calls its limit: the largest level of a step, piecewise linear
+  or `StepGrid` payout, the sum of the components' for a `SumOf`, and the scale
+  times the largest of theirs for a `MaxOf`. A design's `Limit` is not a term
+  of the cover: it bounds the amounts a design chooses, and this line states
+  what they came to.
+- **Templates.** A free parameter appears in the lines by its name, as
+  `free_parameters()` lists it, and the `Free parameters` lines give each one's
+  bounds and grid, in its unit. While an amount is free, the most paid in a
+  year is not known.
+- **Several hazards.** On a `CompositeIndex` the `Index` line lists the
+  components in order. A `SumOf` or `MaxOf` gives each component's payout
+  under its name, and a `StepGrid` one line per cell ([covers on several
+  indices](#covers-on-several-indices)).
+- **A family of your own**, or a subclass of a built-in one, is stated by its
+  `kind` and its parameters as `parameters()` names them, with its amounts in
+  the payout unit when it is `LinearInAmounts`. The most it pays in a year is
+  not known.
+
 ## User-defined payouts
 
 A payout family is any class that implements the `PayoutFunction` protocol
@@ -1170,7 +1230,11 @@ probability each, and for each row an index value and a loss. One draw is one
 year: a cover pays once per draw, on that draw's index, against that draw's
 loss. `period` is the year, or the draw number of a simulated sample. `index`
 and `loss` have one row per draw and one column per asset, and `hazard` keeps
-the value the loss model read when it differs from the index.
+the value the loss model read when it differs from the index. `repr(sample)`
+prints no arrays, so it stays short at any size: the shape of `index` and
+`loss`, the asset ids (the first two and the last, above three), the hazard's
+name or a sample's components, the units, the semantics, the scenario and the
+start of `content_hash`.
 
 A sample can hold several assets. `OutcomeSample.join` puts one-asset samples of
 the same years side by side and `OutcomeSample.from_table` reads a table of
@@ -2668,6 +2732,32 @@ Cover(index, payout, *, payout_unit, asset_id=None, label=None)   # index: an In
 | A `CompositeIndex` | the components of its names, in its order; each unit and tail must be the component's | `SampleError` |
 
 A sample may hold components a cover doesn't read.
+
+`terms_text()` states a cover on several indices too
+([the terms in words](#the-terms-in-words)): every component of the index, and
+each component's payout or, for a `StepGrid`, each cell. Here the grid of the
+example above, with its levels stated rather than designed:
+
+```python
+print(grid.with_values({"levels[0,1]": 1e5, "levels[1,0]": 2e5,
+                         "levels[1,1]": 4e5}).terms_text())
+```
+
+```text
+Label: grid (a display name, not part of the terms)
+Asset: not named
+Index: 2 components, in this order
+  - rx1day: rx1day, in mm/day, read at the asset; larger values are more severe (tail upper); aggregation: annual_maximum; source: not stated
+  - txx: txx, in degC, read at the asset; larger values are more severe (tail upper); aggregation: annual_maximum; source: not stated
+Payout per year, in EUR: one amount per cell of a table over rx1day and txx, the levels never decrease along either (kind "step_grid", monotone=True)
+  - nothing when rx1day is below 70 mm/day and txx is below 36 degC
+  - 100,000 EUR when rx1day is below 70 mm/day and txx is at or above 36 degC
+  - 200,000 EUR when rx1day is at or above 70 mm/day and txx is below 36 degC
+  - 400,000 EUR when rx1day is at or above 70 mm/day and txx is at or above 36 degC
+Most paid in a year: 400,000 EUR
+Free parameters: none
+Hash: sha256:8f7878026907fb2fbc65871f217450a717a359a633f7079c0c3562aa7cfda09c, of the cover document (schema 1.1, semantics crc-parametric-cover/1)
+```
 
 ### Payouts over several indices
 

@@ -1732,7 +1732,7 @@ class StepGrid:
 
 # -- the terms in words ---------------------------------------------------------
 
-Axis = tuple[str, str]
+_Axis = tuple[str, str]
 """What a threshold is read on: the index's name, as a band names it, and its unit."""
 
 
@@ -1797,7 +1797,7 @@ def _role(text: str, value: Any, role: str) -> str:
 
 
 def _linear_words(
-    payout: LinearPayout, words: _Words, axis: Axis, prefix: str
+    payout: LinearPayout, words: _Words, axis: _Axis, prefix: str
 ) -> tuple[str, list[str]]:
     subject, unit = axis
     more, less = _sides(payout.tail)
@@ -1819,7 +1819,7 @@ def _linear_words(
 
 
 def _step_words(
-    payout: StepPayout, words: _Words, axis: Axis, prefix: str
+    payout: StepPayout, words: _Words, axis: _Axis, prefix: str
 ) -> tuple[str, list[str]]:
     subject, unit = axis
     thresholds = [
@@ -1844,7 +1844,7 @@ def _step_words(
 
 
 def _piecewise_words(
-    payout: PiecewiseLinearPayout, words: _Words, axis: Axis, prefix: str
+    payout: PiecewiseLinearPayout, words: _Words, axis: _Axis, prefix: str
 ) -> tuple[str, list[str]]:
     subject, unit = axis
     more, less = _sides(payout.tail)
@@ -1872,7 +1872,7 @@ def _piecewise_words(
 
 
 def _binary_words(
-    payout: BinaryPayout, words: _Words, axis: Axis, prefix: str
+    payout: BinaryPayout, words: _Words, axis: _Axis, prefix: str
 ) -> tuple[str, list[str]]:
     subject, unit = axis
     more, less = _sides(payout.tail)
@@ -1889,7 +1889,7 @@ def _binary_words(
 
 
 def _component_words(
-    payout: _OfComponents, words: _Words, axes: Mapping[str, Axis], prefix: str
+    payout: _OfComponents, words: _Words, axes: Mapping[str, _Axis], prefix: str
 ) -> list[str]:
     """Each component's payout, under its name, its parameters `<name>.<its own>`."""
     lines: list[str] = []
@@ -1903,7 +1903,7 @@ def _component_words(
 
 
 def _grid_words(
-    payout: StepGrid, words: _Words, axes: Mapping[str, Axis], prefix: str
+    payout: StepGrid, words: _Words, axes: Mapping[str, _Axis], prefix: str
 ) -> tuple[str, list[str]]:
     names = payout.index_names
     bins: list[list[str]] = []
@@ -1952,7 +1952,7 @@ def _user_words(payout: Any, words: _Words, prefix: str) -> tuple[str, list[str]
 
 
 def _payout_words(
-    payout: Any, words: _Words, axes: Mapping[str, Axis], prefix: str = ""
+    payout: Any, words: _Words, axes: Mapping[str, _Axis], prefix: str = ""
 ) -> tuple[str, list[str]]:
     """A payout's terms in words: a headline, and one line per band or part.
 

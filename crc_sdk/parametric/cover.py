@@ -25,8 +25,8 @@ from crc_sdk.parametric.index import (
 )
 from crc_sdk.parametric.parameters import Free, _resolve_values
 from crc_sdk.parametric.payouts import (
-    Axis,
     PayoutFunction,
+    _Axis,
     _free_words,
     _index_values,
     _most_words,
@@ -373,7 +373,7 @@ class Cover:
         lines.append(
             f"Asset: {'not named' if self._asset_id is None else self._asset_id}"
         )
-        axes: dict[str, Axis]
+        axes: dict[str, _Axis]
         if isinstance(index, CompositeIndex):
             lines.append(f"Index: {len(index.names)} components, in this order")
             lines += [
