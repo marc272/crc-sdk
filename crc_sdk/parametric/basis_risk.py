@@ -8,7 +8,11 @@ assumed: the samplers take `basis_risk` as a required argument.
   lognormal factor `exp(sigma * Z - sigma**2 / 2)`, one draw per year and
   asset. The cover pays on the index and the loss model reads the hazard at
   the asset, so a year can pay with no loss and a loss can occur with no
-  payout. `sigma` is an assumption the caller states.
+  payout. `sigma` is an assumption the caller states. The factor widens the
+  hazard, so the expected loss moves with `sigma`; with
+  `hold="hazard_distribution"` the hazard at the asset keeps the index's own
+  values, reassigned to the years by the rank of the index times the factor,
+  so the loss of one hazard keeps its distribution at every `sigma`.
 - `ImpactNoise(sigma, *, upper=None)`: multiplies each year's impact by a
   mean-one lognormal factor `exp(sigma * Z - sigma**2 / 2)`, one draw per
   year, then caps it at `upper` if given (1 for a damage ratio). The index is
@@ -30,7 +34,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from numbers import Real
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, get_args, runtime_checkable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -40,6 +44,9 @@ from crc_sdk.parametric.errors import SampleError
 __all__ = ["BasisRisk", "HazardBasisRisk", "HazardNoise", "ImpactNoise", "NoBasisRisk"]
 
 FloatArray = NDArray[np.float64]
+
+_Hold = Literal["hazard_mean", "hazard_distribution"]
+"""What `HazardNoise` holds as `sigma` moves: the mean hazard, or its distribution."""
 
 
 @runtime_checkable
@@ -163,10 +170,46 @@ class HazardNoise:
 
     `sigma` is an assumption the caller states, and the module does not
     estimate it. It is not the same physical quantity as the `sigma` of
-    `ImpactNoise`. The mean is on the hazard, not on the loss: with a damage
-    function that is convex or has a threshold, the mean impact moves with
-    `sigma`, and the samplers record that as `impact_mean_ratio` and
-    `hazard_mean_ratio` in the provenance's `details["basis_risk"]`.
+    `ImpactNoise`.
+
+    **What `sigma` does to the loss level.** The mean is on the hazard, not on
+    the loss. The factor keeps the mean hazard but widens the hazard at the
+    asset, so more years fall beyond a damage function's threshold or cap. With
+    a damage function that is convex, or zero below a threshold that most
+    years don't reach, the expected loss rises with `sigma`; with one that is
+    capped where most years lie, it can fall. A sweep over `sigma` then moves
+    the loss level as well as the gap between index and loss. The samplers
+    record both means as `hazard_mean_ratio` and `impact_mean_ratio` in the
+    provenance's `details["basis_risk"]`: over the rows as built, the mean with
+    the model over the mean on the same draws without it, which is the sample
+    at `sigma=0`. The setup text states them next to `sigma`.
+
+    **`hold="hazard_distribution"`** holds the loss level for such a sweep. The
+    factors are drawn as above, and `y_d = x_d * exp(sigma * Z_d - sigma**2 /
+    2)` ranks the rows, ties by the index and then by row. Row `d` then takes as
+    its hazard at the asset the index value of the rank that `y_d` has:
+    `h_d = x_(r_d)`, with `x_(k)` the `k`-th smallest index value of the rows
+    and `r_d` the rank of `y_d`. The hazard at the asset is a reordering of the
+    index's own values, so its distribution over the rows, and that of any
+    impact computed from it, is exactly the one at `sigma=0`, whatever the
+    damage function, and both mean ratios are 1. Only how the index and the
+    hazard at the asset are paired changes with `sigma`. A zero stays zero. On
+    a sample of several hazards each component keeps its own distribution and
+    its own loss; the combined loss keeps its mean when the rule adds the
+    impacts, and not in general.
+
+    This form assigns values across the rows of one call, as an
+    `EmpiricalCopula` does, so a block of its rows would hold values of the
+    other block's: `holdout` and `year_block_kfold` refuse to split its sample,
+    and an out-of-sample evaluation between two samples cut from one such
+    sample raises `LeakageError`. Build the design and the evaluation samples
+    with separate calls (fresh draws from a curve, or per-year samples of
+    separate years); each then holds its own rows' distribution and reads no
+    value of the other's. The default, `hold="hazard_mean"`, has no such step,
+    as each row's factor is its own. Both forms draw the same `Z_d`, so the two
+    forms of one `sigma` from one generator state read one set of draws, and
+    `to_document()` records `hold` only when it is not the default, so the
+    default's documents, rows and hashes don't change.
 
     The model suits a hazard on a ratio scale, where zero means none (rain,
     wind, depth). A negative hazard is refused, because a factor would move it
@@ -176,20 +219,26 @@ class HazardNoise:
     The factors are drawn with one call `rng.normal(-sigma**2 / 2, sigma,
     size=n)`, at every `sigma`, so a sweep over `sigma` from one generator
     state reads one set of `Z_d`. `sigma=0` is allowed: the factor is exactly 1,
-    the rows equal those of `NoBasisRisk()`, and the samplers warn with
-    `ComonotoneIndexWarning` as they do for it.
+    the rows equal those of `NoBasisRisk()` in either form, and the samplers
+    warn with `ComonotoneIndexWarning` as they do for it.
 
     The samplers refuse it next to a separate index series. The index and the
     hazard then already differ and the hazard at the asset is data, so a
     factor would contradict it.
 
-    Raises `SampleError` unless `sigma` is finite and not negative.
+    Raises `SampleError` unless `sigma` is finite and not negative and `hold` is
+    `"hazard_mean"` or `"hazard_distribution"`.
     """
 
     sigma: float
+    hold: _Hold = field(default="hazard_mean", kw_only=True)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sigma", _not_negative("sigma", self.sigma))
+        if not isinstance(self.hold, str) or self.hold not in get_args(_Hold):
+            raise SampleError(
+                f"hold must be one of {get_args(_Hold)}, got {self.hold!r}"
+            )
 
     @property
     def name(self) -> str:
@@ -197,8 +246,11 @@ class HazardNoise:
         return "hazard_noise"
 
     def to_document(self) -> dict[str, Any]:
-        """Return the kind and `sigma`."""
-        return {"kind": self.name, "sigma": self.sigma}
+        """Return the kind, `sigma`, and `hold` when it is not the default."""
+        document: dict[str, Any] = {"kind": self.name, "sigma": self.sigma}
+        if self.hold != "hazard_mean":
+            document["hold"] = self.hold
+        return document
 
     def apply(
         self,
@@ -219,8 +271,10 @@ class HazardNoise:
     ) -> tuple[FloatArray, FloatArray]:
         """Return the index unchanged and the hazard at the asset.
 
-        Raises `SampleError` without a `numpy.random.Generator`, at every
-        `sigma`, for a negative value, or when the index and the hazard
+        Under `hold="hazard_distribution"` the hazard at the asset is the index's
+        values reordered by the rank of the index times the factor, along the
+        first axis. Raises `SampleError` without a `numpy.random.Generator`, at
+        every `sigma`, for a negative value, or when the index and the hazard
         differ: they are one value here, and the factor multiplies it.
         """
         if not isinstance(rng, np.random.Generator):
@@ -241,7 +295,29 @@ class HazardNoise:
             )
         sigma = self.sigma
         log_factor = rng.normal(loc=-0.5 * sigma * sigma, scale=sigma, size=index.shape)
-        return index, np.asarray(index, dtype=np.float64) * np.exp(log_factor)
+        values = np.asarray(index, dtype=np.float64)
+        at_asset = values * np.exp(log_factor)
+        if self.hold == "hazard_mean":
+            return index, at_asset
+        return index, _reordered_by_rank(values, at_asset)
+
+
+def _reordered_by_rank(values: FloatArray, ranked: FloatArray) -> FloatArray:
+    """`values` reordered along the first axis so that their ranks are `ranked`'s.
+
+    Along each column, the row with the `k`-th smallest `ranked` gets the `k`-th
+    smallest of `values`; ties in `ranked` go by `values`, then by row, so a
+    zero of `values` keeps a zero wherever `ranked` is zero too.
+    """
+    rows = values.shape[0] if values.ndim else 1
+    flat_values = values.reshape(rows, -1)
+    flat_ranked = ranked.reshape(flat_values.shape)
+    result = np.empty_like(flat_values)
+    for column in range(flat_values.shape[1]):
+        own = flat_values[:, column]
+        order = np.lexsort((own, flat_ranked[:, column]))
+        result[order, column] = np.sort(own)
+    return result.reshape(values.shape)
 
 
 @dataclass(frozen=True)
