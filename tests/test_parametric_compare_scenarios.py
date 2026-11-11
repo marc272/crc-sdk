@@ -950,6 +950,39 @@ def test_an_allocation_is_refused_without_a_joint_design() -> None:
         compare_scenarios([designed], scenarios, values={"a": 1.0})
 
 
+@pytest.mark.parametrize("other", ["given-as-is", "designed-on-late"])
+def test_an_allocation_is_refused_beside_another_entry_of_any_scenario(
+    other: str,
+) -> None:
+    # The joint design is designed on "early"; the other entry on no scenario, or
+    # on "late", so each stands in a design-scenario group of its own.
+    designed, scenarios = _joint_setup()
+    options: dict[str, Any] = {}
+    entry: Any
+    if other == "given-as-is":
+        entry = _book_covers()
+        options["design_sample"] = _book("early", (1, 2))
+    else:
+        late = _book("late", (3, 4), horizon=2080, location=95.0)
+        entry = {
+            asset: design(template, late.asset(asset), MSE())
+            for asset, template in _book_covers(free=True).items()
+        }
+    with pytest.raises(
+        EvaluationError, match=r"positions \[1\] are not joint designs.*allocate\("
+    ):
+        compare_scenarios(
+            [designed, entry],
+            scenarios,
+            allocation="value",
+            values={"a": 1e6, "b": 1e6},
+            **options,
+        )
+    # Without allocation=, they stand in one table, and no row is allocated.
+    table = compare_scenarios([designed, entry], scenarios, **options)
+    assert {row["level"] for row in table.to_pylist()} == {"total", "asset"}
+
+
 def test_a_joint_designs_setup_text_stays_method_only() -> None:
     designed, scenarios = _joint_setup()
     text = setup_text(compare_scenarios([designed], scenarios))
@@ -1839,6 +1872,31 @@ def test_the_setup_text_names_a_station() -> None:
         [GIVEN], ScenarioSet([test], reference="one"), design_sample=train
     )
     assert "scenario one at station S1, for asset 'a'" in setup_text(table)
+
+
+def test_the_setup_text_names_a_station_by_the_column_its_series_names() -> None:
+    fields = {
+        "columns": {"year": "year", "value": "value", "station": "station_number"},
+        "where": {"station_number": "S1"},
+    }
+    train, test = holdout(_per_year_at("one", fields, first=2000))
+    table = compare_scenarios(
+        [GIVEN], ScenarioSet([test], reference="one"), design_sample=train
+    )
+    assert "scenario one at station S1, for asset 'a'" in setup_text(table)
+
+
+def test_the_setup_text_names_no_station_for_a_filter_on_other_columns() -> None:
+    fields = {"where": {"model": "M1", "scenario": "historical"}}
+    train, test = holdout(_per_year_at("one", fields, first=2000))
+    table = compare_scenarios(
+        [GIVEN], ScenarioSet([test], reference="one"), design_sample=train
+    )
+    text = setup_text(table)
+    assert "scenario one at where the source of asset 'a' states" in text
+    assert "station" not in text
+    (place,) = _scenarios_record(table)["scenarios"]["one"]["index_read"]
+    assert place == {"owner": "asset 'a'", "kind": "stated"}
 
 
 def test_the_setup_text_names_the_nearest_cell() -> None:

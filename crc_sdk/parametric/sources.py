@@ -1922,12 +1922,19 @@ class AnnualSeries:
         unit: str | None = None,
         years: Sequence[int] | None = None,
         source: Any = None,
+        station: str | None = None,
     ) -> AnnualSeries:
         """Read one location's series from a per-year table.
 
         `year` and `value` name the columns. `where` keeps the rows whose
         columns equal the given values, for example `{"station":
-        "USW00094728"}`; after it, each year may appear once. A null value
+        "USW00094728"}`; after it, each year may appear once. `station`
+        names the column of `where` that selects a station, so that the
+        series records it as one: for example `station="station_number"`
+        with `where={"station_number": "02HC024"}`. Left out, a `station` or
+        `station_id` filter or one-valued column is the station, and a filter
+        on any other column, such as `model` or `scenario`, names none. The
+        plan's `StationColumn` states its `table_column` here. A null value
         (a station's incomplete year) is a missing year. `years` states the
         years the series must cover; rows outside them are left out, and
         years without a row are missing. By default the series covers every
@@ -1961,7 +1968,8 @@ class AnnualSeries:
         NEX-GDDP-CMIP6's `annual_extremes()` iterator) or any table Arrow
         reads. Raises `SampleError` for missing columns, unmatched filters,
         repeated years, a unit mismatch between the caller, the table and the
-        source, or no unit stated by the caller or the table.
+        source, no unit stated by the caller or the table, or a `station`
+        that isn't a column of `where`.
         """
         data = _arrow_table(table, "an annual table")
         rows = data
@@ -1987,12 +1995,15 @@ class AnnualSeries:
                 mask = matches if mask is None else pc.and_(mask, matches)
             rows = data.filter(pc.fill_null(mask, False))
             filter_document = dict(where)
+        columns = {"year": year, "value": value}
+        if station is not None:
+            columns["station"] = _station_column(station, filter_document)
         if rows.num_rows == 0:
             raise SampleError(f"no rows of the annual table match where={where!r}")
         provenance: dict[str, Any] = {
             "kind": "table",
             "source": _series_source_document(source),
-            "columns": {"year": year, "value": value},
+            "columns": columns,
             "where": filter_document,
         }
         return cls._from_rows(
@@ -2109,6 +2120,24 @@ class AnnualSeries:
             years=requested,
             provenance=provenance,
         )
+
+
+def _station_column(station: Any, where: Mapping[str, Any] | None) -> str:
+    """`station`, the column of `where` that selects a station; else `SampleError`."""
+    if not isinstance(station, str) or not station:
+        raise SampleError(
+            f"station must name a column of where=, got {type(station).__name__}"
+            if not isinstance(station, str)
+            else "station must name a column of where=, got an empty string"
+        )
+    if where is None or station not in where:
+        filtered = "no column" if where is None else f"the columns {sorted(where)}"
+        raise SampleError(
+            f"station={station!r} names the column of where= that selects the "
+            f"station, but where= filters {filtered}; state where={{{station!r}: "
+            "<the station id>}"
+        )
+    return station
 
 
 def _series_unit(rows: Any, value: str, stated: str | None) -> str:
@@ -2253,6 +2282,8 @@ def _series_identity(series: AnnualSeries) -> dict[str, Any]:
     A lineage must not depend on when the data was fetched or how its rows
     were found, or the leakage checks would miss rows two series share. A
     series is `located` when its cell or its filter says which rows it reads.
+    The column a filter's station is read from (`from_table(station=)`) says
+    what the filter means, and the filter itself stays.
     """
     identity: dict[str, Any] = {
         "unit": series.unit,
@@ -2262,6 +2293,11 @@ def _series_identity(series: AnnualSeries) -> dict[str, Any]:
             if key not in _ROW_SEARCH
         },
     }
+    columns = identity.get("columns")
+    if isinstance(columns, Mapping) and "station" in columns:
+        identity["columns"] = {
+            name: column for name, column in columns.items() if name != "station"
+        }
     if "source" in identity:
         located = "cell" in identity or identity.get("where") is not None
         identity["source"] = _source_identity(identity["source"], located=located)

@@ -40,6 +40,7 @@ from crc_sdk.parametric import (
     NoBasisRisk,
     ParametricPlan,
     SampleError,
+    ScenarioError,
     StationColumn,
     StepPayout,
     compare,
@@ -48,6 +49,7 @@ from crc_sdk.parametric import (
     setup_text,
 )
 from crc_sdk.parametric.metadata import EVALUATION_METADATA_KEY
+from crc_sdk.parametric.scenarios import _check_bound_cover
 from crc_sdk.types import SourceProvenance
 from crc_sdk.workflows import AssetPortfolio, CellColumn, PointColumns
 
@@ -330,6 +332,7 @@ def test_samples_equal_a_station_index_built_by_hand(model: Any) -> None:
         station_series = AnnualSeries.from_table(
             stations,
             where={"station": STATIONS[asset_id]},
+            station="station",
             unit="mm/day",
             years=series.years.tolist(),
             source=GAUGES,
@@ -354,6 +357,32 @@ def test_samples_equal_a_station_index_built_by_hand(model: Any) -> None:
         assert sample.provenance.sources[1]["series"]["where"] == {
             "station": STATIONS[asset_id]
         }
+
+
+def test_a_station_column_of_any_name_is_the_series_station() -> None:
+    # A table whose station column is not called `station`, as HYDAT's.
+    gauges = _stations().rename_columns(["station_number", "year", "value"])
+    location = StationColumn("station_id", table_column="station_number")
+    samples = (
+        _at_stations(_plan(), gauges, location=location)
+        .basis_risk(NoBasisRisk())
+        .samples()
+    )
+    for asset_id, station in STATIONS.items():
+        sample = samples[asset_id]
+        series = sample.provenance.sources[1]["series"]
+        assert series["columns"]["station"] == "station_number"
+        assert series["where"] == {"station_number": station}
+        _check_bound_cover(_linear(AtStation(station), asset_id=asset_id), sample)
+        other = "S1" if station == "S2" else "S2"
+        with pytest.raises(ScenarioError, match="location"):
+            _check_bound_cover(_linear(AtStation(other), asset_id=asset_id), sample)
+    # The hazard read at a station records its column too.
+    hazard = _plan(gauges, location=location).basis_risk(NoBasisRisk()).samples()
+    for asset_id, station in STATIONS.items():
+        series = hazard[asset_id].provenance.sources[0]["series"]
+        assert series["columns"]["station"] == "station_number"
+        assert series["where"] == {"station_number": station}
 
 
 def test_samples_equal_a_nearest_cell_index_built_by_hand() -> None:

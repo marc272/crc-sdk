@@ -682,6 +682,85 @@ def test_from_table_selects_a_station_and_marks_null_years_missing() -> None:
     assert not series.values.flags.writeable
 
 
+GAUGE_TABLE = STATIONS.rename_columns(
+    ["station_number" if name == "station" else name for name in STATIONS.column_names]
+)
+
+
+def test_from_table_records_the_column_a_station_is_read_from() -> None:
+    series = AnnualSeries.from_table(
+        GAUGE_TABLE,
+        where={"station_number": "S2"},
+        station="station_number",
+        unit="mm/day",
+    )
+    assert series.provenance["columns"] == {
+        "year": "year",
+        "value": "value",
+        "station": "station_number",
+    }
+    assert series.provenance["where"] == {"station_number": "S2"}
+    # Unstated, nothing says the filter is a station's.
+    plain = AnnualSeries.from_table(
+        GAUGE_TABLE, where={"station_number": "S2"}, unit="mm/day"
+    )
+    assert "station" not in plain.provenance["columns"]
+
+
+def test_the_station_column_leaves_the_lineage_as_it_is() -> None:
+    # The same rows read with and without the statement share their lineage, so
+    # the leakage check still sees the years the two series share.
+    def read(**options: Any) -> AnnualSeries:
+        return AnnualSeries.from_table(
+            GAUGE_TABLE,
+            where={"station_number": "S2"},
+            unit="mm/day",
+            source="gauges",
+            **options,
+        )
+
+    stated, plain = _per_year(read(station="station_number")), _per_year(read())
+    assert stated.lineage == plain.lineage
+    with pytest.raises(LeakageError, match="shares 5 periods"):
+        _check_out_of_sample(plain, stated)
+    # Another station is another source.
+    other = sample_annual(
+        AnnualSeries.from_table(
+            GAUGE_TABLE,
+            where={"station_number": "S1"},
+            station="station_number",
+            unit="mm/day",
+            source="gauges",
+        ),
+        loss_model=LOSS,
+        basis_risk=NOISE,
+        asset_id="a",
+        missing="drop_year",
+        rng=np.random.default_rng(0),
+    )
+    assert other.lineage != stated.lineage
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"station": "station_number"}, "where= filters no column"),
+        (
+            {"station": "station", "where": {"station_number": "S1"}},
+            r"station='station' names the column of where=.*\['station_number'\]",
+        ),
+        ({"station": "", "where": {"station_number": "S1"}}, "an empty string"),
+        ({"station": 3, "where": {"station_number": "S1"}}, "got int"),
+    ],
+    ids=["no-filter", "another-column", "empty", "not-a-string"],
+)
+def test_a_station_column_must_be_a_column_of_the_filter(
+    options: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(SampleError, match=message):
+        AnnualSeries.from_table(GAUGE_TABLE, unit="mm/day", **options)
+
+
 def test_from_table_fills_gaps_and_honours_a_window() -> None:
     table = pa.table({"year": [2000, 2003, 2001], "value": [1.0, 3.0, 2.0]})
     series = AnnualSeries.from_table(table, unit="m")

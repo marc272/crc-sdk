@@ -471,8 +471,10 @@ The builders, splits, seeding and outputs are those above.
   Such a series records `"asset_location": "h3_cell"`.
   `StationColumn("station_id")` reads per-station tables: the asset column
   names each asset's station, matched against the table's `station` column
-  (`table_column="station_id"` for NOAA water levels). An asset that cannot be
-  located raises; none is dropped.
+  (`table_column="station_id"` for NOAA water levels, `"station_number"` for
+  HYDAT). The series records `table_column` as the column its station is read
+  from, so a station column of any name is compared as one. An asset that
+  cannot be located raises; none is dropped.
 - **`unit`** is the unit of the table's values. It is checked against the
   impact's calibration (an `ImpactExpression` or a registry impact), against a
   `unit` column of the table, and against the source plan's `explain()`.
@@ -905,8 +907,10 @@ write_comparison(table, "by-hand-annual.parquet")   # atomic
 ```
 
 `AnnualSeries.from_table(table, where={"station": ...}, unit=...)` reads a
-station instead, and `sample_annual(..., index=other_series)` reads the index
-at another cell, station or hazard than the loss, as the plan's
+station instead; `station="station_number"` with `where={"station_number": ...}`
+names a station column of another name, as the plan's `StationColumn` does. And
+`sample_annual(..., index=other_series)` reads the index at another cell,
+station or hazard than the loss, as the plan's
 [`.index(...)`](#an-index-read-elsewhere) does.
 
 `trend=` and `scenario=` are those of the plan ([Climate
@@ -1330,8 +1334,10 @@ describes one year's value:
   `"clamp"` is stated.
 
 **Per-year values.** `AnnualSeries.from_table(table, *, year, value, where,
-unit=None, source=None)` reads one location of an `annual_extremes()` table (a
-station with `where={"station": ...}`), and `AnnualSeries.nearest_cell(table,
+unit=None, source=None, station=None)` reads one location of an
+`annual_extremes()` table (a station with `where={"station": ...}`; `station=`
+names the column of `where` that selects a station when it has another name,
+and the series records it), and `AnnualSeries.nearest_cell(table,
 *, longitude, latitude, unit=None, source=None)` the grid cell whose centre lies
 within half a grid step of a point. `unit` defaults to the unit the table
 states for the series' rows: a `unit` column with one value, as
@@ -2116,7 +2122,9 @@ cell at those horizons. `ScenarioSet` refuses a set in which anything but the
 hazard's values differs. That includes the place: on curves, each asset's or
 hazard's curves must come from one H3 cell (`cell_index`) in every scenario, so a
 scenario can't hold another place's curves under the same asset id, and
-`ScenarioError` names both cells. Cells at two resolutions, as two products may
+`ScenarioError` names both cells. Every pair of scenarios is compared, so a
+coarse cell can't hold two finer cells of two other scenarios that are two
+places. Cells at two resolutions, as two products may
 give, are compared at the coarser one, where the finer cell's parent must be the
 coarser cell or one of its neighbours, because a point's cells at two resolutions
 don't always nest; that needs the `geometry` extra (`crc-sdk[geometry]`). A curve
@@ -2132,12 +2140,14 @@ and every run of a pool, compared pair by pair, like with like, and
 | --- | --- | --- |
 | At a matched grid cell (`AnnualSeries.nearest_cell`, `NearestCell`), of the same grid: one step, centres whole steps apart | The same cell | A point matches one cell of a grid, so a neighbouring cell is another place |
 | At a matched cell of another grid, as two products or two models give | A cell that overlaps it: some point lies within half a grid step of both centres, each by its own step | One asset's point can match both; ERA5's cells beside NEX-GDDP-CMIP6's pass, a cell two steps away doesn't |
-| At a station, named by a `station` or `station_id` filter or one-valued column (`StationColumn`) | The same station | Another station is another place |
+| At a station: the filter on the column the series names as its station (`AnnualSeries.from_table(station=)`, which `StationColumn` states with its `table_column`), whatever it is called, or else a `station` or `station_id` filter or one-valued column | The same station, by its id | Another station is another place |
 
-A record of a cell without a grid step is a point, of step 0. A series that names
+A record of a cell without a grid step is a point, of step 0. A filter on any
+other column, such as `model` or `scenario`, names no station: not here, not for
+a cover bound with `AtStation`, and not in the setup text. A series that names
 neither a cell nor a station, such as a plain table or one filtered on other
 columns, isn't compared, and neither is a cell beside a station: the module holds
-no station's coordinates.
+no station's coordinates, nor a crosswalk of station ids.
 
 - **The rows.** One row per entry and scenario, the reference first, and every
   row has `split="out_of_sample"`. `scenario` says where a row is evaluated and
@@ -2150,6 +2160,10 @@ no station's coordinates.
   on samples of several hazards. A design brings its own design sample, whose
   label must be one of the set's, and that label is the row's `design_scenario`.
   The designs of one mapping or package must share it.
+- **`allocation=`** takes joint designs only, across the whole call, as in
+  `compare`: any other entry raises `EvaluationError`, whichever scenario each
+  entry was designed on, so allocated rows never share a table with the rows of
+  covers that stand on their own.
 - **`design_sample`** is the reference's design block, and is required when an
   entry is a cover given as is. Its label must be the reference.
 - **`fold`.** One fold at a time, as `compare`. Concatenate folds with
@@ -2723,11 +2737,13 @@ columns.
   sample holds no asset values. On a plan, `.allocation(rule)` reads the values
   its loss model read and writes the rows to `<stem>.allocated<suffix>` beside
   the comparison. Only their hash is written.
-- **`allocation=` on `compare`, `evaluate`, `compare_pooled` and
-  `bootstrap_intervals`** still adds a joint design's allocated rows after its
-  `"total"` row, and takes joint designs only: a call with any other entry raises
-  `EvaluationError`, so allocated rows never share a table with the rows of
-  covers that stand on their own. It is the way to pool allocated rows over
+- **`allocation=` on `compare`, `evaluate`, `compare_pooled`,
+  `bootstrap_intervals` and `compare_scenarios`** still adds a joint design's
+  allocated rows after its `"total"` row, and takes joint designs only: a call
+  with any other entry raises `EvaluationError`, so allocated rows never share a
+  table with the rows of covers that stand on their own. On `compare_scenarios`
+  that holds across the whole call, whichever scenario each entry was designed
+  on. It is the way to pool allocated rows over
   folds or give them intervals.
 
 ## Several hazards at one asset
