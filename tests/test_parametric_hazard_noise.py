@@ -30,6 +30,7 @@ from crc_sdk.parametric import (
     ImpactNoise,
     Independent,
     IndexDefinition,
+    LeakageError,
     LinearTrend,
     LossModel,
     MetricOptions,
@@ -48,6 +49,7 @@ from crc_sdk.parametric import (
     sample_curve_hazards,
     sample_curves,
     setup_text,
+    year_block_kfold,
 )
 from crc_sdk.types import HazardDatasetMetadata, SourceProvenance
 from crc_sdk.workflows import ReturnPeriodExtrapolationWarning
@@ -782,10 +784,12 @@ def test_the_setup_text_states_the_model_and_the_two_ratios() -> None:
         setup_text(_metadata_of(evaluate(STEP, sample, split="in_sample")))
     )
     assert STATED in line
+    # The expected loss against sigma 0 stands next to sigma, in the same statement.
     assert (
-        "over the rows as built, with the model over without it, the mean hazard is "
-        f"{summary['hazard_mean_ratio']:.6g} and the mean impact "
-        f"{summary['impact_mean_ratio']:.6g}"
+        f"{STATED}; over the rows as built, with the model over without it (sigma 0, "
+        f"on the same draws), the expected loss is "
+        f"{summary['impact_mean_ratio']:.6g} and the mean hazard is "
+        f"{summary['hazard_mean_ratio']:.6g}"
     ) in line
 
 
@@ -810,12 +814,12 @@ def test_the_setup_text_says_the_factors_are_independent_between_assets() -> Non
         setup_text(_metadata_of(evaluate(designs, sample, split="in_sample")))
     )
     assert f"{STATED}, the factors independent between assets" in line
-    assert "the mean hazard and the mean impact are" in line
+    assert "the expected loss and the mean hazard are" in line
     for asset in ASSETS:
         summary = sample.provenance.details["basis_risk"][asset]
         assert (
-            f"{summary['hazard_mean_ratio']:.6g} and "
-            f"{summary['impact_mean_ratio']:.6g} for {asset}"
+            f"{summary['impact_mean_ratio']:.6g} and "
+            f"{summary['hazard_mean_ratio']:.6g} for {asset}"
         ) in line
 
 
@@ -841,13 +845,13 @@ def test_a_joined_sample_states_each_assets_ratios() -> None:
     )
     line = _sample_line(setup_text(metadata))
     assert f"{STATED}, the factors independent between assets" in line
-    assert "the mean hazard and the mean impact are" in line
+    assert "the expected loss and the mean hazard are" in line
     assert joined.provenance.parts is not None
     for asset in ASSETS:
         summary = joined.provenance.parts[asset]["details"]["basis_risk"]
         assert (
-            f"{summary['hazard_mean_ratio']:.6g} and "
-            f"{summary['impact_mean_ratio']:.6g} for {asset}"
+            f"{summary['impact_mean_ratio']:.6g} and "
+            f"{summary['hazard_mean_ratio']:.6g} for {asset}"
         ) in line
     assert "own provenance" not in line
 
@@ -898,7 +902,7 @@ def test_a_joined_sample_above_five_assets_gives_the_ranges() -> None:
         ]
     }
     assert (
-        "the mean hazard is 1 to 1.05 and the mean impact 1.5 to 2 across 6 assets"
+        "the expected loss is 1.5 to 2 and the mean hazard is 1 to 1.05 across 6 assets"
     ) in _sample_line(setup_text(setup))
 
 
@@ -934,7 +938,7 @@ def test_the_setup_text_gives_the_range_above_five_assets() -> None:
     }
     line = _sample_line(setup_text(setup))
     assert (
-        "the mean hazard is 1 to 1.05 and the mean impact 1.5 to 2 across 6 assets"
+        "the expected loss is 1.5 to 2 and the mean hazard is 1 to 1.05 across 6 assets"
     ) in line
 
 
@@ -955,7 +959,9 @@ def test_the_setup_text_names_a_components_ratios_and_its_undefined_impact() -> 
         )
     )
     assert f"{STATED}, each component with factors of its own" in line
-    assert "and not defined for rain" in line
+    rain = sample.provenance.details["basis_risk"]["rain"]["hazard_mean_ratio"]
+    assert "each component's own expected loss and the mean hazard are" in line
+    assert f"not defined and {rain:.6g} for rain" in line
 
 
 def test_two_drawn_samples_of_one_size_each_state_their_own_ratios() -> None:
@@ -976,7 +982,9 @@ def test_two_drawn_samples_of_one_size_each_state_their_own_ratios() -> None:
     }
     for sample, role in ((drawn, "design"), (fresh, "evaluation")):
         ratio = sample.provenance.details["basis_risk"]["impact_mean_ratio"]
-        assert f"the mean impact {ratio:.6g}" in lines[f"{span}, the {role} sample"]
+        assert (
+            f"the expected loss is {ratio:.6g}" in lines[f"{span}, the {role} sample"]
+        )
 
 
 def test_a_block_carries_the_ratios_of_the_sample_it_was_cut_from() -> None:
@@ -1004,4 +1012,363 @@ def test_a_block_carries_the_ratios_of_the_sample_it_was_cut_from() -> None:
 )
 def test_a_malformed_setup_is_refused(setup: Any, message: str) -> None:
     with pytest.raises(EvaluationError, match=message):
+        setup_text(setup)
+
+
+# -- holding the hazard's distribution -------------------------------------------
+
+
+HELD = HazardNoise(SIGMA, hold="hazard_distribution")
+ONE_HAZARD = [_curve, _annual, _pool, _assets]
+COMPONENTS = [_annual_hazards, _curve_hazards]
+SIGMAS = (0.1, 0.25, 0.4, 1.0)
+# The loss of one hazard holds to this relative tolerance across sigma; the
+# ratios the samplers record are exactly 1.
+TOLERANCE = 1e-12
+
+# The content hashes of the six routes under HazardNoise(0.25), as the samplers
+# gave them before `hold` existed.
+DEFAULT_HASHES = {
+    "_curve": (
+        "sha256:ab0c0a97857663a4f5c513b829291cbf279d83d298b0c290c3959a24e3e69e81"
+    ),
+    "_annual": (
+        "sha256:7efbeee4b73b15a16405b5c1c82b22bd8856553b5fd1be1fb3eec9c64d586ee1"
+    ),
+    "_pool": (
+        "sha256:6c5bc3450cf9a18ea98698768cb2c81c61daeb2667fc50da285e382d52414a08"
+    ),
+    "_assets": (
+        "sha256:94d3dfc53ce1f0ebee040dfd40b3473346a77e63345ed0fdf6eef8cc28e32424"
+    ),
+    "_annual_hazards": (
+        "sha256:5c319339328349254e5648d0ffcfef1d9557a9ddf0471c70b98ce0e0b07dcf3f"
+    ),
+    "_curve_hazards": (
+        "sha256:e0a8c52785b9c8a1deb7765e7a5ee5dd5ed8fef8ccb54bf00773cc93043833b8"
+    ),
+}
+
+
+def _hazards(sample: OutcomeSample) -> list[tuple[FloatArray, FloatArray]]:
+    """Each (index, hazard at the asset) the sample holds, column by column."""
+    if sample.index_components is not None:
+        pairs = []
+        for component in sample.index_components.values():
+            assert component.hazard is not None
+            pairs.append((component.values[:, 0], component.hazard[:, 0]))
+        return pairs
+    assert sample.hazard is not None
+    return [
+        (sample.index[:, j], sample.hazard[:, j]) for j in range(len(sample.asset_ids))
+    ]
+
+
+@pytest.mark.parametrize("route", ROUTES, ids=lambda r: r.__name__)
+def test_the_default_and_its_hashes_are_unchanged(route: Route) -> None:
+    default = route(MODEL)
+    stated = route(HazardNoise(SIGMA, hold="hazard_mean"))
+    assert default.content_hash == DEFAULT_HASHES[route.__name__]
+    assert stated.content_hash == default.content_hash
+    assert stated.lineage == default.lineage
+    assert stated.provenance.to_document() == default.provenance.to_document()
+    assert HazardNoise(SIGMA, hold="hazard_mean") == MODEL
+    assert MODEL.to_document() == {"kind": "hazard_noise", "sigma": SIGMA}
+
+
+def test_the_form_is_recorded_in_the_provenance() -> None:
+    assert HELD.to_document() == {
+        "kind": "hazard_noise",
+        "sigma": SIGMA,
+        "hold": "hazard_distribution",
+    }
+    sample = _curve(HELD)
+    assert sample.provenance.basis_risk == HELD.to_document()
+    back = OutcomeSample.from_written_table(sample.to_table())
+    assert back.provenance.basis_risk == HELD.to_document()
+    assert back.content_hash == sample.content_hash
+    # The rows differ from the default's, the source of the rows does not.
+    assert sample.content_hash != _curve(MODEL).content_hash
+    assert sample.lineage == _curve(MODEL).lineage
+
+
+@pytest.mark.parametrize("hold", ["mean", "", None, 1, "HAZARD_MEAN"])
+def test_an_unknown_form_is_refused(hold: Any) -> None:
+    with pytest.raises(SampleError, match="hold must be one of"):
+        HazardNoise(SIGMA, hold=hold)
+
+
+@pytest.mark.parametrize("route", ONE_HAZARD, ids=lambda r: r.__name__)
+@pytest.mark.parametrize("sigma", SIGMAS)
+def test_the_held_form_holds_the_expected_loss_across_sigma(
+    route: Route, sigma: float
+) -> None:
+    plain = route(NoBasisRisk())
+    held = route(HazardNoise(sigma, hold="hazard_distribution"))
+    np.testing.assert_array_equal(held.index, plain.index)
+    expected = plain.probability @ plain.loss
+    np.testing.assert_allclose(held.probability @ held.loss, expected, rtol=TOLERANCE)
+    # The hazard at the asset is a reordering of the index, column by column.
+    for index, hazard in _hazards(held):
+        np.testing.assert_array_equal(np.sort(hazard), np.sort(index))
+        assert not np.array_equal(hazard, index)
+    recorded = held.provenance.details["basis_risk"]
+    one = len(held.asset_ids) == 1
+    for summary in [recorded] if one else [recorded[a] for a in held.asset_ids]:
+        assert summary["hazard_mean_ratio"] == 1.0
+        assert summary["impact_mean_ratio"] == 1.0
+
+
+@pytest.mark.parametrize("sigma", SIGMAS)
+def test_the_default_form_moves_the_expected_loss_with_sigma(sigma: float) -> None:
+    ratio = _curve(HazardNoise(sigma)).provenance.details["basis_risk"][
+        "impact_mean_ratio"
+    ]
+    assert abs(ratio - 1.0) > 1e-3
+
+
+@pytest.mark.parametrize("route", COMPONENTS, ids=lambda r: r.__name__)
+def test_each_component_holds_its_own_loss(route: Route) -> None:
+    plain, held = route(NoBasisRisk()), route(HELD)
+    assert plain.index_components is not None
+    assert held.index_components is not None
+    for name, component in held.index_components.items():
+        before = plain.index_components[name]
+        assert component.hazard is not None
+        np.testing.assert_array_equal(
+            np.sort(component.hazard[:, 0]), np.sort(before.values[:, 0])
+        )
+        assert component.own_loss is not None and before.own_loss is not None
+        np.testing.assert_allclose(
+            component.own_loss.mean(), before.own_loss.mean(), rtol=TOLERANCE
+        )
+        summary = held.provenance.details["basis_risk"][name]
+        assert summary["hazard_mean_ratio"] == 1.0
+        assert summary["impact_mean_ratio"] == 1.0
+
+
+@pytest.mark.parametrize("route", ROUTES, ids=lambda r: r.__name__)
+def test_the_held_form_keeps_the_ranks_and_the_draws_of_the_default(
+    route: Route,
+) -> None:
+    default, held = route(MODEL), route(HELD)
+    for (index, mean_form), (same_index, held_form) in zip(
+        _hazards(default), _hazards(held), strict=True
+    ):
+        np.testing.assert_array_equal(index, same_index)
+        # Row d has the rank in both forms that the index times its factor has.
+        np.testing.assert_array_equal(
+            np.argsort(mean_form, kind="stable"), np.argsort(held_form, kind="stable")
+        )
+    assert held.provenance.rng == default.provenance.rng
+
+
+@pytest.mark.parametrize("hold", ["hazard_mean", "hazard_distribution"])
+def test_both_forms_leave_the_generator_in_one_state(hold: Any) -> None:
+    def state(model: Any) -> Any:
+        rng = np.random.default_rng(SEED)
+        sample_annual(
+            _series(), loss_model=LOSS, basis_risk=model, asset_id="a", rng=rng
+        )
+        return rng.bit_generator.state
+
+    assert state(HazardNoise(0.4, hold=hold)) == state(MODEL)
+
+
+@pytest.mark.parametrize("route", ROUTES, ids=lambda r: r.__name__)
+def test_the_held_form_at_sigma_zero_gives_the_rows_of_no_basis_risk(
+    route: Route,
+) -> None:
+    plain = route(NoBasisRisk())
+    with pytest.warns(ComonotoneIndexWarning):
+        zero = route(HazardNoise(0.0, hold="hazard_distribution"))
+    np.testing.assert_array_equal(zero.index, plain.index)
+    np.testing.assert_array_equal(zero.loss, plain.loss)
+    assert zero.hazard is None
+    assert zero.content_hash == plain.content_hash
+
+
+def test_the_rule_by_hand() -> None:
+    index = np.array([30.0, 0.0, 10.0, 20.0, 0.0, 40.0])
+    rng = np.random.default_rng(SEED)
+    _, held = HELD.apply_hazard(index, index.copy(), rng)
+    factor = np.exp(np.random.default_rng(SEED).normal(-0.5 * SIGMA**2, SIGMA, 6))
+    ranked = index * factor
+    expected = np.empty(6)
+    expected[np.lexsort((index, ranked))] = np.sort(index)
+    np.testing.assert_array_equal(held, expected)
+    assert (held[index == 0.0] == 0.0).all()
+
+
+def test_a_zero_stays_zero_when_a_factor_underflows() -> None:
+    # sigma 40 makes most factors exp(-800) = 0, so many products tie at zero.
+    index = np.array([0.0, 5.0, 0.0, 7.0, 3.0, 0.0, 9.0, 1.0])
+    model = HazardNoise(40.0, hold="hazard_distribution")
+    _, held = model.apply_hazard(index, index.copy(), np.random.default_rng(SEED))
+    _, plain = HazardNoise(40.0).apply_hazard(
+        index, index.copy(), np.random.default_rng(SEED)
+    )
+    assert (plain[index > 0] == 0.0).any()
+    np.testing.assert_array_equal(held[index == 0.0], 0.0)
+    np.testing.assert_array_equal(np.sort(held), np.sort(index))
+
+
+def test_the_rule_ranks_each_column_of_a_matrix() -> None:
+    index = np.arange(1.0, 13.0).reshape(6, 2)
+    _, held = HELD.apply_hazard(index, index.copy(), np.random.default_rng(SEED))
+    assert held.shape == index.shape
+    for column in range(2):
+        np.testing.assert_array_equal(
+            np.sort(held[:, column]), np.sort(index[:, column])
+        )
+    scalar = np.array(5.0)
+    _, one = HELD.apply_hazard(scalar, scalar.copy(), np.random.default_rng(SEED))
+    assert one.shape == () and float(one) == 5.0
+
+
+def test_the_failure_rates_respond_to_sigma_at_one_loss_level() -> None:
+    def row(sigma: float) -> Any:
+        model = HazardNoise(sigma, hold="hazard_distribution")
+        return evaluate(STEP, _curve(model, n=5000), split="in_sample")
+
+    low, high = row(0.1), row(0.5)
+    assert _column(low, "expected_loss") == pytest.approx(
+        _column(high, "expected_loss"), rel=TOLERANCE
+    )
+    assert 0.0 < _column(low, "false_positive_rate_l0")
+    assert _column(low, "false_positive_rate_l0") < _column(
+        high, "false_positive_rate_l0"
+    )
+    assert _column(low, "false_negative_rate_l0") < _column(
+        high, "false_negative_rate_l0"
+    )
+
+
+# -- the held form and the leakage rules ----------------------------------------
+
+
+@pytest.mark.parametrize("route", ROUTES, ids=lambda r: r.__name__)
+def test_a_held_sample_is_not_split(route: Route) -> None:
+    sample = route(HELD)
+    with pytest.raises(SampleError, match="holdout cannot split this sample"):
+        holdout(sample)
+    with pytest.raises(SampleError, match="year_block_kfold cannot split"):
+        year_block_kfold(sample, 4)
+
+
+def test_an_assets_own_sample_and_a_component_are_not_split_either() -> None:
+    with pytest.raises(SampleError, match="cannot split"):
+        holdout(_assets(HELD).asset("b"))
+    with pytest.raises(SampleError, match="cannot split"):
+        holdout(_annual_hazards(HELD).component("wind"))
+    # A joined sample with one held asset among its parts.
+    held = sample_annual(
+        _series(_values(2), name="b"),
+        loss_model=LOSS,
+        basis_risk=HELD,
+        asset_id="b",
+        rng=np.random.default_rng(SEED),
+    )
+    joined = OutcomeSample.join([_annual(MODEL), held])
+    with pytest.raises(SampleError, match="cannot split"):
+        year_block_kfold(joined, 2)
+
+
+def test_blocks_selected_from_one_held_sample_are_refused() -> None:
+    template = Cover(
+        INDEX, StepPayout([90.0, 120.0], [Free(), Free()]), payout_unit="EUR"
+    )
+    sample = _curve(HELD)
+    first, second = sample.select(np.arange(0, 200)), sample.select(np.arange(200, N))
+    designed = design(template, first, MSE())
+    with pytest.raises(LeakageError, match="cut from one sample"):
+        evaluate(designed, second, split="out_of_sample")
+    # The default's factors are each row's own: its blocks pass, as before.
+    plain = _curve(MODEL)
+    designed = design(template, plain.select(np.arange(0, 200)), MSE())
+    evaluate(designed, plain.select(np.arange(200, N)), split="out_of_sample")
+
+
+def test_separate_calls_each_hold_their_own_rows_and_pass() -> None:
+    template = Cover(
+        INDEX, StepPayout([90.0, 120.0], [Free(), Free()]), payout_unit="EUR"
+    )
+    drawn, fresh = _curve(HELD, seed=1), _curve(HELD, seed=2)
+    table = evaluate(design(template, drawn, MSE()), fresh, split="out_of_sample")
+    assert table.num_rows == 1
+    for sample in (drawn, fresh):
+        assert sample.hazard is not None
+        np.testing.assert_array_equal(
+            np.sort(sample.hazard[:, 0]), np.sort(sample.index[:, 0])
+        )
+    # Per-year samples of separate years of one series.
+    values = _values()
+
+    def years(rows: slice) -> OutcomeSample:
+        series = AnnualSeries(
+            YEARS[rows], values[rows], "mm/day", {"source": {"name": "synthetic s"}}
+        )
+        return sample_annual(
+            series,
+            loss_model=LOSS,
+            basis_risk=HELD,
+            asset_id="a",
+            rng=np.random.default_rng(SEED),
+        )
+
+    early, late = years(slice(0, 28)), years(slice(28, None))
+    assert early.lineage == late.lineage
+    table = evaluate(design(template, early, MSE()), late, split="out_of_sample")
+    assert table.num_rows == 1
+
+
+# -- the held form in the setup text ---------------------------------------------
+
+
+HELD_STATED = (
+    "hazard noise that holds the hazard's distribution, the hazard at the asset "
+    "being the index's own values, reordered by the rank of the index times a "
+    "mean-one lognormal factor with sigma 0.25, one per year and asset, as an "
+    "assumption the caller states"
+)
+
+
+def test_the_setup_text_states_the_held_form_and_its_loss_level() -> None:
+    sample = _annual(HELD)
+    line = _sample_line(
+        setup_text(_metadata_of(evaluate(STEP, sample, split="in_sample")))
+    )
+    assert (
+        f"{HELD_STATED}; over the rows as built, with the model over without it "
+        "(sigma 0, on the same draws), the expected loss is 1 and the mean hazard "
+        "is 1"
+    ) in line
+
+
+def test_the_setup_text_names_another_models_reference_plainly() -> None:
+    setup = {
+        "samples": [
+            {
+                "basis_risk": {"kind": "user_model"},
+                "details": {
+                    "basis_risk": {"hazard_mean_ratio": 2.0, "impact_mean_ratio": 3.0}
+                },
+                "source_kind": "annual",
+            }
+        ]
+    }
+    line = _sample_line(setup_text(setup))
+    assert (
+        "with the model over without it, the expected loss is 3 and the mean "
+        "hazard is 2"
+    ) in line
+
+
+def test_an_unknown_form_in_a_setup_is_refused() -> None:
+    setup = {
+        "samples": [
+            {"basis_risk": {"kind": "hazard_noise", "sigma": 0.25, "hold": "x"}}
+        ]
+    }
+    with pytest.raises(EvaluationError, match=r"basis_risk\.hold must be"):
         setup_text(setup)
