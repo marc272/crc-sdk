@@ -2199,6 +2199,12 @@ function does not, so give each function its own name.
   [`design_frontier`](#a-budget-frontier).
 - `Limit(amount)`: no payout exceeds `amount`. For the built-in families it
   bounds every amount (their payout is at most their largest amount).
+- The payout family's own constraints hold: amounts ≥ 0, non-decreasing levels
+  under `monotone=True`, and every `Free` parameter's bounds.
+- E[U] and the weighted CVaR need a budget or bounded amounts (a `Free` upper
+  bound or a `Limit`): without either, any payout at least as large as the loss
+  is optimal, and `design` raises `DesignError` before solving. MSE needs
+  neither.
 
 ```python
 from crc_sdk.parametric import ExpectedPayoutMultiple
@@ -2208,12 +2214,6 @@ loaded = design(template, design_years, ExpectedUncovered(),
                 budget=Budget(ratio=0.8))
 loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
 ```
-- The payout family's own constraints hold: amounts ≥ 0, non-decreasing levels
-  under `monotone=True`, and every `Free` parameter's bounds.
-- E[U] and the weighted CVaR need a budget or bounded amounts (a `Free` upper
-  bound or a `Limit`): without either, any payout at least as large as the loss
-  is optimal, and `design` raises `DesignError` before solving. MSE needs
-  neither.
 
 ### Routes
 
