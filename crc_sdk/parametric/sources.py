@@ -156,6 +156,7 @@ from crc_sdk.parametric.sample import (
     _check_known_pathway,
     _column,
     _component_note,
+    _field_unit,
     _freeze,
     _generator_record,
     _hazard_record,
@@ -1875,7 +1876,7 @@ class AnnualSeries:
         *,
         year: str,
         value: str,
-        unit: str,
+        unit: str | None,
         years: IntArray | None,
         provenance: dict[str, Any],
     ) -> AnnualSeries:
@@ -1895,13 +1896,7 @@ class AnnualSeries:
                 f"years {unique[counts > 1][:10].tolist()} have several rows; "
                 "select one location (where=, nearest_cell) first"
             )
-        unit = _identifier("unit", unit)
-        if "unit" in rows.column_names:
-            stated = {u for u in rows.column("unit").to_pylist() if u is not None}
-            if stated and stated != {unit}:
-                raise SampleError(
-                    f"the table's unit column says {sorted(stated)}, not {unit!r}"
-                )
+        unit = _series_unit(rows, value, unit)
         expected = (
             np.arange(unique[0], unique[-1] + 1, dtype=np.int64)
             if years is None
@@ -1921,7 +1916,7 @@ class AnnualSeries:
         year: str = "year",
         value: str = "value",
         where: Mapping[str, Any] | None = None,
-        unit: str,
+        unit: str | None = None,
         years: Sequence[int] | None = None,
         source: Any = None,
     ) -> AnnualSeries:
@@ -1943,7 +1938,14 @@ class AnnualSeries:
         `ERA5_ATTRIBUTION` are recorded; a mapping's own `provider`,
         `dataset`, `licence` and `attribution` win. Columns such as
         `attribution`, `archive_licence`, `source_url` or `station` are
-        recorded too. If the table has a `unit` column, it must equal `unit`.
+        recorded too.
+
+        `unit` is the unit of the values. Left out, it is the unit the table
+        states: its `unit` column, which must hold one unit in the kept rows
+        (NEX-GDDP-CMIP6's `annual_extremes()` has one), or the Arrow field
+        metadata `unit` of the value column; where both state one, they must
+        agree. A table that states none needs `unit` stated, and a stated
+        `unit` must equal the table's.
 
         What a source plan's document says of its cache, its run and the
         years it asks for is left out of a sample's lineage, as is the time a
@@ -1953,7 +1955,8 @@ class AnnualSeries:
         `table` is an in-memory Arrow table, record batches (for example
         NEX-GDDP-CMIP6's `annual_extremes()` iterator) or any table Arrow
         reads. Raises `SampleError` for missing columns, unmatched filters,
-        repeated years or a unit mismatch.
+        repeated years, a unit mismatch, or no unit stated by the caller or
+        the table.
         """
         data = _arrow_table(table, "an annual table")
         rows = data
@@ -2003,7 +2006,7 @@ class AnnualSeries:
         *,
         longitude: float,
         latitude: float,
-        unit: str,
+        unit: str | None = None,
         year: str = "year",
         value: str = "value",
         longitude_column: str = "longitude",
@@ -2023,7 +2026,8 @@ class AnnualSeries:
         compared modulo 360. The cell centre and the step are recorded, not
         the point itself. By default the series must cover every year the
         table holds: a year the cell lacks is missing.
-        `years`, `source` and the other arguments are as in `from_table`.
+        `unit`, `years`, `source` and the other arguments are as in
+        `from_table`; the cell's rows give the table's `unit` column.
 
         Raises `SampleError` if no cell centre is close enough, two are
         equally near, or the spacing cannot be inferred.
@@ -2100,6 +2104,57 @@ class AnnualSeries:
             years=requested,
             provenance=provenance,
         )
+
+
+def _series_unit(rows: Any, value: str, stated: str | None) -> str:
+    """The unit of a series' values: `stated`, or the one `rows` states.
+
+    `rows` states a unit in its `unit` column, if it has one and it holds a
+    value in the kept rows, and in the Arrow field metadata `unit` of the
+    `value` column. Raises `SampleError` when the column holds several units,
+    the two disagree, no unit is stated by either side, or `stated` differs
+    from the table's.
+    """
+    column_units: list[str] = []
+    if "unit" in rows.column_names:
+        column_units = sorted(
+            {str(u) for u in rows.column("unit").to_pylist() if u is not None}
+        )
+    if stated is not None:
+        unit = _identifier("unit", stated)
+        if column_units and column_units != [unit]:
+            raise SampleError(
+                f"the table's unit column says {column_units}, not {unit!r}"
+            )
+    elif len(column_units) > 1:
+        raise SampleError(
+            f"the table's unit column says {column_units}: select the rows of "
+            "one unit, or state unit="
+        )
+    from_column = column_units[0] if column_units else None
+    from_field = _field_unit(rows, value)
+    if from_column is not None and from_field is not None and from_column != from_field:
+        raise SampleError(
+            f"the table states two units for its values: {from_column!r} in its "
+            f"unit column and {from_field!r} in the field metadata of column "
+            f"{value!r}"
+        )
+    data = from_column if from_column is not None else from_field
+    if stated is None:
+        if data is None:
+            raise SampleError(
+                "unit is missing, and the table states no unit for its values: "
+                "state unit, or give the table a unit column or the column "
+                f"{value!r} an Arrow field metadata 'unit'"
+            )
+        return _identifier("the table's unit", data)
+    if data is not None and unit != data:
+        raise SampleError(
+            f"unit={unit!r} differs from the unit {data!r} that the table states "
+            f"in the field metadata of column {value!r}; leave unit out to use "
+            "the table's"
+        )
+    return unit
 
 
 def _coordinate(name: str, value: Any, bound: float) -> float:
