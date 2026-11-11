@@ -21,7 +21,8 @@ There are two ways to use the module:
 - **The functions.** Every step is also a function on numpy arrays and Arrow
   tables that does no I/O (`sample_curve`, `sample_annual`, `design`,
   `compare`, ...), for your own tables, fitted curves and chains. Only
-  `write_comparison` writes a file.
+  `write_comparison` writes a file. Covers on several hazards are on this
+  route only ([several hazards](#several-hazards-at-one-asset)).
 
 ## Concepts
 
@@ -30,6 +31,7 @@ There are two ways to use the module:
 | Cover | `Cover` | The contract terms: an index, a payout function with its parameters, the payout unit and the asset |
 | Index | `IndexDefinition` | What the cover pays on: hazard name, unit, severe tail, location, aggregation |
 | Payout function | `LinearPayout`, `StepPayout`, `PiecewiseLinearPayout`, `BinaryPayout`, or your own | Maps a year's index value to its payout |
+| Several hazards | `CompositeIndex`, `SumOf`, `MaxOf`, `StepGrid`, `IndexComponent`, `CappedSum`, `CompoundDamage`, `CoverPackage` | A cover that pays on several hazards at one asset, the sample that holds them, the rule for their combined loss, and separate contracts as one row ([several hazards](#several-hazards-at-one-asset)) |
 | Template | a `Cover` with `Free` parameters | Terms a design chooses within stated bounds |
 | Outcome sample | `OutcomeSample` | Years (or simulated years), each with a probability, an index value and a loss |
 | Loss model | `LossModel` | loss = impact(hazard) × asset value |
@@ -1072,7 +1074,21 @@ A payout family is any class that implements the `PayoutFunction` protocol
 `to_document()` and `from_document()`). Register it with `@register_payout`
 so `Cover.from_json` can read covers that use it; an unregistered `kind`
 raises `UnknownPayoutKindError`. A family that is linear in its amounts can
-also implement `LinearInAmounts`.
+also implement `LinearInAmounts`: `amount_names()`, `basis(index)`, which
+returns one row per index value and one column per amount so that the payout
+is `basis(index) @ amounts`, and `amount_constraints(limit=None)`, which returns
+a `LinearConstraints(a_ub, b_ub, lower, upper)`: `a_ub @ a <= b_ub` and
+`lower <= a <= upper` on the amounts `a`, with `upper` infinite for an unbounded
+amount. A design then solves the amounts as an LP or a QP when the family has at
+least one amount; a family with none is searched on the grids of its free
+parameters.
+
+A family may read several indices: it names them in `index_names`, its `tail`
+is a tuple of one tail per name, in that order, and `evaluate` and `basis` take
+an `(n, k)` array, one column per name. It goes on a cover with a
+`CompositeIndex` of the same names ([several
+hazards](#several-hazards-at-one-asset)). The built-in `SumOf`, `MaxOf` and
+`StepGrid` pass the same checks as a family of your own.
 
 ## Outcome samples
 
@@ -1101,7 +1117,12 @@ sample of several ([joint design](#joint-design-over-several-assets)), and
 | Fitted curves of several assets | `sample_curves(curves, *, dependence, metadata, n_draws, rngs, loss_models, basis_risk, scenario="baseline", hazard_name=None)` | a simulated year | `1/n` |
 | Per-year values | `sample_annual(AnnualSeries, *, loss_model, basis_risk, asset_id, index=None, trend=AsRecorded(), scenario="baseline", hazard_name=None)` | an observed or modelled year | `1/n` |
 | Pooled model-years | `sample_annual_pool(runs, *, loss_model, basis_risk, asset_id, trend=AsRecorded(), scenario="baseline", hazard_name=None)` | one run's year | `1/N` |
-| A user table | `OutcomeSample.from_table(table, *, period, asset_id, index, loss, semantics="annual", ..., scenario="baseline", hazard_name=None)` | a table row | its `probability` column, or `1/n` |
+| A user table | `OutcomeSample.from_table(table, *, period, asset_id, index, loss, probability=None, hazard=None, semantics, index_unit, loss_unit, ..., scenario="baseline", hazard_name=None)` | a table row | its `probability` column, or `1/n` |
+| Several hazards at one asset | `sample_annual_hazards(series, *, tails, loss_models, combine=None, basis_risk, asset_id, ...)`, `sample_curve_hazards(curves, *, dependence, ..., combine=None, basis_risk, asset_id, ...)` ([several hazards](#several-hazards-at-one-asset)) | a year, observed or simulated | `1/n` |
+
+`semantics` has no default in `OutcomeSample.from_table`: `semantics="annual"`,
+its only value, is the caller's statement that one row of the table is one
+year, and leaving it out raises `TypeError`.
 
 A curve may also be a **window of horizons**: a sequence of two or more
 canonical rows of one hazard, cell, pathway and dataset, which differ in `horizon`
@@ -1295,15 +1316,18 @@ sample records it as an assumption.
 import numpy as np
 from crc_sdk.parametric import Comonotonic, ImpactNoise, sample_curves
 
-assets = ("warehouse-a", "warehouse-b")
-children = np.random.SeedSequence(42).spawn(len(assets))
-sample = sample_curves(
+# row_a, row_b: each asset's canonical curve row; here the quick start's curve
+# and a wetter one in its place, to illustrate
+row_a, row_b = row, {**row, "curve_location": 55.0}
+asset_ids = ("warehouse-a", "warehouse-b")
+children = np.random.SeedSequence(42).spawn(len(asset_ids))
+two_sites = sample_curves(
     {"warehouse-a": row_a, "warehouse-b": row_b},   # the order sets asset_ids
     dependence=Comonotonic(),
-    metadata={asset: metadata for asset in assets},
+    metadata={asset: metadata for asset in asset_ids},
     n_draws=10_000,
-    rngs={a: np.random.default_rng(c) for a, c in zip(assets, children)},
-    loss_models={asset: loss_model for asset in assets},
+    rngs={a: np.random.default_rng(c) for a, c in zip(asset_ids, children)},
+    loss_models={asset: loss_model for asset in asset_ids},
     basis_risk=ImpactNoise(0.3, upper=1.0),         # one model for every asset
 )
 ```
@@ -1322,6 +1346,27 @@ a hurdle curve's atom adds no ties. `period` is the row number, 0 to
 | `Independent()` | every asset's draws, in draw order | the assets are independent |
 | `Comonotonic()` | every asset's draw of rank r; the first asset stays in draw order | the assets' uniforms have rank correlation 1 |
 | `EmpiricalCopula(reference)` | for each reference year, the block of each asset's draws at that year's rank there | the reference's ranks at block level, and independence between the assets inside a block |
+| `GaussianCopula(correlation)` | each asset's draw of rank r, in the row where correlated normal scores of the assets' own uniforms have rank r; the first asset stays in draw order | a Gaussian copula with the stated correlation: a number in [−1, 1] for two assets, or a positive definite matrix in asset order |
+| a `DependenceModel` of your own | what its `reorder` says | what its `statement` says |
+
+**`GaussianCopula(correlation)`** takes z_j = Φ⁻¹(u_j), the normal scores of
+each column's own uniforms, and y = z Lᵀ, with L the Cholesky factor of the
+correlation matrix; column j's draw of rank r goes to the row where y_j has rank
+r. It uses no random number beyond the draws. A correlation of 0 gives
+`Independent()`'s rows and 1 gives `Comonotonic()`'s, row for row. The
+correlation is the copula's parameter; the rows' Spearman rank correlation is
+about 6/π · arcsin(ρ/2), and the setup text states both.
+
+**A model of your own** implements `DependenceModel`: `to_document()`, plain
+JSON with a `kind` that is not a built-in's; `record(n_draws, columns)`, what
+the sample records, which may raise for a call the model can't serve, before any
+draw; `statement(n_draws, between)`, one sentence, which the module writes
+after its own opening calling the dependence an assumption; and
+`reorder(uniforms, columns)`, which takes each column's uniforms, `(n, d)`, and
+returns integers of that shape, each column a permutation of 0 to n − 1. Two
+calls on the same uniforms must agree. A model that fails any of these raises
+`SampleError` before the sample is returned, and a bare callable raises
+`TypeError`.
 
 **`EmpiricalCopula(reference)`** takes the ranks of a stated per-year sample.
 `reference` is an `OutcomeSample` of `m` observed or modelled years with equal
@@ -1365,7 +1410,11 @@ The dependence model is what you assume about the assets, and the module does
 not choose it. The same generators give the same draws under every model, so
 the lineage doesn't depend on the model: evaluating out of sample needs other
 generators, whichever models the two samples state. On a plan,
-`.dependence(model)` states it and `.joint_sample()` returns the sample.
+`.dependence(model)` states it and `.joint_sample()` returns the sample; the
+plan takes `Independent()`, `Comonotonic()` and `EmpiricalCopula(reference)`.
+The same models, `GaussianCopula` and a model of your own included, put the
+hazards of one asset side by side in `sample_curve_hazards` ([several
+hazards](#several-hazards-at-one-asset)).
 
 ## Evaluate and compare covers
 
@@ -1383,7 +1432,9 @@ from crc_sdk.parametric import (CostOfCapitalLoad, MetricOptions, compare,
                                 holdout, to_long, write_comparison)
 
 design_years, held_out = holdout(sample, train_fraction=0.7)
-# cover_a and cover_b were chosen on design_years, so name it
+# two covers given as is, here the quick start's linear cover and the resolved
+# step cover above; their terms were chosen on design_years, so name it
+cover_a, cover_b = linear, resolved
 table = compare([cover_a, cover_b], held_out, split="out_of_sample",
                 design_sample=design_years, pricing=CostOfCapitalLoad(0.06, 0.99),
                 options=MetricOptions(betas=(0.9, 0.99), loss_thresholds=(0.0, 1e5)))
@@ -1452,6 +1503,20 @@ The premium a row uses is, in this order:
 
 [`compare_scenarios`](#several-scenarios-in-one-table) prices a cover given as is
 once, on the reference's design block (`"reference"`).
+
+**One table, several bases.** A `compare` table that holds designs and covers
+given as is mixes the first two bases, as the quick start's does. A design's
+row keeps its design premium, priced on the design sample, on every block it is
+read on. A cover given as is has no design premium, so its row is priced on the
+block that row evaluates: out of sample, on the held-out years or the fresh
+draws. The two premiums are then priced on different years, and the difference
+between them is partly the difference between those years. So read
+`premium_basis` before setting the `premium` or net-loss columns of two rows
+side by side: `"design"` is a price fixed on that design's design sample,
+`"evaluation"` a price on the row's own block, and `"stated"` the price given.
+The other metrics don't read the premium. To put every row on one basis, state
+each premium with `evaluate(..., premium=...)`, whose rows then read
+`"stated"`.
 
 ### In and out of sample
 
@@ -1558,12 +1623,15 @@ tables))`.
 ### Pooled folds and intervals
 
 ```python
-from crc_sdk.parametric import bootstrap_intervals, compare_pooled
+import numpy as np
+from crc_sdk.parametric import (Budget, ExpectedUncovered, bootstrap_intervals,
+                                compare_pooled, design, year_block_kfold)
 
+objective, budget = ExpectedUncovered(), Budget(ratio=0.8)
 folds = year_block_kfold(sample, 5)
 designs = [design(template, train, objective, budget=budget) for train, _ in folds]
 table = compare_pooled([designs], folds)
-intervals = bootstrap_intervals([designs], folds, rng=numpy.random.default_rng(7))
+intervals = bootstrap_intervals([designs], folds, rng=np.random.default_rng(7))
 ```
 
 `compare_pooled` evaluates every held-out year with the design made without it,
@@ -1659,12 +1727,22 @@ is better: a row is a measurement of a stated setup.
 ```python
 from crc_sdk.parametric import ScenarioSet, compare_scenarios, sample_curve, to_drift
 
+# rows_2030s, rows_2050s: the members of two windows, one cell's canonical rows
+# at three horizons each; here the quick start's row, its location moved by
+# 0.1 mm/day a year, to illustrate
+def window(horizons):
+    return [{**row, "horizon": h, "curve_location": 50.0 + 0.1 * (h - 2030)}
+            for h in horizons]
+
+rows_2030s, rows_2050s = window((2025, 2030, 2035)), window((2045, 2050, 2055))
+
 # Each scenario's evaluation block on one set of draws: the same seed for every
 # block, a different one from the design's.
 def block(label, rows, seed):
     return sample_curve(rows, metadata=metadata, n_draws=30_000,
-                        rng=numpy.random.default_rng(seed), loss_model=loss_model,
-                        basis_risk=ImpactNoise(0.3), asset_id="site", scenario=label)
+                        rng=np.random.default_rng(seed), loss_model=loss_model,
+                        basis_risk=ImpactNoise(0.3), asset_id="warehouse-a",
+                        scenario=label)
 
 designed = design(template, block("2030s", rows_2030s, 11), MSE(), budget=budget)
 scenarios = ScenarioSet([block("2030s", rows_2030s, 22),
@@ -1675,8 +1753,8 @@ drift = to_drift(table)
 print(setup_text(table))
 ```
 
-`rows_2030s` and `rows_2050s` are lists of canonical rows, the members of a window.
-`ScenarioSet` refuses a set in which anything but the hazard's values differs.
+With real curves, `rows_2030s` and `rows_2050s` are the dataset's own rows of one
+cell at those horizons. `ScenarioSet` refuses a set in which anything but the hazard's values differs.
 
 - **The rows.** One row per entry and scenario, the reference first, and every
   row has `split="out_of_sample"`. `scenario` says where a row is evaluated and
@@ -1807,6 +1885,16 @@ function does not, so give each function its own name.
   Rockafellar–Uryasev form too.
 - `Budget(ratio=k)` means premium ≤ k · E[L] on the design sample;
   `Budget(amount=B)` means premium ≤ B, in payout units. Exactly one of the two.
+- **No objective counts the premium**, so nothing in a design trades premium
+  against cover: the budget is the price you state, not one the design chooses.
+  Under E[U] and the weighted CVaR more payout never raises the objective, so a
+  design spends its whole budget (`budget_use` 1) as long as more payout still
+  lowers the objective, which is the usual case below the budget at which every
+  amount covers the losses of its band. MSE counts payouts above the loss, so
+  an MSE design may leave part of its budget unused, as the quick start's does.
+  A `UserObjective` sees the loss, the payout and the probabilities, and not the
+  premium either. To see what different budgets buy, use
+  [`design_frontier`](#a-budget-frontier).
 - `Limit(amount)`: no payout exceeds `amount`. For the built-in families it
   bounds every amount (their payout is at most their largest amount).
 - The payout family's own constraints hold: amounts ≥ 0, non-decreasing levels
@@ -1824,6 +1912,7 @@ function does not, so give each function its own name.
 | the same | MSE | one QP in the amounts (`route="qp"`) |
 | free thresholds on grids (attachment, exhaustion, breakpoints, knots, trigger) | any built-in | a grid over the thresholds, with the LP or QP at each point (`route="grid"`) |
 | a `UserObjective`, or a payout not linear in its amounts | any | a grid over every free parameter, evaluated in numpy; candidates that break the budget or the limit are dropped |
+| `SumOf`, `MaxOf`, `StepGrid` over several indices | any | one of the routes above, as [design on several indices](#design-on-several-indices) says |
 
 - **The grid.** Every parameter the grid searches needs `Free(..., grid=...)`.
   The candidates are the Cartesian product of the grids, in lexicographic
@@ -1859,6 +1948,15 @@ The design errors are `RuntimeError`s and carry `asset_id`, `status` and
 `solver_message`. Free amounts below 1e-9 of the scale are set to 0 and listed
 in `DesignResult.zeroed`, so a rounding residue does not count as a payout.
 
+Every error class of the module derives from `ParametricError`, and also from
+the built-in exception a caller would expect: `ValueError` for invalid terms,
+samples and evaluations (`CoverDefinitionError`, `UnresolvedParameterError`,
+`SampleError` with `ProbabilitySemanticsError`, `LeakageError` and
+`ScenarioError`, `EvaluationError`), `RuntimeError` for the design errors and
+`ImportError` for `SolverUnavailableError`. So `except ParametricError` catches
+what the module raises of its own, and `except ValueError` keeps working.
+Arguments of the wrong type raise the built-in `TypeError`.
+
 ### Non-unique optima
 
 A design sample often leaves part of a design open, and the result says so
@@ -1883,6 +1981,19 @@ rather than presenting one solver's answer as the design.
   `DesignResult.ranges` gives the wide ranges in payout units. At a unique
   vertex a range shrinks with ε; on a set of optimal designs it keeps the set's
   width. Without `ranges=True`, `unique` is `None` on the LP route.
+- **Why ranging is off by default.** It solves four more LPs per identified
+  amount, each the size of the design LP and at tighter tolerances, so its cost
+  grows with the draws and the amounts, and it is paid again for every design
+  (every objective, fold and budget). On one synthetic setup (one asset, a step
+  cover with six free amounts, weighted CVaR with α = 0.9 and β = 0.9, pure
+  premium, `Budget(ratio=0.8)`, on one laptop), the design with ranging took
+  about twenty times as long as without it at 2,000 draws, and of the order of a
+  hundred times as long at 20,000 draws: minutes against about a second. So by
+  default an LP design's rows have `unique` null, the setup text says "unique
+  optimum: not checked", and `DesignResult.ranges` is `None`; state
+  `DesignOptions(ranges=True)` when you need the report, and read a design whose
+  `unique` is null as one member of a set that may hold others. The QP route
+  reports `unique` either way.
 - **The QP route.** `unique` is true when H = Bᵀ diag(p) B, over the identified
   amounts, is positive definite (smallest eigenvalue above 1e-10 of the
   largest).
@@ -1920,10 +2031,10 @@ years or fresh draws, are the ones to report.
 ### A budget frontier
 
 ```python
-from crc_sdk.parametric import Budget, design_frontier, holdout
+from crc_sdk.parametric import Budget, ExpectedUncovered, design_frontier, holdout
 
 train, test = holdout(sample)
-frontier = design_frontier(template, train, objective,
+frontier = design_frontier(template, train, ExpectedUncovered(),
                            budgets=[Budget(ratio=r) for r in (0.5, 1.0, 1.5)],
                            evaluate_on=test, split="out_of_sample")
 ```
@@ -1963,6 +2074,14 @@ sample.
 - **The table names no best budget.** It has no rank, no best flag, no marginal
   column and no ordering by a metric. A difference between two rows describes that
   pair of budgets, on the block stated.
+- **Each design spends its budget.** No objective counts the premium ([pricing
+  and constraints](#pricing-and-constraints)), so under E[U] and the weighted CVaR
+  each row's design premium is its bound (`budget_use` 1) until a budget is large
+  enough that more payout no longer lowers the objective; from there `budget_use`
+  falls below 1 and the objective on the design sample stops falling. Under MSE
+  `budget_use` can fall
+  below 1 at any budget. The frontier shows what each budget buys, and choosing
+  one is yours.
 - **On the design sample** the objective doesn't rise with the bound, because the
   feasible sets are nested. On another block nothing guarantees that, for the
   objective or for any metric.
@@ -2155,18 +2274,442 @@ Report the out-of-sample rows, each with its setup, as for any comparison. The
 `scope` column keeps the rows of each scope apart and makes no statement about
 them.
 
+## Several hazards at one asset
+
+An asset may lose from several hazards in one year, such as heavy rain and heat.
+The module holds them as named **index components** of one sample, each with its
+index, unit, tail and the loss of that hazard alone, and one **combined loss**
+per year under a rule you state. A cover can pay on several components through a
+`CompositeIndex`, with a payout over several indices (`SumOf`, `MaxOf`,
+`StepGrid` or a family of your own), or on one of them; and separate contracts,
+one per hazard, can be read as one row, a `CoverPackage`. Every piece is a
+function or a type you can combine with the others, and none of them says which
+cover, payout family, rule or dependence suits an asset. These are functions: a
+plan reads one hazard per asset.
+
+Here one asset's covers on rain and heat, on 40 years of a synthetic table:
+one contract on both hazards, a two-dimensional step table, beside two separate
+contracts with the same total budget:
+
+```python
+import numpy as np
+import pyarrow as pa
+from crc_framework import PiecewiseLinearImpact
+from crc_sdk.parametric import (
+    AnnualSeries, Budget, CompositeIndex, CompoundDamage, Cover, CoverPackage,
+    ExpectedUncovered, Free, ImpactNoise, IndexDefinition, LossModel,
+    MetricOptions, StepGrid, StepPayout, compare, design, holdout,
+    payout_breakdown, sample_annual_hazards, setup_text, split_budget,
+)
+from crc_sdk.types import SourceProvenance
+
+# Synthetic per-year values at one station: each year's maximum daily rainfall
+# and maximum daily temperature, 40 years. An illustration, not data.
+rng = np.random.default_rng(3)
+years = np.arange(1981, 2021).astype("int32")
+weather = pa.table({
+    "station": ["ST-1"] * len(years), "year": years,
+    "rx1day": rng.gumbel(50.0, 12.0, len(years)),     # mm/day
+    "txx": rng.gumbel(33.0, 2.0, len(years)),         # degC
+})
+synthetic = SourceProvenance(provider="example", dataset="synthetic weather",
+                             licence="CC0-1.0", attribution="Synthetic data")
+series = {
+    name: AnnualSeries.from_table(weather, value=name, where={"station": "ST-1"},
+                                  unit=unit, source=synthetic)
+    for name, unit in (("rx1day", "mm/day"), ("txx", "degC"))
+}
+
+# Each hazard's impact on a value of 2 million EUR (the heat impact is
+# illustrative), and a stated rule for the year's combined loss.
+loss_models = {
+    "rx1day": LossModel(PiecewiseLinearImpact([40.0, 120.0], [0.0, 0.5]),
+                        value=2e6, value_unit="EUR"),
+    "txx": LossModel(PiecewiseLinearImpact([32.0, 42.0], [0.0, 0.3]),
+                     value=2e6, value_unit="EUR"),
+}
+sample = sample_annual_hazards(
+    series, tails={"rx1day": "upper", "txx": "upper"}, loss_models=loss_models,
+    combine=CompoundDamage(),                  # required: no rule is assumed
+    basis_risk=ImpactNoise(0.3, upper=1.0), asset_id="warehouse-a",
+    rng=np.random.default_rng(42),
+)
+train, test = holdout(sample, train_fraction=0.7)   # 28 design years, 12 held out
+
+# One contract on both hazards: a two-dimensional step table.
+rain = IndexDefinition("rx1day", "mm/day", aggregation="annual_maximum")
+heat = IndexDefinition("txx", "degC", aggregation="annual_maximum")
+grid = Cover(CompositeIndex({"rx1day": rain, "txx": heat}),
+             StepGrid({"rx1day": [70.0], "txx": [36.0]},
+                      [[0.0, Free()], [Free(), Free()]]),
+             payout_unit="EUR", label="grid")
+# Two separate contracts, one per hazard.
+rain_step = Cover(rain, StepPayout([70.0], [Free()]), payout_unit="EUR",
+                  label="rain")
+heat_step = Cover(heat, StepPayout([36.0], [Free()]), payout_unit="EUR",
+                  label="heat")
+
+objective, budget = ExpectedUncovered(), Budget(ratio=0.8)
+shares = split_budget(budget, train, shares="own_loss")   # the same total
+holistic = design(grid, train, objective, budget=budget)  # on the combined loss
+separate = CoverPackage({
+    "rx1day": design(rain_step, train.component("rx1day"), objective,
+                     budget=shares["rx1day"]),       # on rain's own loss
+    "txx": design(heat_step, train.component("txx"), objective,
+                  budget=shares["txx"]),             # on heat's own loss
+}, label="separate")
+
+options = MetricOptions(betas=(0.9,), return_periods=(10,))
+table = compare([holistic, separate], test, split="out_of_sample",
+                options=options)
+parts = payout_breakdown([holistic, separate], test, split="out_of_sample")
+print(setup_text(table))   # the setup of these rows, to print with them
+```
+
+`table` has four rows, all on the 12 held-out years and all against the combined
+loss: `grid` (`level` `"asset"`, `components` `"rx1day+txx"`), designed on the
+combined loss; `rain` and `heat` (`"asset"`, `"rx1day"` and `"txx"`), each
+designed on its own hazard's loss; and `separate` (`"package"`,
+`"rx1day+txx"`), the two contracts' payouts and premiums added up. `parts`
+splits each entry's expected payout into its parts. The setup text states the
+components, the rule, that the dependence between the hazards is the data's own
+and that two annual maxima of one year may come from different events, what
+each row was designed on, and each contract's budget and premium. The rows are
+a measurement of this setup: the module makes no statement that a contract on
+both hazards does better or worse than separate contracts.
+
+On fitted curves, `sample_curve_hazards` draws the same two hazards under a
+dependence you state, here a Gaussian copula, and a fresh sample from other
+generators is the out-of-sample test. This cover pays a free scale times the
+larger of two fixed linear payouts:
+
+```python
+from crc_sdk.parametric import (GaussianCopula, LinearPayout, MaxOf, WeightedCVaR,
+                                sample_curve_hazards)
+from crc_sdk.types import CurveParameters, HazardDatasetMetadata
+
+def dataset(unit, what):
+    return HazardDatasetMetadata(
+        h3_resolution=7, value_unit=unit, value_semantics=what,
+        probability_semantics="annual_exceedance", return_period_support=(2.0, 500.0),
+        producer="example", creation_version="1", source=synthetic)
+
+curves = {"rx1day": CurveParameters(curve_type="gumbel_r", curve_location=50.0,
+                                    curve_scale=12.0),
+          "txx": CurveParameters(curve_type="gumbel_r", curve_location=33.0,
+                                 curve_scale=2.0)}
+datasets = {"rx1day": dataset("mm/day", "annual maximum daily rainfall"),
+            "txx": dataset("degC", "annual maximum daily temperature")}
+
+def draws(seed):
+    children = np.random.SeedSequence(seed).spawn(2)   # one generator per hazard
+    return sample_curve_hazards(
+        curves, dependence=GaussianCopula(0.3),         # stated, never assumed
+        metadata=datasets, n_draws=10_000,
+        rngs={"rx1day": np.random.default_rng(children[0]),
+              "txx": np.random.default_rng(children[1])},
+        loss_models=loss_models, combine=CompoundDamage(),
+        basis_risk=ImpactNoise(0.3, upper=1.0), asset_id="warehouse-a")
+
+design_draws, fresh_draws = draws(7), draws(8)
+either = Cover(CompositeIndex({"rx1day": rain, "txx": heat}),
+               MaxOf({"rx1day": LinearPayout(60.0, 120.0, 1.0),
+                      "txx": LinearPayout(35.0, 42.0, 1.0)}, scale=Free()),
+               payout_unit="EUR", label="either")
+designed = design(either, design_draws, WeightedCVaR(alpha=0.9, beta=0.9),
+                  budget=Budget(ratio=0.8))
+drawn_table = compare([designed], fresh_draws, split="out_of_sample",
+                      options=options)
+```
+
+The correlation 0.3 is an assumption of this example, not an estimate, and the
+setup text calls it one.
+
+### A sample of several hazards
+
+- **Components.** `sample.index_components` maps each component's name to an
+  `IndexComponent(values, *, unit, tail, hazard=None, own_loss=None)`, two or
+  more, in order, and is `None` on a sample of one hazard. `values` is the
+  component's index, `(n, 1)`; `hazard` is the value its loss model read, when
+  it differs from the index; `own_loss` is the loss of that hazard alone, in the
+  sample's loss unit, and `None` for a component with no impact.
+- **The primary.** The first component is the sample's `index`, `index_unit` and
+  `hazard`, so code that reads one index reads it. `loss` is the combined loss.
+- **Names** are non-empty, without surrounding whitespace and without `.`, `+`,
+  `[` or `]`, because parameter names and columns are built from them. A
+  component is usually named after its hazard, as a cover on one index finds its
+  component by its `hazard_name` (below).
+- **One asset.** A sample with components holds exactly one asset, so
+  `OutcomeSample.join` and `design_joint` refuse it.
+- **`sample.component(name, *, loss="own")`** returns that hazard's one-hazard
+  sample, with the same periods and probabilities: with `loss="own"` its loss
+  is the component's own loss, so a separate cover can be designed on it, and
+  with `loss="combined"` it keeps the combined loss. A component with no impact
+  has no own loss, so the default raises `SampleError` and names
+  `loss="combined"`. The view keeps the sample's lineage, so the leakage check
+  still sees its source.
+- **Splits.** `select`, `holdout` and `year_block_kfold` act on every
+  component. On an `EmpiricalCopula` sample they raise, as on several assets.
+- **Hashes and tables.** With components, `content_hash` covers each one's name,
+  unit, tail, values, hazard and own loss, and `to_table` adds the columns
+  `index[<name>]`, `hazard[<name>]` and `own_loss[<name>]`, with
+  `schema_version` `"1.1"`. A sample of one hazard hashes and writes as before.
+
+| Source | Function | The dependence between the hazards |
+| --- | --- | --- |
+| Per-year values | `sample_annual_hazards(series, *, tails, loss_models, combine=None, basis_risk, asset_id, rng=None, missing="raise", trend=AsRecorded(), scenario="baseline", hazard_names=None)` | the data's own: the rows are the same years, not the same events |
+| Fitted curves | `sample_curve_hazards(curves, *, dependence, metadata, n_draws, rngs, loss_models, combine=None, basis_risk, asset_id, assume_semantics=None, outside_support="raise", details=None, scenario="baseline", hazard_names=None)` | the model you state, with no default |
+| A table of yours | `OutcomeSample.from_table(table, ..., index={name: column, ...}, index_unit={name: unit, ...}, tails={name: tail, ...}, hazard=None, own_loss=None, ...)` | the data's own; `loss` is the combined loss as the table states it |
+
+- **Mappings by component.** `series`, `curves`, `tails`, `metadata`, `rngs`,
+  `loss_models` and `hazard_names` are mappings by component name, and the order
+  of `series` or `curves` sets the components. On curves each component's unit is
+  its dataset's `value_unit` and its tail the dataset's `return_period_tail`.
+- **Per-year values.** The series must hold the same years, or `SampleError`
+  lists each one's; `missing="drop_year"` drops a year missing from any series
+  from all of them and lists it. `trend=` is one option with one fit per series,
+  on the same fit years and the same reference year ([Climate
+  trends](#climate-trends)). One basis-risk model serves every component and
+  draws from `rng` in component order, so the first component's draws are those
+  of `sample_annual` with the same generator. `index=` is not offered: a table of
+  yours can state an index that differs from the hazard.
+- **Fitted curves.** Each component is what `sample_curve` draws with that
+  component's own generator, and the dependence model then reorders the rows,
+  as across assets ([several assets](#several-assets-from-fitted-curves)): a
+  row's index, hazard and own loss stay together and no value changes. Two
+  components with the same generator state raise `SampleError`. A window of
+  horizons takes the same horizons of one pathway for every component.
+- **A component with no impact.** A component left out of `loss_models` is read
+  as an index and has no loss: it needs no rule and has no own loss. A sample
+  with no impact at all raises, as it has no loss.
+
+### The combined loss
+
+A year has one loss, and how the hazards' impacts make it is a statement about
+the asset, so it is stated: `combine=` is required whenever two or more
+components have an impact, with no default, and refused with fewer.
+
+| Rule | The combined impact | Example on impacts 0.7 and 0.6 |
+| --- | --- | --- |
+| `CappedSum(cap)` | the sum of the impacts, at most `cap`, in the impacts' unit | `CappedSum(1.0)`: 1.0 |
+| `CompoundDamage()` | 1 − Π(1 − impact): each hazard damages what the others leave; every impact must lie in [0, 1] | 1 − 0.3 · 0.4 = 0.88 |
+| a `CombineRule` of your own | what its `combine` returns | |
+
+- **The order.** Each component's impact comes from its `LossModel`, on its
+  hazard at the asset, after the basis-risk model; its own loss is that impact
+  times the value; the rule takes the impacts, and the combined loss is the
+  rule's result times the value. So the loss models must have one value, one
+  `value_unit` and one `value_column`.
+- **`CompoundDamage()`** raises `SampleError` for an impact outside [0, 1], which
+  `ImpactNoise` without `upper=1.0` can make.
+- **A rule of your own** implements `CombineRule`: `to_document()`, plain JSON
+  with a `kind` that is not a built-in's and no `statement` key; `statement()`,
+  one non-empty sentence for the setup text; and `combine(impacts)`, which takes
+  each component's impact by name, read-only `(n,)` arrays, and returns `(n,)`,
+  finite and non-negative. Anything else raises `SampleError` before the sample
+  is returned, and a bare callable raises `TypeError`.
+- A rule that caps or compounds makes the combined loss smaller than the sum of
+  the own losses in some years, which matters for budgets (below).
+
+### Dependence across hazards
+
+On per-year values the dependence is the data's own, recorded as
+`{"kind": "data"}`. Fitted curves carry none, so `sample_curve_hazards` requires
+a model, the same ones as across assets: `Independent()`, `Comonotonic()`,
+`EmpiricalCopula(reference)`, `GaussianCopula(correlation)` or a
+`DependenceModel` of your own ([several
+assets](#several-assets-from-fitted-curves)), with the component names as the
+columns.
+
+- `EmpiricalCopula(reference)` takes a sample of per-year rows holding exactly
+  the same components, such as one from `sample_annual_hazards`, and ranks each
+  component on its `hazard`, or on its values when it has none. Its rank blocks
+  and ties work as across assets.
+- `GaussianCopula(correlation)` needs no per-year data for both hazards: it
+  states the dependence by one number, for two components, or a matrix.
+- Every model orders the draws by value, not by severity. With one `"upper"` and
+  one `"lower"` component, `Comonotonic()` pairs the most severe draw of one
+  with the least severe of the other, and the setup text says so.
+- The sample's provenance records the model under `hazard_dependence`, and the
+  setup text writes its sentence, which calls the dependence an assumption.
+
+### Covers on several indices
+
+```text
+CompositeIndex(components)    # a mapping from component name to IndexDefinition, two or more, in order
+Cover(index, payout, *, payout_unit, asset_id=None, label=None)   # index: an IndexDefinition or a CompositeIndex
+```
+
+- **The gate.** A cover takes a `CompositeIndex` when its payout's
+  `index_names` are the index's names and its `tail` the index's tails, in
+  order, or raises `CoverDefinitionError`.
+- **Reading it.** `cover.index_definition` is what a cover pays on, an
+  `IndexDefinition` or a `CompositeIndex`; `cover.index` keeps its one-index
+  meaning and raises `CoverDefinitionError` on a composite cover.
+  `cover.payout_values` takes `(n, k)` index values, one column per component
+  in the index's order, and returns `(n,)`.
+- **The document.** A composite cover's document lists the components in order
+  under `"index"`, with `schema_version` `"1.1"`; a cover on one index writes and
+  hashes as before.
+
+| Cover | On a sample with components | On a sample of one hazard |
+| --- | --- | --- |
+| One `IndexDefinition` | the component named its `hazard_name`; with none, `SampleError` lists the names. To read another component against the combined loss, take `sample.component(name, loss="combined")` | `index`, as always |
+| A `CompositeIndex` | the components of its names, in its order; each unit and tail must be the component's | `SampleError` |
+
+A sample may hold components a cover doesn't read.
+
+### Payouts over several indices
+
+| Family | Payout in a year | Parameters |
+| --- | --- | --- |
+| `SumOf(components)` | Σ_k π_k(s_k): each component's one-index payout on its own index | `<component>.<its name>`, such as `rx1day.levels[0]` |
+| `MaxOf(components, *, scale=1.0)` | A · max_k π_k(s_k): one contract, one amount; `scale` A is a float or `Free` | the components', and `scale` |
+| `StepGrid(breakpoints, levels, *, tail=("upper", "upper"), monotone=True)` | θ_{i,j}, with i and j the bins of the two severities | `<component>.breakpoints[k]` and `levels[i,j]`, with no `levels[0,0]` |
+
+`components` maps each component's name to a one-index payout, a built-in
+family or a registered one of your own, two or more, in order.
+
+- **`StepGrid`** takes exactly two components. `breakpoints` maps each to its
+  thresholds, in increasing severity. On each axis bin 0 lies below the first
+  threshold, bin k holds b_{k−1} ≤ s < b_k, and the last bin runs from the last
+  threshold up. `levels` is the table: with m thresholds on the first component
+  and q on the second, m + 1 rows of q + 1 values, rows along the first. Only the
+  cell below both first thresholds pays nothing, so `levels[0][0]` must be 0.0
+  and can't be `Free`, and a year can pay on one hazard alone, in the cells
+  (i, 0) and (0, j). `monotone=True` requires levels non-decreasing along both
+  axes.
+- **Special cases.** A resolved `SumOf` of two steps with levels θ and φ equals
+  the grid with levels θ_i + φ_j, and a `MaxOf` the grid with max(θ_i, φ_j),
+  taking θ_0 = φ_0 = 0.
+- **`MaxOf`'s scale.** A free scale beside a free component amount raises
+  `CoverDefinitionError`, because the scale would multiply amounts that are
+  already free.
+- **`Limit`** bounds a year's payout, so its meaning follows the family. On a
+  `SumOf` it bounds the year's total: for every choice of one amount per
+  component, the chosen amounts sum to at most the limit. On a `MaxOf` with a
+  free scale and G the largest amount of any component, scale ≤ limit / G. On a
+  `StepGrid` it bounds every cell.
+
+### Design on several indices
+
+`design(template, sample, objective, ...)` designs on the loss of the sample it
+is given and on nothing else: `design(template, sample)` designs on the
+combined loss, and `design(template, sample.component(name))` on that hazard's
+own loss.
+
+| Template | Route |
+| --- | --- |
+| `SumOf` of components linear in their amounts, thresholds fixed | one LP or QP on the side-by-side basis [B_1 \| … \| B_K] |
+| `StepGrid`, thresholds fixed | one LP or QP, on the one-hot basis of the cells |
+| `SumOf` or `StepGrid` with free thresholds on grids | the grid over the threshold candidates, with the LP or QP at each point, under `max_grid_points` |
+| `MaxOf` with a free scale over fixed components | one LP or QP in one amount, the scale |
+| `MaxOf` with a fixed scale, a `SumOf` with a component that isn't linear in its amounts, a family of your own without `LinearInAmounts`, or a `UserObjective` | the numpy grid over every free parameter, under `max_grid_points` |
+
+[Non-unique optima](#non-unique-optima) applies: a grid cell or a band that no
+design year reaches is in `unidentified`, and the fill rule runs on the order of
+both axes. With few years a two-dimensional table has cells no year reaches,
+and `unidentified_share` shows how much of an evaluation block falls in them.
+
+### Separate contracts: `CoverPackage` and `split_budget`
+
+`CoverPackage(covers, *, label=None)` holds separate contracts on one asset's
+hazards and makes them one row of a comparison. `covers` maps each component
+name to the one-index cover or design of the contract on that component: two or
+more, all covers or all designs, with one `payout_unit` and one `asset_id`. A
+package has `covers`, `index` (their `CompositeIndex`), `payout` (the `SumOf` of
+the covers as designed, every amount fixed), `as_cover()` (the same payout as
+one contract) and `package_hash`. `compare` and `evaluate` give one `"asset"` row
+per contract and one `"package"` row, whose metrics are on the summed payout
+against the combined loss, and whose `design_id`, `unique`, `ties` and
+`degenerate_tail` are null. A package's contracts listed again beside it repeat a
+row key, and `compare` raises.
+
+| The `"package"` row | What it holds |
+| --- | --- |
+| `premium`, `premium_basis` | The sum of the contracts' premiums, each on its own terms, and their basis |
+| `design_budget` | The sum of the contracts' budget bounds; null if any has none |
+| `cover_hash` | `package_hash`, which can't collide with the hash of a one-contract `SumOf` of the same terms |
+
+- **The premium.** Under `PurePremium()` the sum of the contracts' premiums is
+  the premium of one contract with their summed payout. Under
+  `CostOfCapitalLoad(r, q)` it is Σ_k ((1 − r) E[π_k] + r CVaR_q(π_k)), and one
+  contract on the sum, `as_cover()`, would be priced at most at that, because a
+  loading isn't additive across contracts. The setup text says which contracts
+  a premium prices.
+- **Limits.** Each contract keeps its own limit, and a package has none: its
+  largest year is at most the sum of its contracts' limits.
+- **The budget.** A budget is each design's own, and `design_budget` shows it.
+  `split_budget(budget, sample, *, shares)` splits one budget between the
+  contracts: it returns a `Budget(amount=...)` per component, the bound of
+  `budget` on `sample` times each share, so the bounds sum to the one bound.
+  `shares` has no default, because how to split a budget between hazards is an
+  assumption: `"own_loss"` takes each component's share of the summed expected
+  own losses, and a mapping states the shares, which must sum to 1.
+
+| Contract on both hazards | Separate contracts | The sum of their budgets |
+| --- | --- | --- |
+| `Budget(amount=B)` | `split_budget(Budget(amount=B), train, shares=...)` | B |
+| `Budget(ratio=κ)` | `split_budget(Budget(ratio=κ), train, shares=...)` | κ·E[L] on the combined loss |
+| `Budget(ratio=κ)` | `Budget(ratio=κ)` on each own loss | κ·Σ_k E[L_k], more than κ·E[L] when the rule caps or compounds in some year |
+
+The third row states a different total budget. `compare` neither refuses nor
+adjusts it, and the setup text gives the numbers.
+
+### `payout_breakdown`
+
+`payout_breakdown(covers, sample, *, split, fold=0, options=MetricOptions(),
+design_sample=None)` takes what `compare` takes, on one asset's sample, and
+returns a separate table with one row per entry and part: `compare`'s identity
+columns, `part`, `part_kind`, `expected_payout`, `share` (of the entry's
+expected payout, null when that is 0) and `payout_frequency`. The parts of one
+entry add up to its expected payout, which `payout_breakdown` checks year by
+year, and `write_comparison` writes the table with its metadata.
+
+| Entry | `part` | `part_kind` |
+| --- | --- | --- |
+| A cover on one index | the component's name | `"component"` |
+| `SumOf`, `CoverPackage` | each component | `"component"` |
+| `MaxOf` | each component: each year's payout goes to the component paying most, in equal shares when several tie | `"attribution"`, as one contract pays one amount |
+| `StepGrid` | `only:<first>`, `only:<second>` and `both`: the years where one index is past its first threshold and the other isn't, and those where both are | `"region"`, as a grid has no payout per hazard |
+| A family of your own with `breakdown(index)`, a mapping of `(n,)` arrays that add up to its payout | its keys | `"user"` |
+| A family of your own without one | `whole` | `"whole"` |
+
+### Reporting several hazards
+
+Every row's metrics are on the combined loss of its block, so a single-hazard
+contract's row sets its payout against both hazards' loss, and the setup text
+says so. The text also states every component (its unit, tail, source and
+where it is read), the rule for the combined loss or that a table states it,
+the dependence between the hazards, what each row's cover reads and what loss it
+was designed on, its budget and pricing, and for a package each contract's
+budget and premium. A comparison of a contract on several hazards with separate
+contracts is a measurement of its stated setup, out of sample; the table has no
+rank and no best flag.
+
 ## What this version does not do
 
 - **Clusters of assets, free thresholds in a joint design.** A joint design
   covers all the assets of its sample, as one scope, with fixed thresholds
-  only. A `Limit` is each cover's own: a limit on the total isn't offered. By
-  default, each asset is designed and evaluated on its own sample and a plan
-  builds one sample per asset, so it assumes no dependence between them.
+  only. A `Limit` is each cover's own: a limit on the owner's total isn't
+  offered. By default, each asset is designed and evaluated on its own sample
+  and a plan builds one sample per asset, so it assumes no dependence between
+  them.
 - **Different terms per asset on the plan.** Under `Joint()` a plan applies each
   cover to every asset. `design_joint` takes one template per asset.
-- **A `GaussianCopula` between curve samples.** The dependence models are
-  `Independent()`, `Comonotonic()` and `EmpiricalCopula(reference)`.
-- **Several hazards in one index.** An index is one hazard at one location.
+- **Other dependence models on the plan.** A plan's `.dependence(...)` takes
+  `Independent()`, `Comonotonic()` and `EmpiricalCopula(reference)`;
+  `GaussianCopula` and a `DependenceModel` of your own go through
+  `sample_curves` and `sample_curve_hazards`.
+- **Several hazards on the plan.** A plan reads one hazard per asset and takes
+  covers on one index. Samples of several hazards, covers on a `CompositeIndex`,
+  packages and `payout_breakdown` are functions ([several
+  hazards](#several-hazards-at-one-asset)).
+- **Several hazards beyond one asset and two axes.** A sample with index
+  components holds one asset, so several assets with several hazards, and a
+  joint design over them, are not offered. A `StepGrid` spans two components,
+  a `CoverPackage` holds covers on one index each, and a payout on one hazard
+  scaled by another is not built in (a family of your own can be registered).
 - **Several scenarios at once on the plan.** A per-year plan names one
   `scenario` for its rows, and a plan on fitted curves samples one hazard, horizon
   and pathway per asset. `ScenarioSet`, `compare_scenarios` and `to_drift` are
