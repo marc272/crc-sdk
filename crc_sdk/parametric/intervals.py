@@ -52,7 +52,6 @@ from numpy.typing import NDArray
 
 from crc_sdk.parametric._canonical import content_hash
 from crc_sdk.parametric.cover import Cover
-from crc_sdk.parametric.design import DEGENERATE_TAIL_TOLERANCE
 from crc_sdk.parametric.errors import EvaluationError, SampleError
 from crc_sdk.parametric.evaluate import (
     _NO_PREMIUM_METRICS,
@@ -85,6 +84,7 @@ from crc_sdk.parametric.evaluate import (
     _Run,
     _sample,
     _schema,
+    _short_blocks,
     _split_step,
     _table,
     _total_payout,
@@ -100,6 +100,7 @@ from crc_sdk.parametric.metadata import (
     EvaluationMetadata,
     EvaluationSetup,
     _is_block_column,
+    _reaches_worst_row,
     _replaced,
 )
 from crc_sdk.parametric.metrics import (
@@ -748,7 +749,9 @@ def _pool_entry_rows(
             pricing=runs[0].pricing,
         )
         metrics = _metrics(read, every_row, probability, options, without)
-        collected.rows.append({**identity, **metrics})
+        # A pooled row reads every held-out row, so its flags are on all of them.
+        flags = _short_blocks(options, identity["n_rows"])
+        collected.rows.append({**identity, **flags, **metrics})
         collected.reads.append(read)
         identities.append(identity)
         if not entry.given:
@@ -1080,12 +1083,7 @@ def _replicates(evaluated: _Evaluated, counts: IntArray) -> FloatArray:
 
 def _short_block(column: MetricColumn, n_rows: int) -> bool | None:
     """Whether the column's level reaches the block's worst row; `None` if no level."""
-    if "beta" in column.parameter:
-        reach = (1.0 - column.parameter["beta"]) * n_rows
-        return bool(reach <= 1.0 + DEGENERATE_TAIL_TOLERANCE)
-    if "return_period" in column.parameter:
-        return bool(column.parameter["return_period"] > n_rows)
-    return None
+    return _reaches_worst_row(column.parameter, n_rows)
 
 
 def _n_bootstrap(value: Any) -> int:

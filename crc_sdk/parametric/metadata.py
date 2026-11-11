@@ -141,8 +141,8 @@ IDENTITY_COLUMNS = (
 )
 """The columns of a comparison table before its metric columns.
 
-A comparison's rank-block columns (`_is_block_column`) follow them, and are
-identity columns too.
+A comparison's rank-block columns (`_is_block_column`) follow them, then its
+short-block flags (`_is_short_block_column`), and are identity columns too.
 """
 
 _ADDED_SCENARIO_COLUMNS = (
@@ -212,15 +212,45 @@ _BLOCK_TAIL_TOLERANCE = 1e-9
 _SUMMED_LEVELS = frozenset({"total", "asset_by_value", "asset_by_loss"})
 """The levels whose rows read a sum over a sample's reordered columns."""
 
+_SHORT_BLOCK_BETA_PREFIX = "short_block_b"
+"""The start of a short-block flag's name at a beta; the metrics' label follows."""
+
+_SHORT_BLOCK_PERIOD_PREFIX = "short_block_rp"
+"""The start of a short-block flag's name at a return period; its label follows."""
+
 
 def _is_block_column(name: str) -> bool:
     """Whether `name` is `copula_reference_years` or a rank-block flag."""
     return name == _REFERENCE_YEARS_COLUMN or name.startswith(_BLOCK_TAIL_PREFIX)
 
 
+def _is_short_block_column(name: str) -> bool:
+    """Whether `name` is a short-block flag, `short_block_b<beta>` or `_rp<T>`.
+
+    An intervals table's own `short_block` column is not one.
+    """
+    return name.startswith((_SHORT_BLOCK_BETA_PREFIX, _SHORT_BLOCK_PERIOD_PREFIX))
+
+
 def _tail_in_one_block(beta: float, years: int) -> bool:
     """Whether the tail at `beta` holds at most one of `years` reference blocks."""
     return (1.0 - beta) * years <= 1.0 + _BLOCK_TAIL_TOLERANCE
+
+
+def _reaches_worst_row(parameter: Mapping[str, float], n_rows: int) -> bool | None:
+    """Whether a metric at this level reads only the top of a block of `n_rows`.
+
+    The short-block rule: true when `(1 - beta) * n <= 1` for a beta, with the
+    tolerance of `degenerate_tail` (1e-9), so the tail of 1 - beta of the
+    probability holds at most the block's worst row; and when `T > n` for a
+    return period, so the lower (1 - 1/T)-quantile is the block's largest
+    value. `None` for a metric with no such level.
+    """
+    if "beta" in parameter:
+        return _tail_in_one_block(float(parameter["beta"]), n_rows)
+    if "return_period" in parameter:
+        return bool(float(parameter["return_period"]) > n_rows)
+    return None
 
 
 def _reference_years(
@@ -253,8 +283,9 @@ def _reference_years(
 def _identity_columns(names: Iterable[str]) -> list[str]:
     """The identity columns among `names`, those added since optional.
 
-    A comparison's rank-block flags, a budget frontier's four columns and a
-    payout breakdown's `part` and `part_kind` are identity columns too.
+    A comparison's rank-block flags and short-block flags, a budget frontier's
+    four columns and a payout breakdown's `part` and `part_kind` are identity
+    columns too.
     """
     listed = list(names)
     present = set(listed)
@@ -265,6 +296,7 @@ def _identity_columns(names: Iterable[str]) -> list[str]:
             if name in present or name not in _ADDED_IDENTITY_COLUMNS
         ),
         *(name for name in listed if _is_block_column(name)),
+        *(name for name in listed if _is_short_block_column(name)),
         *(name for name in _FRONTIER_COLUMNS if name in present),
         *(name for name in _BREAKDOWN_COLUMNS if name in present),
     ]
@@ -3180,6 +3212,73 @@ def _rank_block_lines(
     return _first_seen(lines)
 
 
+def _short_block_lines(
+    evaluations: Sequence[Mapping[str, Any]],
+    by_hash: Mapping[str, Mapping[str, Any]],
+    options: Any,
+) -> list[str]:
+    """The `Short blocks` line: the levels that reach their block's worst row.
+
+    A block's rows are the draws of the sample an evaluation reads, all the
+    held-out rows for a pooled one. A payout breakdown has no tail metric, and
+    an evaluation whose sample or counts are not known says nothing.
+    """
+    if not isinstance(options, Mapping):
+        return []
+    levels: dict[str, list[Any]] = {}
+    for key in ("betas", "return_periods"):
+        stated = options.get(key)
+        if stated is not None:
+            # Checked as the `Metrics` line checks them, with its messages.
+            _numbers(stated, f"setup.metric_options.{key}")
+        levels[key] = [] if stated is None else list(stated)
+    betas, periods = levels["betas"], levels["return_periods"]
+    flagged: dict[int, tuple[list[Any], list[Any]]] = {}
+    for i, evaluation in enumerate(evaluations):
+        where = f"setup.evaluations[{i}]"
+        if _list(evaluation, "part_kinds", where):
+            continue
+        sample = by_hash.get(str(evaluation.get("sample_hash")))
+        rows = None if sample is None else _get(sample, "draws", int, "sample")
+        if rows is None:
+            continue
+        at_beta = [b for b in betas if _reaches_worst_row({"beta": b}, rows)]
+        at_period = [
+            t for t in periods if _reaches_worst_row({"return_period": t}, rows)
+        ]
+        if at_beta or at_period:
+            flagged.setdefault(rows, (at_beta, at_period))
+    if not flagged:
+        return []
+    place = "setup.metric_options"
+    blocks: list[str] = []
+    for rows, (at_beta, at_period) in flagged.items():
+        named: list[str] = []
+        if at_beta:
+            named.append(f"beta {_join([_number(b, place) for b in at_beta])}")
+        if at_period:
+            periods_named = _join([_number(t, place) for t in at_period])
+            named.append(f"return periods {periods_named} years")
+        blocks.append(f"on {rows:,} rows, {' and '.join(named)}")
+    text = (
+        "Short blocks: these tail levels reach the worst row of their block, as the "
+        "rows' short_block_b<beta> and short_block_rp<T> columns flag: "
+        f"{'; '.join(blocks)}."
+    )
+    if any(at_beta for at_beta, _ in flagged.values()):
+        text += (
+            " At such a beta, (1 - beta) * n <= 1 for the block's n rows: a CVaR, "
+            "tail-coverage or CVaR-ratio column reads its worst row, and a VaR column "
+            "its largest value, or its second largest where (1 - beta) * n is 1."
+        )
+    if any(at_period for _, at_period in flagged.values()):
+        text += (
+            " At such a return period, T > n: a return-period column reads the "
+            "block's largest value, the worst of its n rows and not a 1-in-T value."
+        )
+    return [text]
+
+
 def _window_lines(samples: Sequence[Mapping[str, Any]]) -> list[str]:
     """One line per window of horizons among samples no set of scenarios states."""
     lines: list[str] = []
@@ -3925,7 +4024,13 @@ def setup_text(
         for i, evaluation in enumerate(evaluations)
         for kind in _list(evaluation, "part_kinds", f"setup.evaluations[{i}]")
     ]
-    if not part_kinds:
+    if levels and set(levels) <= set(_ALLOCATED_LEVELS):
+        lines.append(
+            "Pricing: allocated rows hold no premium and no net-loss values, as a "
+            "pricing prices a joint design's total payout and not a part of it; a "
+            "design's line states its pricing."
+        )
+    elif not part_kinds:
         lines.append(priced)
     else:
         lines.append(
@@ -3948,6 +4053,9 @@ def setup_text(
         labels,
         options if isinstance(options, Mapping) else None,
     )
+    if not across:
+        # Across scenarios the `Short blocks` line names each block's columns.
+        lines += _short_block_lines(evaluations, by_hash, options)
     if "attribution" in part_kinds:
         lines.append(
             "Payout breakdown: the rows of a MaxOf cover are an attribution: each "

@@ -362,6 +362,24 @@ METRICS = (
     "Metrics: beta 0.9, 0.95, 0.99; return periods 2, 5, 10, 25, 50, 100, 250 "
     "years; loss thresholds 0 EUR; payout threshold 0 EUR."
 )
+SHORT_BETA = (
+    " At such a beta, (1 - beta) * n <= 1 for the block's n rows: a CVaR, "
+    "tail-coverage or CVaR-ratio column reads its worst row, and a VaR column its "
+    "largest value, or its second largest where (1 - beta) * n is 1."
+)
+SHORT_PERIOD = (
+    " At such a return period, T > n: a return-period column reads the block's "
+    "largest value, the worst of its n rows and not a 1-in-T value."
+)
+
+
+def _short_blocks(blocks: str) -> str:
+    """The `Short blocks` line with both explanations, for `blocks`."""
+    return (
+        "Short blocks: these tail levels reach the worst row of their block, as the "
+        f"rows' short_block_b<beta> and short_block_rp<T> columns flag: {blocks}."
+        f"{SHORT_BETA}{SHORT_PERIOD}"
+    )
 
 
 def test_setup_text_of_an_in_sample_comparison() -> None:
@@ -376,6 +394,10 @@ def test_setup_text_of_an_in_sample_comparison() -> None:
             TABLE_SAMPLE,
             TABLE_SOURCE,
             PRICING,
+            _short_blocks(
+                "on 20 rows, beta 0.95 and 0.99 and return periods 25, 50, 100 and "
+                "250 years"
+            ),
             METRICS,
         ]
     )
@@ -473,6 +495,10 @@ def test_setup_text_of_a_holdout_comparison() -> None:
             "x E[L] of the design sample; limit: 1,000,000 EUR; design premium: "
             "77,495.1 EUR; route: lp; unique optimum: not checked; ties: 0; "
             "tail: not degenerate.",
+            _short_blocks(
+                "on 5 rows, beta 0.9, 0.95 and 0.99 and return periods 10, 25, 50, "
+                "100 and 250 years"
+            ),
             METRICS,
         ]
     )

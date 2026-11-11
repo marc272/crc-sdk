@@ -99,6 +99,7 @@ from crc_sdk.parametric.errors import (
 )
 from crc_sdk.parametric.evaluate import (
     CoverPackage,
+    allocate,
     compare,
     evaluate,
     payout_breakdown,
@@ -264,6 +265,7 @@ __all__ = [
     "UnresolvedParameterError",
     "UserObjective",
     "WeightedCVaR",
+    "allocate",
     "bootstrap_intervals",
     "compare",
     "compare_pooled",
