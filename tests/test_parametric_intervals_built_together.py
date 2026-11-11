@@ -7,8 +7,10 @@ row, so their rows are not. A synthetic coverage study found intervals
 miscalibrated on the rows of an `EmpiricalCopula` block that read several
 columns, and on every row of a held `HazardNoise` block, and calibrated on an
 asset's own row of a copula block and on independent rows. These tests check
-that the flag marks exactly those rows, by how the block was built, and that
-the setup text says so. Every number is synthetic.
+that the flag marks exactly those rows, by how the block was built; how it
+carries over to what the study didn't measure (hazards, joins, views, pooled
+folds); and that the metadata and the setup text say so. Every number is
+synthetic.
 """
 
 from __future__ import annotations
@@ -88,8 +90,8 @@ HEAT = IndexDefinition("heat", "degC", aggregation="annual_maximum")
 HELD = HazardNoise(0.3, hold="hazard_distribution")
 YEARS = np.arange(1991, 1991 + 24)
 
-COPULA_TEXT = "an EmpiricalCopula dealt each asset's or hazard's draws"
-HELD_TEXT = "HazardNoise(..., hold='hazard_distribution') gave each row's hazard"
+COPULA_TEXT = "they read two or more assets or hazards whose draws an EmpiricalCopula"
+HELD_TEXT = "they read a hazard at the asset whose values HazardNoise(..., hold="
 SENTENCE = "The rows with built_together true read draws that were built together"
 
 
@@ -247,7 +249,7 @@ def _intervals(entries: list[Any], sample: OutcomeSample, **arguments: Any) -> A
 
 
 def _flags(table: Any) -> list[tuple[Any, Any, bool]]:
-    """Each wide row's (level, asset_id or cover label, flag); one flag per row."""
+    """Each wide row's (level, asset_id, flag), checking one flag per wide row."""
     by_row: dict[tuple[Any, Any, Any], set[bool]] = {}
     for row in table.to_pylist():
         key = (row["level"], row["asset_id"], row["cover_label"])
@@ -308,8 +310,8 @@ def test_a_copula_flags_every_row_of_a_joint_design() -> None:
     ids=["independent", "comonotonic", "gaussian"],
 )
 def test_the_other_dependence_models_are_not_flagged(dependence: Any) -> None:
-    # The flag marks what the study measured: independent rows were calibrated,
-    # and these two models were not part of it.
+    # Independent rows were measured and calibrated. Comonotonic and
+    # GaussianCopula weren't measured, and the flag doesn't extend to them.
     table = _intervals([_covers()], _assets(dependence))
     assert not any(table.column("built_together").to_pylist())
     assert _record(table) == []
@@ -481,15 +483,11 @@ def test_pooled_folds_of_held_blocks_are_flagged() -> None:
 # -- the table, the metadata and the setup text ----------------------------------------
 
 
-def test_the_flag_follows_short_block_and_changes_no_number() -> None:
-    sample = _assets(_copula())
-    table = _intervals([_covers()], sample)
+def test_the_flag_is_a_bool_column_after_short_block() -> None:
+    table = _intervals([_covers()], _assets(_copula()))
     assert table.column_names[-2:] == ["short_block", "built_together"]
     assert table.schema.field("built_together").type == pa.bool_()
-    again = _intervals([_covers()], sample)
-    assert table.drop_columns(["built_together"]).equals(
-        again.drop_columns(["built_together"])
-    )
+    assert table.column("built_together").null_count == 0
 
 
 def test_the_setup_text_states_the_rows_built_together() -> None:

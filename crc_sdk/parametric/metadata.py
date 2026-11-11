@@ -195,13 +195,12 @@ _ADDED_INTERVAL_COLUMNS = ("built_together",)
 
 _BUILT_TOGETHER = {
     "empirical_copula": (
-        "an EmpiricalCopula dealt each asset's or hazard's draws to its reference "
-        "years by their rank over every row, and each of these rows reads several "
-        "of them"
+        "they read two or more assets or hazards whose draws an EmpiricalCopula "
+        "dealt to its reference years by their rank over every row"
     ),
     "hazard_distribution": (
-        "HazardNoise(..., hold='hazard_distribution') gave each row's hazard at the "
-        "asset a value by its rank over every row"
+        "they read a hazard at the asset whose values HazardNoise(..., "
+        "hold='hazard_distribution') gave by rank over every row"
     ),
 }
 """How the rows an intervals table flags `built_together` were built, by kind.
@@ -3114,7 +3113,7 @@ def _intervals(intervals: Mapping[str, Any]) -> str:
     if kinds:
         text += (
             " The rows with built_together true read draws that were built "
-            f"together: {'; '.join(_BUILT_TOGETHER[kind] for kind in kinds)}. "
+            f"together: {'; or '.join(_BUILT_TOGETHER[kind] for kind in kinds)}. "
             "Resampling treats them as independent, so on these rows an interval "
             "is not the sampling error of the number, and it can be narrower or "
             "wider; crc-sdk's docs/parametric.md, "
