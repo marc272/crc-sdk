@@ -29,7 +29,7 @@ There are two ways to use the module:
 | Concept | Name | What it is |
 | --- | --- | --- |
 | Cover | `Cover` | The contract terms: an index, a payout function with its parameters, the payout unit and the asset |
-| Index | `IndexDefinition` | What the cover pays on: hazard name, unit, severe tail, location, aggregation |
+| Index | `IndexDefinition` | What the cover pays on: hazard name, unit, severe tail, location and, if stated, aggregation |
 | Payout function | `LinearPayout`, `StepPayout`, `PiecewiseLinearPayout`, `BinaryPayout`, or your own | Maps a year's index value to its payout |
 | Several hazards | `CompositeIndex`, `SumOf`, `MaxOf`, `StepGrid`, `IndexComponent`, `CappedSum`, `CompoundDamage`, `CoverPackage` | A cover that pays on several hazards at one asset, the sample that holds them, the rule for their combined loss, and separate contracts as one row ([several hazards](#several-hazards-at-one-asset)) |
 | Template | a `Cover` with `Free` parameters | Terms a design chooses within stated bounds |
@@ -52,6 +52,69 @@ index and hazard are the same value. "Portfolio" keeps crc-sdk's meaning, a
 set of assets.
 
 ## Quick start
+
+Two quick starts: from your own table of years, the shortest path, which needs
+no CRC data; and from a fitted hazard curve, with the plan.
+
+### From your own table of years
+
+Read a table of years with an index value and a loss each, design a step cover
+on the first 28 years, and compare it with a fixed linear cover on the 12 years
+held out. The record is synthetic, an illustration, not data. `design` needs
+the optional extra `crc-sdk[parametric]` (the HiGHS solver).
+
+```python
+import numpy as np
+import pyarrow as pa
+from crc_sdk.parametric import (
+    Budget, Cover, ExpectedUncovered, Free, IndexDefinition, LinearPayout,
+    OutcomeSample, StepPayout, compare, design, holdout, setup_text,
+)
+
+# Each year's maximum daily rainfall at the asset (mm/day) and its loss (EUR).
+rng = np.random.default_rng(7)
+rain = rng.gumbel(50.0, 12.0, 40)
+loss = 2e6 * np.clip((rain - 40.0) / 160.0, 0.0, 0.5) * rng.lognormal(-0.045, 0.3, 40)
+record = pa.table({"year": np.arange(1985, 2025), "asset_id": ["warehouse-a"] * 40,
+                   "rx1day": rain, "loss_eur": loss})
+
+sample = OutcomeSample.from_table(record, period="year", asset_id="asset_id",
+                                  index="rx1day", loss="loss_eur",
+                                  index_unit="mm/day", loss_unit="EUR")
+rain_index = IndexDefinition("rx1day", "mm/day")
+template = Cover(rain_index, StepPayout([60.0, 80.0, 100.0], [Free(), Free(), Free()]),
+                 payout_unit="EUR", asset_id="warehouse-a", label="step")
+fixed = Cover(rain_index, LinearPayout(60.0, 120.0, 5e5), payout_unit="EUR",
+              asset_id="warehouse-a", label="linear")
+
+design_years, held_out = holdout(sample, train_fraction=0.7)   # 1985-2012, 2013-2024
+designed = design(template, design_years, ExpectedUncovered(), budget=Budget(ratio=0.8))
+comparison = compare([designed, fixed], held_out, split="out_of_sample",
+                     design_sample=design_years)   # where the fixed terms were chosen
+comparison.select(["cover_label", "premium", "expected_uncovered", "coverage_ratio"])
+print(setup_text(comparison))   # the setup of these numbers, to print with them
+```
+
+- **One row is one year.** Passing the table states it, so `semantics="annual"`,
+  its only value, is the default.
+- **Units.** This table carries none, so `index_unit` and `loss_unit` are
+  stated. A table that carries them needs neither: a column's Arrow field
+  metadata `unit` (`pa.field("rx1day", pa.float64(), metadata={"unit":
+  "mm/day"})`), or the record of a table that `sample.to_table()` wrote. A
+  stated unit must then equal the table's.
+- **Aggregation.** `IndexDefinition` leaves `aggregation` out here: the cover
+  pays on the year's value as the table holds it. A stated
+  `aggregation="annual_maximum"` names how that value was made in the terms
+  ([define a cover](#define-a-cover-and-evaluate-its-payouts)).
+- **Basis risk** is the table's own: the index and the loss are each year's
+  values as the table holds them, and no model is applied. If the loss is a monotone function of
+  the index, `from_table` warns with `ComonotoneIndexWarning`.
+- **The rows.** Both rows are out of sample, on the 12 held-out years. The
+  design keeps its design premium and the fixed cover is priced on the
+  held-out years (`premium_basis`). Any number in the table describes this
+  synthetic record under the setup `setup_text` prints, and nothing more.
+
+### From a fitted curve, with the plan
 
 Design a step cover on 5,000 years simulated from a fitted rainfall curve,
 under three objectives, and compare the designs with a fixed linear cover on
@@ -248,7 +311,7 @@ planned evaluation, and in the design terms.
 ```python
 from crc_sdk.parametric import CostOfCapitalLoad
 
-priced = (plan.covers(linear)                   # the quick start's fixed cover
+priced = (plan.covers(linear)                   # the curve quick start's fixed cover
               .pricing(CostOfCapitalLoad(0.06, 0.99)))
 priced_result = priced.write_parquet("priced.parquet")
 ```
@@ -347,7 +410,7 @@ reads the years of an annual-extremes table (ERA5, CMIP6, NEX-GDDP-CMIP6, a
 station, NOAA water levels) at each asset. Each row is a recorded or modelled
 year with probability `1/n`, so no curve and no probability semantics are
 assumed, and by default the years are used as recorded ([Climate
-trends](#climate-trends)). Here the quick start's covers and asset are
+trends](#climate-trends)). Here the curve quick start's covers and asset are
 designed on 28 years of a synthetic table and compared on the 12 years held
 out:
 
@@ -781,7 +844,7 @@ an index of your own.
 
 ### From a fitted curve
 
-The quick start's plan, by hand, for its one asset: `request.asset_curves()`
+The curve quick start's plan, by hand, for its one asset: `request.asset_curves()`
 gives the asset's canonical curve row, `sample_curve` draws simulated years
 from it, and fresh draws from another generator are the out-of-sample test.
 With the plan's generators for its first asset, the samples are the plan's:
@@ -941,7 +1004,7 @@ statements that every split or sample shares are written once.
   one beside a single horizon, stand side by side, so that a difference includes
   the width. A window outside a set of scenarios has a `Window of horizons` line.
 - `Sample notes` writes a note that counts draws once, with each sample's own
-  counts. In the quick start, the draws beyond the curve's fitted support
+  counts. In the curve quick start, the draws beyond the curve's fitted support
   read "2527 of 5000 draws in the design sample and 2464 of 5000 in the fresh
   draws are more frequent than the shortest fitted return period (2 years)",
   and the same for the longest. A sample's count of 1 takes the singular ("1
@@ -951,11 +1014,11 @@ statements that every split or sample shares are written once.
 
 `setup_text(table)` states the setup of a comparison table's own rows: a table
 that `compare` returns, one read back with `pyarrow.parquet.read_table`, or
-rows filtered from either, such as the quick start's out-of-sample rows. It
+rows filtered from either, such as the curve quick start's out-of-sample rows. It
 reads the table's `crc.parametric.evaluation` metadata, which rows and columns
 taken from the table keep, and keeps the evaluations that the rows name (by
 `sample_hash`, `split` and `fold`), their samples and sources, and the designs
-the rows name (by `design_id`). So the out-of-sample rows of the quick start
+the rows name (by `design_id`). So the out-of-sample rows of the curve quick start
 give the text of `result.metadata` without the in-sample `Split` line, and the
 rows of one asset give that asset's setup alone. All of a table's rows give the
 text of its metadata.
@@ -981,7 +1044,7 @@ designed, so there is no such line. Its `Source` line names what the plan
 states: on fitted curves the canonical dataset's path and the hazards, horizons
 and pathways selected ("Source: the hazard curves of the canonical dataset rx1day.parquet, for
 hazard rx1day, horizon 2050 and pathway ssp245; their provider and dataset are
-not known yet." in the quick start), and on per-year values the provider and
+not known yet." in the curve quick start), and on per-year values the provider and
 dataset of the plan's `provenance` and the file, table or source plan the
 values are read from. It has no `Location` line, as only execution matches the
 cells. `setup_text(plan.explain(format="json")["setup"])`, or
@@ -1004,11 +1067,18 @@ cover = Cover(
 cover.payout_values([45.0, 60.0, 85.0, 140.0])   # array([0., 1000., 5000., 20000.])
 ```
 
-- **Index:** `IndexDefinition(hazard_name, unit, *, tail="upper", location=AtAsset(), aggregation, source=None)`.
+- **Index:** `IndexDefinition(hazard_name, unit, *, tail="upper", location=AtAsset(), aggregation=None, source=None)`.
   `tail="upper"` means larger values are more severe (rainfall, wind);
   `tail="lower"` means smaller values are (a drought index), as a dataset's
   `return_period_tail` says. `location` is `AtAsset()`, `AtPoint(longitude,
   latitude)`, `AtStation(station_id)` or `AtCell(cell_index)` (an H3 cell).
+- **Aggregation** is optional: it says how one year's values became the year's
+  index, such as `"annual_maximum"`. A stated value is free text: it is part of
+  the terms, so the cover document and its hash hold it, and nothing checks
+  it or reads it, since a sample holds one index value per year whatever made
+  it. Left out, the terms don't say, and the document holds `"aggregation":
+  null`. The setup text states no cover's terms, so it reads the same either
+  way.
 - **Cover:** `Cover(index, payout, *, payout_unit, asset_id=None, label=None)`.
   The payout's `tail` must equal the index's. `label` is a display name only.
 
@@ -1060,7 +1130,9 @@ resolved = template.with_values({"levels[0]": 1e3, "levels[1]": 5e3, "levels[2]"
 
 `cover.to_json()` returns the cover document as canonical JSON: the index, the
 payout with every parameter, `payout_unit`, `asset_id`, `schema_version` and
-`semantics_version`. `cover.definition_hash` is `sha256:` plus the SHA-256 of
+`semantics_version`. The index always holds `aggregation`, `null` when it is
+not stated, so the same terms with and without an aggregation are two
+documents with two hashes. `cover.definition_hash` is `sha256:` plus the SHA-256 of
 that text, in the canonical spelling crc-framework uses for
 `ImpactExpression.definition_hash`. The label is not part of the document, so
 two covers with the same terms have the same hash; `asset_id` is, so the same
@@ -1117,12 +1189,27 @@ sample of several ([joint design](#joint-design-over-several-assets)), and
 | Fitted curves of several assets | `sample_curves(curves, *, dependence, metadata, n_draws, rngs, loss_models, basis_risk, scenario="baseline", hazard_name=None)` | a simulated year | `1/n` |
 | Per-year values | `sample_annual(AnnualSeries, *, loss_model, basis_risk, asset_id, index=None, trend=AsRecorded(), scenario="baseline", hazard_name=None)` | an observed or modelled year | `1/n` |
 | Pooled model-years | `sample_annual_pool(runs, *, loss_model, basis_risk, asset_id, trend=AsRecorded(), scenario="baseline", hazard_name=None)` | one run's year | `1/N` |
-| A user table | `OutcomeSample.from_table(table, *, period, asset_id, index, loss, probability=None, hazard=None, semantics, index_unit, loss_unit, ..., scenario="baseline", hazard_name=None)` | a table row | its `probability` column, or `1/n` |
+| A user table | `OutcomeSample.from_table(table, *, period, asset_id, index, loss, probability=None, hazard=None, semantics="annual", index_unit=None, loss_unit=None, ..., scenario="baseline", hazard_name=None)` | a table row | its `probability` column, or `1/n` |
 | Several hazards at one asset | `sample_annual_hazards(series, *, tails, loss_models, combine=None, basis_risk, asset_id, ...)`, `sample_curve_hazards(curves, *, dependence, ..., combine=None, basis_risk, asset_id, ...)` ([several hazards](#several-hazards-at-one-asset)) | a year, observed or simulated | `1/n` |
 
-`semantics` has no default in `OutcomeSample.from_table`: `semantics="annual"`,
-its only value, is the caller's statement that one row of the table is one
-year, and leaving it out raises `TypeError`.
+In `OutcomeSample.from_table`, one row of the table is one year: passing the
+table states it, and the provenance records the semantics as the caller's.
+`semantics="annual"`, its only value, is the default and may be written out.
+`index_unit` and `loss_unit` default to the units the table states for the
+index and loss columns:
+
+- a column's Arrow field metadata `unit`, as in `pa.field("loss_eur",
+  pa.float64(), metadata={"unit": "EUR"})`, which Parquet keeps;
+- for the `index`, `loss` and `index[<name>]` columns of a table that
+  `sample.to_table()` wrote, the units its `crc.parametric.sample` record
+  holds, so a written table that was changed reads back with `from_table`.
+
+Where both state a unit they must agree. A table that states none for a column
+needs the unit stated, and leaving it out raises `SampleError`; a stated unit
+that differs from the table's raises too. With several index columns,
+`index_unit` maps any of the component names to a unit, and the others take
+their column's. A sample is the same, with the same content hash and
+provenance, whether its units and semantics were stated or read.
 
 A curve may also be a **window of horizons**: a sequence of two or more
 canonical rows of one hazard, cell, pathway and dataset, which differ in `horizon`
@@ -1168,10 +1255,14 @@ describes one year's value:
   `"clamp"` is stated.
 
 **Per-year values.** `AnnualSeries.from_table(table, *, year, value, where,
-unit, source=None)` reads one location of an `annual_extremes()` table (a
+unit=None, source=None)` reads one location of an `annual_extremes()` table (a
 station with `where={"station": ...}`), and `AnnualSeries.nearest_cell(table,
-*, longitude, latitude, unit, source=None)` the grid cell whose centre lies
-within half a grid step of a point. A year without a value raises in
+*, longitude, latitude, unit=None, source=None)` the grid cell whose centre lies
+within half a grid step of a point. `unit` defaults to the unit the table
+states for the series' rows: a `unit` column with one value, as
+NEX-GDDP-CMIP6's `annual_extremes()` has, or the Arrow field metadata `unit` of
+the value column. ERA5's and CMIP6's tables state none, so `unit` is stated
+for them, and a stated unit must equal the table's. A year without a value raises in
 `sample_annual`, unless `missing="drop_year"`, which lists the dropped years.
 `trend=` states how the climate trend is treated, by default as recorded
 ([Climate trends](#climate-trends)).
@@ -1316,7 +1407,7 @@ sample records it as an assumption.
 import numpy as np
 from crc_sdk.parametric import Comonotonic, ImpactNoise, sample_curves
 
-# row_a, row_b: each asset's canonical curve row; here the quick start's curve
+# row_a, row_b: each asset's canonical curve row; here the curve quick start's curve
 # and a wetter one in its place, to illustrate
 row_a, row_b = row, {**row, "curve_location": 55.0}
 asset_ids = ("warehouse-a", "warehouse-b")
@@ -1432,7 +1523,7 @@ from crc_sdk.parametric import (CostOfCapitalLoad, MetricOptions, compare,
                                 holdout, to_long, write_comparison)
 
 design_years, held_out = holdout(sample, train_fraction=0.7)
-# two covers given as is, here the quick start's linear cover and the resolved
+# two covers given as is, here the curve quick start's linear cover and the resolved
 # step cover above; their terms were chosen on design_years, so name it
 cover_a, cover_b = linear, resolved
 table = compare([cover_a, cover_b], held_out, split="out_of_sample",
@@ -1505,7 +1596,7 @@ The premium a row uses is, in this order:
 once, on the reference's design block (`"reference"`).
 
 **One table, several bases.** A `compare` table that holds designs and covers
-given as is mixes the first two bases, as the quick start's does. A design's
+given as is mixes the first two bases, as the curve quick start's does. A design's
 row keeps its design premium, priced on the design sample, on every block it is
 read on. A cover given as is has no design premium, so its row is priced on the
 block that row evaluates: out of sample, on the held-out years or the fresh
@@ -1728,7 +1819,7 @@ is better: a row is a measurement of a stated setup.
 from crc_sdk.parametric import ScenarioSet, compare_scenarios, sample_curve, to_drift
 
 # rows_2030s, rows_2050s: the members of two windows, one cell's canonical rows
-# at three horizons each; here the quick start's row, its location moved by
+# at three horizons each; here the curve quick start's row, its location moved by
 # 0.1 mm/day a year, to illustrate
 def window(horizons):
     return [{**row, "horizon": h, "curve_location": 50.0 + 0.1 * (h - 2030)}
@@ -1892,7 +1983,7 @@ function does not, so give each function its own name.
   design spends its whole budget (`budget_use` 1) as long as more payout still
   lowers the objective, which is the usual case below the budget at which every
   amount covers the losses of its band. MSE counts payouts above the loss, so
-  an MSE design may leave part of its budget unused, as the quick start's does.
+  an MSE design may leave part of its budget unused, as the curve quick start's does.
   A `UserObjective` sees the loss, the payout and the probabilities, and not the
   premium either. To see what different budgets buy, use
   [`design_frontier`](#a-budget-frontier).
@@ -2460,7 +2551,7 @@ setup text calls it one.
 | --- | --- | --- |
 | Per-year values | `sample_annual_hazards(series, *, tails, loss_models, combine=None, basis_risk, asset_id, rng=None, missing="raise", trend=AsRecorded(), scenario="baseline", hazard_names=None)` | the data's own: the rows are the same years, not the same events |
 | Fitted curves | `sample_curve_hazards(curves, *, dependence, metadata, n_draws, rngs, loss_models, combine=None, basis_risk, asset_id, assume_semantics=None, outside_support="raise", details=None, scenario="baseline", hazard_names=None)` | the model you state, with no default |
-| A table of yours | `OutcomeSample.from_table(table, ..., index={name: column, ...}, index_unit={name: unit, ...}, tails={name: tail, ...}, hazard=None, own_loss=None, ...)` | the data's own; `loss` is the combined loss as the table states it |
+| A table of yours | `OutcomeSample.from_table(table, ..., index={name: column, ...}, index_unit=None, tails={name: tail, ...}, hazard=None, own_loss=None, ...)` | the data's own; `loss` is the combined loss as the table states it |
 
 - **Mappings by component.** `series`, `curves`, `tails`, `metadata`, `rngs`,
   `loss_models` and `hazard_names` are mappings by component name, and the order
@@ -2483,6 +2574,9 @@ setup text calls it one.
 - **A component with no impact.** A component left out of `loss_models` is read
   as an index and has no loss: it needs no rule and has no own loss. A sample
   with no impact at all raises, as it has no loss.
+- **A table of yours.** `index_unit` maps component names to units; a component
+  it leaves out, or all of them with `index_unit=None`, takes the unit its
+  column states ([outcome samples](#outcome-samples)).
 
 ### The combined loss
 

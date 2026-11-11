@@ -34,6 +34,32 @@ def test_defaults() -> None:
     }
 
 
+def test_aggregation_may_be_left_out() -> None:
+    index = IndexDefinition("rx1day", "mm/day")
+    assert index.aggregation is None
+    assert index == IndexDefinition("rx1day", "mm/day", aggregation=None)
+    assert index != IndexDefinition("rx1day", "mm/day", aggregation="annual_maximum")
+    document = index.to_document()
+    assert document["aggregation"] is None
+    assert IndexDefinition.from_document(document) == index
+
+
+def test_a_stated_aggregation_is_free_text() -> None:
+    """Nothing reads it: it is recorded in the terms as given."""
+    index = IndexDefinition("rx1day", "mm/day", aggregation="wettest day of the year")
+    assert index.to_document()["aggregation"] == "wettest day of the year"
+
+
+def test_an_index_document_states_its_aggregation() -> None:
+    """A document holds the key, null when the terms leave it unstated."""
+    document = IndexDefinition("rx1day", "mm/day").to_document()
+    del document["aggregation"]
+    with pytest.raises(
+        CoverDefinitionError, match=r"lacks the fields \['aggregation'\]"
+    ):
+        IndexDefinition.from_document(document)
+
+
 @pytest.mark.parametrize(
     ("location", "document"),
     [
