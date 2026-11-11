@@ -952,3 +952,59 @@ def test_tables_in_other_arrow_forms() -> None:
             loss_unit="EUR",
             source=3,
         )
+
+
+# -- the repr ----------------------------------------------------------------------
+
+
+def test_the_repr_is_short_and_prints_no_arrays() -> None:
+    sample = _sample(
+        provenance=_provenance(hazard={"name": "rx1day", "from": "stated"})
+    )
+    assert repr(sample) == (
+        "OutcomeSample(shape=(10, 1), assets=['warehouse-a'], hazard_name='rx1day', "
+        "index_unit='mm/day', loss_unit='EUR', semantics='annual', "
+        f"scenario='baseline', content_hash='{sample.content_hash[:19]}...')"
+    )
+    assert "array" not in repr(sample) and "10.0" not in repr(sample)
+    assert repr(_sample()).count("hazard_name=None") == 1
+
+
+def test_the_repr_stays_short_at_any_size() -> None:
+    small, large = _sample(10), _sample(100_000)
+    assert len(repr(large)) - len(repr(small)) == len("100000") - len("10")
+    many = _sample(
+        asset_ids=tuple(f"site-{i:03d}" for i in range(200)),
+        index=np.ones((10, 200)),
+        loss=np.zeros((10, 200)),
+        provenance=_provenance(dependence={"kind": "data"}),
+        scenario="ssp245",
+    )
+    text = repr(many)
+    assert "shape=(10, 200)" in text
+    assert "assets=['site-000', 'site-001', ..., 'site-199']" in text
+    assert "scenario='ssp245'" in text
+    assert len(text) < 250
+
+
+def test_the_repr_of_a_sample_of_several_hazards_names_its_components() -> None:
+    sample = OutcomeSample.from_table(
+        {
+            "year": [2000, 2001, 2002, 2003],
+            "site": ["site"] * 4,
+            "rain": [10.0, 60.0, 20.0, 40.0],
+            "heat": [30.0, 25.0, 40.0, 35.0],
+            "loss": [2.0, 3.0, 0.0, 5.0],
+        },
+        period="year",
+        asset_id="site",
+        index={"rain": "rain", "heat": "heat"},
+        loss="loss",
+        index_unit={"rain": "mm/day", "heat": "degC"},
+        loss_unit="EUR",
+        tails={"rain": "upper", "heat": "upper"},
+    )
+    assert repr(sample).startswith(
+        "OutcomeSample(shape=(4, 1), assets=['site'], components=['rain', 'heat'], "
+        "index_unit='mm/day', loss_unit='EUR', "
+    )

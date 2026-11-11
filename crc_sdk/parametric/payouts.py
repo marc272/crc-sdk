@@ -81,7 +81,7 @@ from crc_sdk.parametric.errors import (
     UnknownPayoutKindError,
     UnresolvedParameterError,
 )
-from crc_sdk.parametric.index import Tail, _component_name
+from crc_sdk.parametric.index import Tail, _component_name, _number, _quantity
 from crc_sdk.parametric.parameters import Free, _DefinitionModel, _resolve_values
 
 __all__ = [
@@ -1728,6 +1728,334 @@ class StepGrid:
 
     def __reduce__(self) -> tuple[Any, tuple[dict[str, Any]]]:
         return (_payout_from_document, (self.to_document(),))
+
+
+# -- the terms in words ---------------------------------------------------------
+
+_Axis = tuple[str, str]
+"""What a threshold is read on: the index's name, as a band names it, and its unit."""
+
+
+class _Words:
+    """Spells a payout's values, and records the free parameters it meets.
+
+    A fixed value is spelled with its unit, and a free one by its name; the
+    free one's `Free` and unit are kept, for the cover's list of free
+    parameters.
+    """
+
+    def __init__(self, payout_unit: str) -> None:
+        self.payout_unit = payout_unit
+        self.free: dict[str, tuple[Free, str | None]] = {}
+
+    def value(self, name: str, value: Any, unit: str | None) -> str:
+        if isinstance(value, Free):
+            self.free[name] = (value, unit)
+            return name
+        if isinstance(value, Real) and not isinstance(value, bool):
+            number = float(value)
+            if math.isfinite(number):
+                return _quantity(number, unit)
+        return repr(value)
+
+    def amount(self, name: str, value: Any) -> str:
+        return self.value(name, value, self.payout_unit)
+
+
+def _sides(tail: Tail) -> tuple[str, str]:
+    """The words for the more severe and the less severe side of a threshold."""
+    return ("above", "below") if tail == "upper" else ("below", "above")
+
+
+def _bands(subject: str, thresholds: Sequence[str], tail: Tail) -> list[str]:
+    """Where a value lies: before the first threshold, between two, from the last on.
+
+    A value equal to a threshold belongs to the more severe band, so a band
+    runs from "at or above" one threshold (for `tail="upper"`) to "below" the
+    next.
+    """
+    more, less = _sides(tail)
+    return [
+        f"{subject} is {less} {thresholds[0]}",
+        *(
+            f"{subject} is at or {more} {low} and {less} {high}"
+            for low, high in itertools.pairwise(thresholds)
+        ),
+        f"{subject} is at or {more} {thresholds[-1]}",
+    ]
+
+
+def _order(monotone: bool, along: str = "") -> str:
+    return (
+        f"the levels never decrease{along}" if monotone else "the levels in any order"
+    )
+
+
+def _role(text: str, value: Any, role: str) -> str:
+    """`text` with its role in the terms, unless it is a free parameter's name."""
+    return text if isinstance(value, Free) else f"{text} (the {role})"
+
+
+def _linear_words(
+    payout: LinearPayout, words: _Words, axis: _Axis, prefix: str
+) -> tuple[str, list[str]]:
+    subject, unit = axis
+    more, less = _sides(payout.tail)
+    attachment = words.value(f"{prefix}attachment", payout.attachment, unit)
+    exhaustion = words.value(f"{prefix}exhaustion", payout.exhaustion, unit)
+    limit = words.amount(f"{prefix}limit", payout.limit)
+    return (
+        "in proportion between an attachment and an exhaustion, up to a limit "
+        '(kind "linear")',
+        [
+            f"- nothing when {subject} is at or {less} "
+            f"{_role(attachment, payout.attachment, 'attachment')}",
+            f"- in a straight line from nothing at {attachment} to {limit} at "
+            f"{exhaustion}",
+            f"- {_role(limit, payout.limit, 'limit')} when {subject} is at or "
+            f"{more} {_role(exhaustion, payout.exhaustion, 'exhaustion')}",
+        ],
+    )
+
+
+def _step_words(
+    payout: StepPayout, words: _Words, axis: _Axis, prefix: str
+) -> tuple[str, list[str]]:
+    subject, unit = axis
+    thresholds = [
+        words.value(f"{prefix}breakpoints[{k}]", value, unit)
+        for k, value in enumerate(payout.breakpoints)
+    ]
+    levels = [
+        words.amount(f"{prefix}levels[{k}]", value)
+        for k, value in enumerate(payout.levels)
+    ]
+    first, *bands = _bands(subject, thresholds, payout.tail)
+    return (
+        f'steps, {_order(payout.monotone)} (kind "step", monotone={payout.monotone})',
+        [
+            f"- nothing when {first}",
+            *(
+                f"- {level} when {band}"
+                for level, band in zip(levels, bands, strict=True)
+            ),
+        ],
+    )
+
+
+def _piecewise_words(
+    payout: PiecewiseLinearPayout, words: _Words, axis: _Axis, prefix: str
+) -> tuple[str, list[str]]:
+    subject, unit = axis
+    more, less = _sides(payout.tail)
+    knots = [
+        words.value(f"{prefix}knots[{k}]", value, unit)
+        for k, value in enumerate(payout.knots)
+    ]
+    levels = [
+        words.amount(f"{prefix}levels[{k}]", value)
+        for k, value in enumerate(payout.levels)
+    ]
+    return (
+        f"straight lines between knots, {_order(payout.monotone)} "
+        f'(kind "piecewise_linear", monotone={payout.monotone})',
+        [
+            f"- nothing when {subject} is {less} {knots[0]}",
+            *(
+                f"- in a straight line from {levels[k]} at {knots[k]} to "
+                f"{levels[k + 1]} at {knots[k + 1]}"
+                for k in range(len(knots) - 1)
+            ),
+            f"- {levels[-1]} when {subject} is at or {more} {knots[-1]}",
+        ],
+    )
+
+
+def _binary_words(
+    payout: BinaryPayout, words: _Words, axis: _Axis, prefix: str
+) -> tuple[str, list[str]]:
+    subject, unit = axis
+    more, less = _sides(payout.tail)
+    trigger = words.value(f"{prefix}trigger", payout.trigger, unit)
+    amount = words.amount(f"{prefix}amount", payout.amount)
+    return (
+        'one amount from a trigger on (kind "binary")',
+        [
+            f"- nothing when {subject} is {less} {trigger}",
+            f"- {amount} when {subject} is at or {more} "
+            f"{_role(trigger, payout.trigger, 'trigger')}",
+        ],
+    )
+
+
+def _component_words(
+    payout: _OfComponents, words: _Words, axes: Mapping[str, _Axis], prefix: str
+) -> list[str]:
+    """Each component's payout, under its name, its parameters `<name>.<its own>`."""
+    lines: list[str] = []
+    for name, component in payout.components.items():
+        head, items = _payout_words(
+            component, words, {"index": axes[name]}, f"{prefix}{name}."
+        )
+        lines.append(f"- {name}: {head}")
+        lines += [f"  {item}" for item in items]
+    return lines
+
+
+def _grid_words(
+    payout: StepGrid, words: _Words, axes: Mapping[str, _Axis], prefix: str
+) -> tuple[str, list[str]]:
+    names = payout.index_names
+    bins: list[list[str]] = []
+    for name, thresholds, tail in zip(
+        names, payout.breakpoints.values(), payout.tail, strict=True
+    ):
+        subject, unit = axes[name]
+        spelled = [
+            words.value(f"{prefix}{name}.breakpoints[{k}]", value, unit)
+            for k, value in enumerate(thresholds)
+        ]
+        bins.append(_bands(subject, spelled, tail))
+    cells: list[str] = []
+    for i, row in enumerate(payout.levels):
+        for j, level in enumerate(row):
+            # The cell below both first thresholds pays nothing, by construction.
+            amount = (
+                "nothing"
+                if (i, j) == (0, 0)
+                else words.amount(f"{prefix}levels[{i},{j}]", level)
+            )
+            cells.append(f"- {amount} when {bins[0][i]} and {bins[1][j]}")
+    return (
+        f"one amount per cell of a table over {names[0]} and {names[1]}, "
+        f"{_order(payout.monotone, ' along either')} "
+        f'(kind "step_grid", monotone={payout.monotone})',
+        cells,
+    )
+
+
+def _user_words(payout: Any, words: _Words, prefix: str) -> tuple[str, list[str]]:
+    """A family of your own: its parameters, as it names them."""
+    amounts = (
+        set(payout.amount_names()) if isinstance(payout, LinearInAmounts) else set()
+    )
+    lines: list[str] = []
+    for name, value in payout.parameters().items():
+        unit = words.payout_unit if name in amounts else None
+        spelled = words.value(f"{prefix}{name}", value, unit)
+        lines.append(f"- {name}: {'free' if isinstance(value, Free) else spelled}")
+    return (
+        f'a family of your own (kind "{payout.kind}"), with its parameters as it '
+        "names them",
+        lines,
+    )
+
+
+def _payout_words(
+    payout: Any, words: _Words, axes: Mapping[str, _Axis], prefix: str = ""
+) -> tuple[str, list[str]]:
+    """A payout's terms in words: a headline, and one line per band or part.
+
+    `axes` maps each of the payout's `index_names` to the name a band reads
+    and the unit of its thresholds. The lines start with `"- "`; a part's own
+    lines are indented below it. A built-in family is described by its
+    terms; a family of your own, or a subclass of a built-in one, by its
+    parameters.
+    """
+    kind = type(payout)
+    if kind is LinearPayout:
+        return _linear_words(payout, words, axes["index"], prefix)
+    if kind is StepPayout:
+        return _step_words(payout, words, axes["index"], prefix)
+    if kind is PiecewiseLinearPayout:
+        return _piecewise_words(payout, words, axes["index"], prefix)
+    if kind is BinaryPayout:
+        return _binary_words(payout, words, axes["index"], prefix)
+    if kind is SumOf:
+        return (
+            "the sum of one payout per component, each on its own index "
+            '(kind "sum_of")',
+            _component_words(payout, words, axes, prefix),
+        )
+    if kind is MaxOf:
+        scale = words.value(f"{prefix}scale", payout.scale, None)
+        return (
+            f"the largest of one payout per component, times {scale}: one amount a "
+            'year (kind "max_of")',
+            _component_words(payout, words, axes, prefix),
+        )
+    if kind is StepGrid:
+        return _grid_words(payout, words, axes, prefix)
+    return _user_words(payout, words, prefix)
+
+
+_BUILT_IN_ONE_INDEX = (LinearPayout, StepPayout, PiecewiseLinearPayout, BinaryPayout)
+
+
+def _built_in(payout: Any) -> bool:
+    """Whether the payout and every component of it is a built-in family."""
+    if type(payout) in (SumOf, MaxOf):
+        return all(_built_in(part) for part in payout.components.values())
+    return type(payout) in (*_BUILT_IN_ONE_INDEX, StepGrid)
+
+
+def _most(payout: Any) -> float | None:
+    """The most a built-in payout pays in a year; `None` while an amount is free.
+
+    Thresholds don't change it: every family reaches its largest amount from
+    some severity on, a `SumOf` the sum of its components' and a `MaxOf` its
+    scale times the largest of theirs.
+    """
+    kind = type(payout)
+    values: list[Any]
+    if kind in _BUILT_IN_ONE_INDEX:
+        values = [value for _, value in payout._field_items(payout._amount_fields)]
+    elif kind is StepGrid:
+        values = [value for row in payout.levels for value in row]
+    elif kind in (SumOf, MaxOf):
+        parts = [_most(part) for part in payout.components.values()]
+        if any(part is None for part in parts) or isinstance(
+            getattr(payout, "scale", 1.0), Free
+        ):
+            return None
+        known = cast(list[float], parts)
+        if kind is SumOf:
+            return math.fsum(known)
+        return float(payout.scale) * max(known)
+    else:
+        return None
+    if any(isinstance(value, Free) for value in values):
+        return None
+    return float(max(values))
+
+
+def _most_words(payout: Any, payout_unit: str) -> str:
+    """The most a year pays, in words, or why it is not known."""
+    if not _built_in(payout):
+        return "not known: a family of your own states none"
+    most = _most(payout)
+    if most is None:
+        return "not known until the free amounts are chosen"
+    return _quantity(most, payout_unit)
+
+
+def _free_words(free: Free, unit: str | None) -> str:
+    """A free parameter's bounds and grid, in words."""
+    lower = _quantity(free.lower, unit)
+    text = (
+        f"from {lower}, with no upper bound"
+        if free.upper is None
+        else f"from {lower} to {_quantity(free.upper, unit)}"
+    )
+    grid = free.grid
+    if grid is None:
+        return text
+    if len(grid) <= 10:
+        return f"{text}, on the grid {', '.join(_number(value) for value in grid)}"
+    return (
+        f"{text}, on a grid of {len(grid)} values from {_number(grid[0])} to "
+        f"{_number(grid[-1])}"
+    )
 
 
 _KIND = re.compile(r"^\S(?:.*\S)?$")

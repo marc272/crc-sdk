@@ -1054,6 +1054,35 @@ class OutcomeSample:
     def __len__(self) -> int:
         return int(self.period.shape[0])
 
+    def __repr__(self) -> str:
+        """A short description, which prints no arrays and stays short at any size.
+
+        It gives the shape of `index` and `loss` (periods, assets), the asset
+        ids (the first two and the last above three), the hazard (the stated
+        hazard's name, or the components of a sample of several hazards), the
+        units, the semantics (the annual basis), the scenario and the start of
+        `content_hash`.
+        """
+
+        def shortened(names: Sequence[str]) -> str:
+            shown = [repr(name) for name in names]
+            if len(shown) > 3:
+                shown = [*shown[:2], "...", shown[-1]]
+            return f"[{', '.join(shown)}]"
+
+        if self.index_components is not None:
+            hazard = f"components={shortened(tuple(self.index_components))}"
+        else:
+            stated = self.provenance.hazard
+            hazard = f"hazard_name={None if stated is None else stated['name']!r}"
+        return (
+            f"OutcomeSample(shape={self.index.shape}, "
+            f"assets={shortened(self.asset_ids)}, {hazard}, "
+            f"index_unit={self.index_unit!r}, loss_unit={self.loss_unit!r}, "
+            f"semantics={self.semantics!r}, scenario={self.scenario!r}, "
+            f"content_hash='{self.content_hash[:19]}...')"
+        )
+
     @cached_property
     def content_hash(self) -> str:
         """`"sha256:<hex>"` of the sample's canonical long table and units.

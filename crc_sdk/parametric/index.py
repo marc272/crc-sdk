@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from types import MappingProxyType
 from typing import Annotated, Any, Literal, Self
 
@@ -130,6 +131,65 @@ _LOCATIONS: dict[str, type[AtAsset | AtPoint | AtStation | AtCell]] = {
     "station": AtStation,
     "cell": AtCell,
 }
+
+
+def _number(value: float) -> str:
+    """A number in words: its exact shortest spelling, grouped by thousands.
+
+    `60.0` is `60`, `20000.0` is `20,000` and `1e-07` is `0.0000001`: the
+    value as the cover document holds it, without an exponent or rounding.
+    """
+    text = format(Decimal(repr(float(value) + 0.0)), "f")
+    sign, digits = ("-", text[1:]) if text.startswith("-") else ("", text)
+    whole, _, fraction = digits.partition(".")
+    fraction = fraction.rstrip("0")
+    return f"{sign}{int(whole):,}" + (f".{fraction}" if fraction else "")
+
+
+def _quantity(value: float, unit: str | None) -> str:
+    """A number with its unit; a dimensionless unit (`None` or `"1"`) adds none."""
+    number = _number(value)
+    return number if unit is None or unit == "1" else f"{number} {unit}"
+
+
+def _unit_words(unit: str) -> str:
+    return "dimensionless (unit 1)" if unit == "1" else f"in {unit}"
+
+
+def _location_words(location: AtAsset | AtPoint | AtStation | AtCell) -> str:
+    """Where the index is read, in words."""
+    if isinstance(location, AtPoint):
+        where = (
+            f"longitude {_number(location.longitude)}, "
+            f"latitude {_number(location.latitude)}, WGS84"
+        )
+        if location.name is None:
+            return f"read at the point ({where})"
+        return f"read at the point {location.name} ({where})"
+    if isinstance(location, AtStation):
+        return f"read at the station {location.station_id}"
+    if isinstance(location, AtCell):
+        return f"read in the H3 cell {location.cell_index}"
+    return "read at the asset"
+
+
+def _index_words(index: IndexDefinition) -> str:
+    """An index's terms in words: hazard, unit, place, severe side, aggregation, source.
+
+    The aggregation and the source say plainly when the terms state none.
+    """
+    severe = "larger" if index.tail == "upper" else "smaller"
+    aggregation = (
+        "not stated, so the terms don't say how a year's value is made"
+        if index.aggregation is None
+        else index.aggregation
+    )
+    source = "not stated" if index.source is None else index.source
+    return (
+        f"{index.hazard_name}, {_unit_words(index.unit)}, "
+        f"{_location_words(index.location)}; {severe} values are more severe "
+        f"(tail {index.tail}); aggregation: {aggregation}; source: {source}"
+    )
 
 
 def _location_from_document(document: Mapping[str, Any]) -> Any:
