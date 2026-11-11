@@ -1517,11 +1517,14 @@ def test_a_pool_refuses_a_name_a_run_contradicts() -> None:
         _pool(runs, hazard_name="rx5day")
 
 
-def test_a_pool_of_two_hazard_names_records_none_unless_labelled() -> None:
+@pytest.mark.parametrize("scenario", ["baseline", "x"])
+def test_a_pool_of_two_hazard_names_is_refused_whatever_its_label(
+    scenario: str,
+) -> None:
+    # A pool is one asset's sample of one hazard, unlike the assets of a join.
     runs = [_run("M1", {"hazard_name": "a"}), _run("M2", {"hazard_name": "b"})]
-    assert _pool(runs).provenance.hazard is None
-    with pytest.raises(ScenarioError, match="must read one hazard"):
-        _pool(runs, scenario="x")
+    with pytest.raises(SampleError, match=r"one hazard.*\['a', 'b'\]"):
+        _pool(runs, scenario=scenario)
 
 
 def _runs_stating(

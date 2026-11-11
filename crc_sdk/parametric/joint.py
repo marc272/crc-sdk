@@ -418,8 +418,9 @@ def design_joint(
     `DesignError` for a sample of one asset, a free threshold, a
     `UserObjective`, a payout without `LinearInAmounts`, or any failed solve
     or check; `SampleError` when the templates' number, assets or units don't
-    suit the sample; `ValueError` when no template has free parameters; and
-    `TypeError` for arguments of the wrong type.
+    suit the sample, or a template's index `hazard_name` differs from the
+    hazard the sample records for its asset; `ValueError` when no template has
+    free parameters; and `TypeError` for arguments of the wrong type.
     """
     templates = _check_templates(templates, scope)
     _check_terms(sample, objective, pricing, budget, limit, options)

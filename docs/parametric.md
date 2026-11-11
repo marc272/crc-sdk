@@ -763,12 +763,16 @@ and rows of one year the pathway's forcing, so the number of rows is not an
 effective sample size. Every number from a pool has these two statements next to
 it, in the `Pool` line of `setup_text`.
 
-**One pathway, one weight per model.** These raise `SampleError`: runs under
-different pathways (`historical` is one, so a pool can't span NEX-GDDP-CMIP6's
-historical and SSP experiments); different units; different recipes, where the
-runs state one; the same model twice, whatever the member, so every model has
-the same weight; fewer than two runs. A table with several models at one
-location still raises without `pool=`.
+**One pathway, one hazard, one weight per model.** These raise `SampleError`:
+runs under different pathways (`historical` is one, so a pool can't span
+NEX-GDDP-CMIP6's historical and SSP experiments); different units; different
+recipes, where the runs state one; runs whose records name two hazards, whatever
+the label, as a source's `recipe` or `hazard_name` or a one-valued `recipe` column
+names one (the error names each run's); the same model twice, whatever the member,
+so every model has the same weight; fewer than two runs. A table with several
+models at one location still raises without `pool=`. The pool records its hazard
+when every run names it; a run that names none leaves it to `hazard_name=`, as
+for one series.
 
 **The same years.** After `years=`, the window of `RecentYears` and `missing=`,
 every run must hold the same years, or `SampleError` lists each run's years; a
@@ -1703,7 +1707,10 @@ a unit. The record is
 - on a sample of several assets, each asset's own, for the cover of that asset;
 - on a sample of several hazards, each component's own, for the cover or the
   `CompositeIndex` entry that reads that component. A component is found by its
-  name, and its record must then be the cover's `hazard_name`.
+  name, and its record must then be the cover's `hazard_name`;
+- on a pool with a run that names no hazard, which records none, each run that
+  names one, so the runs that say what they read are still compared. A pool's
+  runs never name two hazards: `sample_annual_pool` refuses them.
 
 `design`, `design_joint`, `evaluate`, `compare`, `payout_breakdown`, the pooled
 folds and intervals, `compare_scenarios` and the plan check it wherever a cover
@@ -2058,6 +2065,22 @@ coarser cell or one of its neighbours, because a point's cells at two resolution
 don't always nest; that needs the `geometry` extra (`crc-sdk[geometry]`). A curve
 given as a distribution or as `CurveParameters` records no cell and isn't
 compared.
+
+On per-year rows, each asset's or hazard's series must be read at one place in
+every scenario: the hazard series and a separate index series each on its own,
+and every run of a pool, compared pair by pair, like with like, and
+`ScenarioError` names both places.
+
+| A series read | Is one place with | So that |
+| --- | --- | --- |
+| At a matched grid cell (`AnnualSeries.nearest_cell`, `NearestCell`), of the same grid: one step, centres whole steps apart | The same cell | A point matches one cell of a grid, so a neighbouring cell is another place |
+| At a matched cell of another grid, as two products or two models give | A cell that overlaps it: some point lies within half a grid step of both centres, each by its own step | One asset's point can match both; ERA5's cells beside NEX-GDDP-CMIP6's pass, a cell two steps away doesn't |
+| At a station, named by a `station` or `station_id` filter or one-valued column (`StationColumn`) | The same station | Another station is another place |
+
+A record of a cell without a grid step is a point, of step 0. A series that names
+neither a cell nor a station, such as a plain table or one filtered on other
+columns, isn't compared, and neither is a cell beside a station: the module holds
+no station's coordinates.
 
 - **The rows.** One row per entry and scenario, the reference first, and every
   row has `split="out_of_sample"`. `scenario` says where a row is evaluated and
