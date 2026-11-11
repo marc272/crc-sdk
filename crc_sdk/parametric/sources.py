@@ -111,6 +111,7 @@ from crc_framework.distributions import (
 from numpy.typing import NDArray
 from pydantic import BaseModel
 
+from crc_sdk.impacts.calibration import units_equivalent
 from crc_sdk.parametric._canonical import content_hash
 from crc_sdk.parametric.basis_risk import (
     BasisRisk,
@@ -1897,6 +1898,7 @@ class AnnualSeries:
                 "select one location (where=, nearest_cell) first"
             )
         unit = _series_unit(rows, value, unit)
+        _check_source_unit(provenance["source"], unit)
         expected = (
             np.arange(unique[0], unique[-1] + 1, dtype=np.int64)
             if years is None
@@ -1945,7 +1947,9 @@ class AnnualSeries:
         (NEX-GDDP-CMIP6's `annual_extremes()` has one), or the Arrow field
         metadata `unit` of the value column; where both state one, they must
         agree. A table that states none needs `unit` stated, and a stated
-        `unit` must equal the table's.
+        `unit` must equal the table's. A unit the source states, as a source
+        plan's `explain()` does for ERA5 and CMIP6, must be the series' too,
+        after crc-sdk's unit aliases: nothing converts it.
 
         What a source plan's document says of its cache, its run and the
         years it asks for is left out of a sample's lineage, as is the time a
@@ -1955,8 +1959,8 @@ class AnnualSeries:
         `table` is an in-memory Arrow table, record batches (for example
         NEX-GDDP-CMIP6's `annual_extremes()` iterator) or any table Arrow
         reads. Raises `SampleError` for missing columns, unmatched filters,
-        repeated years, a unit mismatch, or no unit stated by the caller or
-        the table.
+        repeated years, a unit mismatch between the caller, the table and the
+        source, or no unit stated by the caller or the table.
         """
         data = _arrow_table(table, "an annual table")
         rows = data
@@ -2155,6 +2159,23 @@ def _series_unit(rows: Any, value: str, stated: str | None) -> str:
             "the table's"
         )
     return unit
+
+
+def _check_source_unit(source: Any, unit: str) -> None:
+    """Raise `SampleError` when the series' source states another unit.
+
+    A source plan's `explain()` states the unit of its values, as ERA5's and
+    CMIP6's do, and so does its document passed as a mapping. The plan route
+    compares it with the plan's `unit=`; a series read by hand compares it with
+    its own unit, equal after crc-sdk's unit aliases and never converted.
+    """
+    stated = source.get("unit") if isinstance(source, Mapping) else None
+    if isinstance(stated, str) and not units_equivalent(stated, unit):
+        raise SampleError(
+            f"the source states that its values are in {stated!r}, but the series "
+            f"is in {unit!r}: read the table this source gives, or state the unit "
+            "its values are in"
+        )
 
 
 def _coordinate(name: str, value: Any, bound: float) -> float:
