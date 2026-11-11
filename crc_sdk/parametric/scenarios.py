@@ -421,9 +421,183 @@ def _check_pools(scenarios: Sequence[_Scenario], mixed_products: bool) -> None:
     _require_same(pools, "pool's (model, member) pairs", _pool_models)
 
 
+_SLACK = 1.0 + 1e-9
+"""The slack `AnnualSeries.nearest_cell` allows on half a grid step."""
+
+_STATION_COLUMNS = ("station", "station_id")
+"""The columns whose value names the station a per-year series reads."""
+
+
+@dataclass(frozen=True)
+class _Place:
+    """Where one per-year series is read: a matched grid cell, or its stations.
+
+    A cell is its centre and its grid step, `(latitude, longitude)` in degrees;
+    a record without a step states a point, a step of 0.
+    """
+
+    kind: str
+    centre: tuple[float, float] = (0.0, 0.0)
+    step: tuple[float, float] = (0.0, 0.0)
+    stations: tuple[str, ...] = ()
+
+    def __str__(self) -> str:
+        if self.kind == "station":
+            noun = "station" if len(self.stations) == 1 else "stations"
+            return f"at {noun} {', '.join(repr(each) for each in self.stations)}"
+        latitude, longitude = self.centre
+        text = (
+            f"in the grid cell centred at latitude {latitude:g}, "
+            f"longitude {longitude:g}"
+        )
+        if any(self.step):
+            text += f" (step {self.step[0]:g} by {self.step[1]:g} degrees)"
+        return text
+
+
+def _station_ids(series: Mapping[str, Any]) -> tuple[str, ...]:
+    """The stations a series reads: in its filter, or as a one-valued column."""
+    found = {
+        str(value)
+        for name, value in (series.get("where") or {}).items()
+        if name in _STATION_COLUMNS
+    }
+    columns = series.get("table_columns") or {}
+    for name in _STATION_COLUMNS:
+        column = columns.get(name) or {}
+        if column.get("distinct") == 1:
+            found.update(str(value) for value in column.get("values") or ())
+    return tuple(sorted(found))
+
+
+def _series_place(series: Mapping[str, Any]) -> _Place | None:
+    """Where a series' record says it is read; `None` if it says neither."""
+    cell = series.get("cell")
+    if isinstance(cell, Mapping):
+        spacing = series.get("spacing_degrees") or {}
+        return _Place(
+            "cell",
+            centre=(float(cell["latitude"]), float(cell["longitude"])),
+            step=(
+                float(spacing.get("latitude") or 0.0),
+                float(spacing.get("longitude") or 0.0),
+            ),
+        )
+    stations = _station_ids(series)
+    return _Place("station", stations=stations) if stations else None
+
+
+_Read = tuple[_Place, str]
+"""A place, and whose series is read there, as an error names it."""
+
+
+def _series_places(scenario: _Scenario) -> dict[tuple[str, str], list[_Read]]:
+    """Each asset's or component's places, by owner and role: hazard or index."""
+    held: dict[tuple[str, str], list[_Read]] = {}
+    for owner, leaf in scenario.leaves:
+        for source in leaf.get("sources") or ():
+            role, series = source.get("role"), source.get("series")
+            if role not in ("hazard", "index") or not isinstance(series, Mapping):
+                continue
+            place = _series_place(series)
+            if place is None:
+                continue
+            whose = f"the {role} series of {owner}"
+            if "model" in source:
+                whose += f" (run {source['model']} {source.get('member')})"
+            own = held.setdefault((owner, str(role)), [])
+            if all(place != each for each, _ in own):
+                own.append((place, whose))
+    return held
+
+
+def _offsets(first: _Place, second: _Place) -> tuple[float, float]:
+    """`second`'s centre less `first`'s, in degrees; longitudes modulo 360."""
+    d_latitude = second.centre[0] - first.centre[0]
+    d_longitude = (second.centre[1] - first.centre[1] + 180.0) % 360.0 - 180.0
+    return d_latitude, d_longitude
+
+
+def _one_grid(first: _Place, second: _Place) -> bool:
+    """Whether two cells are of one grid: one step, centres whole steps apart."""
+    for ours, theirs, offset in zip(
+        first.step, second.step, _offsets(first, second), strict=True
+    ):
+        if ours <= 0.0 or not math.isclose(ours, theirs, rel_tol=1e-9):
+            return False
+        steps = offset / ours
+        if abs(steps - round(steps)) > 1e-6:
+            return False
+    return True
+
+
+def _one_series_place(first: _Place, second: _Place) -> bool:
+    """Whether two places of per-year series may be one; another kind isn't compared.
+
+    Stations must be the same. Cells of one grid must be the same cell, since a
+    point matches one cell of a grid. Cells of two grids must overlap: some
+    point must lie within half a grid step of both centres, each by its own
+    step, as `AnnualSeries.nearest_cell` matches a cell to a point.
+    """
+    if first.kind != second.kind:
+        return True
+    if first.kind == "station":
+        return first.stations == second.stations
+    offsets = _offsets(first, second)
+    if _one_grid(first, second):
+        return all(
+            abs(offset) < 0.5 * step
+            for offset, step in zip(offsets, first.step, strict=True)
+        )
+    return all(
+        abs(offset) <= 0.5 * (ours + theirs) * _SLACK + 1e-9
+        for offset, ours, theirs in zip(offsets, first.step, second.step, strict=True)
+    )
+
+
+def _check_places(scenarios: Sequence[_Scenario]) -> None:
+    """Raise `ScenarioError` for a per-year series of one asset read in two places.
+
+    Each asset's or component's hazard series, and its index series, must be
+    read at one place in every scenario, compared pair by pair, like with like:
+    a matched cell with a matched cell, stations with stations. A series whose
+    record names neither isn't compared.
+    """
+    read = [(scenario, _series_places(scenario)) for scenario in scenarios]
+    for i, (first, ours) in enumerate(read):
+        for second, theirs in read[i + 1 :]:
+            for key, places in ours.items():
+                for place, whose in places:
+                    # The same series first, so an error names one run where it can.
+                    for other, other_whose in sorted(
+                        theirs.get(key, ()), key=lambda read: read[1] != whose
+                    ):
+                        if _one_series_place(place, other):
+                            continue
+                        reads = "" if other_whose == whose else f" reads {other_whose}"
+                        raise _differ(
+                            first,
+                            second,
+                            place.kind,
+                            f"{first.label!r} reads {whose} {place}, and "
+                            f"{second.label!r}{reads} {other}"
+                            f"{_place_reason(place, other)}{_FIXED}",
+                        )
+
+
+def _place_reason(first: _Place, second: _Place) -> str:
+    """Why two places of one kind are two."""
+    if first.kind == "station":
+        return ""
+    if _one_grid(first, second):
+        return ": two cells of one grid, where a point matches one"
+    return ": no point lies within half a grid step of both centres"
+
+
 def _check_years(scenarios: Sequence[_Scenario], mixed_products: bool) -> None:
     _require_same(scenarios, "trend", _trend_option)
     _check_pools(scenarios, mixed_products)
+    _check_places(scenarios)
 
 
 # -- curve scenarios -----------------------------------------------------------
@@ -992,6 +1166,18 @@ class ScenarioSet:
       neighbours, because a point's cells at two resolutions don't always nest;
       that needs the `geometry` extra. A curve given as a distribution or as
       `CurveParameters` records no cell, and isn't compared;
+    - on per-year rows, the place each asset's or hazard's series is read at,
+      the hazard series and a separate index series each on its own, every run
+      of a pool included, so that one asset id doesn't hold another place's
+      years. Like is compared with like. Two matched grid cells
+      (`AnnualSeries.nearest_cell`) of one grid, one step with centres whole
+      steps apart, must be one cell, as a point matches one cell of a grid;
+      cells of two grids, as two products or two models give, must overlap, so
+      that some point lies within half a grid step of both centres, each by its
+      own step. Stations, which a series names in a `station` or `station_id`
+      filter or one-valued column, must be the same. A series that names
+      neither, such as a plain table, isn't compared, nor is a cell beside a
+      station;
     - the `product`, unless `mixed_products=True`.
 
     It also raises for two samples with one label, a reference that is no label,

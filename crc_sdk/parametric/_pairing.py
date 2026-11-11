@@ -14,7 +14,10 @@ crosswalk of hazard names. That record is
   column), since the index may read another hazard than the loss on purpose;
 - on a sample of several hazards, each component's own record;
 - on a sample of several assets, each asset's own;
-- otherwise the sample's `provenance.hazard`.
+- otherwise the sample's `provenance.hazard`. A pool records one when every run
+  names it, and `sample_annual_pool` refuses runs that name two. A pool with a
+  run that names none records none, and then each run that names one is
+  compared.
 
 A sample that records no hazard there is read as before: only its units are
 compared, and the hazard is the caller's to know. A mismatch raises
@@ -128,7 +131,10 @@ def _compare(name: str, leaf: SampleProvenance | Mapping[str, Any], owner: str) 
                 )
         return
     record = _field(leaf, "hazard")
-    if record is None or record["name"] == name:
+    if record is None:
+        _compare_runs(name, leaf, owner)
+        return
+    if record["name"] == name:
         return
     stated_by = _STATED_BY.get(str(record["from"]), str(record["from"]))
     raise SampleError(
@@ -137,3 +143,23 @@ def _compare(name: str, leaf: SampleProvenance | Mapping[str, Any], owner: str) 
         "exactly, so state the cover's hazard_name as the sample records it, or "
         "read the cover on a sample of its own hazard"
     )
+
+
+def _compare_runs(
+    name: str, leaf: SampleProvenance | Mapping[str, Any], owner: str
+) -> None:
+    """Raise `SampleError` unless every run of a pool that names a hazard names `name`.
+
+    A pool records no hazard when one of its runs names none, but the runs
+    that name one still say what their rows read.
+    """
+    for source in _field(leaf, "sources") or ():
+        if source.get("role") != "hazard" or "model" not in source:
+            continue
+        found = _series_hazard(source)
+        if found is not None and found != name:
+            raise SampleError(
+                f"the cover pays on the hazard {name!r}, but run {source['model']} "
+                f"{source.get('member')} of {owner} reads {found!r}, as its source "
+                "names it; hazard names are compared exactly"
+            )

@@ -402,6 +402,65 @@ def test_a_run_that_states_no_recipe_is_not_compared() -> None:
     assert len(_pool(runs)) == 60
 
 
+ONE_RECIPE = {"recipe": {"values": ["rx5day"], "distinct": 1}}
+
+
+@pytest.mark.parametrize(
+    "runs",
+    [
+        lambda: [
+            _run("A", source={"name": "a", "hazard_name": "rx1day"}),
+            _run("B", source={"name": "b", "hazard_name": "rx5day"}),
+        ],
+        lambda: [
+            _run("A", source={"name": "a", "recipe": "rx1day"}),
+            _run("B", source={"name": "b", "hazard_name": "rx5day"}),
+        ],
+        lambda: [
+            _run("A", source={"name": "a", "hazard_name": "rx1day"}),
+            _run("B", table_columns=ONE_RECIPE),
+        ],
+    ],
+    ids=["two-hazard-names", "a-recipe-and-a-name", "a-name-and-a-column"],
+)
+@pytest.mark.parametrize("scenario", ["baseline", "ssp245 pool"])
+def test_runs_that_name_two_hazards_are_refused_whatever_the_label(
+    runs: Any, scenario: str
+) -> None:
+    # Each run names its hazard where no recipe does, so the recipes don't refuse it.
+    rng = np.random.default_rng(1)
+    state = rng.bit_generator.state
+    with pytest.raises(SampleError) as error:
+        _pool(runs(), scenario=scenario, basis_risk=ImpactNoise(0.2), rng=rng)
+    assert str(error.value).startswith(
+        "a pool reads one hazard in every run, but its runs name "
+        "['rx1day', 'rx5day'] (run A r1i1p1f1 names 'rx1day', run B r1i1p1f1 "
+        "names 'rx5day')"
+    )
+    assert rng.bit_generator.state == state
+
+
+def test_a_run_that_names_no_hazard_is_not_compared_and_the_pool_records_none() -> None:
+    runs = [
+        _run("A", source={"name": "a", "hazard_name": "rx1day"}),
+        _run("B", source={"name": "b", "hazard_name": "rx1day"}),
+        _run("C"),
+    ]
+    assert _pool(runs).provenance.hazard is None
+    assert _pool(runs[:2]).provenance.hazard == {
+        "name": "rx1day",
+        "from": "source_plan",
+    }
+
+
+def test_runs_that_name_one_hazard_in_different_ways_record_it() -> None:
+    runs = [
+        _run("A", source={"name": "a", "hazard_name": "rx5day"}),
+        _run("B", table_columns=ONE_RECIPE),
+    ]
+    assert _pool(runs).provenance.hazard == {"name": "rx5day", "from": "source_plan"}
+
+
 def test_a_table_of_several_models_at_one_location_still_raises_as_one_series() -> None:
     table = _table_of(cells=CELLS[:1])
     with pytest.raises(SampleError, match="several rows"):

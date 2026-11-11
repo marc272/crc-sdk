@@ -2008,3 +2008,295 @@ def test_two_resolutions_need_the_geometry_extra(
     monkeypatch.setitem(sys.modules, "h3", None)
     with pytest.raises(ImportError, match=r"crc-sdk\[geometry\]"):
         ScenarioSet(entries, reference="a")
+
+
+# -- the place each per-year series is read at -------------------------------------
+
+STEP = {"latitude": 0.25, "longitude": 0.25}
+
+
+def _cell(latitude: float, longitude: float, step: Any = STEP) -> dict[str, Any]:
+    """A nearest-cell record: the matched centre and, if given, the grid step."""
+    record: dict[str, Any] = {
+        "kind": "nearest_cell",
+        "cell": {"latitude": latitude, "longitude": longitude},
+    }
+    if step is not None:
+        record["spacing_degrees"] = step
+    return record
+
+
+def _placed(label: str, first: int, **provenance: Any) -> Any:
+    """A per-year scenario of one product whose series records `provenance`."""
+    return _annual(label, _series(_stated("ssp245"), first=first, **provenance))
+
+
+def _at_cells(*cells: dict[str, Any]) -> list[Any]:
+    """One scenario per cell record, labelled a, b, c, ..., forty years apart."""
+    return [
+        _placed(label, 1980 + 40 * i, **cell)
+        for i, (label, cell) in enumerate(zip("abcdefgh", cells, strict=False))
+    ]
+
+
+def test_series_from_one_cell_stand_side_by_side() -> None:
+    held = ScenarioSet(
+        _at_cells(_cell(43.625, -79.375), _cell(43.625, -79.375)), reference="a"
+    )
+    assert held.labels == ("a", "b")
+
+
+def test_another_cell_of_one_grid_raises() -> None:
+    # The neighbouring cell to the west: one step, centres one step apart.
+    message = _refused(
+        _at_cells(_cell(43.625, -79.375), _cell(43.625, -79.625)),
+        *BOTH,
+        "differ in cell",
+        "asset 'a'",
+        "latitude 43.625, longitude -79.375",
+        "latitude 43.625, longitude -79.625",
+        "two cells of one grid",
+    )
+    assert "the hazard series" in message
+
+
+def test_a_grid_that_runs_to_360_is_one_grid() -> None:
+    held = ScenarioSet(
+        _at_cells(_cell(43.625, -79.375), _cell(43.625, 280.625)), reference="a"
+    )
+    assert held.labels == ("a", "b")
+    _refused(
+        _at_cells(_cell(43.625, -79.375), _cell(43.625, 280.375)),
+        *BOTH,
+        "two cells of one grid",
+    )
+
+
+def test_cells_of_two_grids_must_overlap() -> None:
+    # A 1-degree cell holds the 0.25-degree cell; a cell two degrees away doesn't.
+    coarse = {"latitude": 1.0, "longitude": 1.0}
+    held = ScenarioSet(
+        _at_cells(_cell(43.625, -79.375), _cell(43.5, -79.5, coarse)), reference="a"
+    )
+    assert held.labels == ("a", "b")
+    _refused(
+        _at_cells(_cell(43.625, -79.375), _cell(45.5, -79.5, coarse)),
+        *BOTH,
+        "differ in cell",
+        "(step 1 by 1 degrees)",
+        "no point lies within half a grid step of both centres",
+    )
+
+
+def test_two_grids_of_one_step_offset_by_half_a_step_must_overlap() -> None:
+    # As ERA5's centres at whole quarters beside NEX-GDDP-CMIP6's at odd eighths.
+    held = ScenarioSet(
+        _at_cells(_cell(43.625, -79.375), _cell(43.5, -79.25)), reference="a"
+    )
+    assert held.labels == ("a", "b")
+    _refused(
+        _at_cells(_cell(43.625, -79.375), _cell(43.25, -79.25)),
+        *BOTH,
+        "no point lies within half a grid step of both centres",
+    )
+
+
+def test_a_cell_without_a_step_is_a_point() -> None:
+    held = ScenarioSet(
+        _at_cells(_cell(43.625, -79.375), _cell(43.7, -79.3, step=None)),
+        reference="a",
+    )
+    assert held.labels == ("a", "b")
+    _refused(
+        _at_cells(_cell(43.625, -79.375), _cell(43.8, -79.3, step=None)),
+        *BOTH,
+        "differ in cell",
+    )
+    _refused(
+        _at_cells(_cell(43.7, -79.3, step=None), _cell(43.70001, -79.3, step=None)),
+        *BOTH,
+        "differ in cell",
+    )
+
+
+def test_every_pair_of_per_year_scenarios_is_compared() -> None:
+    # Each fine cell lies in the coarse reference's, but they are two cells.
+    coarse = {"latitude": 1.0, "longitude": 1.0}
+    _refused(
+        _at_cells(
+            _cell(43.5, -79.5, coarse),
+            _cell(43.625, -79.375),
+            _cell(43.875, -79.375),
+        ),
+        "'b'",
+        "'c'",
+        "two cells of one grid",
+    )
+
+
+def test_another_station_raises() -> None:
+    held = ScenarioSet(
+        [
+            _placed("a", 1980, where={"station": "S1"}),
+            _placed(
+                "b",
+                2020,
+                table_columns={"station_id": {"values": ["S1"], "distinct": 1}},
+            ),
+        ],
+        reference="a",
+    )
+    assert held.labels == ("a", "b")
+    _refused(
+        [
+            _placed("a", 1980, where={"station": "S1"}),
+            _placed("b", 2020, where={"station": "S2"}),
+        ],
+        *BOTH,
+        "differ in station",
+        "station 'S1'",
+        "station 'S2'",
+    )
+
+
+def test_a_filter_on_other_columns_names_no_place() -> None:
+    held = ScenarioSet(
+        [
+            _placed("a", 1980, where={"model": "M1", "scenario": "historical"}),
+            _placed("b", 2020, where={"model": "M1", "scenario": "ssp245"}),
+        ],
+        reference="a",
+    )
+    assert held.labels == ("a", "b")
+
+
+def test_a_cell_beside_a_station_is_not_compared() -> None:
+    held = ScenarioSet(
+        [
+            _placed("a", 1980, **_cell(43.625, -79.375)),
+            _placed("b", 2020, where={"station": "S1"}),
+        ],
+        reference="a",
+    )
+    assert held.labels == ("a", "b")
+
+
+def test_the_index_series_is_compared_with_the_index_series() -> None:
+    def scenario(label: str, first: int, station: str) -> Any:
+        hazard = _series(_stated("ssp245"), first=first, **_cell(43.625, -79.375))
+        index = _series(None, first=first, seed=4, where={"station": station})
+        return _annual(label, hazard, index=index)
+
+    # The hazard is read at a cell and the index at a station: each by its own.
+    held = ScenarioSet(
+        [scenario("a", 1980, "S1"), scenario("b", 2020, "S1")], reference="a"
+    )
+    assert held.labels == ("a", "b")
+    _refused(
+        [scenario("a", 1980, "S1"), scenario("b", 2020, "S2")],
+        *BOTH,
+        "the index series of asset 'a'",
+        "station 'S2'",
+    )
+
+
+def test_each_run_of_a_pool_is_compared() -> None:
+    def pool(label: str, pathway: str, longitude: float) -> Any:
+        runs = [
+            _run("M1", pathway, **_cell(43.625, -79.375)),
+            _run("M2", pathway, **_cell(43.625, longitude)),
+        ]
+        return _pool(label, runs)
+
+    held = ScenarioSet(
+        [pool("a", "ssp245", -79.375), pool("b", "ssp585", -79.375)], reference="a"
+    )
+    assert held.labels == ("a", "b")
+    _refused(
+        [pool("a", "ssp245", -79.375), pool("b", "ssp585", -79.625)],
+        *BOTH,
+        "differ in cell",
+        "(run M2 r1i1p1f1) in the grid cell centred at latitude 43.625, "
+        "longitude -79.625",
+    )
+
+
+def test_runs_on_their_own_grids_overlap() -> None:
+    # CMIP6 models each on its own grid: run M2's coarse cell holds M1's.
+    coarse = {"latitude": 1.25, "longitude": 1.875}
+    runs = [
+        _run("M1", **_cell(43.625, -79.375)),
+        _run("M2", **_cell(43.75, -79.6875, coarse)),
+    ]
+    later = [
+        _run("M1", "ssp585", **_cell(43.625, -79.375)),
+        _run("M2", "ssp585", **_cell(43.75, -79.6875, coarse)),
+    ]
+    held = ScenarioSet([_pool("a", runs), _pool("b", later)], reference="a")
+    assert held.labels == ("a", "b")
+
+
+def test_each_asset_of_a_joined_sample_is_compared() -> None:
+    def joined(label: str, first: int, longitude: float) -> OutcomeSample:
+        return OutcomeSample.join(
+            [
+                _annual(
+                    label,
+                    _series(_stated("ssp245"), first=first, **_cell(43.625, -79.375)),
+                    asset_id="a",
+                ),
+                _annual(
+                    label,
+                    _series(
+                        _stated("ssp245"),
+                        first=first,
+                        seed=4,
+                        **_cell(43.625, longitude),
+                    ),
+                    asset_id="b",
+                ),
+            ]
+        )
+
+    held = ScenarioSet(
+        [joined("a", 1980, -79.125), joined("b", 2020, -79.125)], reference="a"
+    )
+    assert held.labels == ("a", "b")
+    _refused(
+        [joined("a", 1980, -79.125), joined("b", 2020, -78.875)],
+        *BOTH,
+        "asset 'b'",
+    )
+
+
+def test_each_component_of_per_year_hazards_is_compared() -> None:
+    def hazards(label: str, first: int, station: str) -> OutcomeSample:
+        sample: OutcomeSample = sample_annual_hazards(
+            {
+                "rain": _series(
+                    _stated("ssp245"), first=first, where={"station": "S1"}
+                ),
+                "heat": _series(
+                    {**_stated("ssp245"), "recipe": "heat"},
+                    first=first,
+                    seed=4,
+                    where={"station": station},
+                ),
+            },
+            tails={"rain": "upper", "heat": "upper"},
+            loss_models={"rain": LOSS},
+            basis_risk=NoBasisRisk(),
+            asset_id="a",
+            scenario=label,
+        )
+        return sample
+
+    held = ScenarioSet(
+        [hazards("a", 1980, "S1"), hazards("b", 2020, "S1")], reference="a"
+    )
+    assert held.labels == ("a", "b")
+    _refused(
+        [hazards("a", 1980, "S1"), hazards("b", 2020, "S2")],
+        *BOTH,
+        "component 'heat'",
+    )

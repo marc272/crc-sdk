@@ -26,6 +26,7 @@ from crc_sdk.parametric import (
     IndexDefinition,
     LinearPayout,
     LossModel,
+    ModelRun,
     OutcomeSample,
     SampleError,
     ScenarioSet,
@@ -38,6 +39,7 @@ from crc_sdk.parametric import (
     holdout,
     payout_breakdown,
     sample_annual,
+    sample_annual_pool,
     sample_curve_hazards,
     sample_curves,
 )
@@ -186,6 +188,27 @@ def _series(source: Any, *, seed: int = 3) -> AnnualSeries:
     )
 
 
+def _pool(*sources: Any, asset: str = "a") -> OutcomeSample:
+    """A pool of one run per source, models M1, M2, ..., for `asset`."""
+    runs = [
+        ModelRun(
+            _series(source, seed=seed),
+            model=f"M{seed}",
+            member="r1i1p1f1",
+            pathway="ssp245",
+        )
+        for seed, source in enumerate(sources, start=1)
+    ]
+    sample: OutcomeSample = sample_annual_pool(
+        runs,
+        loss_model=LOSS,
+        basis_risk=ImpactNoise(0.2),
+        asset_id=asset,
+        rng=np.random.default_rng(0),
+    )
+    return sample
+
+
 # -- the one check -----------------------------------------------------------------
 
 
@@ -273,6 +296,15 @@ def test_a_set_of_covers_and_a_joint_design_check_each_asset() -> None:
         design_joint(templates, book, MSE())
     result = design_joint([_template("rx1day"), _template("rx1day")], book, MSE())
     assert evaluate(result, book, split="in_sample").num_rows == 1
+
+
+def test_design_joint_names_the_hazard_among_its_sample_errors() -> None:
+    documented = " ".join((design_joint.__doc__ or "").split())
+    assert (
+        "`SampleError` when the templates' number, assets or units don't suit the "
+        "sample, or a template's index `hazard_name` differs from the hazard the "
+        "sample records for its asset" in documented
+    )
 
 
 def test_an_index_series_is_compared_with_its_own_source() -> None:
@@ -373,3 +405,48 @@ def test_compare_scenarios_refuses_a_design_block_of_another_hazard() -> None:
     train, _ = holdout(blocks[0], 0.5)
     table = compare_scenarios([_cover("rx1day")], scenarios, design_sample=train)
     assert table.num_rows == 2
+
+
+# -- pools ---------------------------------------------------------------------------
+
+
+def test_a_pool_whose_runs_name_its_hazard_records_and_compares_it() -> None:
+    named = {"provider": "fixture", "recipe": "rx1day"}
+    sample = _pool(named, named)
+    assert sample.provenance.hazard == {"name": "rx1day", "from": "source_plan"}
+    _check_reads(_index("rx1day"), sample)
+    with pytest.raises(SampleError, match="'wind'.*the sample reads 'rx1day'"):
+        _check_reads(_index("wind"), sample)
+
+
+def test_a_pool_with_a_silent_run_compares_the_runs_that_name_one() -> None:
+    # A run that names none leaves the pool without a record of its own.
+    sample = _pool({"provider": "fixture", "hazard_name": "rx1day"}, "a table")
+    assert sample.provenance.hazard is None
+    _check_reads(_index("rx1day"), sample)
+    with pytest.raises(
+        SampleError, match="'wind'.*run M1 r1i1p1f1 of the sample reads 'rx1day'"
+    ):
+        _check_reads(_index("wind"), sample)
+    with pytest.raises(SampleError, match="'wind'.*run M1"):
+        evaluate(_cover("wind"), sample, split="in_sample")
+    with pytest.raises(SampleError, match="'wind'.*run M1"):
+        design(_template("wind"), sample, MSE())
+
+
+def test_a_pool_whose_runs_name_nothing_is_read_as_before() -> None:
+    sample = _pool("a table", "another table")
+    assert sample.provenance.hazard is None
+    _check_reads(_index("anything"), sample)
+
+
+def test_each_asset_of_joined_pools_compares_its_own_runs() -> None:
+    joined = OutcomeSample.join(
+        [
+            _pool({"provider": "fixture", "recipe": "rx1day"}, "a table", asset="a"),
+            _pool("a table", "another table", asset="b"),
+        ]
+    )
+    _check_reads(_index("wind"), joined, "b")
+    with pytest.raises(SampleError, match="'wind'.*run M1 r1i1p1f1 of asset 'a'"):
+        _check_reads(_index("wind"), joined)

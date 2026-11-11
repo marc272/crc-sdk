@@ -68,11 +68,12 @@ gives few years for a tail, so the years of several models can be pooled for
 one asset under one pathway. Every model-year is one row with probability
 `1/N`, in (year, model, member) order, with models and members in UTF-8 byte
 order; `period` is the draw number, and each row's identity is recorded in the
-provenance's `pool`. Every run must hold the same years, and a model appears
-once, whatever its member, so every model has the same weight. A draw mixes
-model spread with year-to-year variability, and the rows are not independent
-years: rows of one run share that model's climate and rows of one year the
-pathway's forcing, so the number of rows is not an effective sample size.
+provenance's `pool`. Every run must hold the same years and read one hazard,
+and a model appears once, whatever its member, so every model has the same
+weight. A draw mixes model spread with year-to-year variability, and the rows
+are not independent years: rows of one run share that model's climate and rows
+of one year the pathway's forcing, so the number of rows is not an effective
+sample size.
 
 **Hazard units.** Before anything is drawn, these functions check the hazard's
 unit (the curve's `value_unit`, the hazard series' `unit`) against the loss
@@ -3121,6 +3122,27 @@ def _stated_recipes(series: AnnualSeries) -> set[str]:
     return recipes
 
 
+def _check_one_hazard(runs: Sequence[ModelRun]) -> None:
+    """Raise `SampleError` for runs whose records name two hazards, whatever the label.
+
+    A run's record names its hazard as `sample_annual` reads it: its source's
+    `recipe` or `hazard_name`, or a one-valued `recipe` column. A run that
+    names none is the caller's to know, and `hazard_name=` stands for it.
+    """
+    named = {
+        run._name: found[0]
+        for run in runs
+        if (found := _series_hazard(run.series)) is not None
+    }
+    if len(set(named.values())) > 1:
+        listed = ", ".join(f"run {run} names {name!r}" for run, name in named.items())
+        raise SampleError(
+            f"a pool reads one hazard in every run, but its runs name "
+            f"{sorted(set(named.values()))} ({listed}); pool each hazard's runs "
+            "on their own"
+        )
+
+
 def _checked_runs(runs: Any) -> tuple[ModelRun, ...]:
     """A pool's runs in (model, member) order, after the refusals of a pool."""
     if isinstance(runs, (str, bytes, Mapping)) or not isinstance(runs, Iterable):
@@ -3159,12 +3181,14 @@ def _checked_runs(runs: Any) -> tuple[ModelRun, ...]:
             f"a model appears once in a pool, whatever its member, so that every "
             f"model has the same weight; got {members}"
         )
-    return tuple(
+    ordered = tuple(
         sorted(
             given,
             key=lambda run: (run.model.encode("utf-8"), run.member.encode("utf-8")),
         )
     )
+    _check_one_hazard(ordered)
+    return ordered
 
 
 def _check_run_pathways(runs: Sequence[ModelRun], scenario: str) -> None:
@@ -3275,10 +3299,13 @@ def sample_annual_pool(
     `missing="drop_year"` drops it from every run and lists it with the run
     that lacked it. `rng` is needed only by a basis-risk model that draws:
     `HazardNoise` and `ImpactNoise` draw one factor per row, in row order.
-    `trend`, `scenario` and `hazard_name` are those of `sample_annual`, and a
-    name in the runs' records must be one. On a pool with a `scenario` label,
-    each run's `pathway` must agree, by `pathways_equivalent`, with every
-    pathway its series' record states.
+    `trend`, `scenario` and `hazard_name` are those of `sample_annual`. The
+    runs read one hazard, whatever the label: the names their records state
+    (a source's `recipe` or `hazard_name`, or a one-valued `recipe` column)
+    must be one, and the pool records it when every run states it. A stated
+    `hazard_name` must agree with it, and stands for the runs that state none.
+    On a pool with a `scenario` label, each run's `pathway` must agree, by
+    `pathways_equivalent`, with every pathway its series' record states.
 
     `holdout` and `year_block_kfold` split a pool by its years, so every run
     holds out the same latest years, and the leakage check compares (run
@@ -3292,15 +3319,15 @@ def sample_annual_pool(
     sample size.
 
     Raises `SampleError` for fewer than two runs; runs under different
-    pathways, in different units or with different stated recipes; the same
-    model twice, whatever the member; runs that do not hold the same years; a
-    missing year (unless `missing="drop_year"`); a hazard unit the loss model's
-    impact is not calibrated for; a trend a run cannot take; and invalid
-    arguments. Raises `ScenarioError` for a `hazard_name` a run contradicts and,
-    on a pool with a `scenario` label, for a run's `pathway` its series
-    contradicts, and `TypeError` for wrong types. Warns with
-    `ComonotoneIndexWarning` for `NoBasisRisk()` and `HazardNoise(0)`, as for
-    one series.
+    pathways, in different units, with different stated recipes or whose
+    records name two hazards; the same model twice, whatever the member; runs
+    that do not hold the same years; a missing year (unless
+    `missing="drop_year"`); a hazard unit the loss model's impact is not
+    calibrated for; a trend a run cannot take; and invalid arguments. Raises
+    `ScenarioError` for a `hazard_name` a run contradicts and, on a pool with
+    a `scenario` label, for a run's `pathway` its series contradicts, and
+    `TypeError` for wrong types. Warns with `ComonotoneIndexWarning` for
+    `NoBasisRisk()` and `HazardNoise(0)`, as for one series.
     """
     sample = _pool_rows(
         runs,
