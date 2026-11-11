@@ -663,13 +663,7 @@ def test_the_metadata_describes_the_set_a_total_row_names() -> None:
 
 
 def test_a_table_round_trips_through_a_file(tmp_path: Path) -> None:
-    table = compare(
-        [_joint(), FIXED],
-        BOOK,
-        split="in_sample",
-        allocation="loss",
-        values=VALUES,
-    )
+    table = compare([_joint(), FIXED], BOOK, split="in_sample")
     path = tmp_path / "comparison.parquet"
     write_comparison(table, path)
     read = pq.read_table(path)

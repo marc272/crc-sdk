@@ -57,6 +57,7 @@ from crc_sdk.parametric import (
     SampleError,
     StationColumn,
     StepPayout,
+    allocate,
     compare,
     design_joint,
     holdout,
@@ -1081,6 +1082,9 @@ def test_joint_rows_are_the_total_only_without_an_allocation(tmp_path: Path) -> 
     stored = EvaluationMetadata.from_table(pq.read_table(result.output))
     assert stored == result.metadata
     assert stored.assets["count"] == len(ALL)
+    # No rule, no allocated rows and no second file.
+    assert result.allocated is None and result.allocated_output is None
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["out.parquet"]
 
 
 @pytest.mark.parametrize("rule", ["value", "loss"])
@@ -1094,25 +1098,33 @@ def test_an_allocation_reads_the_loss_model_s_values(tmp_path: Path, rule: Any) 
     )
     result = plan.write_parquet(tmp_path / "out.parquet")
     level = f"asset_by_{rule}"
-    rows = result.table.to_pylist()
-    assert {row["level"] for row in rows} == {"total", level}
-    assert [row["asset_id"] for row in rows[:4]] == [None, *ALL]
+    # The comparison holds the owner's total; the allocated rows a table of their own.
+    assert {row["level"] for row in result.table.to_pylist()} == {"total"}
+    assert result.metadata.setup.evaluations[0]["allocation"] is None
+    allocated = result.allocated
+    assert result.allocated_output == tmp_path / "out.allocated.parquet"
+    rows = allocated.to_pylist()
+    assert {row["level"] for row in rows} == {level}
+    assert [row["asset_id"] for row in rows[:3]] == list(ALL)
     train, _ = holdout(_joined(source), 0.7)
     made = design_joint([_step(a) for a in ALL], train, MSE(), budget=Budget(ratio=0.8))
-    by_hand = compare(
+    by_hand = allocate(
         [made],
         train,
         split="in_sample",
-        design_sample=train,
         options=OPTIONS,
         allocation=rule,
         values=VALUES,
     )
-    in_sample = result.table.filter(pc.equal(result.table["split"], "in_sample"))
+    in_sample = allocated.filter(pc.equal(allocated["split"], "in_sample"))
     assert _comparable(in_sample).equals(_comparable(by_hand))
-    written = result.metadata.setup.evaluations[0]
+    stored = EvaluationMetadata.from_table(pq.read_table(result.allocated_output))
+    assert stored == EvaluationMetadata.from_table(allocated)
+    written = stored.setup.evaluations[0]
     assert written["allocation"] == rule
-    assert result.metadata.assets["values_sha256"] is not None
+    assert written["level"] == [level]
+    assert stored.assets["values_sha256"] is not None
+    assert pq.read_table(result.allocated_output).equals(allocated)
 
 
 def test_an_allocation_without_a_value_column_shares_by_the_damage_ratios(
@@ -1165,17 +1177,18 @@ def test_an_allocation_without_a_value_column_shares_by_the_damage_ratios(
         sample,
         MSE(),
     )
-    by_hand = compare(
+    by_hand = allocate(
         [made],
         sample,
         split="in_sample",
-        design_sample=sample,
         options=OPTIONS,
         allocation="value",
         values=dict.fromkeys(ALL, 1.0),
     )
-    assert _comparable(result.table).equals(_comparable(by_hand))
-    assert result.metadata.assets["values_sha256"] is not None
+    assert _comparable(result.allocated).equals(_comparable(by_hand))
+    allocated = EvaluationMetadata.from_table(result.allocated)
+    assert allocated.assets["values_sha256"] is not None
+    assert result.metadata.assets["values_sha256"] is None
 
 
 def test_an_allocation_needs_a_joint_design(tmp_path: Path) -> None:
@@ -1224,8 +1237,14 @@ def test_a_plan_holding_both_scopes_keeps_their_rows_apart(tmp_path: Path) -> No
     individual = {
         (row["level"], row["asset_id"]) for row in rows if row["scope"] == "individual"
     }
-    assert joint == {("total", None), *{("asset_by_value", a) for a in ALL}}
+    assert joint == {("total", None)}
     assert individual == {("total", None), *{("asset", a) for a in ALL}}
+    # The allocated rows are in a table of their own, beside no asset row.
+    allocated = result.allocated.to_pylist()
+    assert {(row["level"], row["asset_id"]) for row in allocated} == {
+        ("asset_by_value", a) for a in ALL
+    }
+    assert {row["scope"] for row in allocated} == {"joint"}
     joint_design = result.designs[0]
     train = joint_design.design_sample
     for asset, each in zip(ALL, result.designs[1:], strict=True):
@@ -1367,8 +1386,11 @@ def test_the_plan_s_setup_text_collapses_its_notes_on_real_output(
     assert line.count("more frequent than the shortest") == 1
     assert "Asset warehouse-a: " not in line
     assert lines[0].startswith("Level: total, the sum over warehouse-a, depot-b and")
-    assert "asset_by_value, one row per asset" in lines[0]
+    assert "asset_by_value" not in lines[0]
     assert "Scope: joint" in lines[0]
+    # The allocated rows' own table states their rule.
+    allocated = setup_text(result.allocated).splitlines()[0]
+    assert allocated.startswith("Level: asset_by_value, one row per asset")
     sample = next(item for item in lines if item.startswith("Sample: "))
     assert "Dependence between the assets: Comonotonic(), a stated assumption" in sample
     assert "A joint design's premium is that of one contract on the total." in text

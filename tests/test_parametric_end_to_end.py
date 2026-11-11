@@ -340,20 +340,31 @@ def test_the_docs_joint_design_runs_as_written(
     assert "Dependence between the assets: the data's own" in printed
     result = namespace["joint_result"]
     assert (tmp_path / "joint-comparison.parquet").is_file()
-    # A total and two allocated rows, in and out of sample; the scope is one.
-    assert result.row_count == 6
-    assert set(result.table.column("level").to_pylist()) == {"total", "asset_by_value"}
+    # A total row in and out of sample; the scope is one.
+    assert result.row_count == 2
+    assert set(result.table.column("level").to_pylist()) == {"total"}
     assert set(result.table.column("scope").to_pylist()) == {"joint"}
-    assert "asset_by_value, one row per asset" in setup_text(result.metadata)
+    assert "asset_by_value" not in setup_text(result.metadata)
+    # The two allocated rows, in and out of sample, in a file of their own.
+    assert result.allocated_output == result.output.with_name(
+        "joint-comparison.allocated.parquet"
+    )
+    assert (tmp_path / "joint-comparison.allocated.parquet").is_file()
+    assert result.allocated.num_rows == 4
+    assert set(result.allocated.column("level").to_pylist()) == {"asset_by_value"}
+    assert "asset_by_value, one row per asset" in setup_text(result.allocated)
 
     # The function route gives the plan's sample and design and its rows.
     (planned,) = result.designs
     assert result.joint_sample.content_hash == namespace["joined"].content_hash
     assert namespace["joint_design"].parameters == planned.parameters
-    held_out = result.table.filter(pc.equal(result.table["split"], "out_of_sample"))
-    table = namespace["joint_table"]
-    for column in ("level", "asset_id", "premium", "expected_payout", "sample_hash"):
-        assert table.column(column).to_pylist() == held_out.column(column).to_pylist()
+    columns = ("level", "asset_id", "premium", "expected_payout", "sample_hash")
+    for by_hand, written in (
+        (namespace["joint_table"], result.table),
+        (namespace["joint_shares"], result.allocated),
+    ):
+        held_out = written.filter(pc.equal(written["split"], "out_of_sample"))
+        assert by_hand.select(columns).equals(held_out.select(columns))
 
 
 def test_the_docs_comparison_table_lists_every_identity_column() -> None:
@@ -363,6 +374,7 @@ def test_the_docs_comparison_table_lists_every_identity_column() -> None:
     for column in (*IDENTITY_COLUMNS, "copula_reference_years"):
         assert f"`{column}`" in section
     assert "`copula_block_tail_b<β>`" in section
+    assert "`short_block_b<β>`, `short_block_rp<T>`" in section
     for level in ("asset", "total", "asset_by_value", "asset_by_loss", "package"):
         assert f'`"{level}"`' in section
     assert '`"individual"`' in section and '`"joint"`' in section

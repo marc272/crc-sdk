@@ -18,7 +18,7 @@ ParametricPlan.for_annual_extremes(source, assets, impact=, unit=, provenance=)
   .metrics(MetricOptions(...))          # optional: levels and thresholds
   .scopes(Individual() | Joint())       # optional: asset by asset, or on the total
   .dependence(Comonotonic() | ...)      # with Joint() on curves: required
-  .allocation("value" | "loss")         # optional: per-asset rows of a joint design
+  .allocation("value" | "loss")         # optional: a joint design's allocated rows
   .explain()                            # the setup, no I/O
   .samples()                            # execution: one sample per asset
   .joint_sample()                       # execution: Joint() only
@@ -138,8 +138,9 @@ cover is evaluated as a set, one contract per asset. `.samples()` returns each
 asset's view of the sample and `.joint_sample()` the sample itself. `.scopes`
 may hold both scopes: each asset is then also designed on its own view, and the
 `scope` column keeps the rows of each scope apart. `.allocation(rule)` adds a
-joint design's per-asset rows, with the values the plan's loss model read.
-`docs/parametric.md` describes the rows.
+joint design's allocated rows, with the values the plan's loss model read, in a
+table and a file of their own (`allocate`), so they never sit beside the rows
+of covers that stand on their own. `docs/parametric.md` describes the rows.
 
 **Output.** `write_parquet(path)` writes one comparison table, as `compare`
 builds it, through a temporary sibling and `os.replace`. Its metadata under
@@ -152,8 +153,11 @@ table's likewise), the licences,
 the generator states, and the plan's seed in every evaluation's `details`
 (`"plan_seed"`, with `"fresh_draws_seed"` on fresh-draw rows). Asset values
 are never written; the metadata holds a SHA-256 of the (asset id, value)
-pairs. The returned `ParametricResult` holds the samples, the fresh draws
-and the designs and, under `Joint()`, the sample of all the assets.
+pairs. Under `.allocation(rule)`, a joint design's allocated rows go to a
+second file beside the first, `<stem>.allocated<suffix>`, with metadata of the
+same form. The returned `ParametricResult` holds the samples, the fresh draws
+and the designs and, under `Joint()`, the sample of all the assets and any
+allocated rows.
 """
 
 from __future__ import annotations
@@ -198,8 +202,18 @@ from crc_sdk.parametric.dependence import (
     Independent,
 )
 from crc_sdk.parametric.design import DesignOptions, DesignResult, design
-from crc_sdk.parametric.errors import ProbabilitySemanticsError, SampleError
-from crc_sdk.parametric.evaluate import Allocation, Split, compare, write_comparison
+from crc_sdk.parametric.errors import (
+    EvaluationError,
+    ProbabilitySemanticsError,
+    SampleError,
+)
+from crc_sdk.parametric.evaluate import (
+    Allocation,
+    Split,
+    allocate,
+    compare,
+    write_comparison,
+)
 from crc_sdk.parametric.index import AtAsset, AtPoint, AtStation, IndexDefinition
 from crc_sdk.parametric.joint import Individual, Joint, JointDesignResult, design_joint
 from crc_sdk.parametric.loss import LossModel
@@ -652,7 +666,12 @@ class ParametricResult:
       its years or draws, before any split; otherwise `None`;
     - `fresh_joint_sample`: under `Joint()` with `FreshDraws`, the fresh draws
       of all the assets, whose `content_hash` is the `sample_hash` of the
-      out-of-sample rows; otherwise `None`.
+      out-of-sample rows; otherwise `None`;
+    - `allocated`: under `.allocation(...)`, the joint designs' allocated rows
+      as written, in a table of their own with its metadata, as `allocate`
+      builds them; otherwise `None`;
+    - `allocated_output`: the file of `allocated`, `<stem>.allocated<suffix>`
+      beside `output`; otherwise `None`.
     """
 
     output: Path
@@ -665,6 +684,8 @@ class ParametricResult:
     fresh_samples: Mapping[str, OutcomeSample] | None = None
     joint_sample: OutcomeSample | None = None
     fresh_joint_sample: OutcomeSample | None = None
+    allocated: Any = None
+    allocated_output: Path | None = None
 
     @property
     def row_count(self) -> int:
@@ -678,6 +699,7 @@ class _Run:
     fresh: Mapping[str, OutcomeSample] | None
     designs: tuple[Any, ...]
     tables: tuple[Any, ...]
+    allocated: tuple[Any, ...]
     source_key: str
     source: dict[str, Any]
     id_column: str
@@ -2085,7 +2107,10 @@ class ParametricPlan:
         asset's cover: `"value"` shares each draw's total payout in proportion
         to the assets' values and `"loss"` in proportion to their losses in
         that draw. The rows have `level` `"asset_by_value"` or
-        `"asset_by_loss"` and no premium or net-loss columns. The values are
+        `"asset_by_loss"` and no premium or net-loss values, and they go in a
+        table of their own, as `allocate` builds it: `write_parquet` writes them
+        to a second file and returns them in `ParametricResult.allocated`, so
+        they never sit beside an `"asset"` or `"total"` row. The values are
         those the plan's loss model reads (the asset column `value_column`, or
         1 for a damage ratio); only their hash is written. It applies to joint
         designs only, so `explain()` and every execution point raise without
@@ -3354,18 +3379,18 @@ class ParametricPlan:
             values[asset_id] = 1.0 if read is None else read
         return values
 
-    def _block_tables(
-        self,
-        entries: Sequence[Any],
-        block: _Block,
-        *,
-        values: Mapping[str, float] | None = None,
-    ) -> list[Any]:
-        """The rows of one block: on the design block, and on any held-out one."""
-        fold, train, test = block
+    @staticmethod
+    def _evaluated(block: _Block) -> list[tuple[Split, OutcomeSample]]:
+        """Where a block's rows are read: its design block, and any held-out one."""
+        _, train, test = block
         evaluated: list[tuple[Split, OutcomeSample]] = [("in_sample", train)]
         if test is not None:
             evaluated.append(("out_of_sample", test))
+        return evaluated
+
+    def _block_tables(self, entries: Sequence[Any], block: _Block) -> list[Any]:
+        """The rows of one block: on the design block, and on any held-out one."""
+        fold, train, _ = block
         return [
             compare(
                 entries,
@@ -3375,10 +3400,32 @@ class ParametricPlan:
                 pricing=self._pricing(),
                 options=self.metric_options,
                 design_sample=train,
-                allocation=self.allocation_rule,
-                values=values,
             )
-            for split, sample in evaluated
+            for split, sample in self._evaluated(block)
+        ]
+
+    def _allocated_tables(
+        self,
+        designs: Sequence[JointDesignResult],
+        block: _Block,
+        values: Mapping[str, float] | None,
+    ) -> list[Any]:
+        """The allocated rows of one block's joint designs, in tables of their own."""
+        rule = self.allocation_rule
+        if rule is None or values is None:
+            return []
+        fold = block[0]
+        return [
+            allocate(
+                designs,
+                sample,
+                split=split,
+                fold=fold,
+                allocation=rule,
+                values=values,
+                options=self.metric_options,
+            )
+            for split, sample in self._evaluated(block)
         ]
 
     def _individual_design(
@@ -3487,6 +3534,7 @@ class ParametricPlan:
         covers = self._covers_for(asset_ids, built.locations)
         designs: list[Any] = []
         tables: list[Any] = []
+        allocated: list[Any] = []
         if built.joint is not None:
             values = (
                 None
@@ -3496,8 +3544,17 @@ class ParametricPlan:
             for block in self._joint_blocks(built):
                 entries, made = self._joint_entries(block[1], covers)
                 designs += made
-                if evaluate:
-                    tables += self._block_tables(entries, block, values=values)
+                if not evaluate:
+                    continue
+                joint = [each for each in made if isinstance(each, JointDesignResult)]
+                if values is not None and not joint:
+                    raise EvaluationError(
+                        ".allocation(...) shares out a joint design's total payout, "
+                        "but no entry is a joint design: the plan's covers are all "
+                        "resolved, and Joint() evaluates each as a set of contracts"
+                    )
+                tables += self._block_tables(entries, block)
+                allocated += self._allocated_tables(joint, block, values)
         else:
             for asset_id in asset_ids:
                 for block in self._asset_blocks(built, asset_id):
@@ -3525,6 +3582,7 @@ class ParametricPlan:
             fresh=None if built.fresh is None else MappingProxyType(built.fresh),
             designs=tuple(designs),
             tables=tuple(tables),
+            allocated=tuple(allocated),
             source_key=built.record_key,
             source=built.record,
             id_column=portfolio.id_column,
@@ -3628,22 +3686,61 @@ class ParametricPlan:
         SHA-256 of the (asset id, value) pairs to `assets`.
 
         Under `Joint()` the rows are one `"total"` row per joint design and
-        block (`scope="joint"`) and, under `.allocation(...)`, one allocated
-        row per asset; a resolved cover has one `"asset"` row per asset and a
-        `"total"` row (`scope="individual"`), and so does a template's
-        per-asset design if the plan also holds `Individual()`. Only the rows
-        of a plan that holds `Joint()` include a `"total"` row.
+        block (`scope="joint"`); a resolved cover has one `"asset"` row per
+        asset and a `"total"` row (`scope="individual"`), and so does a
+        template's per-asset design if the plan also holds `Individual()`. Only
+        the rows of a plan that holds `Joint()` include a `"total"` row.
+
+        Under `.allocation(rule)`, each joint design's allocated rows, one per
+        asset and block, are `allocate`'s, and they go in a table of their own,
+        never beside an `"asset"` or `"total"` row: the second file
+        `<stem>.allocated<suffix>` beside `path` (for `"comparison.parquet"`,
+        `"comparison.allocated.parquet"`), written atomically in the same way,
+        with its own metadata, which records the rule and the hash of the asset
+        values. The comparison's own evaluations then record no allocation.
 
         Returns a `ParametricResult`, with the fresh draws in
-        `fresh_samples` when the split is `FreshDraws`. Raises `ValueError`
+        `fresh_samples` when the split is `FreshDraws`, and the allocated rows
+        in `allocated` and their file in `allocated_output` under
+        `.allocation(...)`. Raises `ValueError`
         without covers, a basis-risk model, or an objective for templates;
         `SampleError` for a cover that names another location than the index
         is read at, or a fold with fewer design years than `LinearTrend`'s
-        `min_years`; and as `samples`, `design` and `compare` raise.
+        `min_years`; `EvaluationError` (a `ValueError`) for `.allocation(...)`
+        on a plan whose covers are all resolved, which has no joint design; and
+        as `samples`, `design`, `compare` and `allocate` raise.
         """
         run = self._run(evaluate=True)
+        table, metadata = self._written(run, run.tables)
+        allocated = self._written(run, run.allocated) if run.allocated else None
+        text = os.fspath(path)
+        if not isinstance(text, str) or "://" in text:
+            raise ValueError(f"write_parquet writes local files, got {path!r}")
+        target = Path(text)
+        beside = target.with_name(f"{target.stem}.allocated{target.suffix}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        write_comparison(table, target, metadata=metadata)
+        if allocated is not None:
+            write_comparison(allocated[0], beside, metadata=allocated[1])
+        return ParametricResult(
+            output=target,
+            table=table,
+            metadata=metadata,
+            samples=run.samples,
+            designs=run.designs,
+            fresh_samples=run.fresh,
+            joint_sample=run.joint,
+            fresh_joint_sample=run.fresh_joint,
+            allocated=None if allocated is None else allocated[0],
+            allocated_output=None if allocated is None else beside,
+        )
+
+    def _written(
+        self, run: _Run, tables: Sequence[Any]
+    ) -> tuple[Any, EvaluationMetadata]:
+        """The tables of a run as one, with the plan's records in its metadata."""
         merged = EvaluationMetadata.merge(
-            *(EvaluationMetadata.from_table(table) for table in run.tables)
+            *(EvaluationMetadata.from_table(table) for table in tables)
         )
         document = merged.model_dump(mode="json")
         checksum = run.source[
@@ -3698,25 +3795,10 @@ class ParametricPlan:
             or document["assets"].get("values_sha256"),
         }
         metadata = EvaluationMetadata.model_validate(document)
-        table = pa.concat_tables(run.tables)
+        table = pa.concat_tables(tables)
         existing = dict(table.schema.metadata or {})
         existing[EVALUATION_METADATA_KEY.encode("utf-8")] = metadata.to_json().encode(
             "utf-8"
         )
         table = table.replace_schema_metadata(existing)
-        text = os.fspath(path)
-        if not isinstance(text, str) or "://" in text:
-            raise ValueError(f"write_parquet writes local files, got {path!r}")
-        target = Path(text)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        write_comparison(table, target, metadata=metadata)
-        return ParametricResult(
-            output=target,
-            table=table,
-            metadata=metadata,
-            samples=run.samples,
-            designs=run.designs,
-            fresh_samples=run.fresh,
-            joint_sample=run.joint,
-            fresh_joint_sample=run.fresh_joint,
-        )
+        return table, metadata
