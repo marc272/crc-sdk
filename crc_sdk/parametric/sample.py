@@ -3045,8 +3045,11 @@ def _refuse_reference_year_blocks(sample: OutcomeSample, function: str) -> None:
 
 
 def _holds_hazard_distribution(document: Mapping[str, Any]) -> bool:
-    """Whether a provenance document, or one of its parts or components, states
-    `HazardNoise(..., hold="hazard_distribution")`."""
+    """Whether a provenance document states the held form of `HazardNoise`.
+
+    That is `HazardNoise(..., hold="hazard_distribution")`, in the document or
+    in one of its parts or components.
+    """
     model = document.get("basis_risk")
     if (
         isinstance(model, Mapping)
@@ -3431,7 +3434,7 @@ def _check_not_one_ranking(design: OutcomeSample, evaluation: OutcomeSample) -> 
     ):
         return
     raise LeakageError(
-        f"the design and the evaluation samples are cut from one sample, and "
+        "the design and the evaluation samples are cut from one sample, and "
         f"{_ONE_RANKING}, so each holds values of the other's rows; build them "
         "with separate calls (fresh draws from a curve, or per-year samples of "
         "separate years)"
