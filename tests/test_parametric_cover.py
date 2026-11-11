@@ -84,6 +84,20 @@ LOWER_TAIL_JSON = (
 LOWER_TAIL_HASH = (
     "sha256:e60f7a393b4f5cef855872d1f4a69225f01471133c57413cdc2232b68cfcc070"
 )
+# The template's terms with no aggregation stated: the document holds null, so
+# the hash is another one, and the template's own (above) stays as it was.
+UNSTATED = Cover(
+    IndexDefinition("rx1day", "mm/day"),
+    StepPayout([60.0, 80.0, 100.0], [Free(), Free(), Free()]),
+    payout_unit="EUR",
+    asset_id="warehouse-a",
+)
+UNSTATED_JSON = TEMPLATE_JSON.replace(
+    '"aggregation":"annual_maximum"', '"aggregation":null'
+)
+UNSTATED_HASH = (
+    "sha256:f729f2a3acc9cf4d34986afbe222c5eba05dbb7b0fd22fe8c5653f31cd2a7b36"
+)
 
 
 def test_the_cover_document() -> None:
@@ -116,6 +130,7 @@ def test_the_cover_document() -> None:
     [
         pytest.param(TEMPLATE, TEMPLATE_JSON, TEMPLATE_HASH, id="template"),
         pytest.param(LOWER_TAIL, LOWER_TAIL_JSON, LOWER_TAIL_HASH, id="exponents"),
+        pytest.param(UNSTATED, UNSTATED_JSON, UNSTATED_HASH, id="no-aggregation"),
     ],
 )
 def test_canonical_json_and_hash_are_stable(
@@ -130,6 +145,7 @@ COVERS = [
     TEMPLATE,
     RESOLVED,
     LOWER_TAIL,
+    UNSTATED,
     Cover(
         IndexDefinition(
             "wind_max_daily_max",
@@ -272,6 +288,7 @@ def test_the_label_is_not_in_the_hash_and_the_asset_is() -> None:
             ),
             id="monotone",
         ),
+        pytest.param(UNSTATED, id="aggregation-left-out"),
     ],
 )
 def test_every_term_is_in_the_hash(changed: Cover) -> None:

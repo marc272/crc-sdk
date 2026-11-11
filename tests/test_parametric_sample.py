@@ -768,6 +768,113 @@ def test_a_table_needs_annual_semantics() -> None:
         )
 
 
+def _with_field_units(table: Any, **units: str) -> Any:
+    """`table` with the Arrow field metadata `unit` set on the named columns."""
+    fields = [
+        field.with_metadata({"unit": units[field.name]})
+        if field.name in units
+        else field
+        for field in table.schema
+    ]
+    schema = pa.schema(fields, metadata=table.schema.metadata)
+    return pa.Table.from_arrays(table.columns, schema=schema)
+
+
+def _read(table: Any, **arguments: Any) -> OutcomeSample:
+    columns = {"period": "year", "asset_id": "asset", "index": "rain", "loss": "loss"}
+    return OutcomeSample.from_table(table, **{**columns, **arguments})
+
+
+def test_semantics_may_be_left_out() -> None:
+    stated = _read(_table(), semantics="annual", index_unit="mm/day", loss_unit="EUR")
+    sample = _read(_table(), index_unit="mm/day", loss_unit="EUR")
+    assert sample.semantics == "annual"
+    assert sample.content_hash == stated.content_hash
+    assert sample.lineage == stated.lineage
+    assert sample.provenance.to_document() == stated.provenance.to_document()
+    assert sample.provenance.semantics_source == "caller"
+
+
+def test_units_come_from_the_fields_of_the_table() -> None:
+    table = _with_field_units(_table(), rain="mm/day", loss="EUR")
+    sample = _read(table)
+    assert (sample.index_unit, sample.loss_unit) == ("mm/day", "EUR")
+    stated = _read(_table(), index_unit="mm/day", loss_unit="EUR")
+    assert sample.content_hash == stated.content_hash
+    assert sample.provenance.to_document() == stated.provenance.to_document()
+    # A stated unit that agrees is accepted; one that differs raises.
+    assert _read(table, index_unit="mm/day").content_hash == sample.content_hash
+    with pytest.raises(SampleError, match="loss_unit='USD' differs .* 'EUR'"):
+        _read(table, loss_unit="USD")
+    # One column's unit from the table, the other's stated.
+    one = _read(_with_field_units(_table(), rain="mm/day"), loss_unit="EUR")
+    assert one.content_hash == sample.content_hash
+
+
+@pytest.mark.parametrize(
+    ("units", "arguments", "message"),
+    [
+        pytest.param({}, {"loss_unit": "EUR"}, "index_unit is missing", id="index"),
+        pytest.param({}, {"index_unit": "mm/day"}, "loss_unit is missing", id="loss"),
+        pytest.param(
+            {"rain": "mm/day"}, {}, "loss_unit is missing.*'loss'", id="one-field"
+        ),
+        pytest.param(
+            {"rain": " mm"}, {"loss_unit": "EUR"}, "field metadata 'unit'", id="space"
+        ),
+    ],
+)
+def test_a_unit_the_table_does_not_state_is_required(
+    units: dict[str, str], arguments: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(SampleError, match=message):
+        _read(_with_field_units(_table(), **units), **arguments)
+
+
+def test_a_field_unit_must_be_text() -> None:
+    table = _table()
+    fields = [
+        field.with_metadata({b"unit": b"\xff"}) if field.name == "rain" else field
+        for field in table.schema
+    ]
+    table = pa.Table.from_arrays(table.columns, schema=pa.schema(fields))
+    with pytest.raises(SampleError, match="not UTF-8"):
+        _read(table, loss_unit="EUR")
+
+
+def test_a_written_sample_table_states_its_units() -> None:
+    """`from_table` reads a written table that was changed, with its units."""
+    written = _sample().to_table()
+    changed = written.filter(pa.compute.greater_equal(written["period"], 2003))
+    columns: dict[str, Any] = {
+        "period": "period",
+        "asset_id": "asset_id",
+        "index": "index",
+    }
+    sample = OutcomeSample.from_table(changed, **columns, loss="loss")
+    assert (sample.index_unit, sample.loss_unit) == ("mm/day", "EUR")
+    assert sample.period.tolist() == list(range(2003, 2010))
+    with pytest.raises(SampleError, match="crc.parametric.sample record"):
+        OutcomeSample.from_table(changed, **columns, loss="loss", index_unit="mm")
+    # The record names the units of its own columns only.
+    with pytest.raises(SampleError, match="loss_unit is missing.*'probability'"):
+        OutcomeSample.from_table(changed, **columns, loss="probability")
+    # Its field metadata and its record must agree.
+    disagree = _with_field_units(changed, loss="USD")
+    with pytest.raises(SampleError, match="two units: 'USD' .* 'EUR'"):
+        OutcomeSample.from_table(disagree, **columns, loss="loss")
+
+
+@pytest.mark.parametrize(
+    "record", [b"not json", b"[1, 2]", b'{"index_unit": 1}'], ids=str
+)
+def test_an_unreadable_record_states_no_unit(record: bytes) -> None:
+    table = _table().replace_schema_metadata({SAMPLE_METADATA_KEY: record})
+    with pytest.raises(SampleError, match="index_unit is missing"):
+        _read(table, loss_unit="EUR")
+    assert _read(table, index_unit="mm/day", loss_unit="EUR").index_unit == "mm/day"
+
+
 def test_a_table_whose_loss_follows_its_index_warns() -> None:
     table = _table(loss=[8.0, 2.0, 4.5, 6.0])
     with pytest.warns(ComonotoneIndexWarning, match="comonotone"):

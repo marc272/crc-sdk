@@ -719,6 +719,47 @@ def test_invalid_annual_tables_raise(
         AnnualSeries.from_table(table, unit="mm/day", **options)
 
 
+def _value_unit(table: Any, unit: str) -> Any:
+    """`table` with the Arrow field metadata `unit` on its `value` column."""
+    fields = [
+        field.with_metadata({"unit": unit}) if field.name == "value" else field
+        for field in table.schema
+    ]
+    return pa.Table.from_arrays(table.columns, schema=pa.schema(fields))
+
+
+def test_a_series_takes_its_unit_from_the_table() -> None:
+    plain = pa.table({"year": [2000, 2001], "value": [1.0, 2.0]})
+    with pytest.raises(SampleError, match="unit is missing"):
+        AnnualSeries.from_table(plain)
+    in_field = AnnualSeries.from_table(_value_unit(plain, "mm/day"))
+    assert in_field.unit == "mm/day"
+    column = plain.append_column("unit", pa.array(["mm/day", None]))
+    assert AnnualSeries.from_table(column).unit == "mm/day"
+    both = _value_unit(column, "mm/day")
+    assert AnnualSeries.from_table(both, unit="mm/day").unit == "mm/day"
+    with pytest.raises(SampleError, match="unit='mm' differs .* field metadata"):
+        AnnualSeries.from_table(_value_unit(plain, "mm/day"), unit="mm")
+    with pytest.raises(SampleError, match="two units"):
+        AnnualSeries.from_table(_value_unit(column, "mm"))
+    several = plain.append_column("unit", pa.array(["mm/day", "mm"]))
+    with pytest.raises(SampleError, match="select the rows of one unit"):
+        AnnualSeries.from_table(several)
+    with pytest.raises(SampleError, match="the table's unit"):
+        AnnualSeries.from_table(plain.append_column("unit", pa.array(["", ""])))
+
+
+def test_a_cell_takes_its_unit_from_its_rows() -> None:
+    cells = GRID.append_column(
+        "unit", pa.array(["mm/day"] * GRID.num_rows, pa.string())
+    )
+    series = AnnualSeries.nearest_cell(cells, longitude=6.9, latitude=50.1)
+    assert series.unit == "mm/day"
+    assert series.values.tolist() == [1.0, 11.0, 21.0, 31.0, 41.0]
+    with pytest.raises(SampleError, match="unit is missing"):
+        AnnualSeries.nearest_cell(GRID, longitude=6.9, latitude=50.1)
+
+
 def test_record_batches_with_licence_columns() -> None:
     batches = [
         pa.record_batch(

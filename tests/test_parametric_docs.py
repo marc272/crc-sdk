@@ -107,6 +107,7 @@ def test_every_python_example_on_the_page_runs(
     monkeypatch.chdir(tmp_path)
     namespace: dict[str, Any] = {}
     quick_start: Any = None
+    table_start: dict[str, Any] = {}
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ReturnPeriodExtrapolationWarning)
         warnings.simplefilter("ignore", ComonotoneIndexWarning)
@@ -119,9 +120,30 @@ def test_every_python_example_on_the_page_runs(
                     f"python block {number} of docs/parametric.md fails: {error!r}\n"
                     f"{block}"
                 ) from error
+            # Later blocks reuse the names, so keep what the quick starts made.
             if number == 1:
-                quick_start = namespace["result"]  # later blocks reuse the name
+                table_start = {
+                    name: namespace[name]
+                    for name in ("sample", "template", "comparison", "designed")
+                }
+            if quick_start is None and "result" in namespace:
+                quick_start = namespace["result"]
     capsys.readouterr()
+
+    # The table quick start: no semantics, no aggregation, and both rows held out.
+    sample = table_start["sample"]
+    assert (sample.semantics, sample.index_unit, sample.loss_unit) == (
+        "annual",
+        "mm/day",
+        "EUR",
+    )
+    assert table_start["template"].index.aggregation is None
+    comparison = table_start["comparison"]
+    assert comparison.column("cover_label").to_pylist() == ["step", "linear"]
+    assert set(comparison.column("split").to_pylist()) == {"out_of_sample"}
+    assert set(comparison.column("n_rows").to_pylist()) == {12}
+    assert comparison.column("premium_basis").to_pylist() == ["design", "evaluation"]
+    assert table_start["designed"].budget_use == pytest.approx(1.0)
 
     # The quick start, as "No objective counts the premium" describes it: the
     # E[U] and weighted-CVaR designs spend their budget, the MSE design doesn't.

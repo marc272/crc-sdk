@@ -1678,9 +1678,9 @@ class OutcomeSample:
         probability: str | None = None,
         hazard: str | Mapping[str, str] | None = None,
         own_loss: Mapping[str, str] | None = None,
-        semantics: Literal["annual"],
-        index_unit: str | Mapping[str, str],
-        loss_unit: str,
+        semantics: Literal["annual"] = "annual",
+        index_unit: str | Mapping[str, str] | None = None,
+        loss_unit: str | None = None,
         tails: Mapping[str, Tail] | None = None,
         source: Any = None,
         scenario: str = "baseline",
@@ -1690,13 +1690,22 @@ class OutcomeSample:
 
         `period`, `asset_id`, `index` and `loss` name the required columns;
         `probability` and `hazard` name optional ones. Without a probability
-        column every row gets `1/n`. `semantics="annual"` is required: the
-        caller states that one row is one year. `table` is an Arrow table or
+        column every row gets `1/n`. One row is one year: the caller states
+        it by passing the table, and the provenance records it as the
+        caller's (`semantics_source="caller"`). `semantics` may say so too;
+        `"annual"`, the default, is its only value. `table` is an Arrow table or
         record batch, or any object Arrow reads (a mapping of columns, a
         pandas or polars frame); to use a Parquet file, read it with
         `pyarrow.parquet.read_table`. `source` names the table for the
         provenance: a string, a `SourceProvenance` (with its licence) or a
         mapping.
+
+        `index_unit` and `loss_unit` name the units of the index and loss
+        columns. Left out, each is the unit the table states for its column:
+        the column's Arrow field metadata `unit`, or, for the columns of a
+        table that `to_table` wrote, the units its `SAMPLE_METADATA_KEY`
+        record holds. A table that states none needs them stated, and a stated
+        unit must equal the one the table states.
 
         Rows are sorted by period, and `asset_ids` by asset id. Every
         (period, asset) pair must appear exactly once. A probability column
@@ -1724,12 +1733,17 @@ class OutcomeSample:
         the combined loss or its own loss monotonically, this warns with
         `ComonotoneIndexWarning`.
 
+        With several index columns, `index_unit` maps any of the component
+        names to a unit, and each component left out takes its column's unit
+        from the table, as above.
+
         Raises `SampleError` for a missing column, nulls, non-integer
         periods, repeated or missing (period, asset) pairs, or invalid
-        values, for arguments that don't suit the form of `index`, and for
-        several assets with several index columns; `ScenarioError` for a
-        `hazard_name` the source contradicts; and `TypeError` for a file path
-        or a non-table.
+        values, for a unit that is neither stated nor stated by the table, or
+        that differs from the table's, for arguments that don't suit the form
+        of `index`, and for several assets with several index columns;
+        `ScenarioError` for a `hazard_name` the source contradicts; and
+        `TypeError` for a file path or a non-table.
         """
         if semantics != "annual":
             raise SampleError(
@@ -1778,6 +1792,13 @@ class OutcomeSample:
             None
             if hazard is None
             else _float_values(_column(data, hazard, what), hazard)
+        )
+        written = _written_units(data)
+        index_unit = _resolved_unit(
+            "index_unit", index_unit, _column_unit(data, index, written)
+        )
+        loss_unit = _resolved_unit(
+            "loss_unit", loss_unit, _column_unit(data, loss, written)
         )
         if not ids:
             raise SampleError("the sample table has no rows")
@@ -1923,7 +1944,7 @@ class OutcomeSample:
         own_loss: Any,
         semantics: Literal["annual"],
         index_unit: Any,
-        loss_unit: str,
+        loss_unit: str | None,
         tails: Any,
         source: Any,
         scenario: str,
@@ -1938,7 +1959,7 @@ class OutcomeSample:
             )
         for name in names:
             _component_name(name, SampleError)
-        units = _by_component("index_unit", index_unit, names, every=True)
+        stated_units = _by_component("index_unit", index_unit, names, every=False)
         severe = _by_component("tails", tails, names, every=True)
         hazards = _by_component("hazard", hazard, names, every=False)
         own_losses = _by_component("own_loss", own_loss, names, every=False)
@@ -1974,6 +1995,18 @@ class OutcomeSample:
             return array
 
         loss_values = by_period(loss)
+        written = _written_units(data)
+        units = {
+            name: _resolved_unit(
+                f"index_unit[{name!r}]",
+                stated_units.get(name),
+                _column_unit(data, index[name], written),
+            )
+            for name in names
+        }
+        loss_unit = _resolved_unit(
+            "loss_unit", loss_unit, _column_unit(data, loss, written)
+        )
         components = {
             name: IndexComponent(
                 by_period(index[name]),
@@ -2116,6 +2149,113 @@ def _refuse_component_arguments(
             "hazard_name is a mapping only with several index columns: a mapping "
             "from component name to column as index"
         )
+
+
+_UNIT_KEY = b"unit"
+"""The Arrow field metadata key that states a column's unit."""
+
+
+def _written_units(table: Any) -> dict[str, str]:
+    """The units that the record of a table `to_table` wrote holds, by column.
+
+    `index_unit` for its `index` column, `loss_unit` for `loss`, and each
+    component's unit for its `index[<name>]` column. A table without a
+    readable record states no unit this way.
+    """
+    raw = (table.schema.metadata or {}).get(SAMPLE_METADATA_KEY.encode("utf-8"))
+    if raw is None:
+        return {}
+    try:
+        document = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(document, Mapping):
+        return {}
+    units = {
+        column: document[key]
+        for column, key in (("index", "index_unit"), ("loss", "loss_unit"))
+        if isinstance(document.get(key), str)
+    }
+    components = document.get("components")
+    for entry in components if isinstance(components, list) else ():
+        if (
+            isinstance(entry, Mapping)
+            and isinstance(entry.get("name"), str)
+            and isinstance(entry.get("unit"), str)
+        ):
+            units[f"index[{entry['name']}]"] = entry["unit"]
+    return units
+
+
+@dataclass(frozen=True)
+class _ColumnUnit:
+    """The unit a table states for one column, and where it states it."""
+
+    column: str
+    unit: str | None
+    where: str | None
+
+
+def _field_unit(table: Any, column: str) -> str | None:
+    """The unit that the Arrow field metadata of `column` states, if any.
+
+    `column` must be a column of `table`. Raises `SampleError` for a `unit`
+    that is not non-empty UTF-8 text without surrounding whitespace.
+    """
+    raw = (table.schema.field(column).metadata or {}).get(_UNIT_KEY)
+    if raw is None:
+        return None
+    what = f"the field metadata 'unit' of column {column!r}"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SampleError(f"{what} is not UTF-8 text") from error
+    return _identifier(what, text)
+
+
+def _column_unit(table: Any, column: str, written: Mapping[str, str]) -> _ColumnUnit:
+    """The unit `table` states for `column`, and where; `unit` is `None` if none.
+
+    The column's Arrow field metadata `unit` states it, and so does the
+    record of a table `to_table` wrote (`written`), for its own columns; the
+    two must agree.
+    """
+    _column(table, column, "the sample table")
+    stated = _field_unit(table, column)
+    recorded = written.get(column)
+    if stated is not None and recorded is not None and stated != recorded:
+        raise SampleError(
+            f"column {column!r} has two units: {stated!r} in its field metadata "
+            f"and {recorded!r} in the table's {SAMPLE_METADATA_KEY} record"
+        )
+    if stated is not None:
+        return _ColumnUnit(column, stated, "its field metadata")
+    if recorded is not None:
+        return _ColumnUnit(column, recorded, f"the {SAMPLE_METADATA_KEY} record")
+    return _ColumnUnit(column, None, None)
+
+
+def _resolved_unit(argument: str, stated: Any, data: _ColumnUnit) -> str:
+    """`stated`, or the table's unit for the column when it is `None`.
+
+    Raises `SampleError` when neither gives a unit, or the two differ.
+    """
+    if stated is None:
+        if data.unit is None:
+            raise SampleError(
+                f"{argument} is missing, and the table states no unit for column "
+                f"{data.column!r}: state {argument}, or give the column an Arrow "
+                "field metadata 'unit'"
+            )
+        return data.unit
+    unit = _identifier(argument, stated)
+    if data.unit is not None and unit != data.unit:
+        raise SampleError(
+            f"{argument}={unit!r} differs from the unit {data.unit!r} that the "
+            f"table states for column {data.column!r} in {data.where}; leave "
+            f"{argument} out to use the table's"
+        )
+    return unit
 
 
 def _by_component(

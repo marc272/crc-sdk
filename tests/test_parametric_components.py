@@ -1343,6 +1343,61 @@ def test_an_invalid_table_with_several_index_columns_raises(
         _from_table(**overrides)
 
 
+def _with_field_units(units: Mapping[str, str]) -> Any:
+    """`TABLE` with the Arrow field metadata `unit` set on the named columns."""
+    table = pa.table(TABLE)
+    fields = [
+        field.with_metadata({"unit": units[field.name]})
+        if field.name in units
+        else field
+        for field in table.schema
+    ]
+    return pa.Table.from_arrays(table.columns, schema=pa.schema(fields))
+
+
+def test_a_table_with_several_index_columns_states_its_units() -> None:
+    table = _with_field_units(
+        {"rain_index": "mm/day", "heat_index": "degC", "loss": "EUR"}
+    )
+    expected = _from_table().content_hash
+    sample = _from_table(table=table, index_unit=None, loss_unit=None)
+    assert sample.content_hash == expected
+    with pytest.raises(SampleError, match=r"index_unit\['heat'\]='K' differs"):
+        _from_table(table=table, index_unit={"heat": "K"})
+    # One component's unit stated, the other's read; no semantics stated.
+    partial = OutcomeSample.from_table(
+        _with_field_units({"rain_index": "mm/day"}),
+        period="year",
+        asset_id="site",
+        index={"rain": "rain_index", "heat": "heat_index"},
+        loss="loss",
+        own_loss={"rain": "rain_loss", "heat": "heat_loss"},
+        index_unit={"heat": "degC"},
+        loss_unit="EUR",
+        tails={"rain": "upper", "heat": "upper"},
+        source="a user table",
+    )
+    assert partial.content_hash == expected
+    assert partial.provenance.to_document() == _from_table().provenance.to_document()
+
+
+def test_a_written_table_with_components_states_its_units() -> None:
+    written = _from_table().to_table()
+    sample = OutcomeSample.from_table(
+        written,
+        period="period",
+        asset_id="asset_id",
+        index={"rain": "index[rain]", "heat": "index[heat]"},
+        loss="loss",
+        own_loss={"rain": "own_loss[rain]", "heat": "own_loss[heat]"},
+        tails={"rain": "upper", "heat": "upper"},
+        source="a user table",
+    )
+    assert sample.index_components is not None
+    assert [c.unit for c in sample.index_components.values()] == ["mm/day", "degC"]
+    assert sample.loss_unit == "EUR"
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
