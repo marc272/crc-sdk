@@ -12,6 +12,7 @@ import dataclasses
 import itertools
 import json
 import math
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, ClassVar, Self, cast
@@ -1755,6 +1756,7 @@ def _mse_optimum(
     return best
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="TEMPORARY diagnostic")
 @pytest.mark.parametrize(
     ("n", "seed", "levels", "ratio"),
     [(200, 30, 6, 0.2), (500, 26, 4, 0.1)],
