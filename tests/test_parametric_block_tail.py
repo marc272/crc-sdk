@@ -202,7 +202,9 @@ def test_the_columns_sit_beside_the_identity_columns() -> None:
     start = len(IDENTITY_COLUMNS)
     assert tuple(table.column_names[:start]) == IDENTITY_COLUMNS
     assert table.column_names[start : start + 4] == [YEARS, *FLAGS]
-    assert table.column_names[start + 4] == "expected_loss"
+    # The short-block flags follow, one per beta and return period, then metrics.
+    assert table.column_names[start + 4] == "short_block_b0_9"
+    assert table.column_names[start + 14] == "expected_loss"
     assert table.schema.field(YEARS).type == pa.int32()
     assert all(table.schema.field(name).type == pa.bool_() for name in FLAGS)
     assert all(table.schema.field(name).nullable for name in (YEARS, *FLAGS))

@@ -237,7 +237,7 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
   .scopes(Individual() | Joint())             # optional; default Individual()
   .dependence(Independent() | Comonotonic() | EmpiricalCopula(reference))
                                               # fitted curves; required with Joint()
-  .allocation("value" | "loss")               # optional: a joint design's asset rows
+  .allocation("value" | "loss")               # optional: allocated rows, own file
   .explain(format="text")                     # no I/O
   .samples() / .joint_sample() / .designs() / .write_parquet(path)   # execution
 ```
@@ -293,7 +293,7 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
 | `.metrics(options)` | The `MetricOptions` of every row |
 | `.scopes(*scopes)` | `Individual()`, the default, designs each asset on its own; `Joint()` designs each template on the owner's total ([joint design](#joint-design-over-several-assets)) |
 | `.dependence(model)` | Fitted curves only, and required there with `Joint()`: how the assets' draws are put side by side (`Independent()`, `Comonotonic()` or `EmpiricalCopula(reference)`). A plan on per-year values raises: its dependence is the data's own |
-| `.allocation(rule)` | With `Joint()`: adds a joint design's per-asset rows, under `"value"` or `"loss"` |
+| `.allocation(rule)` | With `Joint()`: adds a joint design's allocated rows, under `"value"` or `"loss"`, in a table and a file of their own ([allocated rows](#allocated-rows-in-a-table-of-their-own)) |
 
 A designed cover keeps the template's label (or the first 12 hex digits of its
 hash) followed by the objective, for example `"step (mse)"`; its hash and
@@ -951,7 +951,7 @@ split, the samples' source and basis-risk model, the pricing and, for a design,
 its objective and constraints. `setup_text(result.metadata)` states that setup
 in plain text, one statement per line (`Level`, `Split`, `Seeds`, `Scenario`,
 `Sample`, `Source`, `Location`, `Trend`, `Sample notes`, `Pricing`, `Design`,
-`Frontier`, `Intervals`, `Metrics`), for a notebook or a report to print next to the numbers. The text
+`Short blocks`, `Frontier`, `Intervals`, `Metrics`), for a notebook or a report to print next to the numbers. The text
 reads only the metadata, so the same metadata always gives the same text, and
 statements that every split or sample shares are written once.
 
@@ -986,6 +986,11 @@ statements that every split or sample shares are written once.
   where a `LinearTrend` has one fit per asset and run, the line gives the range
   of the slopes and of the intercepts, and counts the assets; the sample's
   `trend` record holds each series' fit.
+- `Short blocks` names, for each block whose rows the text describes, the tail
+  levels of the metric options that reach the block's worst row, as the rows'
+  [short-block flags](#short-blocks) do, and says how each kind of tail column
+  then reads. A table of `compare_scenarios` states them in its own `Short
+  blocks` line, one per block.
 - `Frontier`, for a table of [`design_frontier`](#a-budget-frontier), states the
   budgets, the template and the objective, that there is one design per budget on
   the stated design block and that each row is read on the stated block, and that
@@ -1759,6 +1764,31 @@ years of an outcome sample, for one continuous quantity of one cover
 dependence assumptions all differ. The two never share a column and are never
 compared.
 
+### Short blocks
+
+A tail column reads the top of its block when the block is short for the
+column's level. On a block of n rows of equal probability:
+
+| Columns | Flag | True when | What the column then reads |
+| --- | --- | --- | --- |
+| At β: `tail_coverage_b<β>`, `cvar_uncovered_to_loss_b<β>`, `cvar_uncovered_b<β>`, `cvar_net_loss_b<β>`, `cvar_loss_b<β>` | `short_block_b<β>` | (1 − β)·n ≤ 1, within 1e-9 | The block's worst row of each quantity it reads, U, N or L (with any row tied there): the tail of 1 − β of the probability holds no other row |
+| At β: `var_uncovered_b<β>`, `var_net_loss_b<β>`, `var_loss_b<β>` | `short_block_b<β>` | (1 − β)·n ≤ 1, within 1e-9 | The block's largest value, or its second largest where (1 − β)·n is 1 |
+| At T: `loss_rp<T>`, `payout_rp<T>`, `uncovered_rp<T>`, `net_loss_rp<T>` | `short_block_rp<T>` | T > n | The block's largest value: on 20 held-out years, `loss_rp250` is the worst of the 20 years, not a 1-in-250 loss |
+
+- **On every row.** `compare`, `evaluate` and `compare_pooled` give each row one
+  boolean per β of `MetricOptions.betas` and per T of `return_periods`, labelled as
+  the metrics are, after the rank-block columns. n is the rows the row's metrics
+  read, its `n_rows`: the evaluation block, or every held-out row of a pooled
+  row. `compare_scenarios` and `design_frontier` give them too, and `to_long`
+  keeps them as identity columns.
+- **The rule is `bootstrap_intervals`' `short_block`**, which flags an interval's
+  rows the same way. A flag is true or false on every row, and null only in a
+  table written before the flags existed.
+- **The setup text** names the flagged levels of each block in a `Short blocks`
+  line. A flag says how far a number can reach on its block, nothing more: a
+  flagged number is the block's own extreme, and the tail beyond it is not
+  measured.
+
 ### Pricing and the premium used
 
 A pricing prices a cover's premium P from its payouts π on a sample, for one
@@ -1857,7 +1887,7 @@ between the two.
 | `cover_hash` | string | `Cover.definition_hash`. On `"total"` and allocated rows, the hash of the set of covers, one per asset |
 | `design_id` | string, nullable | The design's id; null for a cover given as is, and on the `"total"` row of a set of covers |
 | `asset_id` | string, nullable | The asset; null exactly on `"total"` rows |
-| `level` | string | `"asset"`: an asset's own cover. `"total"`: the sum over the assets of one owner, draw by draw. `"asset_by_value"`, `"asset_by_loss"`: an asset's share of a joint design's total payout, under the rule in the name. `"package"`: the sum of one asset's separate contracts (`CoverPackage`), draw by draw, against the combined loss, with the sum of their premiums; `cover_hash` is the package's hash and `design_id` is null |
+| `level` | string | `"asset"`: an asset's own cover. `"total"`: the sum over the assets of one owner, draw by draw. `"asset_by_value"`, `"asset_by_loss"`: an asset's share of a joint design's total payout, under the rule in the name, in [a table of their own](#allocated-rows-in-a-table-of-their-own). `"package"`: the sum of one asset's separate contracts (`CoverPackage`), draw by draw, against the combined loss, with the sum of their premiums; `cover_hash` is the package's hash and `design_id` is null |
 | `scope` | string | `"individual"`, each cover standing on its own, or `"joint"`, one objective and one budget on the owner's total |
 | `scenario` | string | The sample's scenario, `"baseline"` by default |
 | `design_scenario` | string, nullable | The `scenario` of the design's own design sample. Null for a cover given as is, and on a `"total"` or `"package"` row whose designs don't share one |
@@ -1872,6 +1902,7 @@ between the two.
 | `design_budget` | float64, nullable | The design's budget bound in payout units. On a `"package"` row, or the `"total"` row of a set of covers, the sum of the covers' bounds, null if any has none. Null for a cover given as is |
 | `copula_reference_years` | int32, nullable | m, the reference's rows, on a row that reads a sum over the columns an `EmpiricalCopula` reordered: the `"total"` and allocated rows of a sample of several assets, and every row of a sample of several hazards. Null on any other row: an `"asset"` row of a sample of several assets, other dependence models and per-year samples |
 | `copula_block_tail_b<β>` | bool, nullable | One per β of `MetricOptions.betas`, labelled as the metrics are, and null where `copula_reference_years` is: true when (1 − β)·m ≤ 1, with the tolerance of `degenerate_tail` (1e-9), so that the tail at β holds at most one reference year's block, inside which the columns are independent by assumption; else false |
+| `short_block_b<β>`, `short_block_rp<T>` | bool, nullable | One per β of `MetricOptions.betas` and per T of `return_periods`, labelled as the metrics are: true when the level reaches the block's worst row, (1 − β)·n ≤ 1 or T > n with n the row's `n_rows` ([short blocks](#short-blocks)); else false. Null only in a table written before them |
 | one column per metric | float64, nullable | As defined above; null where undefined |
 
 A comparison on one asset has `level` `"asset"` and `scope` `"individual"`
@@ -2527,10 +2558,11 @@ joint_plan = (
     .split(Holdout(0.7))
     .metrics(MetricOptions(betas=(0.9,), return_periods=(10,)))
     .scopes(Joint())
-    .allocation("value")                       # optional: the rows per asset, below
+    .allocation("value")                       # optional: allocated rows, below
 )
 print(setup_text(joint_plan.explain(format="json")))   # the setup; no I/O
 joint_result = joint_plan.write_parquet("joint-comparison.parquet")
+joint_result.allocated_output       # joint-comparison.allocated.parquet, beside it
 ```
 
 - **The sample.** On per-year values, `OutcomeSample.join` of each asset's
@@ -2566,7 +2598,10 @@ joint_result = joint_plan.write_parquet("joint-comparison.parquet")
 
 The designs are in `joint_result.designs`, one `JointDesignResult` per template,
 objective and block, and `setup_text(joint_result.metadata)` states the setup of
-the rows: which assets a total sums, the dependence, the allocation.
+the rows: which assets a total sums, the dependence. Under `.allocation(rule)`
+the allocated rows are not in that file: `joint_result.allocated` holds them,
+written to `joint_result.allocated_output`, and `setup_text(joint_result.allocated)`
+states their rule ([allocated rows](#allocated-rows-in-a-table-of-their-own)).
 
 ### The function route
 
@@ -2574,8 +2609,8 @@ The plan's steps by hand, for the same two sites. With the plan's generators,
 the sample and the designs are the plan's:
 
 ```python
-from crc_sdk.parametric import (AnnualSeries, LossModel, OutcomeSample, compare,
-                                design_joint, holdout, sample_annual)
+from crc_sdk.parametric import (AnnualSeries, LossModel, OutcomeSample, allocate,
+                                compare, design_joint, holdout, sample_annual)
 
 sites = [("warehouse-a", 6.96, 50.94, 2e6), ("warehouse-b", 7.10, 51.10, 1.5e6)]
 children = np.random.SeedSequence(42).spawn(len(sites))
@@ -2595,21 +2630,24 @@ joint_years, joint_held_out = holdout(joined, train_fraction=0.7)
 joint_design = design_joint([step, step], joint_years,
                             WeightedCVaR(alpha=0.9, beta=0.9),
                             budget=Budget(ratio=0.8))
-joint_table = compare([joint_design], joint_held_out, split="out_of_sample",
-                      allocation="value",
-                      values={"warehouse-a": 2e6, "warehouse-b": 1.5e6})
+joint_table = compare([joint_design], joint_held_out, split="out_of_sample")
+joint_shares = allocate([joint_design], joint_held_out, split="out_of_sample",
+                        allocation="value",
+                        values={"warehouse-a": 2e6, "warehouse-b": 1.5e6})
 ```
+
+`joint_table` holds the owner's total row, which is what the design optimises,
+and `joint_shares` the allocated rows, in a table of their own.
 
 ### The rows of a joint design
 
 `evaluate` and `compare` take a sample of several assets and, as each entry,
 a `JointDesignResult` or a mapping from every asset id to that asset's cover or
-design, which are all covers or all designs. `allocation=` and `values=` ask for
-a joint design's per-asset rows.
+design, which are all covers or all designs.
 
 | Entry | Rows |
 | --- | --- |
-| A `JointDesignResult` | One `"total"` row, `scope="joint"`, and one allocated row per asset when `allocation` is set. No `"asset"` row, because the split of the total payout across the assets is the solver's choice |
+| A `JointDesignResult` | One `"total"` row, `scope="joint"`. No `"asset"` row, because the split of the total payout across the assets is the solver's choice. Its allocated rows come from `allocate`, in a table of their own |
 | A set of individual covers | One `"asset"` row per asset and one `"total"` row, all `scope="individual"` |
 
 - **`"total"` rows** hold every metric of [the table](#metrics) on L_d and π_d.
@@ -2617,23 +2655,44 @@ a joint design's per-asset rows.
   the total. A set of individual covers pays one premium per contract, so its
   total's premium is the sum of the asset rows' premiums, and its `design_id`,
   `unique`, `ties` and `degenerate_tail` are null.
-- **Allocated rows** (`level` `"asset_by_value"` or `"asset_by_loss"`) share a
-  joint design's total payout out over its assets: π_{d,i} = π_d · v_i / Σ_k v_k
-  by value, and π_{d,i} = π_d · L_{d,i} / L_d by loss, by value in a draw without
-  loss. `premium` and the net-loss columns are null, as a pricing prices the
-  total payout and not a part of it. `expected_loss` and `expected_payout` add
-  up to the total row's under both rules, and `expected_uncovered` under `"loss"`
-  only; the other metrics don't add up.
-- **A rule is an accounting statement** about the total payout, not the payout
-  of an asset's cover. The rule is in `level`, so no row can be read as the
-  solver's split.
-- **The values.** `values=` maps every asset id to its value in the loss unit: a
-  sample holds no asset values. On a plan `.allocation(rule)` reads the values
-  its loss model read. Only their hash is written.
 
 Report the out-of-sample rows, each with its setup, as for any comparison. The
 `scope` column keeps the rows of each scope apart and makes no statement about
 them.
+
+### Allocated rows in a table of their own
+
+`allocate(designs, sample, *, split, allocation, values, fold=0,
+options=MetricOptions())` shares each joint design's total payout out over its
+assets and returns those rows alone: one row per design and asset, at `level`
+`"asset_by_value"` or `"asset_by_loss"`, `scope="joint"`, with `compare`'s
+columns.
+
+- **The rules.** π_{d,i} = π_d · v_i / Σ_k v_k by value, and π_{d,i} = π_d ·
+  L_{d,i} / L_d by loss, by value in a draw without loss. `allocation` has no
+  default, because how to share out a total is an accounting choice.
+- **A rule is an accounting statement** about the total payout, not the payout
+  of an asset's cover. The rule is in `level`, so no row can be read as the
+  solver's split. `premium`, `premium_basis` and the net-loss columns are null,
+  as a pricing prices the total payout and not a part of it. `expected_loss` and
+  `expected_payout` add up to the total row's under both rules, and
+  `expected_uncovered` under `"loss"` only; the other metrics don't add up.
+- **Why a table of their own.** An allocated row's metrics follow from the
+  rule's arithmetic, not from a cover of that asset, so they never sit beside the
+  `"asset"` rows of covers that stand on their own, nor beside the `"total"` row
+  that `compare` gives the joint design, which is what it optimises.
+  `write_comparison` writes the table to a file of its own, `to_long` gives its
+  tidy form and `setup_text` states its rule.
+- **The values.** `values=` maps every asset id to its value in the loss unit: a
+  sample holds no asset values. On a plan, `.allocation(rule)` reads the values
+  its loss model read and writes the rows to `<stem>.allocated<suffix>` beside
+  the comparison. Only their hash is written.
+- **`allocation=` on `compare`, `evaluate`, `compare_pooled` and
+  `bootstrap_intervals`** still adds a joint design's allocated rows after its
+  `"total"` row, and takes joint designs only: a call with any other entry raises
+  `EvaluationError`, so allocated rows never share a table with the rows of
+  covers that stand on their own. It is the way to pool allocated rows over
+  folds or give them intervals.
 
 ## Several hazards at one asset
 
