@@ -518,6 +518,76 @@ def _check_horizons_in_window(scenario: _Scenario) -> None:
                 ) from error
 
 
+_RESOLUTION_SHIFT = 52
+"""Where an H3 index holds its resolution, in 4 bits."""
+
+
+def _h3_resolution(cell: int) -> int:
+    return (cell >> _RESOLUTION_SHIFT) & 0xF
+
+
+def _one_place(first: str, second: str) -> bool:
+    """Whether two H3 cells, as hexadecimal text, hold one place.
+
+    At one resolution they must be equal. A point's cells at two resolutions
+    don't always nest: the finer cell's parent at the coarser resolution is the
+    coarser cell or one of its neighbours. So cells at two resolutions are
+    compared at the coarser one, with that slack, which needs the `geometry`
+    extra.
+    """
+    ours, theirs = int(first, 16), int(second, 16)
+    if ours == theirs:
+        return True
+    if _h3_resolution(ours) == _h3_resolution(theirs):
+        return False
+    try:
+        import h3  # type: ignore[import-untyped]
+    except ImportError as error:
+        raise ImportError(
+            "comparing the cells of curves at two H3 resolutions requires "
+            "`pip install crc-sdk[geometry]`"
+        ) from error
+    coarse, fine = sorted((ours, theirs), key=_h3_resolution)
+    coarse_cell, fine_cell = h3.int_to_str(coarse), h3.int_to_str(fine)
+    if not (h3.is_valid_cell(coarse_cell) and h3.is_valid_cell(fine_cell)):
+        return False
+    parent = h3.cell_to_parent(fine_cell, _h3_resolution(coarse))
+    return bool(coarse_cell in h3.grid_disk(parent, 1))
+
+
+def _check_cells(scenarios: Sequence[_Scenario]) -> None:
+    """Raise `ScenarioError` for an asset or hazard read in two places.
+
+    Each asset's or hazard's curves must come from one place in every scenario:
+    each is compared with the first scenario that records a cell, the reference
+    first. A curve given as a distribution or as `CurveParameters` records no
+    cell, and isn't compared.
+    """
+    first_seen: dict[str, tuple[_Scenario, str]] = {}
+    for scenario in scenarios:
+        for owner, leaf in scenario.leaves:
+            for source in _curve_sources(leaf):
+                cell = (source.get("row") or {}).get("cell_index")
+                if not isinstance(cell, str):
+                    continue
+                first, held = first_seen.setdefault(owner, (scenario, cell))
+                if _one_place(held, cell):
+                    continue
+                levels = {_h3_resolution(int(held, 16)), _h3_resolution(int(cell, 16))}
+                slack = (
+                    ", which at two resolutions must nest up to one neighbouring cell"
+                    if len(levels) > 1
+                    else ""
+                )
+                raise _differ(
+                    first,
+                    scenario,
+                    "cell_index",
+                    f"{first.label!r} reads {owner} in the H3 cell {held!r} and "
+                    f"{scenario.label!r} in {cell!r}{slack}" + _FIXED,
+                )
+
+
 @dataclass(frozen=True, eq=False)
 class _Curve:
     """One distinct curve of a set, for one asset or hazard."""
@@ -629,6 +699,7 @@ def _check_curves(scenarios: Sequence[_Scenario]) -> None:
             },
         )
         _check_horizons_in_window(scenario)
+    _check_cells(scenarios)
     _check_equal_curves(scenarios)
     _check_shared_draws(scenarios)
     for field in ("dependence", "hazard_dependence"):
@@ -914,6 +985,13 @@ class ScenarioSet:
       asset or hazard, so that row d holds one uniform in every scenario, and the
       `dependence` and `hazard_dependence` documents, whatever the number of a
       window's members;
+    - on curves, the H3 cell (`cell_index`) each asset's or hazard's curves are
+      read in, so that one asset id doesn't hold another place's curves. Cells
+      at two resolutions, from two products, are compared at the coarser one,
+      where the finer cell's parent must be the coarser cell or one of its
+      neighbours, because a point's cells at two resolutions don't always nest;
+      that needs the `geometry` extra. A curve given as a distribution or as
+      `CurveParameters` records no cell, and isn't compared;
     - the `product`, unless `mixed_products=True`.
 
     It also raises for two samples with one label, a reference that is no label,
