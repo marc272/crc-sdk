@@ -1000,10 +1000,23 @@ def _basis_risk(sample: Mapping[str, Any], where: str) -> str:
         return "no model"
     if kind == "hazard_noise":
         sigma = _number(model.get("sigma"), f"{where}.basis_risk.sigma")
-        return (
-            "hazard noise, the hazard at the asset being the index times a mean-one "
-            f"lognormal factor with sigma {sigma}, one per year and asset, as an "
-            "assumption the caller states"
+        hold = model.get("hold", "hazard_mean")
+        if hold == "hazard_mean":
+            return (
+                "hazard noise, the hazard at the asset being the index times a "
+                f"mean-one lognormal factor with sigma {sigma}, one per year and "
+                "asset, as an assumption the caller states"
+            )
+        if hold == "hazard_distribution":
+            return (
+                "hazard noise that holds the hazard's distribution, the hazard at "
+                "the asset being the index's own values, reordered by the rank of "
+                f"the index times a mean-one lognormal factor with sigma {sigma}, "
+                "one per year and asset, as an assumption the caller states"
+            )
+        raise EvaluationError(
+            f"{where}.basis_risk.hold must be 'hazard_mean' or "
+            f"'hazard_distribution', got {hold!r}"
         )
     if kind == "impact_noise":
         sigma = _number(model.get("sigma"), f"{where}.basis_risk.sigma")
@@ -1067,9 +1080,26 @@ def _recorded_mean_ratios(
     return named
 
 
+def _all_hazard_noise(sample: Mapping[str, Any]) -> bool:
+    """Whether every basis-risk model the sample or its assets state is `HazardNoise`.
+
+    Then "without the model" is the sample at sigma 0, on the same draws.
+    """
+    parts = sample.get("parts") or {}
+    models = [sample.get("basis_risk"), *(p.get("basis_risk") for p in parts.values())]
+    stated = [model for model in models if model is not None]
+    return bool(stated) and all(
+        isinstance(model, Mapping) and model.get("kind") == "hazard_noise"
+        for model in stated
+    )
+
+
 def _mean_ratios(sample: Mapping[str, Any], where: str) -> str:
     """What a model that acts on the hazard did to the means, in words.
 
+    The expected loss comes first, as the ratio of the mean impact: the loss is
+    the impact times a value, one per asset. On a sample of several hazards it
+    is each component's own loss; the combined loss has no ratio recorded.
     Blocks of one sample carry its ratios, which are over the rows as built.
     Above `_MANY_ASSETS` names the text gives the ranges.
     """
@@ -1081,19 +1111,22 @@ def _mean_ratios(sample: Mapping[str, Any], where: str) -> str:
     def say(value: Any, at: str) -> str:
         return "not defined" if value is None else _number(value, at)
 
-    lead = "; over the rows as built, with the model over without it, "
+    without = " (sigma 0, on the same draws)" if _all_hazard_noise(sample) else ""
+    lead = f"; over the rows as built, with the model over without it{without}, "
     if "" in named:
         own = named[""]
         hazard = say(own.get("hazard_mean_ratio"), f"{place}.hazard_mean_ratio")
         impact = say(own.get("impact_mean_ratio"), f"{place}.impact_mean_ratio")
-        return f"{lead}the mean hazard is {hazard} and the mean impact {impact}"
+        return f"{lead}the expected loss is {impact} and the mean hazard is {hazard}"
+    assets = bool(sample.get("parts"))
+    loss = "the expected loss" if assets else "each component's own expected loss"
     if len(named) <= _MANY_ASSETS:
         each = [
-            f"{say(entry.get('hazard_mean_ratio'), f'{place}.{name}')} and "
-            f"{say(entry.get('impact_mean_ratio'), f'{place}.{name}')} for {name}"
+            f"{say(entry.get('impact_mean_ratio'), f'{place}.{name}')} and "
+            f"{say(entry.get('hazard_mean_ratio'), f'{place}.{name}')} for {name}"
             for name, entry in named.items()
         ]
-        return f"{lead}the mean hazard and the mean impact are {', '.join(each)}"
+        return f"{lead}{loss} and the mean hazard are {', '.join(each)}"
 
     def ranged(key: str) -> str:
         values = [entry[key] for entry in named.values() if entry.get(key) is not None]
@@ -1101,10 +1134,10 @@ def _mean_ratios(sample: Mapping[str, Any], where: str) -> str:
             return "not defined"
         return _span(values, lambda value: _number(value, f"{place}.{key}"))
 
-    who = "assets" if sample.get("parts") else "components"
+    who = "assets" if assets else "components"
     return (
-        f"{lead}the mean hazard is {ranged('hazard_mean_ratio')} and the mean impact "
-        f"{ranged('impact_mean_ratio')} across {len(named)} {who}"
+        f"{lead}{loss} is {ranged('impact_mean_ratio')} and the mean hazard is "
+        f"{ranged('hazard_mean_ratio')} across {len(named)} {who}"
     )
 
 

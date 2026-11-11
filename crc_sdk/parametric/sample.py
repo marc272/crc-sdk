@@ -3044,6 +3044,48 @@ def _refuse_reference_year_blocks(sample: OutcomeSample, function: str) -> None:
         )
 
 
+def _holds_hazard_distribution(document: Mapping[str, Any]) -> bool:
+    """Whether a provenance document states the held form of `HazardNoise`.
+
+    That is `HazardNoise(..., hold="hazard_distribution")`, in the document or
+    in one of its parts or components.
+    """
+    model = document.get("basis_risk")
+    if (
+        isinstance(model, Mapping)
+        and model.get("kind") == "hazard_noise"
+        and model.get("hold") == "hazard_distribution"
+    ):
+        return True
+    return any(
+        _holds_hazard_distribution(own)
+        for key in ("parts", "components")
+        for own in (document.get(key) or {}).values()
+    )
+
+
+_ONE_RANKING = (
+    "HazardNoise(..., hold='hazard_distribution') gave each row's hazard at the "
+    "asset an index value by its rank over every row the sampler built"
+)
+
+
+def _refuse_one_ranking(sample: OutcomeSample, function: str) -> None:
+    """Raise `SampleError` if `sample`'s hazard at the asset was ranked over its rows.
+
+    A block of such a sample would hold index values of the other block's
+    rows, so a split would not hold out what the design reads.
+    """
+    if _holds_hazard_distribution(sample.provenance.to_document()):
+        raise SampleError(
+            f"{function} cannot split this sample: {_ONE_RANKING}, so one block "
+            "would hold values of the other's; build the design and the evaluation "
+            "samples with separate calls (fresh draws from a curve, FreshDraws on a "
+            "plan, or per-year samples of separate years), or use the default "
+            "hold='hazard_mean', whose factors are each row's own"
+        )
+
+
 def holdout(
     sample: OutcomeSample, train_fraction: float = 0.7
 ) -> tuple[OutcomeSample, OutcomeSample]:
@@ -3060,11 +3102,14 @@ def holdout(
     `LeakageError`.
 
     Raises `SampleError` unless `train_fraction` is a number in (0, 1) that
-    leaves at least one period in each block, and for an `EmpiricalCopula`
-    sample, whose rows come in reference-year blocks: use fresh draws.
+    leaves at least one period in each block, for an `EmpiricalCopula`
+    sample, whose rows come in reference-year blocks: use fresh draws, and for
+    a sample built with `HazardNoise(..., hold="hazard_distribution")`, whose
+    hazard at the asset is ranked over every row: build each block separately.
     """
     sample = _require_sample(sample)
     _refuse_reference_year_blocks(sample, "holdout")
+    _refuse_one_ranking(sample, "holdout")
     if (
         isinstance(train_fraction, bool)
         or not isinstance(train_fraction, Real)
@@ -3106,12 +3151,15 @@ def year_block_kfold(
     `(design, held_out)` pair per fold, in fold order; each sample's
     probabilities are rescaled to sum to 1.
 
-    Raises `SampleError` unless `k` is an integer with `2 <= k <= n`, and for
+    Raises `SampleError` unless `k` is an integer with `2 <= k <= n`, for
     an `EmpiricalCopula` sample, whose rows come in reference-year blocks: use
-    fresh draws.
+    fresh draws, and for a sample built with `HazardNoise(...,
+    hold="hazard_distribution")`, whose hazard at the asset is ranked over
+    every row: build each block separately.
     """
     sample = _require_sample(sample)
     _refuse_reference_year_blocks(sample, "year_block_kfold")
+    _refuse_one_ranking(sample, "year_block_kfold")
     row_years = _row_years(sample)
     blocks = np.unique(row_years)
     n = blocks.size
@@ -3315,6 +3363,13 @@ def _check_out_of_sample(design: OutcomeSample, evaluation: OutcomeSample) -> No
     different curves have no source in common, so this is what shows that a
     block reuses the design's draws; the blocks of one holdout have disjoint
     periods and pass.
+
+    Two samples cut from one sample built with `HazardNoise(...,
+    hold="hazard_distribution")` share rows too, whatever their periods: each
+    row's hazard at the asset is an index value that the ranks over every row
+    of that sample chose, so a block holds values of the other's rows.
+    `holdout` and `year_block_kfold` refuse such a sample; this catches blocks
+    taken with `select`.
     """
     design = _require_sample(design)
     evaluation = _require_sample(evaluation)
@@ -3364,3 +3419,23 @@ def _check_out_of_sample(design: OutcomeSample, evaluation: OutcomeSample) -> No
                 "from the same source; state the design years with "
                 "LinearTrend(fit_years=...), or let a plan fit the trend per fold"
             )
+    _check_not_one_ranking(design, evaluation)
+
+
+def _check_not_one_ranking(design: OutcomeSample, evaluation: OutcomeSample) -> None:
+    """Raise `LeakageError` for two cuts of one sample ranked over its rows."""
+    roots = {
+        sample.provenance.parent or sample.content_hash
+        for sample in (design, evaluation)
+    }
+    if len(roots) > 1 or not any(
+        _holds_hazard_distribution(sample.provenance.to_document())
+        for sample in (design, evaluation)
+    ):
+        return
+    raise LeakageError(
+        "the design and the evaluation samples are cut from one sample, and "
+        f"{_ONE_RANKING}, so each holds values of the other's rows; build them "
+        "with separate calls (fresh draws from a curve, or per-year samples of "
+        "separate years)"
+    )

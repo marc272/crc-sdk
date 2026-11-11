@@ -1386,7 +1386,10 @@ sample is tested on its latest years. `year_block_kfold(sample, k)` holds out
 each of `k` contiguous blocks in turn. On a [pool of
 model-years](#pooled-model-years), `n` is its number of distinct years. Monte
 Carlo draws are independent, so a fresh sample from another generator is the
-plainer out-of-sample test.
+plainer out-of-sample test. Neither splits a sample whose rows were built
+together: an `EmpiricalCopula` sample, or one built with
+`HazardNoise(..., hold="hazard_distribution")`
+([the loss level](#hazardnoise-and-the-loss-level)).
 
 **Provenance.** `sample.provenance` (`SampleProvenance`) records the source
 (dataset metadata with licence, attribution, version and checksum; the series
@@ -1411,7 +1414,7 @@ and its loss differ. The module does not say which model suits an asset.
 
 | Model | Index | Loss | What it can and can't change |
 | --- | --- | --- | --- |
-| `HazardNoise(sigma)` | the hazard, unchanged | `impact(h) × value`, where the hazard at the asset is `h = index · exp(sigma·Z − sigma²/2)`, one `Z` per year and asset | A year can pay with no loss and a loss can occur with no payout, so the false-negative and false-positive rates respond to `sigma`. The index does not change |
+| `HazardNoise(sigma, *, hold="hazard_mean")` | the hazard, unchanged | `impact(h) × value`, where the hazard at the asset is `h = index · exp(sigma·Z − sigma²/2)`, one `Z` per year and asset; with `hold="hazard_distribution"`, the index value of the rank `h` has | A year can pay with no loss and a loss can occur with no payout, so the false-negative and false-positive rates respond to `sigma`. The index does not change. The expected loss moves with `sigma`, unless `hold="hazard_distribution"` holds it |
 | `ImpactNoise(sigma, *, upper=None)` | the hazard, unchanged | each year's impact times `exp(sigma·Z − sigma²/2)`, capped at `upper` | The size of a loss the index has already fixed. It can't change whether a year pays or whether a loss occurs, so `false_negative_rate_l0` and `false_positive_rate_l0` don't move with `sigma`. With a loss threshold above zero they can, because the factor can carry a loss across the threshold |
 | `NoBasisRisk()` | the hazard at the asset | `impact(hazard) × value`; warns with `ComonotoneIndexWarning` | Nothing: the loss is a function of the index, so a cover can track it almost exactly |
 | `index=` series in `sample_annual` | another cell, station or hazard | from the hazard series | The dependence between index and loss is the data's own, not a stated factor |
@@ -1424,11 +1427,8 @@ and its loss differ. The module does not say which model suits an asset.
 - It suits a hazard on a ratio scale, where zero means none (rain, wind, depth).
   A negative hazard raises `SampleError`, and a zero stays zero. The module can't
   tell that a temperature in °C is not on such a scale.
-- The mean is on the hazard, not on the loss. With a damage function that is
-  convex or has a threshold, the mean impact moves with `sigma`. The provenance's
-  `details["basis_risk"]` records `hazard_mean_ratio` and `impact_mean_ratio`,
-  each the mean with the factor over the mean without it, and the setup text
-  gives both.
+- The mean is on the hazard, not on the loss, so the expected loss moves with
+  `sigma` ([the loss level](#hazardnoise-and-the-loss-level)).
 - Its `sigma` and the `sigma` of `ImpactNoise` act at different places, one on
   the hazard and one on the impact, and are not the same physical quantity.
 - It draws at every `sigma`, so a sweep over `sigma` from one generator state
@@ -1445,6 +1445,83 @@ and its loss differ. The module does not say which model suits an asset.
   every component, each with factors of its own. A component with no impact
   still draws its factors, so the others' draws don't depend on it, and a
   negative value on it raises as on any other.
+
+#### HazardNoise and the loss level
+
+The factor has mean one, so the mean hazard holds, but it widens the hazard at
+the asset: more years fall beyond a damage function's threshold or its cap. With
+a damage function that is zero below a threshold that most years' index doesn't
+reach, or convex, the expected loss rises with `sigma`; with one that is capped
+where most years lie, it can fall. A sweep over `sigma` then moves the loss level
+as well as the gap between index and loss, and a `Budget(ratio=k)`, a share of
+the expected loss, moves with it.
+
+Every sample built with a model that acts on the hazard records it: the
+provenance's `details["basis_risk"]` holds `impact_mean_ratio`, the expected loss
+over the rows as built over the expected loss on the same draws without the
+model, which for `HazardNoise` is the sample at `sigma=0` (no call at `sigma=0`
+is needed), and `hazard_mean_ratio`, the same for the mean hazard. The setup text
+states both in the statement that gives `sigma`: "... with sigma 0.25, one per
+year and asset, as an assumption the caller states; over the rows as built, with
+the model over without it (sigma 0, on the same draws), the expected loss is ...
+and the mean hazard is ...". On a sample of several assets it gives each asset's
+(their ranges above five assets); on a sample of several hazards, each
+component's own loss, as the combined loss has no ratio recorded.
+
+`hold="hazard_distribution"` holds the loss level for a sweep. The factors are
+drawn as in the default, `hold="hazard_mean"`, and `y = index · exp(sigma·Z −
+sigma²/2)` ranks the rows (ties by the index, then by row). Each row then takes
+as its hazard at the asset the index value of the rank its `y` has. So the hazard
+at the asset is the index's own values in another order:
+
+- its distribution over the rows, and with it the distribution of the loss of
+  one hazard, is exactly the one at `sigma=0`, whatever the damage function, and
+  both recorded ratios are 1;
+- the rows are paired as in the default form, with the same ranks, so how the
+  index and the hazard at the asset move together still loosens as `sigma`
+  grows, and the false-negative and false-positive rates still respond;
+- a zero stays zero, `sigma=0` gives the rows of `NoBasisRisk()`, and the form is
+  recorded: the model's document gains `"hold": "hazard_distribution"`, and the
+  setup text says the model holds the hazard's distribution. The default's
+  document, rows and hashes are as they were;
+- on a sample of several hazards each component keeps its own distribution and
+  its own loss, and the combined loss keeps its mean when the rule adds the
+  impacts, not in general (a cap, as in `CappedSum`, can move it).
+
+```python
+# A sweep over sigma on the curve above (the synthetic Gumbel curve of the curve
+# quick start), 10,000 draws from one seed, with a damage ratio from 70 mm/day,
+# which about one year in six of this curve exceeds, to 1 at 150 mm/day.
+steep = LossModel(PiecewiseLinearImpact([70.0, 150.0], [0.0, 1.0]),
+                  value=2e6, value_unit="EUR")
+for hold in ("hazard_mean", "hazard_distribution"):
+    ratios = [
+        sample_curve(distribution_from_hazard_row(row), metadata=metadata,
+                     n_draws=10_000, rng=np.random.default_rng(42),
+                     loss_model=steep, basis_risk=HazardNoise(sigma, hold=hold),
+                     asset_id="warehouse-a")
+        .provenance.details["basis_risk"]["impact_mean_ratio"]
+        for sigma in (0.1, 0.25, 0.4)
+    ]
+    print(hold, [round(ratio, 2) for ratio in ratios])   # the expected loss over sigma 0
+```
+
+On this synthetic setup the default form's expected loss is 1.15, 1.87 and 2.9
+times that at `sigma=0` for `sigma` 0.1, 0.25 and 0.4, and the held form's is 1 at
+each. With the damage ratio of the block before, which starts at 40 mm/day below
+most years, the default's ratios are 1.01, 1.03 and 1.05. These numbers describe
+this synthetic curve and these damage ratios, nothing more.
+
+The held form assigns values across the rows of one call, so its rows are built
+together, as an `EmpiricalCopula`'s are. `holdout` and `year_block_kfold` raise
+`SampleError` on such a sample (and on a plan, `Holdout` and `KFold` do), and an
+out-of-sample evaluation between two samples cut from one such sample, as with
+`select`, raises `LeakageError`: a block would hold index values of the other's
+rows. Build the design and the evaluation samples with separate calls: fresh
+draws from a curve (`FreshDraws` on a plan), or per-year samples of separate
+years. Each then holds its own rows' distribution and reads nothing of the
+other's, so each block's ratio is 1. The default form has no such step, as each
+row's factor is its own.
 
 **A model of your own** implements the `BasisRisk` protocol (`name`,
 `to_document()`, `apply(index, hazard, impact, rng)`). To act before the impact is
@@ -1750,6 +1827,10 @@ draws; the fold for k-fold, which must match the sample's own split).
   raises `LeakageError`. Build each block with a new generator from one seed
   sequence, as reusing one generator state repeats its draws. The blocks of one
   `holdout` have disjoint periods and pass.
+- Two samples cut from one sample built with `HazardNoise(...,
+  hold="hazard_distribution")`, as with `select`, share rows whatever their
+  periods, as each row's hazard at the asset is an index value chosen over every
+  row, and raise `LeakageError`.
 - In sample, a known design sample must be the evaluation sample itself.
 - The metadata records how the split was made: `holdout` (with the train
   fraction), `kfold` (with k), `fresh_draws` (Monte Carlo samples from
