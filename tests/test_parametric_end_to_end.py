@@ -1,6 +1,6 @@
 """End to end, offline: from synthetic sources to a written comparison file.
 
-- the quick start of `docs/parametric.md` (the plan on a fitted curve), its
+- the curve quick start of `docs/parametric.md` (the plan on a fitted curve), its
   per-year step, both function routes and its joint design, executed as
   written;
 - the function route from a synthetic canonical file of fitted curves;
@@ -117,7 +117,7 @@ def _quiet_comonotone() -> Iterator[None]:
 def test_the_docs_quick_start_runs_as_written(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    quick_start = _python_blocks("## Quick start")
+    quick_start = _python_blocks("### From a fitted curve, with the plan")
     builders = _python_blocks("### Builders")
     per_year = _python_blocks("## Next step: per-year values")
     curve_by_hand = _python_blocks("### From a fitted curve")
@@ -321,7 +321,7 @@ def test_the_docs_quick_start_runs_as_written(
 def test_the_docs_joint_design_runs_as_written(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    quick_start = _python_blocks("## Quick start")
+    quick_start = _python_blocks("### From a fitted curve, with the plan")
     per_year = _python_blocks("## Next step: per-year values")
     joint = _python_blocks("## Joint design over several assets")
     assert len(joint) == 2

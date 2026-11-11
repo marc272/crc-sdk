@@ -846,7 +846,11 @@ def test_a_written_sample_table_states_its_units() -> None:
     """`from_table` reads a written table that was changed, with its units."""
     written = _sample().to_table()
     changed = written.filter(pa.compute.greater_equal(written["period"], 2003))
-    columns = {"period": "period", "asset_id": "asset_id", "index": "index"}
+    columns: dict[str, Any] = {
+        "period": "period",
+        "asset_id": "asset_id",
+        "index": "index",
+    }
     sample = OutcomeSample.from_table(changed, **columns, loss="loss")
     assert (sample.index_unit, sample.loss_unit) == ("mm/day", "EUR")
     assert sample.period.tolist() == list(range(2003, 2010))
