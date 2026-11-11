@@ -604,7 +604,8 @@ table with several index columns takes a mapping. It is optional where the sourc
 names a hazard: a canonical row's `hazard_name`, a source document's `recipe` or
 `hazard_name`, or a one-valued `recipe` column. Then the two must agree, or
 `ScenarioError` names both. `sample.provenance.hazard` records the name and what
-states it, and the hashes and the lineage leave it out.
+states it, and the hashes and the lineage leave it out. A cover is then read only
+on its own hazard ([the hazard a cover reads](#the-hazard-a-cover-reads)).
 
 ### An index read elsewhere
 
@@ -1327,7 +1328,10 @@ within half a grid step of a point. `unit` defaults to the unit the table
 states for the series' rows: a `unit` column with one value, as
 NEX-GDDP-CMIP6's `annual_extremes()` has, or the Arrow field metadata `unit` of
 the value column. ERA5's and CMIP6's tables state none, so `unit` is stated
-for them, and a stated unit must equal the table's. A year without a value raises in
+for them, and a stated unit must equal the table's. A unit the `source` states, as
+an ERA5 or CMIP6 plan's `explain()` does, must be the series' too, as on the plan:
+`SampleError` names both, compared after crc-sdk's unit aliases and never
+converted. A year without a value raises in
 `sample_annual`, unless `missing="drop_year"`, which lists the dropped years.
 `trend=` states how the climate trend is treated, by default as recorded
 ([Climate trends](#climate-trends)).
@@ -1578,8 +1582,9 @@ hazards](#several-hazards-at-one-asset)).
 metrics on a sample; `compare(covers, sample, *, split, ...)` returns one row
 per cover, with covers as rows and metrics as columns. A cover is a resolved
 `Cover` (a template raises `UnresolvedParameterError`) or a design, which
-brings its design sample and its premium. The cover's payout unit, index unit
-and asset must be the sample's. On a sample of several assets an entry is a
+brings its design sample and its premium. The cover's payout unit, index unit,
+hazard ([below](#the-hazard-a-cover-reads)) and asset must be the sample's. On a
+sample of several assets an entry is a
 `JointDesignResult`, or a mapping from every asset id to that asset's cover or
 design ([the rows](#the-rows-of-a-joint-design)).
 
@@ -1597,6 +1602,31 @@ table = compare([cover_a, cover_b], held_out, split="out_of_sample",
 write_comparison(table, "comparison.parquet")   # atomic
 tidy = to_long(table)                           # one row per cover and metric
 ```
+
+### The hazard a cover reads
+
+A cover's `IndexDefinition.hazard_name` must be the hazard the sample records for
+the series its index reads, or `SampleError` names both. Names are compared
+exactly: crc-sdk has no crosswalk of hazard names, so `Rx1day` is not `rx1day`.
+Units alone don't catch a cover on another hazard, because two hazards may share
+a unit. The record is
+
+- `sample.provenance.hazard`: a canonical row's `hazard_name`, a source's
+  `recipe` or `hazard_name`, a one-valued `recipe` column, or `hazard_name=`;
+- on a per-year sample with `index=`, the hazard the index series' source names
+  in the same way, since the index may read another hazard than the loss on
+  purpose;
+- on a sample of several assets, each asset's own, for the cover of that asset;
+- on a sample of several hazards, each component's own, for the cover or the
+  `CompositeIndex` entry that reads that component. A component is found by its
+  name, and its record must then be the cover's `hazard_name`.
+
+`design`, `design_joint`, `evaluate`, `compare`, `payout_breakdown`, the pooled
+folds and intervals, `compare_scenarios` and the plan check it wherever a cover
+meets a sample, through one function. `compare_scenarios` checks a cover given as
+is on the reference's design block too, where it is priced. A sample that records
+no hazard, such as a table or a series whose source names none, is read as
+before: only its units are compared, and its hazard is yours to know.
 
 ### Metrics
 
@@ -1911,7 +1941,15 @@ print(setup_text(table))
 
 With real curves, `rows_2030s` and `rows_2050s` are the dataset's own rows of one
 cell at those horizons. `ScenarioSet` refuses a set in which anything but the
-hazard's values differs.
+hazard's values differs. That includes the place: on curves, each asset's or
+hazard's curves must come from one H3 cell (`cell_index`) in every scenario, so a
+scenario can't hold another place's curves under the same asset id, and
+`ScenarioError` names both cells. Cells at two resolutions, as two products may
+give, are compared at the coarser one, where the finer cell's parent must be the
+coarser cell or one of its neighbours, because a point's cells at two resolutions
+don't always nest; that needs the `geometry` extra (`crc-sdk[geometry]`). A curve
+given as a distribution or as `CurveParameters` records no cell and isn't
+compared.
 
 - **The rows.** One row per entry and scenario, the reference first, and every
   row has `split="out_of_sample"`. `scenario` says where a row is evaluated and
@@ -1994,7 +2032,8 @@ design's rows are the owner's total, per scenario, as in
 limit=None, options=DesignOptions())` chooses a template's `Free` parameters
 on a design sample and returns a `DesignResult`: the resolved cover and its
 design record. The template must be written for the sample's asset (or for
-none) and pay in the sample's loss unit on an index in its index unit.
+none) and pay in the sample's loss unit on an index in its index unit, of the
+hazard the sample records ([the hazard a cover reads](#the-hazard-a-cover-reads)).
 
 ```python
 from crc_sdk.parametric import (Budget, CostOfCapitalLoad, DesignOptions, Free,

@@ -6,6 +6,7 @@ Every number here is synthetic: small made-up curves, series and tables.
 from __future__ import annotations
 
 import dataclasses
+import sys
 from typing import Any
 
 import numpy as np
@@ -1903,3 +1904,107 @@ def test_two_products_compare_the_joined_providers() -> None:
     _refused(entries, *BOTH, "product", "one+two")
     held = ScenarioSet(entries, reference="a", mixed_products=True)
     assert held.labels == ("a", "b")
+
+
+# -- the cell each asset is read in ------------------------------------------------
+
+TORONTO = (43.65, -79.38)
+HAMILTON = (43.26, -79.87)
+
+
+def test_curves_of_one_asset_from_two_cells_raise() -> None:
+    entries = [
+        _curve("2030s", _row(2030)),
+        _curve("2050s", _row(2050, cell_index=OTHER_CELL)),
+    ]
+    _refused(
+        entries,
+        "'2030s'",
+        "'2050s'",
+        "cell_index",
+        "asset 'a'",
+        repr(CELL_HEX),
+        repr(format(OTHER_CELL, "x")),
+    )
+
+
+def test_a_window_beside_a_horizon_in_another_cell_raises() -> None:
+    entries = [_window("a"), _curve("b", _row(2080, cell_index=OTHER_CELL))]
+    _refused(entries, *BOTH, "cell_index", "asset 'a'")
+
+
+def test_each_asset_of_a_book_is_read_in_one_cell() -> None:
+    moved = {"a": _row(2080), "b": _row(2080, cell_index=OTHER_CELL, location=90.0)}
+    _refused([_curves("a"), _curves("b", moved)], *BOTH, "cell_index", "asset 'b'")
+
+
+def test_each_hazard_of_an_asset_is_read_in_one_cell() -> None:
+    moved = {
+        "rain": _row(2080, hazard_name="rain"),
+        "heat": _row(2080, hazard_name="heat", location=80.0, cell_index=OTHER_CELL),
+    }
+    entries = [_hazards("a"), _hazards("b", 2080, curves=moved)]
+    _refused(entries, *BOTH, "cell_index", "component 'heat'")
+
+
+def test_a_curve_without_a_row_has_no_cell_to_compare() -> None:
+    bare = FittedDistribution.from_parameters("gumbel_r", location=75.0, scale=10.0)
+    entries = [_curve("a", _row(2050)), _curve("b", bare, hazard_name="rx1day")]
+    assert ScenarioSet(entries, reference="a").labels == ("a", "b")
+
+
+def _h3_cell(h3: Any, point: tuple[float, float], resolution: int) -> int:
+    return int(h3.str_to_int(h3.latlng_to_cell(*point, resolution)))
+
+
+def _at(label: str, horizon: int, cell: int, resolution: int) -> OutcomeSample:
+    return _curve(
+        label,
+        _row(horizon, cell_index=cell),
+        metadata=_dataset(h3_resolution=resolution),
+    )
+
+
+def test_another_place_at_one_resolution_raises() -> None:
+    h3 = pytest.importorskip("h3")
+    toronto, hamilton = (_h3_cell(h3, place, 8) for place in (TORONTO, HAMILTON))
+    entries = [_at("2030s", 2030, toronto, 8), _at("2050s", 2050, hamilton, 8)]
+    message = _refused(entries, "'2030s'", "'2050s'", "cell_index")
+    assert "two resolutions" not in message
+
+
+def test_cells_at_two_resolutions_are_compared_at_the_coarser() -> None:
+    h3 = pytest.importorskip("h3")
+    fine = _h3_cell(h3, TORONTO, 8)
+    parent = h3.cell_to_parent(h3.int_to_str(fine), 5)
+    beside = next(cell for cell in h3.grid_disk(parent, 1) if cell != parent)
+    # A point's cells at two resolutions nest up to one neighbouring cell.
+    for coarse in (parent, beside):
+        entries = [
+            _at("a", 2030, fine, 8),
+            _at("b", 2050, int(h3.str_to_int(coarse)), 5),
+        ]
+        assert ScenarioSet(entries, reference="a").labels == ("a", "b")
+    elsewhere = _h3_cell(h3, HAMILTON, 5)
+    entries = [_at("a", 2030, fine, 8), _at("b", 2050, elsewhere, 5)]
+    _refused(entries, *BOTH, "cell_index", "two resolutions")
+
+
+def test_a_cell_that_is_no_h3_cell_is_another_place() -> None:
+    pytest.importorskip("h3")
+    # The resolution bits say 5, but the digits below it are not H3's.
+    invalid = (CELL & ~(0xF << 52)) | (5 << 52)
+    entries = [_at("a", 2030, CELL, 8), _at("b", 2050, invalid, 5)]
+    _refused(entries, *BOTH, "cell_index")
+
+
+def test_two_resolutions_need_the_geometry_extra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h3 = pytest.importorskip("h3")
+    fine = _h3_cell(h3, TORONTO, 8)
+    coarse = int(h3.str_to_int(h3.cell_to_parent(h3.int_to_str(fine), 5)))
+    entries = [_at("a", 2030, fine, 8), _at("b", 2050, coarse, 5)]
+    monkeypatch.setitem(sys.modules, "h3", None)
+    with pytest.raises(ImportError, match=r"crc-sdk\[geometry\]"):
+        ScenarioSet(entries, reference="a")

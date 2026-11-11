@@ -125,6 +125,7 @@ from numpy.typing import NDArray
 
 from crc_sdk._version import framework_version, platform_tag, sdk_version
 from crc_sdk.parametric._canonical import content_hash
+from crc_sdk.parametric._pairing import _check_reads
 from crc_sdk.parametric.constraints import Budget
 from crc_sdk.parametric.cover import Cover
 from crc_sdk.parametric.errors import (
@@ -165,7 +166,6 @@ from crc_sdk.parametric.payouts import LinearInAmounts, MaxOf, StepGrid, SumOf
 from crc_sdk.parametric.pricing import CostOfCapitalLoad, Pricing, PurePremium
 from crc_sdk.parametric.sample import (
     OutcomeSample,
-    _check_cover_index,
     _check_out_of_sample,
     _cover_index_values,
     _is_labelled,
@@ -668,7 +668,7 @@ def _check_cover(
             f"in {sample.loss_unit!r}"
         )
     if read_index:
-        _check_cover_index(cover.index_definition, sample)
+        _check_reads(cover.index_definition, sample, asset)
     if cover.asset_id is not None and cover.asset_id != asset:
         raise SampleError(
             f"the cover is written for asset {cover.asset_id!r}, but the sample "
@@ -735,8 +735,8 @@ def _check_item_design(
 def _check_package(
     entry: CoverPackage, sample: OutcomeSample, given: OutcomeSample | None
 ) -> None:
-    _check_cover_index(entry.index, sample)
     asset = sample.asset_ids[0]
+    _check_reads(entry.index, sample, asset)
     for item in entry._items.values():
         _check_cover(item.cover, sample, asset, read_index=False)
         _check_item_design(item, sample, given)
@@ -1793,6 +1793,10 @@ def _prepared(
             )
     for entry in entries:
         _check_entry(entry, sample, given)
+    if price_on is not None:
+        # A cover given as is is priced there, so it must read that block too.
+        for entry in entries:
+            _check_entry(entry, price_on, None)
     pairs = [
         pair
         for entry in entries
