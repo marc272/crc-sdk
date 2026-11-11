@@ -43,6 +43,7 @@ from crc_sdk.parametric.evaluate import (
     EvaluationEntry,
     _allocation,
     _block_fields,
+    _check_allocated,
     _check_keys,
     _CoverSet,
     _describe_rows,
@@ -425,7 +426,7 @@ _SLACK = 1.0 + 1e-9
 """The slack `AnnualSeries.nearest_cell` allows on half a grid step."""
 
 _STATION_COLUMNS = ("station", "station_id")
-"""The columns whose value names the station a per-year series reads."""
+"""The columns that name a station, where a series names no station column."""
 
 
 @dataclass(frozen=True)
@@ -456,12 +457,20 @@ class _Place:
 
 
 def _station_ids(series: Mapping[str, Any]) -> tuple[str, ...]:
-    """The stations a series reads: in its filter, or as a one-valued column."""
-    found = {
-        str(value)
-        for name, value in (series.get("where") or {}).items()
-        if name in _STATION_COLUMNS
-    }
+    """The stations a series reads, from its station filter alone.
+
+    A series that names its station column (`from_table(station=)`, which a
+    plan's `StationColumn` states) reads the station of that filter, whatever
+    the column is called. Otherwise a `station` or `station_id` filter or
+    one-valued column is the station. A filter on any other column, such as
+    `model` or `scenario`, names no station.
+    """
+    where = series.get("where") or {}
+    read = series.get("columns")
+    named = read.get("station") if isinstance(read, Mapping) else None
+    if isinstance(named, str):
+        return (str(where[named]),) if named in where else ()
+    found = {str(value) for name, value in where.items() if name in _STATION_COLUMNS}
     columns = series.get("table_columns") or {}
     for name in _STATION_COLUMNS:
         column = columns.get(name) or {}
@@ -729,25 +738,41 @@ def _one_place(first: str, second: str) -> bool:
     return bool(coarse_cell in h3.grid_disk(parent, 1))
 
 
-def _check_cells(scenarios: Sequence[_Scenario]) -> None:
-    """Raise `ScenarioError` for an asset or hazard read in two places.
-
-    Each asset's or hazard's curves must come from one place in every scenario:
-    each is compared with the first scenario that records a cell, the reference
-    first. A curve given as a distribution or as `CurveParameters` records no
-    cell, and isn't compared.
-    """
-    first_seen: dict[str, tuple[_Scenario, str]] = {}
+def _scenario_cells(
+    scenarios: Sequence[_Scenario],
+) -> dict[str, list[tuple[_Scenario, str]]]:
+    """Each asset's or hazard's distinct curve cells, each with its first scenario."""
+    held: dict[str, list[tuple[_Scenario, str]]] = {}
     for scenario in scenarios:
         for owner, leaf in scenario.leaves:
             for source in _curve_sources(leaf):
                 cell = (source.get("row") or {}).get("cell_index")
                 if not isinstance(cell, str):
                     continue
-                first, held = first_seen.setdefault(owner, (scenario, cell))
-                if _one_place(held, cell):
+                own = held.setdefault(owner, [])
+                if all(int(cell, 16) != int(seen, 16) for _, seen in own):
+                    own.append((scenario, cell))
+    return held
+
+
+def _check_cells(scenarios: Sequence[_Scenario]) -> None:
+    """Raise `ScenarioError` for an asset or hazard read in two places.
+
+    Each asset's or hazard's curves must come from one place in every scenario,
+    compared pair by pair: with the first scenario that records a cell alone, a
+    coarse-resolution reference could hold two finer cells of two other
+    scenarios that are two places. A curve given as a distribution or as
+    `CurveParameters` records no cell, and isn't compared.
+    """
+    for owner, cells in _scenario_cells(scenarios).items():
+        for i, (first, ours) in enumerate(cells):
+            for second, theirs in cells[i + 1 :]:
+                if _one_place(ours, theirs):
                     continue
-                levels = {_h3_resolution(int(held, 16)), _h3_resolution(int(cell, 16))}
+                levels = {
+                    _h3_resolution(int(ours, 16)),
+                    _h3_resolution(int(theirs, 16)),
+                }
                 slack = (
                     ", which at two resolutions must nest up to one neighbouring cell"
                     if len(levels) > 1
@@ -755,10 +780,10 @@ def _check_cells(scenarios: Sequence[_Scenario]) -> None:
                 )
                 raise _differ(
                     first,
-                    scenario,
+                    second,
                     "cell_index",
-                    f"{first.label!r} reads {owner} in the H3 cell {held!r} and "
-                    f"{scenario.label!r} in {cell!r}{slack}" + _FIXED,
+                    f"{first.label!r} reads {owner} in the H3 cell {ours!r} and "
+                    f"{second.label!r} in {theirs!r}{slack}" + _FIXED,
                 )
 
 
@@ -937,17 +962,6 @@ def _check_scenarios(
 # -- a bound cover ---------------------------------------------------------------
 
 
-def _series_stations(series: Mapping[str, Any]) -> set[str]:
-    """The stations a series names: in its filter, or as a one-valued column."""
-    found = {str(value) for value in (series.get("where") or {}).values()}
-    columns = series.get("table_columns") or {}
-    for name in ("station", "station_id"):
-        column = columns.get(name) or {}
-        if column.get("distinct") == 1:
-            found.update(str(value) for value in column["values"])
-    return found
-
-
 def _reads_at(location: Any, source: Mapping[str, Any]) -> bool:
     """Whether one source of an index is read where `location` says."""
     # A plan holds a set, so plan.py can't be imported as this module loads.
@@ -964,7 +978,7 @@ def _reads_at(location: Any, source: Mapping[str, Any]) -> bool:
     if not isinstance(series, Mapping):
         return False
     if isinstance(location, AtStation):
-        return location.station_id in _series_stations(series)
+        return location.station_id in _station_ids(series)
     cell = series.get("cell")
     if not isinstance(cell, Mapping):
         return False
@@ -985,10 +999,18 @@ def _check_location(
         source for source in held if source.get("role") == "hazard"
     ]
     if not sources or not all(_reads_at(location, source) for source in sources):
+        stations = (
+            "; a series names its station in a station or station_id filter or "
+            "one-valued column, or in the filter that "
+            "AnnualSeries.from_table(station=) names, and a filter on another column "
+            "names none"
+            if isinstance(location, AtStation)
+            else ""
+        )
         raise ScenarioError(
             f"scenario {label!r} and cover {cover.label or cover.definition_hash!r} "
             f"differ in location: the cover is read at {location!r}, which the index "
-            f"of {owner} does not read"
+            f"of {owner} does not read{stations}"
         )
 
 
@@ -998,7 +1020,9 @@ def _check_bound_cover(cover: Cover, sample: OutcomeSample) -> None:
     `AtAsset()` reads any scenario's own index at the asset. `AtPoint` needs a
     per-year series whose matched cell is centred there, compared as
     `.index(...)` compares a bound location, `AtStation` a per-year series of
-    that station, and `AtCell` a curve at that cell, every member of a window.
+    that station, read from its station filter alone (a filter on `model` or
+    `scenario` names no station), and `AtCell` a curve at that cell, every
+    member of a window.
     A sample that holds several assets is read at the cover's, or at each if it
     names none, and a sample of several hazards at each component the cover
     reads. What the cover can't read at all is `_check_cover_index`'s error.
@@ -1160,12 +1184,14 @@ class ScenarioSet:
       `dependence` and `hazard_dependence` documents, whatever the number of a
       window's members;
     - on curves, the H3 cell (`cell_index`) each asset's or hazard's curves are
-      read in, so that one asset id doesn't hold another place's curves. Cells
-      at two resolutions, from two products, are compared at the coarser one,
-      where the finer cell's parent must be the coarser cell or one of its
-      neighbours, because a point's cells at two resolutions don't always nest;
-      that needs the `geometry` extra. A curve given as a distribution or as
-      `CurveParameters` records no cell, and isn't compared;
+      read in, so that one asset id doesn't hold another place's curves. Every
+      pair of scenarios is compared, so a coarse cell can't hold two finer
+      cells of two other scenarios. Cells at two resolutions, from two
+      products, are compared at the coarser one, where the finer cell's parent
+      must be the coarser cell or one of its neighbours, because a point's
+      cells at two resolutions don't always nest; that needs the `geometry`
+      extra. A curve given as a distribution or as `CurveParameters` records
+      no cell, and isn't compared;
     - on per-year rows, the place each asset's or hazard's series is read at,
       the hazard series and a separate index series each on its own, every run
       of a pool included, so that one asset id doesn't hold another place's
@@ -1174,10 +1200,13 @@ class ScenarioSet:
       steps apart, must be one cell, as a point matches one cell of a grid;
       cells of two grids, as two products or two models give, must overlap, so
       that some point lies within half a grid step of both centres, each by its
-      own step. Stations, which a series names in a `station` or `station_id`
-      filter or one-valued column, must be the same. A series that names
-      neither, such as a plain table, isn't compared, nor is a cell beside a
-      station;
+      own step. Stations must be the same. A series' station is the filter on
+      the column its record names (`AnnualSeries.from_table(station=)`, which
+      a plan's `StationColumn` states), whatever it is called, or else a
+      `station` or `station_id` filter or one-valued column; a filter on any
+      other column, such as `model` or `scenario`, names none. A series that
+      names neither a cell nor a station, such as a plain table, isn't
+      compared, nor is a cell beside a station;
     - the `product`, unless `mixed_products=True`.
 
     It also raises for two samples with one label, a reference that is no label,
@@ -1535,7 +1564,7 @@ def _index_place(owner: str, leaf: Mapping[str, Any]) -> list[dict[str, Any]]:
             }
         elif isinstance(series, Mapping):
             cell = series.get("cell")
-            stations = sorted(_series_stations(series))
+            stations = _station_ids(series)
             if isinstance(cell, Mapping):
                 place |= {
                     "kind": "nearest_cell",
@@ -1677,14 +1706,19 @@ def compare_scenarios(
 
     `fold` is the fold of a k-fold split, one at a time: concatenate folds with
     `pyarrow.concat_tables` and pass `EvaluationMetadata.merge` of their metadata to
-    `write_comparison`. `allocation` and `values` are `compare`'s.
+    `write_comparison`. `allocation` and `values` are `compare`'s, and `allocation`
+    takes joint designs only, across the whole call: any other entry raises
+    `EvaluationError`, as in `compare`, whichever scenario each entry was designed
+    on, so allocated rows never share a table with the rows of covers that stand on
+    their own.
 
     Raises `TypeError` for a `scenarios` that isn't a `ScenarioSet` or that
     describes what a plan reads, and for arguments of the wrong type;
     `ScenarioError` on an empty set, for a design sample labelled outside the set,
     and for a cover bound to a location a scenario's index doesn't read; `SampleError`
     without the `design_sample` a cover given as is needs; `EvaluationError` for a
-    `premiums=` key that matches no cover given as is; `LeakageError` for a shared
+    `premiums=` key that matches no cover given as is and for an `allocation` beside
+    an entry that isn't a joint design; `LeakageError` for a shared
     period or a reused generator state; and otherwise as `compare` does.
     """
     if not isinstance(scenarios, ScenarioSet):
@@ -1702,11 +1736,11 @@ def compare_scenarios(
     rule = _allocation(allocation)
     reference_block = scenarios.sample(reference)
     checked_values = _values(values, rule, reference_block)
-    if rule is not None and not any(isinstance(e, _JointEntry) for e in entries):
-        raise EvaluationError(
-            "allocation= shares out a joint design's total payout, but no entry is "
-            "a joint design"
-        )
+    if rule is not None:
+        # Across the whole call: each design scenario's group is prepared on its
+        # own, so a joint design of one scenario and a cover set of another would
+        # otherwise pass the check `_prepared` makes within a group.
+        _check_allocated(entries)
     columns = _with_repriced(metric_columns(checked_options))
     terms = _Terms(
         entries=entries,

@@ -10,6 +10,7 @@ import sys
 from typing import Any
 
 import numpy as np
+import pyarrow as pa  # type: ignore[import-untyped]
 import pytest
 from crc_framework import FittedDistribution, PiecewiseLinearImpact
 
@@ -1631,6 +1632,34 @@ def test_a_cover_at_a_station_refuses_what_is_not_there(build: Any) -> None:
         _check_bound_cover(_cover(AtStation("S1")), build())
 
 
+NAMED = {"year": "year", "value": "value", "station": "station_number"}
+"""The columns of a series that names its station column, as `from_table` records."""
+
+
+def test_a_cover_at_a_station_reads_the_station_column_its_series_names() -> None:
+    series = _series(None, columns=NAMED, where={"station_number": "S1"})
+    _check_bound_cover(_cover(AtStation("S1")), _annual("a", series))
+    with pytest.raises(ScenarioError, match="location"):
+        _check_bound_cover(_cover(AtStation("S2")), _annual("a", series))
+
+
+@pytest.mark.parametrize(
+    ("where", "station"),
+    [
+        ({"model": "M1", "scenario": "historical"}, "historical"),
+        ({"model": "M1"}, "M1"),
+        ({"station_number": "S1"}, "S1"),
+    ],
+    ids=["scenario", "model", "an-unnamed-column"],
+)
+def test_a_filter_on_another_column_is_no_station(
+    where: dict[str, Any], station: str
+) -> None:
+    sample = _annual("a", _series(None, where=where))
+    with pytest.raises(ScenarioError, match=r"does not read.*from_table\(station=\)"):
+        _check_bound_cover(_cover(AtStation(station)), sample)
+
+
 def test_a_cover_at_a_cell_reads_a_curve_there() -> None:
     _check_bound_cover(_cover(AtCell(CELL)), _curve("a"))
     _check_bound_cover(_cover(AtCell(CELL_HEX)), _curve("a"))
@@ -1990,6 +2019,38 @@ def test_cells_at_two_resolutions_are_compared_at_the_coarser() -> None:
     _refused(entries, *BOTH, "cell_index", "two resolutions")
 
 
+def test_every_pair_of_curve_scenarios_is_compared() -> None:
+    h3 = pytest.importorskip("h3")
+    fine = _h3_cell(h3, TORONTO, 8)
+    parent = h3.cell_to_parent(h3.int_to_str(fine), 5)
+    coarse = int(h3.str_to_int(parent))
+    other = next(
+        int(h3.str_to_int(cell))
+        for cell in h3.cell_to_children(parent, 8)
+        if int(h3.str_to_int(cell)) != fine
+    )
+    held = ScenarioSet(
+        [_at("a", 2030, coarse, 5), _at("b", 2050, fine, 8), _at("c", 2080, fine, 8)],
+        reference="a",
+    )
+    assert held.labels == ("a", "b", "c")
+    # Each fine cell nests in the coarse reference's, but they are two cells.
+    entries = [
+        _at("a", 2030, coarse, 5),
+        _at("b", 2050, fine, 8),
+        _at("c", 2080, other, 8),
+    ]
+    message = _refused(
+        entries,
+        "scenarios 'b' and 'c' differ in cell_index",
+        repr(format(fine, "x")),
+        repr(format(other, "x")),
+    )
+    assert "two resolutions" not in message
+    # Whichever scenario is the reference.
+    _refused(entries, "'b'", "'c'", "cell_index", reference="b")
+
+
 def test_a_cell_that_is_no_h3_cell_is_another_place() -> None:
     pytest.importorskip("h3")
     # The resolution bits say 5, but the digits below it are not H3's.
@@ -2157,6 +2218,69 @@ def test_another_station_raises() -> None:
         "station 'S1'",
         "station 'S2'",
     )
+
+
+def _gauges(first: int) -> Any:
+    """A per-station table whose station column is `station_number`, as HYDAT's."""
+    years = np.arange(first, first + 40, dtype=np.int64)
+    rows = {
+        name: np.random.default_rng(seed).gumbel(60.0, 12.0, len(years))
+        for seed, name in enumerate(("S1", "S2"), first)
+    }
+    return pa.table(
+        {
+            "station_number": [name for name in rows for _ in years],
+            "year": np.tile(years, len(rows)),
+            "value": np.concatenate(list(rows.values())),
+        }
+    )
+
+
+def _gauge(label: str, first: int, gauge: str, *, named: bool = True) -> Any:
+    """A per-year scenario of the station `gauge`, read by `from_table`."""
+    series = AnnualSeries.from_table(
+        _gauges(first),
+        where={"station_number": gauge},
+        station="station_number" if named else None,
+        unit="mm/day",
+        source=_stated("ssp245"),
+    )
+    return _annual(label, series)
+
+
+def test_a_station_column_of_any_name_is_compared() -> None:
+    held = ScenarioSet(
+        [_gauge("a", 1980, "S1"), _gauge("b", 2020, "S1")], reference="a"
+    )
+    assert held.labels == ("a", "b")
+    _refused(
+        [_gauge("a", 1980, "S1"), _gauge("b", 2020, "S2")],
+        *BOTH,
+        "differ in station",
+        "the hazard series of asset 'a' at station 'S1'",
+        "station 'S2'",
+    )
+    # Unless the record names the column, a filter on it names no station.
+    held = ScenarioSet(
+        [_gauge("a", 1980, "S1", named=False), _gauge("b", 2020, "S2", named=False)],
+        reference="a",
+    )
+    assert held.labels == ("a", "b")
+
+
+def test_a_named_station_column_is_the_only_station() -> None:
+    def placed(label: str, first: int, other: str) -> Any:
+        return _placed(
+            label,
+            first,
+            columns={"year": "year", "value": "value", "station": "stn"},
+            where={"stn": "S1"},
+            table_columns={"station": {"values": [other], "distinct": 1}},
+        )
+
+    # The one-valued `station` column isn't the station the record names.
+    held = ScenarioSet([placed("a", 1980, "X"), placed("b", 2020, "Y")], reference="a")
+    assert held.labels == ("a", "b")
 
 
 def test_a_filter_on_other_columns_names_no_place() -> None:

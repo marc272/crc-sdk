@@ -2896,6 +2896,7 @@ class ParametricPlan:
             year=read.year_column,
             value=read.value_column,
             where={location.table_column: station},
+            station=location.table_column,
             unit=read.unit,
             years=read.years,
             source=source,
