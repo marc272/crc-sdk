@@ -1631,9 +1631,16 @@ rows, each model-year taking a block of its own, and `first_year` and
   there. Dependence finer than one year in `m` is assumed, not observed.
 - The rows come in reference-year blocks, so `holdout` and `year_block_kfold`
   raise `SampleError` on such a sample and on one asset's sample taken from it.
-  The out-of-sample test is a fresh sample: call `sample_curves` again with new
-  generators and the same reference. The reference is part of the stated model,
-  so the two samples share it.
+  Two blocks cut from one such sample with `select` raise `LeakageError` at an
+  out-of-sample evaluation, whatever their periods, because each asset's draws
+  were dealt to the reference years by their rank over every row. A block of
+  whole reference years holds the rank blocks the other lacks: with `k = 1`,
+  the years above the median of an asset's reference hold that asset's larger
+  half of the draws, whatever the seed. A reference year with rows in both
+  blocks puts draws of one rank block in each, so each block nearly repeats the
+  other. The out-of-sample test is a fresh sample: call `sample_curves` again
+  with new generators and the same reference. The reference is part of the
+  stated model, so the two samples share it.
 
 **The record.** `sample.provenance.dependence` holds the model's document:
 `{"kind": "independent"}`, `{"kind": "comonotonic"}`, or for `EmpiricalCopula`
@@ -1830,7 +1837,10 @@ draws; the fold for k-fold, which must match the sample's own split).
 - Two samples cut from one sample built with `HazardNoise(...,
   hold="hazard_distribution")`, as with `select`, share rows whatever their
   periods, as each row's hazard at the asset is an index value chosen over every
-  row, and raise `LeakageError`.
+  row, and raise `LeakageError`. So do two samples cut from one `EmpiricalCopula`
+  sample, or from one asset's or one hazard's view of it, as each column's draws
+  were dealt to the reference years by their rank over every row (see
+  [several assets from fitted curves](#several-assets-from-fitted-curves)).
 - In sample, a known design sample must be the evaluation sample itself.
 - The metadata records how the split was made: `holdout` (with the train
   fraction), `kfold` (with k), `fresh_draws` (Monte Carlo samples from
@@ -2774,7 +2784,9 @@ setup text calls it one.
   `loss="combined"`. The view keeps the sample's lineage, so the leakage check
   still sees its source.
 - **Splits.** `select`, `holdout` and `year_block_kfold` act on every
-  component. On an `EmpiricalCopula` sample they raise, as on several assets.
+  component. On an `EmpiricalCopula` sample `holdout` and `year_block_kfold`
+  raise, and two blocks cut with `select` raise `LeakageError` at an
+  out-of-sample evaluation, as on several assets.
 - **Hashes and tables.** With components, `content_hash` covers each one's name,
   unit, tail, values, hazard and own loss, and `to_table` adds the columns
   `index[<name>]`, `hazard[<name>]` and `own_loss[<name>]`, with

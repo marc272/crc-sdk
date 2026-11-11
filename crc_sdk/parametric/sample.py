@@ -3022,6 +3022,26 @@ def _hazard_reorder(provenance: SampleProvenance) -> tuple[Mapping[str, Any], ..
     return ({"kind": "reorder", "dependence": model["kind"]},)
 
 
+def _reorders_by_reference(document: Mapping[str, Any]) -> bool:
+    """Whether a provenance document states the reorder of an `EmpiricalCopula`.
+
+    That is its `dependence` or `hazard_dependence`, a `reorder` step of its
+    `selection`, which one asset's or one hazard's view of such a sample keeps
+    though it has no `dependence` of its own, or the same in one of its parts
+    or components.
+    """
+    kinds = {step.get("dependence") for step in document.get("selection") or ()}
+    for key in ("dependence", "hazard_dependence"):
+        model = document.get(key)
+        if isinstance(model, Mapping):
+            kinds.add(model.get("kind"))
+    return "empirical_copula" in kinds or any(
+        _reorders_by_reference(own)
+        for key in ("parts", "components")
+        for own in (document.get(key) or {}).values()
+    )
+
+
 def _refuse_reference_year_blocks(sample: OutcomeSample, function: str) -> None:
     """Raise `SampleError` if `sample`'s rows come in reference-year blocks.
 
@@ -3029,12 +3049,7 @@ def _refuse_reference_year_blocks(sample: OutcomeSample, function: str) -> None:
     would not hold out independent draws. One asset's sample taken from it
     has no `dependence` of its own, but its `selection` records the reordering.
     """
-    provenance = sample.provenance
-    models = {step.get("dependence") for step in provenance.selection}
-    for model in (provenance.dependence, provenance.hazard_dependence):
-        if model is not None:
-            models.add(model["kind"])
-    if "empirical_copula" in models:
+    if _reorders_by_reference(sample.provenance.to_document()):
         raise SampleError(
             f"{function} cannot split an EmpiricalCopula sample: its rows come in "
             "reference-year blocks, so a block of rows is a set of reference years; "
@@ -3067,6 +3082,11 @@ def _holds_hazard_distribution(document: Mapping[str, Any]) -> bool:
 _ONE_RANKING = (
     "HazardNoise(..., hold='hazard_distribution') gave each row's hazard at the "
     "asset an index value by its rank over every row the sampler built"
+)
+
+_DEALT_BY_RANK = (
+    "an EmpiricalCopula dealt each column's draws to the reference years by their "
+    "rank over every row of that sample"
 )
 
 
@@ -3370,6 +3390,17 @@ def _check_out_of_sample(design: OutcomeSample, evaluation: OutcomeSample) -> No
     of that sample chose, so a block holds values of the other's rows.
     `holdout` and `year_block_kfold` refuse such a sample; this catches blocks
     taken with `select`.
+
+    So do two samples cut from one `EmpiricalCopula` sample, whatever their
+    periods. Each column's draws were dealt to the reference years by their
+    rank over every row: the k draws of rank band r went to the rows of the
+    reference year of rank r. A block of whole reference years then holds the
+    bands the other block lacks, and a reference year with rows in both blocks
+    puts draws of one band in each, so neither block is a fresh sample of the
+    stated model. `holdout` and `year_block_kfold` refuse such a sample too;
+    this catches blocks taken with `select`, of the sample or of one asset's or
+    one hazard's view of it. Its out-of-sample test is a fresh sample with new
+    generators and the same reference.
     """
     design = _require_sample(design)
     evaluation = _require_sample(evaluation)
@@ -3419,23 +3450,39 @@ def _check_out_of_sample(design: OutcomeSample, evaluation: OutcomeSample) -> No
                 "from the same source; state the design years with "
                 "LinearTrend(fit_years=...), or let a plan fit the trend per fold"
             )
-    _check_not_one_ranking(design, evaluation)
+    _check_not_cut_from_one_sample(design, evaluation)
 
 
-def _check_not_one_ranking(design: OutcomeSample, evaluation: OutcomeSample) -> None:
-    """Raise `LeakageError` for two cuts of one sample ranked over its rows."""
+def _check_not_cut_from_one_sample(
+    design: OutcomeSample, evaluation: OutcomeSample
+) -> None:
+    """Raise `LeakageError` for two cuts of one sample whose rows share values.
+
+    That is a sample whose hazard at the asset was ranked over its rows, by
+    the held form of `HazardNoise`, or whose draws an `EmpiricalCopula` dealt
+    to the reference years by their rank over its rows.
+    """
     roots = {
         sample.provenance.parent or sample.content_hash
         for sample in (design, evaluation)
     }
-    if len(roots) > 1 or not any(
-        _holds_hazard_distribution(sample.provenance.to_document())
-        for sample in (design, evaluation)
-    ):
+    if len(roots) > 1:
         return
-    raise LeakageError(
-        "the design and the evaluation samples are cut from one sample, and "
-        f"{_ONE_RANKING}, so each holds values of the other's rows; build them "
-        "with separate calls (fresh draws from a curve, or per-year samples of "
-        "separate years)"
-    )
+    documents = [sample.provenance.to_document() for sample in (design, evaluation)]
+    if any(_holds_hazard_distribution(document) for document in documents):
+        raise LeakageError(
+            "the design and the evaluation samples are cut from one sample, and "
+            f"{_ONE_RANKING}, so each holds values of the other's rows; build them "
+            "with separate calls (fresh draws from a curve, or per-year samples of "
+            "separate years)"
+        )
+    if any(_reorders_by_reference(document) for document in documents):
+        raise LeakageError(
+            "the design and the evaluation samples are cut from one sample, and "
+            f"{_DEALT_BY_RANK}: whole reference years on one side hold the rank "
+            "bands the other side lacks, and a reference year on both sides puts "
+            "draws of one band on each, so neither is a fresh sample of the stated "
+            "model; test the design on fresh draws (FreshDraws on a plan, or "
+            "sample_curves or sample_curve_hazards with new generators and the same "
+            "reference)"
+        )
