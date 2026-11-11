@@ -34,6 +34,17 @@ the impact function and the design, and on a curve block it is the Monte Carlo
 error of the draws and says nothing about the curve. Two rows' intervals are not
 a test of a difference between them.
 
+**Rows built together.** Resampling rows treats them as independent draws. The
+rows of an `EmpiricalCopula` block, and of a block built with `HazardNoise(...,
+hold="hazard_distribution")`, are not: each asset's or hazard's draws, or each
+row's hazard at the asset, were assigned by their rank over every row. There an
+interval is not the Monte Carlo error of the draws, and it can be narrower or
+wider. An asset's own row of an `EmpiricalCopula` block reads that asset's draws
+alone, which are independent, so its intervals are those of independent rows; a
+row that reads several assets or hazards is affected, and so is every row of a
+held `HazardNoise` block. `docs/parametric.md` gives a synthetic coverage study.
+Resampling whole reference years instead made most intervals too wide.
+
 Both functions rank nothing. They work in memory and do no I/O. Random numbers
 come only from the `rng` a call states, and its state at entry is recorded, so
 the table can be rebuilt.
@@ -1306,7 +1317,11 @@ def bootstrap_intervals(
     leaves out uncertainty in the hazard data, the impact function and the
     design, and on a curve block it is the Monte Carlo error of the draws and
     says nothing about the curve. Two rows' intervals are not a test of a
-    difference between them.
+    difference between them. On an `EmpiricalCopula` block, a row that reads
+    several assets or hazards, and every row of a block built with
+    `HazardNoise(..., hold="hazard_distribution")`, read rows that were built
+    together, so there an interval can be narrower or wider than the Monte
+    Carlo error of the draws (the module docstring says why).
 
     The table holds an `EvaluationMetadata` under the same key as a
     comparison's, with `setup.intervals`, and `write_comparison` writes it.

@@ -222,9 +222,13 @@ class EmpiricalCopula:
     Inside a block the reference says nothing, so the columns are independent
     there: dependence finer than one year in `m` is assumed, not observed.
     Because the rows come in reference-year blocks, `holdout` and
-    `year_block_kfold` raise `SampleError` on such a sample. Its out-of-sample
-    test is a fresh sample with new generators and the same reference, which
-    is part of the stated model.
+    `year_block_kfold` raise `SampleError` on such a sample, and two blocks cut
+    from it with `select` raise `LeakageError` at an out-of-sample evaluation.
+    Each column's draws were dealt to the reference years by their rank over
+    every row, so a block of whole reference years holds the rank blocks the
+    other lacks, and a reference year with rows in both blocks puts draws of one
+    rank block in each. Its out-of-sample test is a fresh sample with new
+    generators and the same reference, which is part of the stated model.
 
     A reference may be a pool of model-years: `m` is then its number of rows,
     each model-year taking a block of its own, and the first and last year in
