@@ -6,7 +6,8 @@ the reference year of rank r. The tests below show the two ways a cut of such a
 sample fails, then check that `_check_out_of_sample` refuses both, on either
 axis, through one asset's or one hazard's view, after a written table, and
 through `evaluate`. Fresh draws with the same reference, and cuts of the other
-models, still pass. Every number is synthetic.
+models, still pass. The same detection sets the resampling unit of
+`bootstrap_intervals`. Every number is synthetic.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ from crc_sdk.parametric import (
     sample_curve_hazards,
     sample_curves,
 )
+from crc_sdk.parametric.intervals import _resampling_unit
 from crc_sdk.parametric.sample import _check_out_of_sample
 from crc_sdk.types import HazardDatasetMetadata, SourceProvenance
 
@@ -282,3 +284,25 @@ def test_cuts_of_the_other_models_still_pass(model: Any) -> None:
     first, second = _whole_years(_assets(model))
     _check_out_of_sample(first, second)
     _check_out_of_sample(first.asset("site-c"), second.asset("site-c"))
+
+
+# -- the resampling unit of bootstrap_intervals ------------------------------------
+
+
+def test_every_view_of_a_copula_sample_is_resampled_by_row() -> None:
+    assets = _assets(EmpiricalCopula(_reference()))
+    hazards = _hazards(EmpiricalCopula(_hazard_reference()))
+    first, _ = _whole_years(assets)
+    for sample in (
+        assets,
+        first,
+        first.asset("site-c"),
+        assets.asset("site-b"),
+        hazards,
+        hazards.component("heat"),
+        _whole_years(hazards)[1].component("rain"),
+        OutcomeSample.from_written_table(first.to_table()),
+    ):
+        assert _resampling_unit(sample) == "row"
+    for model in (Independent(), Comonotonic()):
+        assert _resampling_unit(_whole_years(_assets(model))[0]) == "year"

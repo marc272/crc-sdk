@@ -2016,6 +2016,32 @@ difference between them.
   curve sample, and every run's row of one calendar year in a pool. Rows of
   several assets or hazards in a year stay together. An `EmpiricalCopula` block
   is resampled by row, because its reference is part of the stated model.
+- **Rows built together.** Resampling rows treats them as independent draws. The
+  rows of an `EmpiricalCopula` block, and of a block built with
+  `HazardNoise(..., hold="hazard_distribution")`, are not: each asset's or
+  hazard's draws, or each row's hazard at the asset, were assigned by their rank
+  over every row of the block. There an interval is not the Monte Carlo error of
+  the draws, and it can be narrower or wider. A synthetic study measured how
+  often 90% intervals held the true value: Gumbel curves, linear covers given as
+  is, 300 rows, 1,000 replications, the true value from 600,000 rows or more.
+  Each share below has a Monte Carlo error of at most 0.025.
+
+  | Block | Rows or columns | Share that held the true value |
+  | --- | --- | --- |
+  | Independent rows: one asset, or two under `Independent()` | every row and column | 0.86 to 0.92 |
+  | `EmpiricalCopula` of two assets, 30 reference years, 10 draws each | an asset's own row | 0.86 to 0.92 |
+  | The same | the `"total"` row | 0.55 to 0.97, lowest for `payout_frequency` and `false_negative_rate`, and lower overall when the reference's columns move in opposite directions |
+  | `HazardNoise(0.3, hold="hazard_distribution")` | `expected_uncovered`, `rmse`, `coverage_ratio` | 0.96 to 0.99 |
+  | The same | `false_positive_rate` | 0.78 |
+  | The same | the other columns | 0.88 to 0.95 |
+
+  An asset's own row of an `EmpiricalCopula` block reads that asset's draws
+  alone, which are independent, so its intervals are those of independent rows.
+  Resampling whole reference years instead made most intervals of the block too
+  wide, up to about four times the Monte Carlo error. These numbers describe
+  this synthetic setup, nothing more. Read the intervals of a row that reads
+  several assets or hazards of an `EmpiricalCopula` block, and those of a held
+  `HazardNoise` block, as indicative only.
 - **Replicates.** One call `rng.integers(0, Y, size=(n_bootstrap, Y))` draws the
   block's Y years. A replicate reweights the rows by how often their year was
   drawn, which gives the metrics of the concatenated years. One set of replicates
