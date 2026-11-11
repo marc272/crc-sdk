@@ -152,19 +152,29 @@ class IndexDefinition(_DefinitionModel):
     severe: `"upper"` for hazards where larger values are worse (rainfall,
     wind), `"lower"` where smaller values are worse (a drought index); it
     follows the dataset's `return_period_tail`. `location` says where the
-    index is read (`AtAsset()` by default). `aggregation` says how one year's
-    values become the year's index, for example `"annual_maximum"`.
-    `source` optionally names the data source.
+    index is read (`AtAsset()` by default). `source` optionally names the
+    data source.
+
+    `aggregation` optionally says how one year's values become the year's
+    index, for example `"annual_maximum"`. It is part of the terms, so the
+    cover document and its hash hold it, but nothing checks it: a stated
+    value is free text, and no design or evaluation reads it, because a
+    sample holds one index value per year whatever made it. Left out
+    (`None`), the terms
+    don't say how the year's value was made, and the document holds
+    `"aggregation": null`, so its hash differs from that of the same terms
+    with an aggregation stated.
 
     Raises `CoverDefinitionError` for empty names or units, an unknown tail
-    or an invalid location.
+    or an invalid location, and from `from_document` for a document without
+    the `aggregation` key.
     """
 
     hazard_name: Identifier
     unit: Identifier
     tail: Tail = "upper"
     location: Location = AtAsset()
-    aggregation: Identifier
+    aggregation: Identifier | None = None
     source: Identifier | None = None
 
     def __init__(
@@ -174,7 +184,7 @@ class IndexDefinition(_DefinitionModel):
         *,
         tail: Tail = "upper",
         location: AtAsset | AtPoint | AtStation | AtCell = AtAsset(),
-        aggregation: str,
+        aggregation: str | None = None,
         source: str | None = None,
     ) -> None:
         super().__init__(
@@ -198,7 +208,25 @@ class IndexDefinition(_DefinitionModel):
 
     @classmethod
     def from_document(cls, document: Mapping[str, Any]) -> Self:
-        """Read a definition written by `to_document`."""
+        """Read a definition written by `to_document`.
+
+        The document holds `aggregation`, `null` when the terms leave it
+        unstated, as every document `to_document` writes does.
+        """
+        if isinstance(document, Mapping) and "aggregation" not in document:
+            fields = cls.model_fields
+            unknown = sorted(str(key) for key in document if key not in fields)
+            missing = [
+                name
+                for name, info in fields.items()
+                if (info.is_required() or name == "aggregation")
+                and name not in document
+            ]
+            raise CoverDefinitionError(
+                f"a {cls.__name__} document has unknown fields {unknown} and lacks "
+                f"the fields {missing}; aggregation is null when the terms don't "
+                "state one"
+            )
         return cls._validated(document)
 
 
