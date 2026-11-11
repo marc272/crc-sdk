@@ -78,6 +78,7 @@ PUBLIC = [
     "SampleProvenance",
     "ScenarioError",
     "ScenarioSet",
+    "SolverLimitError",
     "SolverUnavailableError",
     "StationColumn",
     "StepGrid",

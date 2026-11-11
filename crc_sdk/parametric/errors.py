@@ -18,6 +18,7 @@ __all__ = [
     "ProbabilitySemanticsError",
     "SampleError",
     "ScenarioError",
+    "SolverLimitError",
     "SolverUnavailableError",
     "UnboundedDesignError",
     "UnknownPayoutKindError",
@@ -115,6 +116,17 @@ class InfeasibleDesignError(DesignError):
 
 class UnboundedDesignError(DesignError):
     """The design's objective is unbounded under its constraints."""
+
+
+class SolverLimitError(DesignError):
+    """A solve stopped at its iteration or time limit, before it found an optimum.
+
+    `status` names the limit: `"qp_iteration_limit"`, `"simplex_iteration_limit"`
+    or `"time_limit"` (HiGHS's options of those names), or
+    `"active_set_iteration_limit"` (the dense fallback of a small QP). The
+    message gives its value. The limit stopped the solver, so the design may
+    well have an optimum.
+    """
 
 
 class SolverUnavailableError(ParametricError, ImportError):

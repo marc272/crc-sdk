@@ -19,6 +19,29 @@ when it is missing.
 A programme is `minimise 1/2 x'Qx + c'x + offset` subject to `row_lower <=
 A x <= row_upper` and `col_lower <= x <= col_upper`, with infinite bounds as
 `inf`. `Q` is given as its lower triangle; an LP has none.
+
+**QPs.** HiGHS's active-set QP solver can cycle at a degenerate vertex of a
+small, well-posed QP, and it has reported "unbounded" for one whose variables
+are all bounded; on Windows that report also corrupts the process's heap
+(highspy 1.15.1), so it can't be caught after the fact. `solve_qp` therefore
+gives a QP of at most `ACTIVE_SET_FIRST_COLUMNS` columns to a dense
+active-set method in numpy and never to HiGHS's QP solver. A larger QP goes
+to HiGHS, which stops at `QP_ITERATION_LIMIT` iterations or `QP_TIME_LIMIT`
+seconds, whichever comes first; when it ends with any outcome but optimal or
+infeasible, a QP of at most `ACTIVE_SET_MAX_COLUMNS` columns is solved again
+by the dense method (`Solution.fallback`). A solve that stops at a limit has
+the status `"limit"` and the limit's name in `Solution.limit`.
+
+**The dense active-set method.** From a feasible point found by HiGHS's
+simplex, it minimises the objective on the face of its working constraints,
+and at the minimum of a face it asks a small LP, solved by HiGHS's simplex at
+the tolerances of `RANGING_OPTIONS`, for a feasible descent direction over
+every active constraint. A degenerate vertex is thus left through an LP,
+whose simplex does not cycle, and every step along an LP's direction lowers
+the objective, so no face is visited twice. It stops when that LP finds no
+descent direction, which is the optimality condition of a convex QP, or at
+`ACTIVE_SET_ITERATION_LIMIT` iterations. `Solution.method` says which method
+gave the outcome: `"highs"` or `"active_set"`.
 """
 
 from __future__ import annotations
@@ -26,7 +49,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Any, Literal
 
@@ -36,13 +59,19 @@ from numpy.typing import NDArray
 from crc_sdk.parametric.errors import SolverUnavailableError
 
 __all__ = [
+    "ACTIVE_SET_FIRST_COLUMNS",
+    "ACTIVE_SET_ITERATION_LIMIT",
+    "ACTIVE_SET_MAX_COLUMNS",
     "EXTRA",
     "LP_OPTIONS",
     "LPSession",
+    "QP_ITERATION_LIMIT",
     "QP_OPTIONS",
+    "QP_TIME_LIMIT",
     "RANGING_OPTIONS",
     "SOLVER_NAME",
     "Basis",
+    "Method",
     "Programme",
     "Solution",
     "SolveStatus",
@@ -66,12 +95,50 @@ EXTRA = "parametric"
 LP_OPTIONS: Mapping[str, bool | int | float | str] = {"solver": "simplex"}
 """HiGHS options of a design LP: the simplex, so a solution is a vertex."""
 
-QP_OPTIONS: Mapping[str, bool | int | float | str] = {"qp_regularization_value": 1e-12}
+QP_ITERATION_LIMIT = 100_000
+"""The most iterations of HiGHS's QP solver in one solve (`qp_iteration_limit`).
+
+A design QP of one column per amount needs tens of iterations, and the QP of
+a cost-of-capital premium at 50,000 draws about 1,300. A cycling solve runs
+this many in about a quarter of a second on a QP of six amounts.
+"""
+
+QP_TIME_LIMIT = 600.0
+"""The most seconds of one HiGHS QP solve (`time_limit`), a backstop."""
+
+QP_OPTIONS: Mapping[str, bool | int | float | str] = {
+    "qp_regularization_value": 1e-12,
+    "qp_iteration_limit": QP_ITERATION_LIMIT,
+    "time_limit": QP_TIME_LIMIT,
+}
 """HiGHS options of a design QP.
 
 HiGHS adds `qp_regularization_value` (1e-7 by default) to the Hessian's
 diagonal, which moves a solution by about that share of its scale; 1e-12
-keeps the semi-definite design QPs solvable without that bias.
+keeps the semi-definite design QPs solvable without that bias. The limits
+stop a solve that cycles (`QP_ITERATION_LIMIT`, `QP_TIME_LIMIT`).
+"""
+
+ACTIVE_SET_FIRST_COLUMNS = 100
+"""A QP of at most this many columns is solved by the dense active-set method.
+
+It never reaches HiGHS's QP solver. A design QP of one column per amount has
+that few unless its payout has more than 100 amounts; the method takes about
+2 ms on 6 columns and 25 ms on 100, against HiGHS's 0.3 ms and 1.4 ms.
+"""
+
+ACTIVE_SET_MAX_COLUMNS = 500
+"""The most columns of a QP that the dense method solves after HiGHS failed.
+
+Each of its iterations works on dense matrices of that size: a cost-of-capital
+QP of 480 draws (one column per draw) takes about 4 seconds.
+"""
+
+ACTIVE_SET_ITERATION_LIMIT = 10_000
+"""The most iterations of the dense active-set method in one solve.
+
+A design QP of one column per amount needs tens, and a cost-of-capital QP of
+480 draws about 400.
 """
 
 RANGING_OPTIONS: Mapping[str, bool | int | float | str] = {
@@ -82,9 +149,29 @@ RANGING_OPTIONS: Mapping[str, bool | int | float | str] = {
 """HiGHS options of the LPs that range an optimal set (its defaults are 1e-7)."""
 
 SolveStatus = Literal[
-    "optimal", "infeasible", "unbounded", "infeasible_or_unbounded", "error"
+    "optimal", "infeasible", "unbounded", "infeasible_or_unbounded", "limit", "error"
 ]
-"""A solve's outcome; only `"optimal"` comes with values."""
+"""A solve's outcome; only `"optimal"` comes with values.
+
+`"limit"`: the solve stopped at an iteration or time limit, which
+`Solution.limit` names.
+"""
+
+Method = Literal["highs", "active_set"]
+"""What gave a solve's outcome: HiGHS, or the dense active-set method."""
+
+_REJECTED = "HiGHS rejected the model"
+
+# The dense active-set method works on rows of unit length. A row is active
+# when its slack is at most _ACTIVE times max(1, |x|); rows are independent
+# above _RANK times the largest singular value; a direction has no curvature
+# below _CURVATURE times the Hessian's largest entry; and a slope below
+# _SLOPE times the gradient's scale is no descent.
+_ACTIVE = 1e-9
+_RANK = 1e-10
+_CURVATURE = 1e-12
+_SLOPE = 1e-9
+_KEEP = 1e-8
 
 
 def require() -> ModuleType:
@@ -245,6 +332,12 @@ class Solution:
     interior point and QP iterations together) and `seconds` the wall time.
     `basis` is the optimal basis of an LP solved with `keep_basis=True`, and
     `None` otherwise, or when the solver has no valid basis to give.
+    `method` is `"highs"`, or `"active_set"` when the dense method gave the
+    outcome; `fallback` is true when it did so after HiGHS failed (its
+    `iterations` and `seconds` then include HiGHS's). `limit` names the limit
+    a `"limit"` status stopped at: `"qp_iteration_limit"`,
+    `"simplex_iteration_limit"`, `"time_limit"` or
+    `"active_set_iteration_limit"`; the message gives its value.
     """
 
     status: SolveStatus
@@ -254,16 +347,21 @@ class Solution:
     iterations: int
     seconds: float
     basis: Basis | None = None
+    method: Method = "highs"
+    limit: str | None = None
+    fallback: bool = False
 
 
 def _options(
     highs: Any, base: Mapping[str, Any], options: Mapping[str, Any] | None
-) -> None:
+) -> dict[str, Any]:
+    """Set the options on a HiGHS instance; return them."""
     chosen = {"output_flag": False, **base, **(options or {})}
     for name, value in chosen.items():
         status = highs.setOptionValue(name, value)
         if status != require().HighsStatus.kOk:
             raise ValueError(f"HiGHS rejected the option {name}={value!r}")
+    return chosen
 
 
 def _pass(highs: Any, programme: Programme) -> bool:
@@ -314,10 +412,18 @@ def _pass(highs: Any, programme: Programme) -> bool:
     return bool(passed != highspy.HighsStatus.kError)
 
 
-def _solved(highs: Any, n_columns: int, keep_basis: bool = False) -> Solution:
+def _solved(
+    highs: Any,
+    n_columns: int,
+    chosen: Mapping[str, Any],
+    *,
+    keep_basis: bool = False,
+    qp: bool = False,
+) -> Solution:
     """Run a HiGHS instance that holds a model, and read its outcome.
 
-    With `keep_basis`, an optimal outcome carries the instance's basis.
+    `chosen` are the options it runs with, to name a limit it stops at. With
+    `keep_basis`, an optimal outcome carries the instance's basis.
     """
     highspy = require()
     began = time.perf_counter()
@@ -340,10 +446,29 @@ def _solved(highs: Any, n_columns: int, keep_basis: bool = False) -> Solution:
         highspy.HighsModelStatus.kInfeasible: "infeasible",
         highspy.HighsModelStatus.kUnbounded: "unbounded",
         highspy.HighsModelStatus.kUnboundedOrInfeasible: "infeasible_or_unbounded",
+        highspy.HighsModelStatus.kIterationLimit: "limit",
+        highspy.HighsModelStatus.kTimeLimit: "limit",
     }
     status: SolveStatus = statuses.get(model_status, "error")
-    if ran == highspy.HighsStatus.kError:
+    if ran == highspy.HighsStatus.kError and status != "limit":
         status = "error"
+    if status == "limit":
+        limit = (
+            "time_limit"
+            if model_status == highspy.HighsModelStatus.kTimeLimit
+            else "qp_iteration_limit"
+            if qp
+            else "simplex_iteration_limit"
+        )
+        return Solution(
+            "limit",
+            None,
+            None,
+            f"{message} (HiGHS, {limit}={chosen.get(limit)!r})",
+            iterations,
+            seconds,
+            limit=limit,
+        )
     if status != "optimal":
         return Solution(status, None, None, message, iterations, seconds)
     values = np.asarray(highs.getSolution().col_value, dtype=np.float64)
@@ -372,10 +497,16 @@ def _run(
     keep_basis: bool = False,
 ) -> Solution:
     highs = require().Highs()
-    _options(highs, base, options)
+    chosen = _options(highs, base, options)
     if not _pass(highs, programme):
-        return Solution("error", None, None, "HiGHS rejected the model", 0, 0.0)
-    return _solved(highs, programme.n_columns, keep_basis)
+        return Solution("error", None, None, _REJECTED, 0, 0.0)
+    return _solved(
+        highs,
+        programme.n_columns,
+        chosen,
+        keep_basis=keep_basis,
+        qp=programme.hessian is not None,
+    )
 
 
 class LPSession:
@@ -481,10 +612,10 @@ class LPSession:
     ) -> Solution:
         """Solve the current model; `options` hold for this solve only."""
         if not self._accepted:
-            return Solution("error", None, None, "HiGHS rejected the model", 0, 0.0)
+            return Solution("error", None, None, _REJECTED, 0, 0.0)
         self._highs.resetOptions()
-        _options(self._highs, self._base, options)
-        return _solved(self._highs, self._n_columns)
+        chosen = _options(self._highs, self._base, options)
+        return _solved(self._highs, self._n_columns, chosen)
 
 
 def solve_lp(
@@ -508,13 +639,295 @@ def solve_lp(
 def solve_qp(
     programme: Programme, options: Mapping[str, bool | int | float | str] | None = None
 ) -> Solution:
-    """Solve a convex quadratic programme with HiGHS.
+    """Solve a convex quadratic programme with the dense method or with HiGHS.
 
-    The Hessian must be positive semi-definite. `options` are HiGHS options
-    on top of `QP_OPTIONS`. Raises `SolverUnavailableError` without highspy,
-    and `ValueError` for a programme without a Hessian or an option HiGHS
+    The Hessian must be positive semi-definite. A programme of at most
+    `ACTIVE_SET_FIRST_COLUMNS` columns is solved by the dense active-set
+    method (the module docstring describes it). A larger one goes to HiGHS's
+    QP solver, with `options` on top of `QP_OPTIONS`, whose limits stop a
+    solve that cycles; when HiGHS ends with any outcome but optimal or
+    infeasible, a programme of at most `ACTIVE_SET_MAX_COLUMNS` columns is
+    solved again by the dense method, and its outcome is returned with
+    `method="active_set"` and `fallback=True`; a larger one keeps HiGHS's
+    outcome. Raises `SolverUnavailableError` without highspy, and
+    `ValueError` for a programme without a Hessian or an option HiGHS
     rejects.
     """
     if programme.hessian is None:
         raise ValueError("solve_qp takes a programme with a hessian")
-    return _run(programme, QP_OPTIONS, options)
+    if programme.n_columns <= ACTIVE_SET_FIRST_COLUMNS:
+        return _active_set(programme, ACTIVE_SET_ITERATION_LIMIT)
+    highs = _run(programme, QP_OPTIONS, options)
+    if highs.status in ("optimal", "infeasible") or highs.message == _REJECTED:
+        return highs
+    if programme.n_columns > ACTIVE_SET_MAX_COLUMNS:
+        return replace(
+            highs,
+            message=f"{highs.message}; the QP has {programme.n_columns} columns, "
+            f"more than the dense method takes after HiGHS ({ACTIVE_SET_MAX_COLUMNS})",
+        )
+    dense = _active_set(programme, ACTIVE_SET_ITERATION_LIMIT)
+    return replace(
+        dense,
+        message=f"{dense.message}, after HiGHS: {highs.message}",
+        iterations=highs.iterations + dense.iterations,
+        seconds=highs.seconds + dense.seconds,
+        fallback=True,
+    )
+
+
+# -- the dense active-set method ----------------------------------------------
+
+
+def _dense(matrix: SparseColumns) -> FloatArray:
+    """A `SparseColumns` matrix as a dense array."""
+    dense = np.zeros((matrix.n_rows, matrix.n_columns), dtype=np.float64)
+    columns = np.repeat(np.arange(matrix.n_columns), np.diff(matrix.start))
+    dense[matrix.index, columns] = matrix.value
+    return dense
+
+
+def _inequalities(programme: Programme) -> tuple[FloatArray, FloatArray]:
+    """The programme's finite row and column bounds as `G x <= h`.
+
+    Each row of `G` has length 1; rows of zeros are left out.
+    """
+    n = programme.n_columns
+    matrix = _dense(programme.matrix)
+    identity = np.eye(n)
+    rows: list[FloatArray] = [np.zeros((0, n))]
+    bounds: list[FloatArray] = [np.zeros(0)]
+    for block, bound, sign in (
+        (matrix, programme.row_upper, 1.0),
+        (matrix, programme.row_lower, -1.0),
+        (identity, programme.col_upper, 1.0),
+        (identity, programme.col_lower, -1.0),
+    ):
+        finite = np.isfinite(bound)
+        rows.append(sign * block[finite])
+        bounds.append(sign * bound[finite])
+    g, h = np.vstack(rows), np.concatenate(bounds)
+    norms = np.linalg.norm(g, axis=1)
+    keep = norms > 0.0
+    return g[keep] / norms[keep, None], h[keep] / norms[keep]
+
+
+def _row_space(rows: FloatArray) -> tuple[FloatArray, FloatArray]:
+    """Orthonormal bases of the row space of `rows` and of its null space."""
+    n = rows.shape[1]
+    if rows.shape[0] == 0:
+        return np.zeros((0, n)), np.eye(n)
+    _, singular, vt = np.linalg.svd(rows)
+    rank = int(np.count_nonzero(singular > _RANK * singular[0]))
+    return vt[:rank], vt[rank:].T
+
+
+def _face_step(
+    hessian: FloatArray,
+    gradient: FloatArray,
+    rows: FloatArray,
+    curvature: float,
+    slope: float,
+) -> tuple[FloatArray, bool]:
+    """The step to the minimum on the face `rows @ step = 0`.
+
+    Returns the Newton step and `False`; or, when a direction of the face
+    without curvature has a slope above `slope`, a descent direction among
+    those directions and `True`: the objective falls linearly along it, so
+    only a constraint can stop a step along it.
+    """
+    _, null = _row_space(rows)
+    if null.shape[1] == 0:
+        return np.zeros(gradient.shape[0]), False
+    reduced = null.T @ hessian @ null
+    values, vectors = np.linalg.eigh(0.5 * (reduced + reduced.T))
+    coordinates = vectors.T @ (null.T @ gradient)
+    curved = values > curvature
+    flat = coordinates[~curved]
+    if (np.abs(flat) > slope).any():
+        return -(null @ (vectors[:, ~curved] @ flat)), True
+    newton = vectors[:, curved] @ (coordinates[curved] / values[curved])
+    return -(null @ newton), False
+
+
+def _line_minimum(
+    hessian: FloatArray, gradient: FloatArray, direction: FloatArray, curvature: float
+) -> float:
+    """The step to the minimum along a descent direction, or `inf`."""
+    bend = float(direction @ hessian @ direction)
+    if bend <= curvature * float(direction @ direction):
+        return math.inf
+    return -float(gradient @ direction) / bend
+
+
+def _ratio(
+    rows: FloatArray,
+    bounds: FloatArray,
+    x: FloatArray,
+    direction: FloatArray,
+    exclude: Any,
+    cap: float,
+) -> tuple[float, int | None]:
+    """The longest step up to `cap` along `direction` that keeps `rows @ x <= bounds`.
+
+    Rows in `exclude` are not tested. Returns the step and the row that
+    blocks it, or `None` when `cap` is reached first.
+    """
+    along = rows @ direction
+    moving = along > 1e-14 * max(1.0, float(np.abs(direction).max(initial=0.0)))
+    moving[np.asarray(exclude, dtype=np.int64)] = False
+    if not moving.any():
+        return cap, None
+    candidates = np.flatnonzero(moving)
+    slack = np.maximum(bounds[candidates] - rows[candidates] @ x, 0.0)
+    ratios = slack / along[candidates]
+    first = int(np.argmin(ratios))
+    if ratios[first] < cap:
+        return float(ratios[first]), int(candidates[first])
+    return cap, None
+
+
+def _descent(
+    gradient: FloatArray, rows: FloatArray, scale: float
+) -> tuple[FloatArray, float] | None:
+    """The most descending direction in the box [-1, 1] with `rows @ d <= 0`.
+
+    An LP, solved by HiGHS's simplex at tight tolerances. Returns the
+    direction and its slope divided by `scale`, or `None` if the LP fails.
+    """
+    m, n = rows.shape
+    where = np.nonzero(rows)
+    lp = Programme(
+        cost=gradient / scale,
+        col_lower=np.full(n, -1.0),
+        col_upper=np.full(n, 1.0),
+        matrix=sparse_columns(where[0], where[1], rows[where], (m, n)),
+        row_lower=np.full(m, -math.inf),
+        row_upper=np.zeros(m),
+    )
+    solution = _run(lp, RANGING_OPTIONS, None)
+    if solution.status != "optimal" or solution.values is None:
+        return None
+    return solution.values, float(gradient @ solution.values) / scale
+
+
+def _start(programme: Programme) -> Solution:
+    """A feasible point of the programme, from HiGHS's simplex."""
+    feasibility = Programme(
+        cost=np.zeros(programme.n_columns),
+        col_lower=programme.col_lower,
+        col_upper=programme.col_upper,
+        matrix=programme.matrix,
+        row_lower=programme.row_lower,
+        row_upper=programme.row_upper,
+    )
+    solution = _run(feasibility, RANGING_OPTIONS, None)
+    if solution.status == "infeasible_or_unbounded":
+        solution = _run(feasibility, RANGING_OPTIONS, {"presolve": "off"})
+    return solution
+
+
+def _active_set(programme: Programme, limit: int) -> Solution:
+    """Solve a small convex QP with the dense active-set method.
+
+    The module docstring describes the method. Returns `"optimal"` with the
+    values and the objective, `"infeasible"`, `"unbounded"` (a descent
+    direction without curvature that no constraint blocks), `"limit"` after
+    `limit` iterations, or `"error"` if an LP of the method fails.
+    """
+    assert programme.hessian is not None
+    began = time.perf_counter()
+
+    def outcome(
+        status: SolveStatus,
+        message: str,
+        iterations: int,
+        x: FloatArray | None = None,
+        name: str | None = None,
+    ) -> Solution:
+        seconds = time.perf_counter() - began
+        if x is None:
+            return Solution(
+                status,
+                None,
+                None,
+                message,
+                iterations,
+                seconds,
+                method="active_set",
+                limit=name,
+            )
+        objective = 0.5 * float(x @ hessian @ x) + float(cost @ x) + programme.offset
+        return Solution(
+            status, x, objective, message, iterations, seconds, method="active_set"
+        )
+
+    start = _start(programme)
+    if start.status == "infeasible":
+        return outcome("infeasible", "Infeasible (active set)", 0)
+    if start.status != "optimal" or start.values is None:
+        return outcome("error", f"no feasible start ({start.message})", 0)
+    lower = np.tril(_dense(programme.hessian))
+    hessian = lower + np.tril(lower, -1).T
+    cost = programme.cost
+    rows, bounds = _inequalities(programme)
+    curvature = _CURVATURE * max(float(np.abs(hessian).max(initial=0.0)), 1e-300)
+    x = np.clip(start.values, programme.col_lower, programme.col_upper)
+
+    def active(x: FloatArray) -> NDArray[np.int64]:
+        slack = bounds - rows @ x
+        tolerance = _ACTIVE * max(1.0, float(np.abs(x).max(initial=0.0)))
+        return np.flatnonzero(slack <= tolerance)
+
+    working = active(x)
+    stationary = False
+    for iteration in range(1, limit + 1):
+        gradient = hessian @ x + cost
+        scale = max(
+            float(np.abs(cost).max(initial=0.0)),
+            float(np.abs(hessian).max(initial=0.0))
+            * max(1.0, float(np.abs(x).max(initial=0.0))),
+            1e-300,
+        )
+        if not stationary:
+            step, ray = _face_step(
+                hessian, gradient, rows[working], curvature, _SLOPE * scale
+            )
+            size = float(np.abs(step).max(initial=0.0))
+            if size > 1e-15 * max(1.0, float(np.abs(x).max(initial=0.0))):
+                cap = _line_minimum(hessian, gradient, step, curvature) if ray else 1.0
+                alpha, block = _ratio(rows, bounds, x, step, working, cap)
+                if math.isinf(alpha):
+                    return outcome("unbounded", "Unbounded (active set)", iteration)
+                x = x + alpha * step
+                if block is not None:
+                    working = np.append(working, block)
+                else:
+                    stationary = not ray
+                continue
+        # x is the minimum on its face: is there a feasible descent direction?
+        on = active(x)
+        found = _descent(gradient, rows[on], scale)
+        if found is None:
+            return outcome("error", "a direction LP failed", iteration)
+        direction, value = found
+        if value >= -_SLOPE:
+            return outcome("optimal", "Optimal (active set)", iteration, x)
+        keep = on[rows[on] @ direction > -_KEEP]
+        space, _ = _row_space(rows[keep])
+        direction = direction - space.T @ (space @ direction)
+        if float(gradient @ direction) >= -_SLOPE * scale:
+            return outcome("optimal", "Optimal (active set)", iteration, x)
+        cap = _line_minimum(hessian, gradient, direction, curvature)
+        alpha, block = _ratio(rows, bounds, x, direction, keep, cap)
+        if math.isinf(alpha):
+            return outcome("unbounded", "Unbounded (active set)", iteration)
+        x = x + alpha * direction
+        working = keep if block is None else np.append(keep, block)
+        stationary = False
+    return outcome(
+        "limit",
+        f"Iteration limit reached (active set, active_set_iteration_limit={limit})",
+        limit,
+        name="active_set_iteration_limit",
+    )
