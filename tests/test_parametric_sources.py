@@ -1335,7 +1335,6 @@ def test_a_real_cmip6_plans_lineage_is_the_same_after_a_fetch(tmp_path: Path) ->
         (ERA5_DOCUMENT, "store_url", "gs://bucket/other.zarr"),
         (ERA5_DOCUMENT, "grid_degrees", 0.5),
         (ERA5_DOCUMENT, "requested_version", "2024"),
-        (ERA5_DOCUMENT, "unit", "mm"),
         (CMIP6_DOCUMENT, "model", "N"),
         (CMIP6_DOCUMENT, "member", "r2i1p1f1"),
         (CMIP6_DOCUMENT, "pathway", "ssp585"),
@@ -1350,6 +1349,29 @@ def test_a_lineage_still_tells_sources_apart(
     other = _per_year(read({**document, key: value}))
     assert other.lineage != design.lineage
     _check_out_of_sample(design, other)  # no shared source, so no overlap
+
+
+@READS
+def test_a_source_that_states_another_unit_is_refused(read: Any) -> None:
+    # The table is in mm/day; the plan says its values are in mm.
+    stated = {**ERA5_DOCUMENT, "unit": "mm"}
+    for source in (_SourcePlan(stated), stated):
+        with pytest.raises(SampleError, match="source states.*'mm'.*'mm/day'"):
+            read(source)
+    assert read(_SourcePlan(ERA5_DOCUMENT)).unit == "mm/day"
+
+
+def test_a_source_unit_is_checked_against_the_table_s_own() -> None:
+    table = pa.table(
+        {"year": [2000, 2001, 2002], "value": [1.0, 2.0, 3.0], "unit": ["m"] * 3}
+    )
+    with pytest.raises(SampleError, match="source states.*'mm'.*'m'"):
+        AnnualSeries.from_table(table, source={"provider": "x", "unit": "mm"})
+    # Units are compared after crc-sdk's aliases, and never converted.
+    series = AnnualSeries.from_table(table, source={"provider": "x", "unit": "metre"})
+    assert series.unit == "m"
+    # A source that states no unit leaves the table's.
+    assert AnnualSeries.from_table(table, source="gauges").unit == "m"
 
 
 def test_windows_of_one_source_plan_share_a_lineage() -> None:
