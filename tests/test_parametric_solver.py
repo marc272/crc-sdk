@@ -228,7 +228,10 @@ def _qp(
         matrix=_matrix(dense)
         if dense
         else _solver.SparseColumns(
-            np.zeros(n + 1, dtype=np.int32), np.zeros(0), np.zeros(0), 0
+            np.zeros(n + 1, dtype=np.int32),
+            np.zeros(0, dtype=np.int32),
+            np.zeros(0),
+            0,
         ),
         row_lower=(
             np.full(len(row_upper), -np.inf)

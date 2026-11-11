@@ -41,6 +41,7 @@ from crc_sdk.parametric import (
     PurePremium,
     SampleError,
     SampleProvenance,
+    SolverLimitError,
     SolverUnavailableError,
     StepPayout,
     UserObjective,
@@ -912,3 +913,49 @@ def test_the_record_is_plain_json() -> None:
     assert (record["ties"], record["grid"]) == (0, None)
     assert record["premium"] == result.premium
     assert record["budget"] == {"ratio": 0.5}
+
+
+# -- QP limits and the active-set fallback -----------------------------------
+
+
+def test_a_joint_mse_design_that_highs_stops_is_solved_by_the_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budget = Budget(ratio=0.5)
+    by_highs = design_joint(_pair(), SEPARATE, MSE(), budget=budget)
+    assert (by_highs.solved_by, by_highs.fallbacks) == ("highs", 0)
+    monkeypatch.setattr(
+        _solver, "QP_OPTIONS", {**_solver.QP_OPTIONS, "qp_iteration_limit": 1}
+    )
+    result = design_joint(_pair(), SEPARATE, MSE(), budget=budget)
+    assert (result.route, result.solved_by, result.fallbacks) == ("qp", "active_set", 1)
+    assert result.objective_value == pytest.approx(by_highs.objective_value)
+    for asset in ("A", "B"):
+        assert _level(result, asset) == pytest.approx(_level(by_highs, asset), abs=1e-9)
+    record = result.to_record()
+    assert (record["solve"]["solved_by"], record["solve"]["fallbacks"]) == (
+        "active_set",
+        1,
+    )
+    assert record["solve"]["options"]["active_set"] is not None
+
+
+def test_a_joint_qp_at_its_limit_raises_a_solver_limit_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        _solver, "QP_OPTIONS", {**_solver.QP_OPTIONS, "qp_iteration_limit": 1}
+    )
+    monkeypatch.setattr(_solver, "ACTIVE_SET_MAX_COLUMNS", 0)
+    with pytest.raises(SolverLimitError, match="the joint design") as raised:
+        design_joint(_pair(), SEPARATE, MSE(), budget=Budget(ratio=0.5))
+    assert raised.value.status == "qp_iteration_limit"
+    assert raised.value.asset_id is None
+
+
+def test_a_joint_lp_design_is_solved_by_highs() -> None:
+    result = design_joint(
+        _pair(), SEPARATE, ExpectedUncovered(), budget=Budget(ratio=0.5)
+    )
+    assert (result.solved_by, result.fallbacks) == ("highs", 0)
+    assert result.solver_options["active_set"] is None

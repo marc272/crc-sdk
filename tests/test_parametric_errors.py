@@ -16,6 +16,7 @@ from crc_sdk.parametric.errors import (
     ProbabilitySemanticsError,
     SampleError,
     ScenarioError,
+    SolverLimitError,
     SolverUnavailableError,
     UnboundedDesignError,
     UnknownPayoutKindError,
@@ -37,6 +38,7 @@ from crc_sdk.parametric.errors import (
         (DesignError, (ParametricError, RuntimeError)),
         (InfeasibleDesignError, (DesignError, RuntimeError)),
         (UnboundedDesignError, (DesignError, RuntimeError)),
+        (SolverLimitError, (DesignError, RuntimeError)),
         (SolverUnavailableError, (ParametricError, ImportError)),
     ],
 )
@@ -80,3 +82,11 @@ def test_every_error_is_listed() -> None:
         for name, value in vars(errors).items()
         if isinstance(value, type) and issubclass(value, (ParametricError, Warning))
     )
+
+
+def test_a_limit_error_is_named_by_its_limit() -> None:
+    error = SolverLimitError(
+        "stopped", asset_id="a", status="qp_iteration_limit", solver_message="..."
+    )
+    assert error.status == "qp_iteration_limit"
+    assert not isinstance(error, UnboundedDesignError)
