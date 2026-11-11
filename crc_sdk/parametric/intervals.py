@@ -43,7 +43,9 @@ wider. An asset's own row of an `EmpiricalCopula` block reads that asset's draws
 alone, which are independent, so its intervals are those of independent rows; a
 row that reads several assets or hazards is affected, and so is every row of a
 held `HazardNoise` block. `docs/parametric.md` gives a synthetic coverage study.
-Resampling whole reference years instead made most intervals too wide.
+Resampling whole reference years instead made most intervals too wide. The
+column `built_together` flags those rows by how the block was built, and the
+setup text says what it means; the numbers are those of any other row.
 
 Both functions rank nothing. They work in memory and do no I/O. Random numbers
 come only from the `rng` a call states, and its state at entry is recorded, so
@@ -103,8 +105,10 @@ from crc_sdk.parametric.evaluate import (
     _values_hash,
     to_long,
 )
+from crc_sdk.parametric.index import CompositeIndex, IndexDefinition
 from crc_sdk.parametric.joint import JointDesignResult
 from crc_sdk.parametric.metadata import (
+    _BUILT_TOGETHER,
     EVALUATION_METADATA_KEY,
     KEY_COLUMNS,
     CoverEntry,
@@ -125,7 +129,9 @@ from crc_sdk.parametric.sample import (
     OutcomeSample,
     _cover_index_values,
     _generator_record,
+    _holds_hazard_distribution,
     _refuse_reference_year_blocks,
+    _reorders_by_reference,
     _require_generator,
     _row_years,
 )
@@ -241,6 +247,134 @@ def _arrays(entry: _Entry, run: _Run) -> list[_Arrays]:
     return _joint_arrays(entry, run)
 
 
+# -- rows built together -------------------------------------------------------
+
+
+_DEALT = "empirical_copula"
+"""An `EmpiricalCopula` dealt the columns' draws to its reference years."""
+
+_HELD = "hazard_distribution"
+"""`HazardNoise(..., hold="hazard_distribution")` ranked each row's hazard."""
+
+_UNRECORDED = "the combined loss"
+"""A stand-in column for a combined loss whose hazards a view doesn't record."""
+
+
+def _view_columns(sample: OutcomeSample) -> frozenset[str]:
+    """The columns that every row of a one-asset, one-hazard sample reads.
+
+    That one column, unless the sample is a `component(name, loss="combined")`
+    view: its loss reads the hazards with an impact too, which its
+    `source_lineages` keeps. A view that doesn't keep them counts as reading
+    several.
+    """
+    for step in reversed(sample.provenance.selection):
+        if step.get("kind") != "component":
+            continue
+        if step.get("loss") != "combined":
+            break
+        read = sample.provenance.source_lineages
+        return frozenset({str(step.get("name")), *(read or (_UNRECORDED,))})
+    return frozenset(sample.asset_ids)
+
+
+def _impact_columns(sample: OutcomeSample) -> frozenset[str]:
+    """The hazards that the combined loss of a sample of several hazards reads."""
+    components = sample.index_components
+    assert components is not None
+    return frozenset(
+        name for name, component in components.items() if component.own_loss is not None
+    )
+
+
+def _index_columns(index: IndexDefinition | CompositeIndex) -> frozenset[str]:
+    if isinstance(index, CompositeIndex):
+        return frozenset(index.components)
+    return frozenset({index.hazard_name})
+
+
+def _cover_columns(cover: Cover, sample: OutcomeSample, asset: str) -> frozenset[str]:
+    """The columns that the row of `cover` at `asset` reads: its index and loss."""
+    if sample.index_components is not None:
+        return _index_columns(cover.index_definition) | _impact_columns(sample)
+    if len(sample.asset_ids) > 1:
+        return frozenset({asset})
+    return _view_columns(sample)
+
+
+def _reads(entry: _Entry, run: _Run) -> list[frozenset[str]]:
+    """The columns each row of `entry` reads, in the order of `_arrays`.
+
+    A column is an asset of a sample of several assets, a hazard of a sample
+    of several hazards, and the one column of any other sample. A `"total"`
+    row reads its parts' columns, and so do a joint design's rows, whose
+    allocated rows share the total payout.
+    """
+    sample = run.sample
+    if isinstance(entry, _Item):
+        return [_cover_columns(entry.cover, sample, sample.asset_ids[0])]
+    if isinstance(entry, _CoverSet):
+        parts = [
+            _cover_columns(entry.items[asset].cover, sample, asset)
+            for asset in sample.asset_ids
+        ]
+        return [*parts, frozenset().union(*parts)]
+    if isinstance(entry, CoverPackage):
+        impacts = _impact_columns(sample)
+        parts = [frozenset({name}) | impacts for name in entry._items]
+        return [*parts, frozenset().union(*parts)]
+    every = frozenset().union(
+        *(
+            _cover_columns(entry.design.covers[asset], sample, asset)
+            for asset in sample.asset_ids
+        )
+    )
+    return [every] * (1 if run.allocation is None else 1 + len(sample.asset_ids))
+
+
+def _held_columns(sample: OutcomeSample, names: frozenset[str]) -> frozenset[str]:
+    """The columns among `names` whose hazard at the asset was ranked over the rows.
+
+    The sample's own basis-risk model applies to every column; on a join, each
+    part's applies to its asset.
+    """
+    document = sample.provenance.to_document()
+    if not _holds_hazard_distribution(document):
+        return frozenset()
+    own = document.get("parts") or document.get("components")
+    if own is None or _holds_hazard_distribution(
+        {"basis_risk": document.get("basis_risk")}
+    ):
+        return names
+    return frozenset(
+        name for name in names if name in own and _holds_hazard_distribution(own[name])
+    )
+
+
+def _built_together(entry: _Entry, run: _Run) -> list[frozenset[str]]:
+    """How each row of `entry` reads rows built together, in the order of `_arrays`.
+
+    `"empirical_copula"` when an `EmpiricalCopula` dealt the block's columns
+    and the row reads two of them or more; `"hazard_distribution"` when a
+    column the row reads holds the held form of `HazardNoise`. Empty when the
+    row reads neither.
+    """
+    reads = _reads(entry, run)
+    dealt = _reorders_by_reference(run.sample.provenance.to_document())
+    held = _held_columns(run.sample, frozenset().union(*reads))
+    return [
+        frozenset(
+            kind
+            for kind, flagged in (
+                (_DEALT, dealt and len(read) > 1),
+                (_HELD, bool(read & held)),
+            )
+            if flagged
+        )
+        for read in reads
+    ]
+
+
 @dataclass(frozen=True, eq=False)
 class _Read:
     """One row of a comparison, and how a replicate sets its premium.
@@ -257,10 +391,15 @@ class _Read:
 
 @dataclass(frozen=True, eq=False)
 class _Evaluated:
-    """A comparison table and what resampling its rows needs."""
+    """A comparison table and what resampling its rows needs.
+
+    `together` holds, for each of `reads`, how its rows were built together
+    (`_built_together`).
+    """
 
     table: Any
     reads: tuple[_Read, ...]
+    together: tuple[frozenset[str], ...]
     probability: FloatArray
     year: IntArray
     n_years: int
@@ -667,6 +806,7 @@ class _PooledRows:
     designs: dict[str, dict[str, Any]]
     row_records: list[dict[str, Any]]
     package_records: list[dict[str, Any]]
+    together: list[frozenset[str]]
 
 
 def _record_pooled(
@@ -737,6 +877,9 @@ def _pool_entry_rows(
     """Add the pooled rows of one entry."""
     groups = [_rows(item, run) for item, run in zip(entry.folds, runs, strict=True)]
     drawn = [_arrays(item, run) for item, run in zip(entry.folds, runs, strict=True)]
+    built = [
+        _built_together(item, run) for item, run in zip(entry.folds, runs, strict=True)
+    ]
     if any(_shape(group) != _shape(groups[0]) for group in groups):
         raise EvaluationError(
             "an entry's items must give the same rows on every fold: the same "
@@ -764,6 +907,10 @@ def _pool_entry_rows(
         flags = _short_blocks(options, identity["n_rows"])
         collected.rows.append({**identity, **flags, **metrics})
         collected.reads.append(read)
+        # A pooled row reads every fold's rows, so it reads any fold's built together.
+        collected.together.append(
+            frozenset().union(*(each[position] for each in built))
+        )
         identities.append(identity)
         if not entry.given:
             _record_pooled(fold_rows, identity, collected)
@@ -886,7 +1033,7 @@ def _pooled(
     n_rows = sum(len(test) for test in tests)
     probability = np.full(n_rows, 1.0 / n_rows, dtype=np.float64)
     sample_hash = _folds_hash(test.content_hash for test in tests)
-    collected = _PooledRows([], [], {}, {}, [], [])
+    collected = _PooledRows([], [], {}, {}, [], [], [])
     for entry in pooled:
         _pool_entry_rows(
             entry,
@@ -913,6 +1060,7 @@ def _pooled(
     return _Evaluated(
         table=pa.Table.from_pylist(collected.rows, schema=schema),
         reads=tuple(collected.reads),
+        together=tuple(collected.together),
         probability=probability,
         year=positions.astype(np.int64),
         n_years=int(distinct.size),
@@ -1030,6 +1178,9 @@ def _block(
     groups = _apply_premiums(premiums, [_rows(entry, run) for entry in checked])
     rows = [row for group in groups for row in group]
     drawn = [each for entry in checked for each in _arrays(entry, run)]
+    together = tuple(
+        kinds for entry in checked for kinds in _built_together(entry, run)
+    )
     reads = tuple(
         _block_read(row, arrays, run.pricing)
         for row, arrays in zip(rows, drawn, strict=True)
@@ -1045,6 +1196,7 @@ def _block(
     return _Evaluated(
         table=table,
         reads=reads,
+        together=together,
         probability=probability,
         year=positions.astype(np.int64),
         n_years=int(distinct.size),
@@ -1142,6 +1294,7 @@ def _interval_table(
     # to_long orders its rows by metric column, then by the wide rows.
     null = (np.isnan(low) | point_null).ravel(order="F")
     flags = [_short_block(column, n_rows) for column in columns]
+    together = [bool(kinds) for kinds in evaluated.together]
 
     long = to_long(wide)
     n_long = long.num_rows
@@ -1172,6 +1325,10 @@ def _interval_table(
                 [flag for flag in flags for _ in range(wide.num_rows)], pa.bool_()
             ),
         ),
+        (
+            pa.field("built_together", pa.bool_()),
+            pa.array([flag for _ in columns for flag in together], pa.bool_()),
+        ),
     )
     for field, values in additions:
         long = long.append_column(field, values)
@@ -1191,6 +1348,11 @@ def _interval_table(
                     if flag
                 ],
                 "unit": evaluated.unit,
+                "built_together": [
+                    kind
+                    for kind in _BUILT_TOGETHER
+                    if any(kind in kinds for kinds in evaluated.together)
+                ],
             },
         ),
         rng=(*metadata.rng, {**record, "sample_hash": sample_hashes[0]}),
@@ -1311,17 +1473,23 @@ def bootstrap_intervals(
     - `short_block`: true when the column's level reaches the block's worst row,
       (1 - beta) * n <= 1 or T > n with n the rows the metric reads, and null
       for a column with no level. Such bounds cannot reach beyond the block's
-      largest rows, so they understate how far the number could move.
+      largest rows, so they understate how far the number could move;
+    - `built_together`: true when the wide row reads rows built together: on an
+      `EmpiricalCopula` block, a row that reads two of its columns or more (an
+      asset or a hazard each; a `"total"` row, a joint design's rows, and on a
+      sample of several hazards a row whose index and combined loss read two
+      hazards or more), and any row that reads a column built with
+      `HazardNoise(..., hold="hazard_distribution")`. A pooled row is flagged
+      when a fold's row is. `setup.intervals.built_together` lists how the
+      flagged rows were built, `"empirical_copula"` and `"hazard_distribution"`.
 
     An interval describes how much a number moves with the years drawn. It
     leaves out uncertainty in the hazard data, the impact function and the
     design, and on a curve block it is the Monte Carlo error of the draws and
     says nothing about the curve. Two rows' intervals are not a test of a
-    difference between them. On an `EmpiricalCopula` block, a row that reads
-    several assets or hazards, and every row of a block built with
-    `HazardNoise(..., hold="hazard_distribution")`, read rows that were built
-    together, so there an interval can be narrower or wider than the Monte
-    Carlo error of the draws (the module docstring says why).
+    difference between them. On the rows with `built_together` true an
+    interval can be narrower or wider than the Monte Carlo error of the draws
+    (the module docstring says why), and the setup text says so.
 
     The table holds an `EvaluationMetadata` under the same key as a
     comparison's, with `setup.intervals`, and `write_comparison` writes it.
