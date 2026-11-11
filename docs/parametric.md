@@ -37,7 +37,7 @@ There are two ways to use the module:
 | Loss model | `LossModel` | loss = impact(hazard) × asset value |
 | Basis-risk model | `HazardNoise`, `ImpactNoise`, `NoBasisRisk`, or an index series read elsewhere | How the index and the loss differ |
 | Objective | `MSE`, `ExpectedUncovered`, `WeightedCVaR`, `UserObjective` | What a design minimises |
-| Pricing and constraints | `PurePremium`, `CostOfCapitalLoad`, `Budget`, `Limit` | The premium of a payout, and what a design must respect |
+| Pricing and constraints | `PurePremium`, `CostOfCapitalLoad`, `ExpectedPayoutMultiple`, `Budget`, `Limit` | The premium of a payout ([pricing](#pricing-and-the-premium-used)), and what a design must respect |
 | Design | `design`, `DesignResult` | A template's resolved cover and its design record |
 | Scope | `Individual()`, `Joint()` | Whether each asset's cover is designed on its own or several together, for one objective on the owner's total ([joint design](#joint-design-over-several-assets)) |
 | Comparison | `compare`, a `pyarrow.Table` | Covers as rows, metrics as columns, in and out of sample |
@@ -231,7 +231,7 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
   .covers(*covers)                            # resolved covers and templates
   .objective(*objectives, pricing=None, budget=None, limit=None,
              options=DesignOptions())         # to design the templates
-  .pricing(PurePremium() | CostOfCapitalLoad(rate, q))   # optional
+  .pricing(pricing)                           # optional: one pricing for every premium
   .split(FreshDraws(n_draws, seed=...) | Holdout(train_fraction) | KFold(k))
   .metrics(MetricOptions(...))                # optional
   .scopes(Individual() | Joint())             # optional; default Individual()
@@ -288,7 +288,7 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
 | `.basis_risk(model)` | How index and loss differ: `HazardNoise(sigma)`, `ImpactNoise(sigma, upper=...)`, `NoBasisRisk()` (warns with `ComonotoneIndexWarning`) or a `BasisRisk` of your own ([what each can change](#basis-risk-models)). Required: no model is assumed |
 | `.covers(*covers)` | The covers to compare. A template is designed; a resolved cover is evaluated as it is. A cover written for no asset applies to every asset, as a copy written for that asset; one written for an asset applies to it only. Each cover pays in the loss unit, on an index read at the asset (`AtAsset()`), in the hazard's unit, or as [`.index(...)`](#an-index-read-elsewhere) states |
 | `.objective(*objectives, pricing, budget, limit, options)` | Designs every template under each objective, with `design`'s terms. `pricing` is the plan's pricing, below |
-| `.pricing(pricing)` | The plan's pricing, `PurePremium()` or `CostOfCapitalLoad(rate, q)`, for a plan of resolved covers that has no `.objective(...)` |
+| `.pricing(pricing)` | The plan's pricing, `PurePremium()`, `CostOfCapitalLoad(rate, q)` or `ExpectedPayoutMultiple(multiple, expense)` ([pricing](#pricing-and-the-premium-used)), for a plan of resolved covers that has no `.objective(...)` |
 | `.split(rule)` | `FreshDraws(n_draws, seed=...)` (fitted curves), `Holdout(train_fraction)` or `KFold(k)`, below |
 | `.metrics(options)` | The `MetricOptions` of every row |
 | `.scopes(*scopes)` | `Individual()`, the default, designs each asset on its own; `Joint()` designs each template on the owner's total ([joint design](#joint-design-over-several-assets)) |
@@ -1754,8 +1754,25 @@ compared.
 
 ### Pricing and the premium used
 
-`PurePremium()` prices P = E[π]. `CostOfCapitalLoad(rate, q)` prices
-P = (1 − rate) · E[π] + rate · CVaR_q(π), with rate in [0, 1] and q in (0, 1).
+A pricing prices a cover's premium P from its payouts π on a sample, for one
+contract and one year:
+
+| Pricing | P | Terms | In a design |
+| --- | --- | --- | --- |
+| `PurePremium()` | E[π] | none | the budget is one linear row in the amounts |
+| `CostOfCapitalLoad(rate, q)` | (1 − rate) · E[π] + rate · CVaR_q(π) | rate ∈ [0, 1], q ∈ (0, 1) | convex in π: the CVaR enters in the Rockafellar–Uryasev form, with n + 1 more columns and n more rows for n draws |
+| `ExpectedPayoutMultiple(multiple, expense=0.0)` | multiple · E[π] + expense | multiple ≥ 1; expense ≥ 0, a fixed amount in the payout unit | linear in π: one row, multiple · E[π] ≤ bound − expense, so an MSE design stays a QP in the amounts only |
+
+`ExpectedPayoutMultiple` is the price an insurer or a broker usually states
+first: a multiple of the expected payout, plus a fixed expense per contract and
+year. `multiple` has no default; `ExpectedPayoutMultiple(1.0)` prices what
+`PurePremium()` prices, under another document and so another design id. Its
+expense is paid by each contract: the `"total"` row of a set of covers sums
+their premiums, one expense per cover, and a joint design, one contract on the
+total, pays it once. Every pricing has a JSON document (`to_document()`), which
+the design record and the comparison's metadata hold, and the setup text states
+it with its terms.
+
 The premium a row uses is, in this order:
 
 - the `premium=` argument of `evaluate` (`premium_basis` `"stated"`);
@@ -2156,12 +2173,20 @@ function does not, so give each function its own name.
 
 ### Pricing and constraints
 
-- The premium is priced on the design sample with `pricing`: `PurePremium()`
-  or `CostOfCapitalLoad(rate, q)`. The cost-of-capital premium is convex in
-  the payout, so the design stays an LP or a QP; its CVaR enters in the
-  Rockafellar–Uryasev form too.
+- The premium is priced on the design sample with `pricing`: `PurePremium()`,
+  `CostOfCapitalLoad(rate, q)` or `ExpectedPayoutMultiple(multiple, expense)`
+  ([the pricings](#pricing-and-the-premium-used)). Each is convex in the
+  payout, so the design stays an LP or a QP; the cost-of-capital CVaR enters
+  in the Rockafellar–Uryasev form too.
 - `Budget(ratio=k)` means premium ≤ k · E[L] on the design sample;
   `Budget(amount=B)` means premium ≤ B, in payout units. Exactly one of the two.
+  The premium is the whole price, its loads and any expense included. So under
+  `ExpectedPayoutMultiple(m, e)` a ratio is still the premium's ratio to the
+  expected loss, not the expected payout's: the cover's expected payout is at
+  most (k · E[L] − e) / m. A bound below the expense admits no cover, because a
+  cover that never pays still costs e, and `design` raises
+  `InfeasibleDesignError` before solving, on every route. A bound equal to it
+  buys a cover that never pays.
 - **No objective counts the premium**, so nothing in a design trades premium
   against cover: the budget is a bound you state, not one the design chooses.
   Under E[U] and the weighted CVaR more payout never raises the objective, so a
@@ -2180,6 +2205,15 @@ function does not, so give each function its own name.
   bound or a `Limit`): without either, any payout at least as large as the loss
   is optimal, and `design` raises `DesignError` before solving. MSE needs
   neither.
+
+```python
+from crc_sdk.parametric import ExpectedPayoutMultiple
+
+loaded = design(template, design_years, ExpectedUncovered(),
+                pricing=ExpectedPayoutMultiple(1.5, expense=25_000.0),
+                budget=Budget(ratio=0.8))
+loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
+```
 
 ### Routes
 
@@ -2229,7 +2263,7 @@ the larger of the bound and the scale). Nothing is returned that fails them.
 
 | Error | When |
 | --- | --- |
-| `InfeasibleDesignError` | no payout meets the constraints, including a fixed amount or a lower bound above the limit, and a grid without a feasible candidate |
+| `InfeasibleDesignError` | no payout meets the constraints, including a fixed amount or a lower bound above the limit, a budget below the pricing's fixed expense, and a grid without a feasible candidate |
 | `UnboundedDesignError` | the solver reports an unbounded objective; never for `MSE()`, which is at least 0, so a QP reported unbounded raises `DesignError` |
 | `SolverLimitError` | a solve stopped at its iteration or time limit before it found an optimum; its `status` names the limit: `"qp_iteration_limit"`, `"time_limit"` or `"active_set_iteration_limit"` |
 | `DesignError` | any other solver status, a failed check, a missing grid, a grid above the cap, E[U] or weighted CVaR without a budget or bounds |

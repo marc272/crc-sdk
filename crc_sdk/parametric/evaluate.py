@@ -163,7 +163,7 @@ from crc_sdk.parametric.metrics import (
     _label as _metric_label,
 )
 from crc_sdk.parametric.payouts import LinearInAmounts, MaxOf, StepGrid, SumOf
-from crc_sdk.parametric.pricing import CostOfCapitalLoad, Pricing, PurePremium
+from crc_sdk.parametric.pricing import Pricing, PurePremium, _check_pricing
 from crc_sdk.parametric.sample import (
     OutcomeSample,
     _check_out_of_sample,
@@ -348,12 +348,7 @@ def _fold(fold: Any) -> int:
 
 
 def _pricing(pricing: Any) -> Pricing:
-    if not isinstance(pricing, (PurePremium, CostOfCapitalLoad)):
-        raise TypeError(
-            "pricing must be PurePremium() or CostOfCapitalLoad(rate, q), "
-            f"got {type(pricing).__name__}"
-        )
-    return pricing
+    return _check_pricing(pricing)
 
 
 def _options(options: Any) -> MetricOptions:

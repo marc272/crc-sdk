@@ -2386,6 +2386,13 @@ def _pricing(pricing: Any, where: str) -> str:
             f"a cost-of-capital load, P = (1 - {rate}) E[payout] + {rate} "
             f"CVaR_{q}(payout)"
         )
+    if pricing.get("kind") == "expected_payout_multiple":
+        multiple = _number(pricing.get("multiple"), f"{where}.pricing.multiple")
+        expense = _number(pricing.get("expense"), f"{where}.pricing.expense")
+        return (
+            "a multiple of the expected payout plus a fixed expense in the payout "
+            f"unit, P = {multiple} E[payout] + {expense}"
+        )
     return str(pricing.get("kind"))
 
 
