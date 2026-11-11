@@ -1074,11 +1074,12 @@ cover.payout_values([45.0, 60.0, 85.0, 140.0])   # array([0., 1000., 5000., 2000
   latitude)`, `AtStation(station_id)` or `AtCell(cell_index)` (an H3 cell).
 - **Aggregation** is optional: it says how one year's values became the year's
   index, such as `"annual_maximum"`. A stated value is free text: it is part of
-  the terms, so the cover document and its hash hold it, and nothing checks
-  it or reads it, since a sample holds one index value per year whatever made
-  it. Left out, the terms don't say, and the document holds `"aggregation":
-  null`. The setup text states no cover's terms, so it reads the same either
-  way.
+  the terms, so the cover document and its hash hold it, and no design or
+  evaluation checks or reads it, since a sample holds one index value per year
+  whatever made it. Left out, the terms don't say, and the document holds `"aggregation":
+  null`. The setup text states no cover's terms, so it says nothing of
+  aggregation: it names a design's template by its label and the start of its
+  hash, which differs with and without one.
 - **Cover:** `Cover(index, payout, *, payout_unit, asset_id=None, label=None)`.
   The payout's `tail` must equal the index's. `label` is a display name only.
 
