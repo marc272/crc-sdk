@@ -6,7 +6,7 @@ import copy
 import json
 import re
 from collections.abc import Mapping
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -17,9 +17,23 @@ from crc_sdk.parametric.errors import (
     SampleError,
     UnresolvedParameterError,
 )
-from crc_sdk.parametric.index import CompositeIndex, IndexDefinition
+from crc_sdk.parametric.index import (
+    CompositeIndex,
+    IndexDefinition,
+    _index_words,
+    _unit_words,
+)
 from crc_sdk.parametric.parameters import Free, _resolve_values
-from crc_sdk.parametric.payouts import PayoutFunction, _index_values, _payout_reader
+from crc_sdk.parametric.payouts import (
+    Axis,
+    PayoutFunction,
+    _free_words,
+    _index_values,
+    _most_words,
+    _payout_reader,
+    _payout_words,
+    _Words,
+)
 
 __all__ = [
     "COMPOSITE_COVER_SCHEMA_VERSION",
@@ -314,6 +328,90 @@ class Cover:
                 f"payout {self._payout.kind!r} returned negative or non-finite values"
             )
         return payout
+
+    def terms_text(self) -> str:
+        """Return the cover's terms in plain text, for a report or a broker.
+
+        One statement a line, in this order:
+
+        - `Label`, when the cover has one: a display name, not a term;
+        - `Asset`: the asset the cover is written for, or that it names none;
+        - `Index`: the hazard, its unit, where it is read, its severe side,
+          the aggregation and the source, saying plainly when the terms state
+          no aggregation or source; on a `CompositeIndex`, one indented line
+          per component, in order;
+        - `Payout per year`: the payout unit and the family, with its `kind`,
+          then one indented line per band, knot or cell, from nothing to the
+          most severe, in index and payout units. A value equal to a threshold
+          belongs to the more severe band. A `SumOf` or `MaxOf` gives each
+          component's payout under its name, a `StepGrid` one line per cell,
+          and a family of your own (or a subclass of a built-in one) its
+          parameters as it names them;
+        - `Most paid in a year`: the largest amount the terms pay, which a
+          `LinearPayout` calls its limit, or why it is not known yet;
+        - `Free parameters`: none, or, on a template, each free parameter's
+          bounds and grid, in its unit. A free value appears in the lines
+          above by its name, as `free_parameters()` lists it;
+        - `Hash`: `definition_hash`, with the document's schema and semantics
+          versions.
+
+        Numbers are spelled exactly as the cover document holds them, grouped
+        by thousands and without an exponent, so the text states the terms
+        that the hash identifies. A rounded amount is another contract: build
+        the cover with it, and it has its own hash.
+
+        The text is a view of the terms: it depends only on them and the
+        label, so the same cover gives the same text, and it reads or writes
+        nothing.
+        """
+        index = self._index
+        lines = (
+            []
+            if self._label is None
+            else [f"Label: {self._label} (a display name, not part of the terms)"]
+        )
+        lines.append(
+            f"Asset: {'not named' if self._asset_id is None else self._asset_id}"
+        )
+        axes: dict[str, Axis]
+        if isinstance(index, CompositeIndex):
+            lines.append(f"Index: {len(index.names)} components, in this order")
+            lines += [
+                f"  - {name}: {_index_words(component)}"
+                for name, component in index.components.items()
+            ]
+            axes = {
+                name: (name, component.unit)
+                for name, component in index.components.items()
+            }
+        else:
+            lines.append(f"Index: {_index_words(index)}")
+            axes = {"index": (index.hazard_name, index.unit)}
+        words = _Words(self._payout_unit)
+        head, items = _payout_words(self._payout, words, axes)
+        lines.append(f"Payout per year, {_unit_words(self._payout_unit)}: {head}")
+        lines += [f"  {item}" for item in items]
+        lines.append(
+            f"Most paid in a year: {_most_words(self._payout, self._payout_unit)}"
+        )
+        free = self.free_parameters()
+        if not free:
+            lines.append("Free parameters: none")
+        else:
+            lines.append(
+                "Free parameters: a design chooses them, and the cover pays nothing "
+                "until they are resolved"
+            )
+            parameters = self._payout.parameters()
+            for name in free:
+                value, unit = words.free.get(name, (parameters[name], None))
+                lines.append(f"  - {name}: {_free_words(cast(Free, value), unit)}")
+        lines.append(
+            f"Hash: {self._hash}, of the cover document (schema "
+            f"{self._document['schema_version']}, semantics "
+            f"{COVER_SEMANTICS_VERSION})"
+        )
+        return "\n".join(lines)
 
     def to_document(self) -> dict[str, Any]:
         """Return a copy of the cover document, as plain JSON types."""
