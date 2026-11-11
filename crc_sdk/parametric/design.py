@@ -15,7 +15,8 @@ built-in family is) has its amounts solved exactly:
   the Rockafellar-Uryasev form;
 - MSE: one quadratic programme in the amounts (`route="qp"`);
 - a cost-of-capital premium adds the Rockafellar-Uryasev auxiliaries of the
-  premium's CVaR to either;
+  premium's CVaR to the LP. The QP stays one in the amounts, and cutting
+  planes on the premium's CVaR add the budget (see **Solver**);
 - a premium that is a multiple of the expected payout plus an expense
   (`ExpectedPayoutMultiple`) keeps the budget one linear row in the amounts,
   `multiple * E[payout] <= bound - expense`, so the QP stays one in the
@@ -35,17 +36,28 @@ objective at every candidate is kept (`DesignResult.profile`).
 `crc-sdk[parametric]` (`pip install crc-sdk[parametric]`), imported only
 when needed; without it they raise `SolverUnavailableError`. A grid
 evaluated in numpy needs no solver. HiGHS's active-set QP solver can cycle
-at a degenerate vertex of a small QP, and has reported a bounded one
-unbounded (on Windows, corrupting the process's heap). So a QP of at most 100
-columns (one per amount, unless a cost-of-capital premium adds a column per
-draw) is solved by a dense active-set method in numpy, whose steps at a
+at a degenerate vertex of a QP, and has reported a bounded one unbounded (on
+Windows, corrupting the process's heap). So a QP of at most 100 columns (one
+per amount) is solved by a dense active-set method in numpy, whose steps at a
 degenerate vertex are LPs solved by HiGHS's simplex. A larger QP goes to
 HiGHS with an iteration and a time limit; when HiGHS stops at its limit, or
 ends with any outcome but optimal or infeasible, a QP of at most 500 columns
-is solved again by the dense method. `DesignResult.solved_by` says which
-method solved the design (`"highs"` or `"active_set"`) and `fallbacks` how
-many of its solves the dense method finished after HiGHS failed. A solve
-that stops at a limit raises `SolverLimitError`, which names the limit.
+is solved again by the dense method.
+
+An MSE design under a cost-of-capital budget is solved by cutting planes on
+the premium's CVaR, which is convex and piecewise linear in the amounts:
+each step solves the QP in the amounts, as above, with the budget's cuts
+found so far, and adds the cut of its solution's tail (the largest `1 - q`
+of the payout's probability), until the solution's premium exceeds the
+budget by at most 1e-9 of the larger of the scale and the budget. Each QP
+relaxes the budget, so the design's MSE is at most the optimum. The QPs have
+one column per amount, not one per draw, so they reach HiGHS's QP solver only
+with more than 100 amounts. The method stops after 1,000 QPs.
+
+`DesignResult.solved_by` says which method solved the design (`"highs"`,
+`"active_set"` or `"cutting_planes"`) and `fallbacks` how many of its solves
+the dense method finished after HiGHS failed. A solve that stops at a limit
+raises `SolverLimitError`, which names the limit.
 
 **Scaling.** Losses and payouts are divided by the largest loss of a draw
 (1 if that is at most 1e-6) before solving; results are in payout units.
@@ -298,11 +310,13 @@ class DesignResult:
     - `solver` (`{"name", "version"}`, or `None` for a grid in numpy),
       `status`, `solver_message`, `iterations`, `solves`, `seconds` (solver
       time) and `solver_options`.
-    - `solved_by`: what solved the design's amounts, `"highs"` or
+    - `solved_by`: what solved the design's amounts, `"highs"`,
       `"active_set"` (the dense method of a small QP, or of one that HiGHS
-      left unsolved), or `None` for a grid in numpy; `fallbacks`: how many
-      of the design's solves the dense method finished after HiGHS failed,
-      over every candidate of a grid.
+      left unsolved) or `"cutting_planes"` (MSE under a cost-of-capital
+      budget), or `None` for a grid in numpy; `fallbacks`: how many of the
+      design's solves the dense method finished after HiGHS failed, over
+      every candidate of a grid (a cutting-plane solve counts once, however
+      many of its QPs did).
     - The non-uniqueness report: `unidentified` amounts and the `fill` rule
       that set them, `zeroed` amounts, `ranges` (wide ranges in payout
       units, with `ranges=True` on the LP route), `unique`, `ties`, and the
@@ -626,10 +640,13 @@ def _lower_triangle(matrix: FloatArray, n_columns: int) -> _solver.SparseColumns
 
 def _programme(
     basis: FloatArray, constraints: LinearConstraints, context: _Context
-) -> tuple[_solver.Programme, Literal["lp", "qp"]]:
+) -> tuple[_solver.Programme, Literal["lp", "qp"], _solver.CVaRRow | None]:
     """Build the LP or QP over the amounts, in scaled units.
 
-    The amounts are the first columns, in `amount_names()` order.
+    The amounts are the first columns, in `amount_names()` order. An MSE
+    design under a cost-of-capital budget gets a QP in the amounts only,
+    without the budget, and the budget as a `CVaRRow`, which cutting planes
+    add (`_solver.solve_qp_cvar`); every other design gets no such row.
     """
     n, k = basis.shape
     scale = context.scale
@@ -641,6 +658,7 @@ def _programme(
     route: Literal["lp", "qp"]
     hessian: _solver.SparseColumns | None = None
     offset = 0.0
+    tail_row: _solver.CVaRRow | None = None
     if isinstance(objective, MSE):
         route = "qp"
     else:
@@ -662,7 +680,22 @@ def _programme(
     if context.bound is not None:
         expected = p @ basis
         pricing = context.pricing
-        if isinstance(pricing, CostOfCapitalLoad) and pricing.rate > 0.0:
+        if (
+            isinstance(pricing, CostOfCapitalLoad)
+            and pricing.rate > 0.0
+            and route == "qp"
+        ):
+            # The premium's CVaR stays out of the QP, which keeps one column
+            # per amount; cutting planes add it.
+            tail_row = _solver.CVaRRow(
+                linear=(1.0 - pricing.rate) * expected,
+                basis=basis,
+                probability=p,
+                q=pricing.q,
+                weight=pricing.rate,
+                upper=context.bound / scale,
+            )
+        elif isinstance(pricing, CostOfCapitalLoad) and pricing.rate > 0.0:
             rate, q = pricing.rate, pricing.q
             eta = builder.variables(1, -math.inf, math.inf, 0.0)
             tail = builder.variables(n, 0.0, math.inf, 0.0)
@@ -694,7 +727,7 @@ def _programme(
         builder.cost[0] = -2.0 * (weighted.T @ loss)
         hessian = _lower_triangle(2.0 * gram, builder.n_columns)
         offset = math.fsum((p * loss**2).tolist())
-    return builder.programme(hessian=hessian, offset=offset), route
+    return builder.programme(hessian=hessian, offset=offset), route, tail_row
 
 
 # -- solving -----------------------------------------------------------------
@@ -708,14 +741,18 @@ def _solve(
     options: Mapping[str, Any] | None = None,
     *,
     keep_basis: bool = False,
+    tail_row: _solver.CVaRRow | None = None,
 ) -> _solver.Solution:
     """Solve; raise the typed error of any status other than optimal.
 
-    With `keep_basis`, an LP's solution carries its optimal basis. The QP
-    route's objective, a mean squared error, is bounded below by 0.
+    With `keep_basis`, an LP's solution carries its optimal basis. A QP with
+    a `tail_row` is solved by cutting planes. The QP route's objective, a
+    mean squared error, is bounded below by 0.
     """
 
     def run(chosen: Mapping[str, Any] | None) -> _solver.Solution:
+        if tail_row is not None:
+            return _solver.solve_qp_cvar(programme, tail_row, chosen)
         if route == "qp":
             return _solver.solve_qp(programme, chosen)
         return _solver.solve_lp(programme, chosen, keep_basis=keep_basis)
@@ -1122,9 +1159,11 @@ def _solve_block(
             "bounded amounts (a Free upper bound or a Limit): without either, any "
             "payout at least as large as the loss is optimal",
         )
-    programme, route = _programme(basis, constraints, context)
+    programme, route, tail_row = _programme(basis, constraints, context)
     ranging = report and route == "lp" and context.options.ranges
-    solution = _solve(programme, route, context, solves, keep_basis=ranging)
+    solution = _solve(
+        programme, route, context, solves, keep_basis=ranging, tail_row=tail_row
+    )
     assert solution.values is not None and solution.objective is not None
     edges, other = _order_edges(constraints)
     amounts = _repair(solution.values[: len(names)] * context.scale, constraints, edges)
@@ -1431,6 +1470,14 @@ def _solver_options(route: Literal["lp", "qp"], ranging: bool) -> dict[str, Any]
                 "first_columns": _solver.ACTIVE_SET_FIRST_COLUMNS,
                 "max_columns": _solver.ACTIVE_SET_MAX_COLUMNS,
                 "iteration_limit": _solver.ACTIVE_SET_ITERATION_LIMIT,
+            }
+            if route == "qp"
+            else None
+        ),
+        "cutting_planes": (
+            {
+                "tolerance": _solver.CUTTING_PLANE_TOLERANCE,
+                "limit": _solver.CUTTING_PLANE_LIMIT,
             }
             if route == "qp"
             else None

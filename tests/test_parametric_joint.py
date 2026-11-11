@@ -1004,3 +1004,87 @@ def test_a_joint_lp_design_is_solved_by_highs() -> None:
     )
     assert (result.solved_by, result.fallbacks) == ("highs", 0)
     assert result.solver_options["active_set"] is None
+
+
+# -- MSE under a cost-of-capital budget: cutting planes ------------------------
+
+
+def _no_highs_qp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail the test if a QP reaches HiGHS's QP solver; its LPs run as they are."""
+    real = _solver._run
+
+    def run(programme: _solver.Programme, *args: Any) -> _solver.Solution:
+        assert programme.hessian is None, "a QP reached HiGHS's QP solver"
+        return real(programme, *args)
+
+    monkeypatch.setattr(_solver, "_run", run)
+
+
+def test_a_joint_mse_design_under_a_loaded_premium_is_solved_by_cutting_planes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # As in test_a_loaded_premium_is_priced_on_the_total_payout, the premium
+    # is (a + b) / 8 + max(a, b) / 2, and the MSE is ((60 - a)^2 + (60 -
+    # b)^2) / 4: symmetric and strictly convex, so the optimum under a budget
+    # of 15 is a = b, where 3a/4 = 15. The CVaR's tail is A's year or B's, so
+    # the cutting planes need the cuts of both.
+    _no_highs_qp(monkeypatch)
+    sample = _sample(
+        [[0.0, 0.0], [3.0, 0.0], [0.0, 3.0], [0.0, 0.0]],
+        [[0.0, 0.0], [60.0, 0.0], [0.0, 60.0], [0.0, 0.0]],
+    )
+    result = design_joint(
+        _pair(),
+        sample,
+        MSE(),
+        pricing=CostOfCapitalLoad(0.5, 0.75),
+        budget=Budget(amount=15.0),
+    )
+    assert (result.route, result.solved_by, result.fallbacks) == (
+        "qp",
+        "cutting_planes",
+        0,
+    )
+    assert _level(result, "A") == pytest.approx(20.0, rel=1e-9)
+    assert _level(result, "B") == pytest.approx(20.0, rel=1e-9)
+    assert result.premium == pytest.approx(15.0, rel=1e-9)
+    assert result.objective_value == pytest.approx(800.0, rel=1e-9)
+    assert result.solver_message == (
+        "Optimal (cutting planes: QP 3, 2 cuts; the last QP: Optimal (active set))"
+    )
+    record = result.to_record()
+    assert record["solve"]["solved_by"] == "cutting_planes"
+    assert record["solve"]["options"]["cutting_planes"] is not None
+
+
+def test_a_joint_design_of_a_thousand_years_never_reaches_highs_qp_solver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Three assets of six levels each: with the premium's CVaR in the
+    # Rockafellar-Uryasev form the QP had 1,019 columns and went to HiGHS's
+    # QP solver. The covers designed asset by asset are a feasible point of
+    # the joint problem (see the ratio-budget test above), so the joint
+    # optimum is at most their MSE on the total.
+    _no_highs_qp(monkeypatch)
+    book = _book(4, n=1000)
+    template = Cover(
+        INDEX,
+        StepPayout((25.0, 30.0, 36.0, 43.0, 51.0, 60.0), [Free() for _ in range(6)]),
+        payout_unit="EUR",
+    )
+    pricing = CostOfCapitalLoad(0.06, 0.95)
+    budget = Budget(ratio=0.2)
+    joint = design_joint([template] * 3, book, MSE(), pricing=pricing, budget=budget)
+    assert (joint.solved_by, joint.fallbacks) == ("cutting_planes", 0)
+    assert joint.budget_bound is not None
+    assert joint.premium <= joint.budget_bound * (1.0 + 1e-9)
+    assert joint.budget_use == pytest.approx(1.0, rel=1e-9)
+    individual = [
+        design(template, book.asset(asset), MSE(), pricing=pricing, budget=budget)
+        for asset in book.asset_ids
+    ]
+    assert {result.solved_by for result in individual} == {"cutting_planes"}
+    payout = _total_payout([result.cover for result in individual], book)
+    total_loss = book.loss.sum(axis=1)
+    at_the_point = MSE().value(total_loss, payout, book.probability)
+    assert joint.objective_value <= at_the_point * (1.0 + 1e-9)
