@@ -2064,8 +2064,8 @@ difference between them.
     construction. Every row of a sample of several hazards reads the combined
     loss, so a row is flagged when its index and that loss read two hazards or
     more under an `EmpiricalCopula`. With two impacts or more that is every row.
-    With one, a cover on that hazard alone reads one column and isn't flagged.
-    A view `component(name)` reads one hazard and isn't flagged, and
+    With one impact, a cover on that hazard alone reads one column and isn't
+    flagged. A view `component(name)` reads one hazard and isn't flagged, and
     `component(name, loss="combined")` is flagged when its loss reads another
     hazard.
   - `Independent()` was measured, and isn't flagged. `Comonotonic()` and
@@ -3263,4 +3263,4 @@ rank and no best flag.
   the difference between two rows is not offered.
 - **Intervals that follow how rows were built together.** `bootstrap_intervals`
   resamples the rows of an `EmpiricalCopula` block or a held `HazardNoise` block
-  as independent rows, and flags them with `built_together`.
+  as independent rows, and flags the rows this affects with `built_together`.
