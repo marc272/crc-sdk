@@ -5,6 +5,8 @@
 - `compare(covers, sample, *, split, ...)` returns one row per cover, with
   covers as rows and metrics as columns, the layout of crc-sdk's portfolio
   output.
+- `allocate(designs, sample, *, split, allocation, values, ...)` returns a joint
+  design's allocated rows, in a table of their own.
 - `write_comparison(table, path)` writes a comparison table to one Parquet
   file atomically, with its metadata under `crc.parametric.evaluation`.
 - `to_long(table)` gives the tidy form, one row per cover and metric.
@@ -26,13 +28,17 @@ against the sum of their payouts, draw by draw; the `scope` column says
   the total. It gets no `"asset"` row, because the split of the total payout
   across the assets is the solver's choice and is often not identified.
 
-Per-asset rows of a joint design exist only under a stated `allocation`, with
+Per-asset rows of a joint design exist only under a stated rule, with
 `values=` giving every asset's value: `level="asset_by_value"` shares the total
 payout of each draw in proportion to the values, and `level="asset_by_loss"` in
 proportion to the assets' losses in that draw (by value in a draw without
 loss). An allocation is an accounting statement about the total payout, not
 the payout of an asset's cover; a pricing prices the total payout, so these
-rows have no premium and no net-loss columns.
+rows have no premium and no net-loss columns. They read better or worse per
+asset by the rule's arithmetic, not by the covers, so they never share a table
+with the rows of covers that stand on their own: `allocate` returns them in a
+table of their own, and `allocation=` on `compare` and `evaluate`, which adds
+them after each joint design's `"total"` row, takes joint designs only.
 
 **A sample of several hazards** has `index_components`. Its one asset's rows
 read the loss of the sample, the combined loss, for every cover: a cover with
@@ -93,6 +99,19 @@ reads null there: one asset's draws are the same under every model, and other
 dependence models, per-year samples and a `component(name)` view have no rank
 blocks. A flag says where a number lies inside an assumption, nothing more.
 
+**Short blocks.** On a block of n rows of equal probability, a tail metric at
+beta with `(1 - beta) * n <= 1` reads the top of the block: a CVaR, a tail
+coverage or a CVaR ratio its worst row (with any row tied there), and a VaR its
+largest value, or its second largest where `(1 - beta) * n` is 1. A
+return-period column with `T > n` reads the block's largest value: on 20 years
+a "1-in-250" column is the worst of the 20, not a 1-in-250 value. Beside the
+identity columns each row records one boolean per level of the metric options,
+`short_block_b<beta>` and `short_block_rp<T>`, by the rule of
+`bootstrap_intervals`' `short_block`, with n the rows the row's metrics read
+(`n_rows`) and within 1e-9 for beta. They are true or false on every row; a
+table written before them reads null there. A flag says how far a number can
+reach on its block, nothing more, and the setup text names the flagged levels.
+
 **The breakdown.** `payout_breakdown(covers, sample, *, split, ...)` returns a
 separate table with one row per entry and part: the part's expected payout, its
 share of the entry's and how often it pays. The rows of one entry add up to its
@@ -140,6 +159,8 @@ from crc_sdk.parametric.metadata import (
     _ADDED_SCENARIO_COLUMNS,
     _BLOCK_TAIL_PREFIX,
     _REFERENCE_YEARS_COLUMN,
+    _SHORT_BLOCK_BETA_PREFIX,
+    _SHORT_BLOCK_PERIOD_PREFIX,
     EVALUATION_METADATA_KEY,
     IDENTITY_COLUMNS,
     KEY_COLUMNS,
@@ -148,6 +169,7 @@ from crc_sdk.parametric.metadata import (
     EvaluationMetadata,
     EvaluationSetup,
     _identity_columns,
+    _reaches_worst_row,
     _reference_years,
     _tail_in_one_block,
 )
@@ -185,6 +207,7 @@ __all__ = [
     "EvaluationEntry",
     "PremiumBasis",
     "Split",
+    "allocate",
     "compare",
     "evaluate",
     "payout_breakdown",
@@ -1318,15 +1341,70 @@ def _joint_reads(entry: _JointEntry, sample: OutcomeSample) -> BoolArray | None:
     return _union_reads(parts)
 
 
+@dataclass(frozen=True, eq=False)
+class _JointPayout:
+    """A joint design's total payout on a sample, draw by draw."""
+
+    label: str
+    payout: FloatArray
+    filled: BoolArray | None
+
+
+def _joint_payout(entry: _JointEntry, sample: OutcomeSample) -> _JointPayout:
+    covers = entry.design.covers
+    return _JointPayout(
+        label=_set_label(covers, entry.design.covers_hash),
+        payout=_total_payout(covers, sample),
+        filled=_joint_reads(entry, sample),
+    )
+
+
+def _allocated_rows(
+    entry: _JointEntry, run: _Run, paid: _JointPayout | None = None
+) -> list[dict[str, Any]]:
+    """A joint design's allocated rows under the run's rule, one per asset."""
+    rule, values = run.allocation, run.values
+    assert rule is not None and values is not None
+    design = entry.design
+    sample = run.sample
+    paid = _joint_payout(entry, sample) if paid is None else paid
+    without = [
+        column.name
+        for column in metric_columns(run.options)
+        if column.metric in _NO_PREMIUM_METRICS
+    ]
+    rows: list[dict[str, Any]] = []
+    for asset in sample.asset_ids:
+        row = _identity(
+            run,
+            label=paid.label,
+            cover_hash=design.covers_hash,
+            design=design,
+            asset_id=asset,
+            level=_ALLOCATED_LEVEL[rule],
+            scope="joint",
+            basis=None,
+        )
+        row.update(
+            metric_values(
+                sample.loss[:, sample.asset_ids.index(asset)],
+                _allocated_payout(rule, paid.payout, sample, values, asset),
+                sample.probability,
+                premium=0.0,
+                options=run.options,
+                unidentified=paid.filled,
+            )
+        )
+        row.update(dict.fromkeys(without))
+        rows.append(row)
+    return rows
+
+
 def _joint_rows(entry: _JointEntry, run: _Run) -> list[dict[str, Any]]:
     """The total of a joint design, then its allocated rows, if a rule is set."""
     design = entry.design
     sample = run.sample
-    probability = sample.probability
-    covers = design.covers
-    label = _set_label(covers, design.covers_hash)
-    payout = _total_payout(covers, sample)
-    filled = _joint_reads(entry, sample)
+    paid = _joint_payout(entry, sample)
     basis: PremiumBasis
     if run.premium is not None:
         basis, used = "stated", run.premium
@@ -1334,7 +1412,7 @@ def _joint_rows(entry: _JointEntry, run: _Run) -> list[dict[str, Any]]:
         basis, used = "design", float(design.premium) + 0.0
     total = _identity(
         run,
-        label=label,
+        label=paid.label,
         cover_hash=design.covers_hash,
         design=design,
         asset_id=None,
@@ -1346,46 +1424,16 @@ def _joint_rows(entry: _JointEntry, run: _Run) -> list[dict[str, Any]]:
     total.update(
         metric_values(
             sample.loss.sum(axis=1),
-            payout,
-            probability,
+            paid.payout,
+            sample.probability,
             premium=used,
             options=run.options,
-            unidentified=filled,
+            unidentified=paid.filled,
         )
     )
-    rows = [total]
     if run.allocation is None:
-        return rows
-    assert run.values is not None
-    without = [
-        column.name
-        for column in metric_columns(run.options)
-        if column.metric in _NO_PREMIUM_METRICS
-    ]
-    for asset in sample.asset_ids:
-        row = _identity(
-            run,
-            label=label,
-            cover_hash=design.covers_hash,
-            design=design,
-            asset_id=asset,
-            level=_ALLOCATED_LEVEL[run.allocation],
-            scope="joint",
-            basis=None,
-        )
-        row.update(
-            metric_values(
-                sample.loss[:, sample.asset_ids.index(asset)],
-                _allocated_payout(run.allocation, payout, sample, run.values, asset),
-                probability,
-                premium=0.0,
-                options=run.options,
-                unidentified=filled,
-            )
-        )
-        row.update(dict.fromkeys(without))
-        rows.append(row)
-    return rows
+        return [total]
+    return [total, *_allocated_rows(entry, run, paid)]
 
 
 def _package_label(entry: CoverPackage) -> str:
@@ -1483,10 +1531,51 @@ def _block_values(run: _Run, level: str) -> dict[str, Any]:
     }
 
 
+def _short_block_name(parameter: Mapping[str, float]) -> str | None:
+    """The short-block flag of a metric's level; `None` for a metric without one.
+
+    `short_block_b<beta>` at a beta and `short_block_rp<T>` at a return period,
+    with the metrics' labels, so `cvar_uncovered_b0_99` has `short_block_b0_99`
+    and `loss_rp250` has `short_block_rp250`.
+    """
+    if "beta" in parameter:
+        return f"{_SHORT_BLOCK_BETA_PREFIX}{_metric_label(parameter['beta'])}"
+    if "return_period" in parameter:
+        period = parameter["return_period"]
+        return f"{_SHORT_BLOCK_PERIOD_PREFIX}{_metric_label(period)}"
+    return None
+
+
+def _short_block_levels(
+    columns: Iterable[MetricColumn],
+) -> dict[str, Mapping[str, float]]:
+    """Each short-block flag the metric columns need, with its level, in order.
+
+    The betas come first and the return periods after them, each in the order
+    of the metric options, as the metric columns first name them.
+    """
+    levels: dict[str, Mapping[str, float]] = {}
+    for column in columns:
+        name = _short_block_name(column.parameter)
+        if name is not None:
+            levels.setdefault(name, column.parameter)
+    return levels
+
+
+def _short_blocks(options: MetricOptions, n_rows: int) -> dict[str, bool]:
+    """The short-block flags of a row whose metrics read `n_rows` rows."""
+    return {
+        name: bool(_reaches_worst_row(parameter, n_rows))
+        for name, parameter in _short_block_levels(metric_columns(options)).items()
+    }
+
+
 def _rows(entry: _Entry, run: _Run) -> list[dict[str, Any]]:
-    """The rows of one entry, with their rank-block columns."""
+    """The rows of one entry, with their rank-block and short-block columns."""
+    flags = _short_blocks(run.options, len(run.sample))
     return [
-        {**row, **_block_values(run, row["level"])} for row in _entry_rows(entry, run)
+        {**row, **_block_values(run, row["level"]), **flags}
+        for row in _entry_rows(entry, run)
     ]
 
 
@@ -1527,9 +1616,12 @@ def _schema(
         pa.field("components", pa.string()),
         pa.field("design_budget", pa.float64()),
     ]
+    # One short-block flag per level of the metric columns, after `extra`; a
+    # payout breakdown's columns have no level, so it has none.
+    flags = [pa.field(name, pa.bool_()) for name in _short_block_levels(columns)]
     metrics = [pa.field(column.name, pa.float64()) for column in columns]
     return pa.schema(
-        [*identity, *extra, *metrics],
+        [*identity, *extra, *flags, *metrics],
         metadata={EVALUATION_METADATA_KEY: metadata.to_json()},
     )
 
@@ -1745,6 +1837,30 @@ def _metadata(
     )
 
 
+def _check_allocated(entries: Sequence[_Entry]) -> None:
+    """Raise unless every entry of an allocation is a joint design.
+
+    So a table that holds allocated rows holds no row of a cover that stands
+    on its own beside them.
+    """
+    others = [
+        i for i, entry in enumerate(entries) if not isinstance(entry, _JointEntry)
+    ]
+    if len(others) == len(entries):
+        raise EvaluationError(
+            "allocation= shares out a joint design's total payout, but no entry is "
+            "a joint design"
+        )
+    if others:
+        raise EvaluationError(
+            "allocation= takes joint designs only, so that allocated rows never sit "
+            "beside the rows of covers that stand on their own, but the entries at "
+            f"positions {others} are not joint designs: evaluate them in a call "
+            "without allocation=, and get the allocated rows on their own with "
+            "allocate(...)"
+        )
+
+
 def _prepared(
     entries: Sequence[_Entry],
     sample: OutcomeSample,
@@ -1773,11 +1889,8 @@ def _prepared(
     given = None if design_sample is None else _sample(design_sample, "design_sample")
     rule = _allocation(allocation)
     checked_values = _values(values, rule, sample)
-    if rule is not None and not any(isinstance(e, _JointEntry) for e in entries):
-        raise EvaluationError(
-            "allocation= shares out a joint design's total payout, but no entry is "
-            "a joint design"
-        )
+    if rule is not None:
+        _check_allocated(entries)
     if given is not None:
         if len(sample.asset_ids) == 1:
             _require_one_asset(given, "evaluate and compare")
@@ -2105,15 +2218,21 @@ def evaluate(
     With several assets it is a sample of those assets.
 
     `allocation` (`"value"` or `"loss"`, default none) asks for a joint
-    design's per-asset rows and needs `values`, a mapping from every asset id
-    to its value in the loss unit. Only the hash of the values is written.
+    design's allocated rows after its `"total"` row and needs `values`, a
+    mapping from every asset id to its value in the loss unit. Only the hash
+    of the values is written. It takes joint designs only, so allocated rows
+    never sit beside the rows of covers that stand on their own; `allocate`
+    returns them in a table of their own.
 
     The table has the identity columns (`cover_label`, `cover_hash`,
     `design_id`, `asset_id`, `level`, `scope`, `scenario`, `design_scenario`,
     `pathway`, `horizon`, `product`, `split`, `fold`, `sample_hash`, `n_rows`,
     `premium_basis`, `unique`, `ties`, `degenerate_tail`, `components`,
-    `design_budget`) and one float64 column per metric, null where the metric
-    is undefined. `design_scenario` is the label of the design's own design
+    `design_budget`), then the rank-block columns (`copula_reference_years`,
+    `copula_block_tail_b<beta>`) and the short-block flags
+    (`short_block_b<beta>`, `short_block_rp<T>`, one per level of `options`;
+    see the module docstring), and one float64 column per metric, null where
+    the metric is undefined. `design_scenario` is the label of the design's own design
     sample: null for a cover given as is, and on a `"total"` or `"package"` row
     whose designs don't share one. `pathway`, `horizon` and `product` are what
     the sample's source records state, never its label, and null where they
@@ -2146,9 +2265,9 @@ def evaluate(
     `EvaluationError` (a `ValueError`) for invalid arguments,
     such as an unknown split or allocation, a negative fold or premium, a
     fold that contradicts the sample's k-fold step, an invalid design record,
-    a set mixing covers and designs, an allocation without a joint design or
-    without valid `values`, or `values` without an allocation, and `TypeError`
-    for arguments of the wrong type.
+    a set mixing covers and designs, an allocation of an entry that is not a
+    joint design or without valid `values`, or `values` without an
+    allocation, and `TypeError` for arguments of the wrong type.
     """
     return _table(
         _entries([cover]),
@@ -2183,8 +2302,11 @@ def compare(
     on `sample` with `pricing`. `design_sample` is for the covers given as
     is; each design brings its own, and a `design_sample` that differs from
     it raises `EvaluationError`. Each entry of `covers` is one that `evaluate`
-    takes; `allocation` applies to the joint designs among them, and raises
-    `EvaluationError` if there is none.
+    takes. `allocation` needs every entry to be a joint design, and raises
+    `EvaluationError` otherwise, so a joint design's allocated rows never sit
+    beside the rows of covers that stand on their own; compare the other
+    entries in a call without it, or take the allocated rows on their own
+    from `allocate`.
 
     The table has covers as rows and metrics as columns, in the order of
     `covers`. Its key (`cover_hash`, `design_id`, `asset_id`, `level`,
@@ -2207,6 +2329,111 @@ def compare(
         allocation=allocation,
         values=values,
     )
+
+
+def _joint_entries(designs: Any) -> list[_JointEntry]:
+    """The joint designs of `allocate`; raise for anything else."""
+    if isinstance(designs, (str, bytes, Mapping)) or not isinstance(designs, Sequence):
+        raise TypeError("designs must be a sequence of JointDesignResult")
+    if not designs:
+        raise EvaluationError("allocate needs at least one joint design")
+    for i, design in enumerate(designs):
+        if not isinstance(design, JointDesignResult):
+            raise TypeError(
+                "allocate shares out a joint design's total payout, so designs must "
+                f"hold JointDesignResult objects, got {type(design).__name__} at "
+                f"position {i}; compare evaluates covers and sets of covers"
+            )
+    return [_JointEntry(design, design.to_record()) for design in designs]
+
+
+def allocate(
+    designs: Sequence[JointDesignResult],
+    sample: OutcomeSample,
+    *,
+    split: Split,
+    allocation: Allocation,
+    values: Mapping[str, float],
+    fold: int = 0,
+    options: MetricOptions = MetricOptions(),
+) -> Any:
+    """Share each joint design's total payout out over its assets, in a table.
+
+    Returns a joint design's allocated rows, and nothing else: one row per
+    design and asset, at `level` `"asset_by_value"` or `"asset_by_loss"`. They
+    go in a table of their own, so they never sit beside the `"asset"` rows of
+    covers that stand on their own, or beside the `"total"` row that
+    `compare` gives each joint design. `compare` holds the owner's total, which
+    is what a joint design optimises.
+
+    `designs` are `JointDesignResult`s on `sample`, a sample of their assets.
+    `allocation` is the rule, with no default, because how to share out a
+    total is an accounting choice: `"value"` shares each draw's total payout in
+    proportion to the assets' `values`, and `"loss"` in proportion to their
+    losses in that draw, and to their values in a draw without loss. `values`
+    maps every asset id to its value in the loss unit, as a sample holds none;
+    only the hash of the (asset id, value) pairs is written. `split`, `fold`
+    and `options` are those of `compare`.
+
+    A rule is an accounting statement about the total payout, not the payout
+    of an asset's cover, and the rule is in `level`. The rows have `compare`'s
+    columns, with `premium_basis`, `premium` and the net-loss columns null: a
+    pricing prices the total payout, not a part of it. `expected_loss` and
+    `expected_payout` add up to the total row's under both rules, and
+    `expected_uncovered` under `"loss"` only; the other metrics don't add up.
+    The table's metadata (`crc.parametric.evaluation`) records the rule, and
+    `setup_text` states it; `write_comparison` writes the table to a file of its
+    own, and `to_long` gives its tidy form.
+
+    Raises `EvaluationError` for an empty `designs`, an unknown rule, `values`
+    that miss an asset or hold a negative, non-finite or all-zero value, a
+    design repeated, and as `compare` does for the split and the samples;
+    `TypeError` for an entry that is not a `JointDesignResult` and for
+    arguments of the wrong type.
+    """
+    entries = _joint_entries(designs)
+    if allocation is None:
+        raise EvaluationError(
+            f"allocate needs a rule: allocation= one of {get_args(Allocation)}"
+        )
+    run, evaluation, design_samples = _prepared(
+        entries,
+        sample,
+        split=split,
+        fold=fold,
+        pricing=PurePremium(),
+        premium=None,
+        options=options,
+        design_sample=None,
+        allocation=allocation,
+        values=values,
+    )
+    flags = _short_blocks(run.options, len(run.sample))
+    by_entry = [
+        [
+            {**row, **_block_values(run, row["level"]), **flags}
+            for row in _allocated_rows(entry, run)
+        ]
+        for entry in entries
+    ]
+    rows = [row for group in by_entry for row in group]
+    _describe_rows(evaluation, run, entries, by_entry)
+    # Allocated rows hold no premium: a pricing prices the total payout.
+    evaluation["pricing"] = None
+    _check_keys(rows, KEY_COLUMNS)
+    assert run.values is not None
+    columns = metric_columns(run.options)
+    metadata = _metadata(
+        entries,
+        run.sample,
+        evaluation=evaluation,
+        design_samples=design_samples,
+        options=run.options,
+        columns=columns,
+        values_sha256=_values_hash(run.values),
+    )
+    schema = _schema(columns, metadata, extra=_block_fields(run.options.betas))
+    return pa.Table.from_pylist(rows, schema=schema)
 
 
 def _own_loss_shares(
@@ -2502,6 +2729,28 @@ def _with_added_blocks(table: Any, betas: Iterable[float]) -> Any:
     return table
 
 
+def _with_added_short_blocks(table: Any, options: Mapping[str, Any]) -> Any:
+    """`table` with the short-block flags it was written without, all null.
+
+    A payout breakdown has none, so it is returned as it is.
+    """
+    if "payout_to_loss_ratio" not in table.column_names:
+        return table
+    names = [
+        *(_short_block_name({"beta": beta}) for beta in options.get("betas") or ()),
+        *(
+            _short_block_name({"return_period": period})
+            for period in options.get("return_periods") or ()
+        ),
+    ]
+    for name in names:
+        if name is not None and name not in table.column_names:
+            table = table.append_column(
+                pa.field(name, pa.bool_()), pa.nulls(table.num_rows, pa.bool_())
+            )
+    return table
+
+
 def to_long(table: Any) -> Any:
     """Return the tidy form of a comparison table: one row per metric.
 
@@ -2513,8 +2762,9 @@ def to_long(table: Any) -> Any:
     `payout_frequency` and `unidentified_share` existed reads as null: its
     long form holds them with a null `value`. So does one written before
     `design_scenario`, `pathway`, `horizon`, `product` and `n_rows` existed, or
-    before the rank-block columns existed: its long form holds those columns,
-    null.
+    before the rank-block columns or the short-block flags existed: its long
+    form holds those columns, null. The flags are identity columns, so each
+    long row carries all of them; a row's own is the one at its `parameter`.
 
     Raises `EvaluationError` for a table without comparison metadata or
     with metadata that does not describe it, or for a table of
@@ -2531,9 +2781,13 @@ def to_long(table: Any) -> Any:
     metadata = EvaluationMetadata.from_table(table)
     metadata.check_table(table)
     schema_metadata = table.schema.metadata
-    table = _with_added_blocks(
-        _with_added_identity(_with_added_metrics(table)),
-        metadata.setup.metric_options.get("betas") or (),
+    options = metadata.setup.metric_options
+    table = _with_added_short_blocks(
+        _with_added_blocks(
+            _with_added_identity(_with_added_metrics(table)),
+            options.get("betas") or (),
+        ),
+        options,
     )
     described = {**_added_entries(), **metadata.columns}
     columns = _identity_columns(table.column_names)

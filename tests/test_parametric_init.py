@@ -90,6 +90,7 @@ PUBLIC = [
     "UnresolvedParameterError",
     "UserObjective",
     "WeightedCVaR",
+    "allocate",
     "bootstrap_intervals",
     "compare",
     "compare_pooled",
