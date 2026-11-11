@@ -280,10 +280,18 @@ def test_fresh_draws_with_the_same_reference_pass() -> None:
     [Independent(), Comonotonic(), GaussianCopula(np.eye(3) * 0.5 + 0.5)],
     ids=["independent", "comonotonic", "gaussian"],
 )
-def test_cuts_of_the_other_models_still_pass(model: Any) -> None:
+def test_cuts_of_one_assets_rows_of_the_other_models_still_pass(model: Any) -> None:
     first, second = _whole_years(_assets(model))
-    _check_out_of_sample(first, second)
     _check_out_of_sample(first.asset("site-c"), second.asset("site-c"))
+
+
+def test_cuts_of_every_asset_pass_only_in_draw_order() -> None:
+    first, second = _whole_years(_assets(Independent()))
+    _check_out_of_sample(first, second)
+    for model in (Comonotonic(), GaussianCopula(np.eye(3) * 0.5 + 0.5)):
+        first, second = _whole_years(_assets(model))
+        with pytest.raises(LeakageError, match="depend on the other block"):
+            _check_out_of_sample(first, second)
 
 
 # -- the resampling unit of bootstrap_intervals ------------------------------------

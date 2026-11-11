@@ -45,6 +45,7 @@ from crc_sdk.parametric import (
     Joint,
     JointDesignResult,
     KFold,
+    LeakageError,
     LinearPayout,
     LinearTrend,
     LossModel,
@@ -66,6 +67,7 @@ from crc_sdk.parametric import (
     setup_text,
     year_block_kfold,
 )
+from crc_sdk.parametric.sample import _check_out_of_sample
 from crc_sdk.types import HazardDatasetMetadata, SourceProvenance
 from crc_sdk.workflows import (
     AssetPortfolio,
@@ -859,21 +861,22 @@ def test_an_empirical_copula_plan_equals_the_function_route(dataset: Path) -> No
     assert result.designs[0].parameters == made.parameters
 
 
-def test_a_holdout_of_a_comonotonic_sample_splits_the_draws(dataset: Path) -> None:
+def test_a_joint_holdout_of_a_comonotonic_sample_is_refused(dataset: Path) -> None:
+    # Comonotonic() placed each moved asset's draws by the ranks of every row,
+    # so the design block's rows depend on the held-out block's draws.
     plan = (
         _designed_on_curves(dataset)
         .split(Holdout(0.75))
         .scopes(Joint())
         .dependence(Comonotonic())
     )
-    result = plan.write_parquet(dataset.parent / "out.parquet")
+    with pytest.raises(LeakageError, match="depend on the other block"):
+        plan.write_parquet(dataset.parent / "out.parquet")
     train, test = holdout(_drawn(dataset, Comonotonic()), 0.75)
-    assert result.designs[0].design_sample.content_hash == train.content_hash
-    hashes = set(result.table.column("sample_hash").to_pylist())
-    assert hashes == {train.content_hash, test.content_hash}
-    entries = result.metadata.setup.evaluations
-    method = {e["method"] for e in entries if e["split"] == "out_of_sample"}
-    assert method == {"holdout"}
+    with pytest.raises(LeakageError, match="depend on the other block"):
+        _check_out_of_sample(train, test)
+    # One asset's blocks still are out of sample.
+    _check_out_of_sample(train.asset(ALL[1]), test.asset(ALL[1]))
 
 
 def test_each_curve_records_its_spatial_match_under_its_asset(dataset: Path) -> None:

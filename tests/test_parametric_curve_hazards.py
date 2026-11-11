@@ -1243,9 +1243,16 @@ def test_the_other_models_split_on_every_array(model: Any) -> None:
     assert np.array_equal(_values(design, "heat"), _values(sample, "heat")[:210])
     assert np.array_equal(design.loss, sample.loss[:210])
     assert design.lineage == held_out.lineage == sample.lineage
-    _check_out_of_sample(design, held_out)
     with pytest.raises(LeakageError):
         _check_out_of_sample(design, sample)
+    # One hazard's own rows are out of sample under every model.
+    _check_out_of_sample(design.component("heat"), held_out.component("heat"))
+    if isinstance(model, Independent):
+        _check_out_of_sample(design, held_out)
+        return
+    # The heat draws were placed by the ranks of every row of both blocks.
+    with pytest.raises(LeakageError, match="depend on the other block"):
+        _check_out_of_sample(design, held_out)
 
 
 def test_the_lineage_links_the_same_draws_under_every_model() -> None:
