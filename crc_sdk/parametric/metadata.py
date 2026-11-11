@@ -200,15 +200,17 @@ _BUILT_TOGETHER = {
     ),
     "comonotonic": (
         "they read two or more assets or hazards whose draws Comonotonic() placed "
-        "by their rank over every row"
+        "by their rank over every row, where interval coverage is unmeasured"
     ),
     "gaussian_copula": (
         "they read two or more assets or hazards whose draws a GaussianCopula "
-        "placed by their rank over every row"
+        "placed by their rank over every row, where interval coverage is "
+        "unmeasured"
     ),
     "dependence_model": (
         "they read two or more assets or hazards whose draws a dependence model "
-        "of the caller's placed by a rule over every row"
+        "of the caller's placed by a rule over every row, where interval coverage "
+        "is unmeasured"
     ),
     "hazard_distribution": (
         "they read a hazard at the asset whose values HazardNoise(..., "

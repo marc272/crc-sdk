@@ -1004,8 +1004,9 @@ statements that every split or sample shares are written once.
   level and the unit, what an interval leaves out, that two rows' intervals are
   not a test of a difference between them, and the columns whose level reaches
   the block's worst row. When a row has `built_together` true, it also says how
-  those rows were built, that their intervals are not the sampling error of
-  their numbers, and where the [coverage study](#pooled-folds-and-intervals) is.
+  those rows were built, whether their coverage is unmeasured, that their
+  intervals are not the sampling error of their numbers, and where the
+  [coverage study](#pooled-folds-and-intervals) is.
 - On a table of [`compare_scenarios`](#several-scenarios-in-one-table), one
   `Scenario` line each (its label, whether it is the reference, the hazard it
   reads and whether the caller stated that name, its product, pathway and

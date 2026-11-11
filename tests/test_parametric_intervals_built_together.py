@@ -353,6 +353,8 @@ def test_every_model_that_moves_draws_flags_the_total(model: Any, kind: str) -> 
     table = _intervals([_covers()], _assets(model()))
     assert [flag for *_, flag in _flags(table)] == [False, False, True]
     assert _record(table) == [kind]
+    unmeasured = "where interval coverage is unmeasured" in _intervals_line(table)
+    assert unmeasured is (kind != "empirical_copula")
 
 
 @pytest.mark.parametrize("model", [_copula, Comonotonic], ids=["copula", "comonotonic"])
