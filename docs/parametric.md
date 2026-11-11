@@ -2102,25 +2102,33 @@ difference between them.
   The column `built_together` flags the rows whose intervals to read as
   indicative only. It follows how the block was built, not a measured coverage:
 
-  - On an `EmpiricalCopula` block, a row that reads two of its columns or more:
-    the `"total"` row of a set of covers, and every row of a joint design, its
-    allocated rows included, as they share the total payout. An asset's own row
-    isn't flagged, and neither is one asset's view of the block,
-    `sample.asset(asset_id)`.
+  - On a block whose columns a dependence model moved, a row that reads two of
+    its columns or more: the `"total"` row of a set of covers, and every row of
+    a joint design, its allocated rows included, as they share the total
+    payout. That is under `EmpiricalCopula`, `Comonotonic()`, `GaussianCopula`
+    and a model of your own: each puts a column's draws in the rows its ranks
+    over every row choose, so a row of several columns doesn't hold independent
+    draws. An asset's own row isn't flagged, and neither is one asset's view of
+    the block, `sample.asset(asset_id)`: one column's draws are the same
+    whatever their order.
   - Every row that reads an asset or a hazard built with `HazardNoise(...,
     hold="hazard_distribution")`. On a join, a part with the default `hold`
     keeps its own row unflagged.
   - Across hazards the study measured nothing, and the flag follows the same
     construction. Every row of a sample of several hazards reads the combined
     loss, so a row is flagged when its index and that loss read two hazards or
-    more under an `EmpiricalCopula`. With two impacts or more that is every row.
-    With one impact, a cover on that hazard alone reads one column and isn't
-    flagged. A view `component(name)` reads one hazard and isn't flagged, and
-    `component(name, loss="combined")` is flagged when its loss reads another
-    hazard.
-  - `Independent()` was measured, and isn't flagged. `Comonotonic()` and
-    `GaussianCopula` put each column's own draws side by side by rank too, but
-    the study didn't measure them, and they aren't flagged.
+    more under a model that moved them. With two impacts or more that is every
+    row. With one impact, a cover on that hazard alone reads one column and
+    isn't flagged. A view `component(name)` reads one hazard and isn't flagged,
+    and `component(name, loss="combined")` is flagged when its loss reads
+    another hazard.
+  - Of the models that move draws, the study measured `EmpiricalCopula` alone.
+    Under `Comonotonic()` and `GaussianCopula` the rows of several columns are
+    exchangeable, not independent ([cuts of one
+    sample](#several-assets-from-fitted-curves)), and the coverage of their
+    intervals is unmeasured; they are flagged by construction, and so is a model
+    of your own. `Independent()` keeps every column in draw order. It was
+    measured, and isn't flagged.
 
   When a row is flagged, the setup text's `Intervals` line says how its rows
   were built and that their intervals are not the sampling error of their
@@ -2147,7 +2155,7 @@ never changes a point estimate.
 | `ci_level`, `n_bootstrap` | float64, int32 | As stated |
 | `n_undefined` | int32 | The replicates in which the metric is undefined, such as those with no expected loss |
 | `short_block` | bool, nullable | True when the column's level reaches the block's worst row: (1 - beta) n <= 1 for a beta column, T > n for a return-period column, with n the rows the metric reads. Null for a column with no level |
-| `built_together` | bool, nullable | True when the wide row reads rows that were built together ([rows built together](#pooled-folds-and-intervals)): a row of an `EmpiricalCopula` block that reads two of its columns or more, or a row that reads a column built with `HazardNoise(..., hold="hazard_distribution")`. The same on every metric column of a wide row; a pooled row is flagged when a fold's row is. A table written before it lacks the column, which reads as null. `setup.intervals.built_together` lists how the flagged rows were built: `"empirical_copula"`, `"hazard_distribution"` or both |
+| `built_together` | bool, nullable | True when the wide row reads rows that were built together ([rows built together](#pooled-folds-and-intervals)): a row that reads two columns or more of a block whose columns a dependence model moved, or a row that reads a column built with `HazardNoise(..., hold="hazard_distribution")`. The same on every metric column of a wide row; a pooled row is flagged when a fold's row is. A table written before it lacks the column, which reads as null. `setup.intervals.built_together` lists how the flagged rows were built: `"empirical_copula"`, `"comonotonic"`, `"gaussian_copula"`, `"dependence_model"` (a model of your own) and `"hazard_distribution"` |
 
 The bounds of a `short_block` row are computed like any other. They cannot reach
 beyond the block's largest rows, so they understate how far the number could
@@ -3320,5 +3328,6 @@ rank and no best flag.
   fold; `compare_pooled` and `bootstrap_intervals` are functions. An interval on
   the difference between two rows is not offered.
 - **Intervals that follow how rows were built together.** `bootstrap_intervals`
-  resamples the rows of an `EmpiricalCopula` block or a held `HazardNoise` block
-  as independent rows, and flags the rows this affects with `built_together`.
+  resamples the rows of a block whose columns a dependence model moved, or of a
+  held `HazardNoise` block, as independent rows, and flags the rows this
+  affects with `built_together`.

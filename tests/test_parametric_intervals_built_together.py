@@ -8,9 +8,9 @@ miscalibrated on the rows of an `EmpiricalCopula` block that read several
 columns, and on every row of a held `HazardNoise` block, and calibrated on an
 asset's own row of a copula block and on independent rows. These tests check
 that the flag marks exactly those rows, by how the block was built; how it
-carries over to what the study didn't measure (hazards, joins, views, pooled
-folds); and that the metadata and the setup text say so. Every number is
-synthetic.
+carries over to what the study didn't measure (the other models that move
+draws, hazards, joins, views, pooled folds); and that the metadata and the
+setup text say so. Every number is synthetic.
 """
 
 from __future__ import annotations
@@ -304,24 +304,69 @@ def test_a_copula_flags_every_row_of_a_joint_design() -> None:
     }
 
 
-@pytest.mark.parametrize(
-    "dependence",
-    [Independent(), Comonotonic(), GaussianCopula(np.array([[1.0, 0.8], [0.8, 1.0]]))],
-    ids=["independent", "comonotonic", "gaussian"],
-)
-def test_the_other_dependence_models_are_not_flagged(dependence: Any) -> None:
-    # Independent rows were measured and calibrated. Comonotonic and
-    # GaussianCopula weren't measured, and the flag doesn't extend to them.
-    table = _intervals([_covers()], _assets(dependence))
+def test_independent_rows_are_not_flagged() -> None:
+    table = _intervals([_covers()], _assets(Independent()))
     assert not any(table.column("built_together").to_pylist())
     assert _record(table) == []
 
 
-def test_an_assets_own_view_of_a_copula_sample_is_not_flagged() -> None:
+class Countermonotonic:
+    """A model of the caller's: each other column's draws in reverse rank order."""
+
+    def to_document(self) -> dict[str, Any]:
+        return {"kind": "countermonotonic"}
+
+    def record(self, n_draws: int, columns: Any) -> dict[str, Any]:
+        del n_draws, columns
+        return self.to_document()
+
+    def statement(self, n_draws: int, between: str) -> str:
+        del n_draws
+        return f"the {between} move in opposite directions."
+
+    def reorder(self, uniforms: Any, columns: Any) -> Any:
+        del columns
+        n, d = uniforms.shape
+        rank = np.argsort(np.argsort(uniforms[:, 0], kind="stable"), kind="stable")
+        order = np.empty((n, d), dtype=np.int64)
+        order[:, 0] = np.arange(n)
+        for j in range(1, d):
+            order[:, j] = np.argsort(uniforms[:, j], kind="stable")[n - 1 - rank]
+        return order
+
+
+MOVED = [
+    (_copula, "empirical_copula"),
+    (Comonotonic, "comonotonic"),
+    (lambda: GaussianCopula(np.array([[1.0, 0.8], [0.8, 1.0]])), "gaussian_copula"),
+    (Countermonotonic, "dependence_model"),
+]
+
+
+@pytest.mark.parametrize(
+    ("model", "kind"), MOVED, ids=["copula", "comonotonic", "gaussian", "callers"]
+)
+def test_every_model_that_moves_draws_flags_the_total(model: Any, kind: str) -> None:
+    # Each column's draws are placed by their ranks over every row, so a row of
+    # several columns doesn't hold independent draws; one column's draws are
+    # the same whatever their order. Only the EmpiricalCopula was measured.
+    table = _intervals([_covers()], _assets(model()))
+    assert [flag for *_, flag in _flags(table)] == [False, False, True]
+    assert _record(table) == [kind]
+
+
+@pytest.mark.parametrize("model", [_copula, Comonotonic], ids=["copula", "comonotonic"])
+def test_an_assets_own_view_is_not_flagged(model: Any) -> None:
+    # Comonotonic() keeps the first asset in draw order and moves site-b's draws.
+    view = _assets(model()).asset("site-b")
+    table = _intervals([_cover("site-b")], view)
+    assert not any(table.column("built_together").to_pylist())
+
+
+def test_an_assets_own_view_of_a_copula_sample_is_resampled_by_row() -> None:
     view = _assets(_copula()).asset("site-b")
     table = _intervals([_cover("site-b")], view)
     assert EvaluationMetadata.from_table(table).setup.intervals["unit"] == "row"  # type: ignore[index]
-    assert not any(table.column("built_together").to_pylist())
 
 
 def test_a_written_copula_sample_keeps_its_flags() -> None:
@@ -393,9 +438,22 @@ def test_a_hazards_view_is_flagged_when_its_loss_reads_another_hazard(
     assert set(table.column("built_together").to_pylist()) == {flagged}
 
 
-def test_the_other_models_across_hazards_are_not_flagged() -> None:
+def test_independent_hazards_are_not_flagged() -> None:
     table = _intervals([_package()], _hazards(dependence=Independent()))
     assert not any(table.column("built_together").to_pylist())
+
+
+def test_a_gaussian_copula_across_hazards_flags_rows_of_several() -> None:
+    sample = _hazards(dependence=GaussianCopula(np.array([[1.0, 0.5], [0.5, 1.0]])))
+    table = _intervals([_package()], sample)
+    assert set(table.column("built_together").to_pylist()) == {True}
+    assert _record(table) == ["gaussian_copula"]
+    own = _intervals([_cover(index=HEAT)], sample.component("heat"))
+    assert not any(own.column("built_together").to_pylist())
+    combined = _intervals(
+        [_cover(index=HEAT)], sample.component("heat", loss="combined")
+    )
+    assert set(combined.column("built_together").to_pylist()) == {True}
 
 
 # -- the held form of HazardNoise ----------------------------------------------------

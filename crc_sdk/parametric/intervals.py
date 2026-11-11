@@ -43,9 +43,12 @@ wider. An asset's own row of an `EmpiricalCopula` block reads that asset's draws
 alone, which are independent, so its intervals are those of independent rows; a
 row that reads several assets or hazards is affected, and so is every row of a
 held `HazardNoise` block. `docs/parametric.md` gives a synthetic coverage study.
-Resampling whole reference years instead made most intervals too wide. The
-column `built_together` flags those rows by how the block was built, and the
-setup text says what it means; the numbers are those of any other row.
+Resampling whole reference years instead made most intervals too wide.
+`Comonotonic()`, `GaussianCopula` and a model of the caller's also place each
+column's draws by their ranks over every row, so a row that reads several of
+their columns is built together too, though its coverage is unmeasured. The
+column `built_together` flags all those rows by how the block was built, and
+the setup text says what it means; the numbers are those of any other row.
 
 Both functions rank nothing. They work in memory and do no I/O. Random numbers
 come only from the `rng` a call states, and its state at entry is recorded, so
@@ -131,7 +134,7 @@ from crc_sdk.parametric.sample import (
     _generator_record,
     _holds_hazard_distribution,
     _refuse_reference_year_blocks,
-    _reorders_by_reference,
+    _reorder_kinds,
     _require_generator,
     _row_years,
 )
@@ -250,8 +253,11 @@ def _arrays(entry: _Entry, run: _Run) -> list[_Arrays]:
 # -- rows built together -------------------------------------------------------
 
 
-_DEALT = "empirical_copula"
-"""An `EmpiricalCopula` dealt the columns' draws to its reference years."""
+_MOVED = frozenset({"comonotonic", "empirical_copula", "gaussian_copula"})
+"""The built-in models that move a column's draws, each its own kind of rows."""
+
+_CALLERS_MODEL = "dependence_model"
+"""The kind of rows that a dependence model of the caller's moved."""
 
 _HELD = "hazard_distribution"
 """`HazardNoise(..., hold="hazard_distribution")` ranked each row's hazard."""
@@ -351,26 +357,36 @@ def _held_columns(sample: OutcomeSample, names: frozenset[str]) -> frozenset[str
     )
 
 
+def _moved_by(sample: OutcomeSample) -> frozenset[str]:
+    """The dependence models that moved the draws of `sample`'s columns.
+
+    Each by its `kind`, `"empirical_copula"`, `"comonotonic"` or
+    `"gaussian_copula"`, and `"dependence_model"` for a model of the caller's.
+    Empty when every column is in draw order, as under `Independent()`.
+    """
+    return frozenset(
+        kind if kind in _MOVED else _CALLERS_MODEL
+        for kind in _reorder_kinds(sample.provenance.to_document())
+    )
+
+
 def _built_together(entry: _Entry, run: _Run) -> list[frozenset[str]]:
     """How each row of `entry` reads rows built together, in the order of `_arrays`.
 
-    `"empirical_copula"` when an `EmpiricalCopula` dealt the block's columns
-    and the row reads two of them or more; `"hazard_distribution"` when a
+    The models that moved the block's columns (`_moved_by`), when the row
+    reads two columns or more: each column's draws were placed by their ranks
+    over every row, so its rows sit beside the other columns' by rule and not
+    as independent draws. One column's draws are the same whatever their
+    order, so a row of one column has none. `"hazard_distribution"` when a
     column the row reads holds the held form of `HazardNoise`. Empty when the
     row reads neither.
     """
     reads = _reads(entry, run)
-    dealt = _reorders_by_reference(run.sample.provenance.to_document())
+    moved = _moved_by(run.sample)
     held = _held_columns(run.sample, frozenset().union(*reads))
     return [
-        frozenset(
-            kind
-            for kind, flagged in (
-                (_DEALT, dealt and len(read) > 1),
-                (_HELD, bool(read & held)),
-            )
-            if flagged
-        )
+        (moved if len(read) > 1 else frozenset())
+        | (frozenset({_HELD}) if read & held else frozenset())
         for read in reads
     ]
 
@@ -1474,14 +1490,17 @@ def bootstrap_intervals(
       (1 - beta) * n <= 1 or T > n with n the rows the metric reads, and null
       for a column with no level. Such bounds cannot reach beyond the block's
       largest rows, so they understate how far the number could move;
-    - `built_together`: true when the wide row reads rows built together: on an
-      `EmpiricalCopula` block, a row that reads two of its columns or more (an
-      asset or a hazard each; a `"total"` row, a joint design's rows, and on a
-      sample of several hazards a row whose index and combined loss read two
-      hazards or more), and any row that reads a column built with
-      `HazardNoise(..., hold="hazard_distribution")`. A pooled row is flagged
-      when a fold's row is. `setup.intervals.built_together` lists how the
-      flagged rows were built, `"empirical_copula"` and `"hazard_distribution"`.
+    - `built_together`: true when the wide row reads rows built together: on a
+      block whose columns a dependence model moved (`EmpiricalCopula`,
+      `Comonotonic()`, `GaussianCopula` or a model of the caller's), a row that
+      reads two of its columns or more (an asset or a hazard each; a `"total"`
+      row, a joint design's rows, and on a sample of several hazards a row
+      whose index and combined loss read two hazards or more), and any row that
+      reads a column built with `HazardNoise(...,
+      hold="hazard_distribution")`. A pooled row is flagged when a fold's row
+      is. `setup.intervals.built_together` lists how the flagged rows were
+      built: `"empirical_copula"`, `"comonotonic"`, `"gaussian_copula"`,
+      `"dependence_model"` and `"hazard_distribution"`.
 
     An interval describes how much a number moves with the years drawn. It
     leaves out uncertainty in the hazard data, the impact function and the

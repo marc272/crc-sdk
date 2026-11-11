@@ -198,6 +198,18 @@ _BUILT_TOGETHER = {
         "they read two or more assets or hazards whose draws an EmpiricalCopula "
         "dealt to its reference years by their rank over every row"
     ),
+    "comonotonic": (
+        "they read two or more assets or hazards whose draws Comonotonic() placed "
+        "by their rank over every row"
+    ),
+    "gaussian_copula": (
+        "they read two or more assets or hazards whose draws a GaussianCopula "
+        "placed by their rank over every row"
+    ),
+    "dependence_model": (
+        "they read two or more assets or hazards whose draws a dependence model "
+        "of the caller's placed by a rule over every row"
+    ),
     "hazard_distribution": (
         "they read a hazard at the asset whose values HazardNoise(..., "
         "hold='hazard_distribution') gave by rank over every row"
