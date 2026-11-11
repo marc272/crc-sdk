@@ -1,4 +1,4 @@
-"""A cover's terms in words: `Cover.terms_text()`."""
+"""A cover's terms in words: `Cover.terms_text()`, and a package's."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from crc_sdk.parametric import (
     BinaryPayout,
     CompositeIndex,
     Cover,
+    CoverPackage,
     Free,
     IndexDefinition,
     LinearConstraints,
@@ -76,6 +77,43 @@ Payout per year, in EUR: one amount per cell of a table over rx1day and txx, the
 Most paid in a year: 400,000 EUR
 Free parameters: none
 Hash: {GRID_HASH}, of the cover document (schema 1.1, semantics crc-parametric-cover/1)"""  # noqa: E501
+
+
+PACKAGE = CoverPackage(
+    {
+        "rx1day": Cover(
+            RAIN, StepPayout([70.0], [2e5]), payout_unit="EUR", label="rain"
+        ),
+        "txx": Cover(HEAT, StepPayout([36.0], [1e5]), payout_unit="EUR", label="heat"),
+    },
+    label="separate",
+)
+PACKAGE_HASH = "sha256:d415585b582cb80d9f4cae44ad2e328dad4bf137351a5bc4e96c401e0e6caf64"
+PACKAGE_TERMS = f"""\
+Label: separate (a display name, not part of the terms)
+Package: 2 separate contracts, on the components rx1day and txx, in this order; each has its own terms and premium, and a year pays the sum of what they pay
+Contract 1 of 2, on the component rx1day:
+  Label: rain (a display name, not part of the terms)
+  Asset: not named
+  Index: rx1day, in mm/day, read at the asset; larger values are more severe (tail upper); aggregation: annual_maximum; source: not stated
+  Payout per year, in EUR: steps, the levels never decrease (kind "step", monotone=True)
+    - nothing when rx1day is below 70 mm/day
+    - 200,000 EUR when rx1day is at or above 70 mm/day
+  Most paid in a year: 200,000 EUR
+  Free parameters: none
+  Hash: sha256:4a27d42a1ef401184c85a6fef793a754cda7256cb8ccb19c18c32e193837112b, of the cover document (schema 1.0, semantics crc-parametric-cover/1)
+Contract 2 of 2, on the component txx:
+  Label: heat (a display name, not part of the terms)
+  Asset: not named
+  Index: txx, in degC, read at the asset; larger values are more severe (tail upper); aggregation: annual_maximum; source: not stated
+  Payout per year, in EUR: steps, the levels never decrease (kind "step", monotone=True)
+    - nothing when txx is below 36 degC
+    - 100,000 EUR when txx is at or above 36 degC
+  Most paid in a year: 100,000 EUR
+  Free parameters: none
+  Hash: sha256:c235eebc933ed3634604ba9ba4139ab0f0bfd0a4ba604a58959009236599e7a8, of the cover document (schema 1.0, semantics crc-parametric-cover/1)
+Most paid in a year by the package: 300,000 EUR, the sum of its contracts'
+Hash: {PACKAGE_HASH}, of the package: each contract's hash, by the component it reads"""  # noqa: E501
 
 
 def _lines(cover: Cover) -> list[str]:
@@ -600,5 +638,138 @@ def test_every_spelled_number_reads_back_as_itself() -> None:
 
 def test_the_docs_page_shows_these_terms() -> None:
     page = DOCS.read_text(encoding="utf-8")
-    for terms in (STEP_TERMS, GRID_TERMS):
+    for terms in (STEP_TERMS, GRID_TERMS, PACKAGE_TERMS):
         assert f"```text\n{terms}\n```" in page
+
+
+# -- a package -----------------------------------------------------------------------
+
+
+def _contracts(text: str) -> dict[str, list[str]]:
+    """Each contract's lines under its heading, by component, without the indent."""
+    contracts: dict[str, list[str]] = {}
+    lines: list[str] = []
+    for line in text.splitlines():
+        heading = re.fullmatch(r"Contract \d+ of \d+, on the component (.+):", line)
+        if heading:
+            lines = contracts.setdefault(heading.group(1), [])
+        elif line.startswith("  "):
+            lines.append(line[2:])
+        else:
+            lines = []
+    return contracts
+
+
+def test_a_package_states_each_contract_in_turn() -> None:
+    assert PACKAGE.package_hash == PACKAGE_HASH
+    assert PACKAGE.terms_text() == PACKAGE_TERMS
+
+
+def test_a_package_reads_as_its_contracts() -> None:
+    covers = {
+        "rx1day": Cover(
+            RAIN,
+            LinearPayout(60.0, 120.0, 5e5),
+            payout_unit="EUR",
+            asset_id="warehouse-a",
+        ),
+        "txx": Cover(
+            HEAT, BinaryPayout(38.0, 5e4), payout_unit="EUR", asset_id="warehouse-a"
+        ),
+        "spei": Cover(
+            IndexDefinition("spei", "1", tail="lower"),
+            StepPayout([-1.0, -2.0], [1e4, 3e4], tail="lower"),
+            payout_unit="EUR",
+            asset_id="warehouse-a",
+            label="drought",
+        ),
+    }
+    package = CoverPackage(covers)
+    text = package.terms_text()
+    lines = text.splitlines()
+    assert lines[0] == (
+        "Package: 3 separate contracts, on the components rx1day, txx and spei, in "
+        "this order; each has its own terms and premium, and a year pays the sum of "
+        "what they pay"
+    )
+    headings = [line for line in lines if line.startswith("Contract ")]
+    assert headings == [
+        "Contract 1 of 3, on the component rx1day:",
+        "Contract 2 of 3, on the component txx:",
+        "Contract 3 of 3, on the component spei:",
+    ]
+    contracts = _contracts(text)
+    assert list(contracts) == list(covers)
+    for name, cover in covers.items():
+        assert contracts[name] == cover.terms_text().splitlines()
+    assert lines[-2] == (
+        "Most paid in a year by the package: 580,000 EUR, the sum of its contracts'"
+    )
+    assert lines[-1] == (
+        f"Hash: {package.package_hash}, of the package: each contract's hash, by the "
+        "component it reads"
+    )
+
+
+def test_a_package_keys_each_contract_by_the_component_it_reads() -> None:
+    heat = Cover(
+        HEAT, BinaryPayout(38.0, 5e4), payout_unit="EUR", asset_id="warehouse-a"
+    )
+    package = CoverPackage({"wet": STEP, "hot": heat})
+    contracts = _contracts(package.terms_text())
+    assert list(contracts) == ["wet", "hot"]
+    assert contracts["wet"] == STEP_TERMS.splitlines()
+    assert "on the components wet and hot, in this order" in package.terms_text()
+
+
+def test_a_package_of_a_family_of_your_own_does_not_know_its_most() -> None:
+    package = CoverPackage(
+        {
+            "rx1day": Cover(RAIN, Tiered(60.0, 5e3), payout_unit="EUR"),
+            "txx": Cover(HEAT, BinaryPayout(38.0, 5e4), payout_unit="EUR"),
+        }
+    )
+    assert package.terms_text().splitlines()[-2] == (
+        "Most paid in a year by the package: not known: a family of your own "
+        "states none"
+    )
+
+
+def test_the_package_terms_are_a_view() -> None:
+    documents = {name: cover.to_json() for name, cover in PACKAGE.covers.items()}
+    state = (
+        PACKAGE.package_hash,
+        PACKAGE.index.to_document(),
+        PACKAGE.payout.to_document(),
+        PACKAGE.as_cover().definition_hash,
+    )
+    terms = PACKAGE.terms_text()
+    assert {name: cover.to_json() for name, cover in PACKAGE.covers.items()} == (
+        documents
+    )
+    assert (
+        PACKAGE.package_hash,
+        PACKAGE.index.to_document(),
+        PACKAGE.payout.to_document(),
+        PACKAGE.as_cover().definition_hash,
+    ) == state
+    assert PACKAGE.terms_text() == terms
+    assert pickle.loads(pickle.dumps(PACKAGE)).terms_text() == terms
+    # The same contracts read back from their documents give the same text.
+    read = CoverPackage(
+        {
+            name: Cover.from_json(cover.to_json(), label=cover.label)
+            for name, cover in PACKAGE.covers.items()
+        },
+        label=PACKAGE.label,
+    )
+    assert read.terms_text() == terms
+
+
+def test_the_package_label_is_the_only_line_outside_the_terms() -> None:
+    unlabelled = CoverPackage(dict(PACKAGE.covers))
+    assert unlabelled.package_hash == PACKAGE.package_hash
+    assert PACKAGE.terms_text() == (
+        "Label: separate (a display name, not part of the terms)\n"
+        + unlabelled.terms_text()
+    )

@@ -1225,6 +1225,11 @@ class ScenarioSet:
 
     A set compares what the samples record and says nothing about which scenario
     or product is better. `TypeError` for arguments of the wrong type.
+
+    A set holds samples and no terms. The covers that `compare_scenarios` puts on
+    its scenarios keep their terms in every scenario, and each states them in
+    words: `cover.terms_text()`, `result.cover.terms_text()` for a design and
+    `package.terms_text()` for a `CoverPackage`.
     """
 
     entries: tuple[OutcomeSample, ...]

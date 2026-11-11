@@ -447,6 +447,29 @@ def _is_monotone_function(index: FloatArray, loss: FloatArray) -> bool:
     return bool((steps >= 0).all() or (steps <= 0).all())
 
 
+# -- short reprs -------------------------------------------------------------
+
+
+def _shortened(names: Iterable[Any]) -> str:
+    """A list of reprs, with the first two and the last above three."""
+    shown = [repr(name) for name in names]
+    if len(shown) > 3:
+        shown = [*shown[:2], "...", shown[-1]]
+    return f"[{', '.join(shown)}]"
+
+
+def _start(text: str | None) -> str:
+    """The repr of a hash cut to `sha256:` and 12 digits, or of a short text whole."""
+    if text is None or len(text) <= 19:
+        return repr(text)
+    return repr(f"{text[:19]}...")
+
+
+def _kind(document: Mapping[str, Any]) -> str:
+    """The repr of a document's kind."""
+    return repr(document.get("kind"))
+
+
 # -- the provenance ----------------------------------------------------------
 
 
@@ -576,8 +599,9 @@ class SampleProvenance:
 
     Mappings and sequences are stored read-only; `to_document()` returns
     plain JSON types, without the three fields of a sample with components and
-    without `source_lineages` and `hazard` when they are `None`. Raises
-    `SampleError` for unknown kinds or values that are not plain JSON.
+    without `source_lineages` and `hazard` when they are `None`. The repr is
+    short, and `to_document()` holds every field. Raises `SampleError` for
+    unknown kinds or values that are not plain JSON.
     """
 
     source_kind: SourceKind
@@ -697,6 +721,46 @@ class SampleProvenance:
             object.__setattr__(self, name, _freeze(_thaw(value)))
         object.__setattr__(self, "notes", tuple(self.notes))
 
+    def __repr__(self) -> str:
+        """A short description, which prints no documents and stays short at any size.
+
+        It gives `source_kind`, `semantics_source`, the hazard's name, the
+        number of source documents and of random steps, each selection step's
+        kind, the start of `lineage` and `parent`, and the fields of a sample of
+        several assets or hazards, of a per-year sample and of a pool when they
+        are set: a document by its kind, `parts`, `components` and
+        `source_lineages` by their names and `pool` by its number of runs. A
+        list shows its first two items and its last above three.
+        """
+        hazard = None if self.hazard is None else self.hazard["name"]
+        shown = [
+            f"source_kind={self.source_kind!r}",
+            f"semantics_source={self.semantics_source!r}",
+            f"hazard_name={hazard!r}",
+            f"n_sources={len(self.sources)}",
+            f"n_random_steps={len(self.rng)}",
+            f"selection={_shortened(step.get('kind') for step in self.selection)}",
+            f"lineage={_start(self.lineage)}",
+            f"parent={_start(self.parent)}",
+        ]
+        if self.dependence is not None:
+            shown.append(f"dependence={_kind(self.dependence)}")
+        if self.parts is not None:
+            shown.append(f"parts={_shortened(self.parts)}")
+        if self.trend is not None:
+            shown.append(f"trend={_kind(self.trend)}")
+        if self.pool is not None:
+            shown.append(f"pool_runs={len(self.pool['runs'])}")
+        if self.hazard_dependence is not None:
+            shown.append(f"hazard_dependence={_kind(self.hazard_dependence)}")
+        if self.combine is not None:
+            shown.append(f"combine={_kind(self.combine)}")
+        if self.components is not None:
+            shown.append(f"components={_shortened(self.components)}")
+        if self.source_lineages is not None:
+            shown.append(f"source_lineages={_shortened(self.source_lineages)}")
+        return f"SampleProvenance({', '.join(shown)})"
+
     def to_document(self) -> dict[str, Any]:
         """Return every field as plain JSON types.
 
@@ -789,7 +853,8 @@ class IndexComponent:
     no loss reads, it is the hazard at the asset that a basis-risk model with
     `apply_hazard`, such as `HazardNoise`, gave. `own_loss` is the loss of
     this hazard alone, finite and non-negative, in the sample's loss unit, and
-    `None` for a component with no impact. The arrays are read-only copies.
+    `None` for a component with no impact. The arrays are read-only copies,
+    and the repr prints none of them.
 
     Raises `SampleError` for any invalid field.
     """
@@ -821,6 +886,21 @@ class IndexComponent:
         object.__setattr__(self, "values", values)
         object.__setattr__(self, "hazard", hazard)
         object.__setattr__(self, "own_loss", own_loss)
+
+    def __repr__(self) -> str:
+        """A short description, which prints no arrays and stays short at any size.
+
+        It gives the shape of `values`, the unit and the tail, and `hazard` and
+        `own_loss` as `...` when the component holds them and `None` when not.
+        """
+        hazard, own_loss = (
+            "None" if column is None else "..."
+            for column in (self.hazard, self.own_loss)
+        )
+        return (
+            f"IndexComponent(shape={self.values.shape}, unit={self.unit!r}, "
+            f"tail={self.tail!r}, hazard={hazard}, own_loss={own_loss})"
+        )
 
     def _subset(self, rows: NDArray[np.bool_]) -> IndexComponent:
         return dataclasses.replace(
@@ -1063,21 +1143,14 @@ class OutcomeSample:
         units, the semantics (the annual basis), the scenario and the start of
         `content_hash`.
         """
-
-        def shortened(names: Sequence[str]) -> str:
-            shown = [repr(name) for name in names]
-            if len(shown) > 3:
-                shown = [*shown[:2], "...", shown[-1]]
-            return f"[{', '.join(shown)}]"
-
         if self.index_components is not None:
-            hazard = f"components={shortened(tuple(self.index_components))}"
+            hazard = f"components={_shortened(self.index_components)}"
         else:
             stated = self.provenance.hazard
             hazard = f"hazard_name={None if stated is None else stated['name']!r}"
         return (
             f"OutcomeSample(shape={self.index.shape}, "
-            f"assets={shortened(self.asset_ids)}, {hazard}, "
+            f"assets={_shortened(self.asset_ids)}, {hazard}, "
             f"index_unit={self.index_unit!r}, loss_unit={self.loss_unit!r}, "
             f"semantics={self.semantics!r}, scenario={self.scenario!r}, "
             f"content_hash='{self.content_hash[:19]}...')"

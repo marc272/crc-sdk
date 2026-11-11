@@ -16,6 +16,7 @@ from crc_framework import FittedDistribution, PiecewiseLinearImpact
 from crc_sdk.parametric import (
     ComonotoneIndexWarning,
     ImpactNoise,
+    IndexComponent,
     LeakageError,
     LossModel,
     OutcomeSample,
@@ -1008,3 +1009,163 @@ def test_the_repr_of_a_sample_of_several_hazards_names_its_components() -> None:
         "OutcomeSample(shape=(4, 1), assets=['site'], components=['rain', 'heat'], "
         "index_unit='mm/day', loss_unit='EUR', "
     )
+
+
+def _two_hazards(n: int = 4) -> OutcomeSample:
+    rng = np.random.default_rng(0)
+    return OutcomeSample.from_table(
+        {
+            "year": list(range(2000, 2000 + n)),
+            "site": ["site"] * n,
+            "rain": rng.uniform(0.0, 100.0, n),
+            "heat": rng.uniform(20.0, 45.0, n),
+            "loss": rng.uniform(0.0, 5.0, n),
+        },
+        period="year",
+        asset_id="site",
+        index={"rain": "rain", "heat": "heat"},
+        loss="loss",
+        index_unit={"rain": "mm/day", "heat": "degC"},
+        loss_unit="EUR",
+        tails={"rain": "upper", "heat": "upper"},
+    )
+
+
+def test_the_repr_of_a_component_prints_no_arrays() -> None:
+    values = np.linspace(10.0, 100.0, 10)
+    bare = IndexComponent(values, unit="mm/day", tail="upper")
+    assert repr(bare) == (
+        "IndexComponent(shape=(10, 1), unit='mm/day', tail='upper', hazard=None, "
+        "own_loss=None)"
+    )
+    full = IndexComponent(
+        values,
+        unit="degC",
+        tail="lower",
+        hazard=np.full(10, 3.0),
+        own_loss=np.ones(10),
+    )
+    assert repr(full) == (
+        "IndexComponent(shape=(10, 1), unit='degC', tail='lower', hazard=..., "
+        "own_loss=...)"
+    )
+    assert "array" not in repr(full) and "10.0" not in repr(full)
+
+
+def test_the_repr_of_a_component_stays_short_at_any_size() -> None:
+    def component(n: int) -> IndexComponent:
+        return IndexComponent(
+            np.ones(n),
+            unit="mm/day",
+            tail="upper",
+            hazard=np.ones(n),
+            own_loss=np.ones(n),
+        )
+
+    small, large = repr(component(10)), repr(component(100_000))
+    assert len(large) - len(small) == len("100000") - len("10")
+    components = _two_hazards(100_000).index_components
+    assert components is not None
+    assert len(repr(dict(components))) < 250
+
+
+def test_the_repr_of_a_provenance_is_short() -> None:
+    assert repr(_provenance()) == (
+        "SampleProvenance(source_kind='table', semantics_source='caller', "
+        "hazard_name=None, n_sources=1, n_random_steps=0, selection=[], "
+        "lineage=None, parent=None)"
+    )
+    stated = _provenance(hazard={"name": "rx1day", "from": "stated"}, lineage="t-1")
+    assert "hazard_name='rx1day'" in repr(stated)
+    assert "lineage='t-1', parent=None)" in repr(stated)
+
+
+def test_the_repr_of_a_provenance_names_its_steps_and_components() -> None:
+    sample = _two_hazards()
+    train, _ = holdout(sample, train_fraction=0.5)
+    lineage, parent = train.provenance.lineage, train.provenance.parent
+    assert lineage is not None and parent == sample.content_hash
+    assert repr(train.provenance) == (
+        "SampleProvenance(source_kind='table', semantics_source='caller', "
+        "hazard_name=None, n_sources=1, n_random_steps=0, selection=['holdout'], "
+        f"lineage='{lineage[:19]}...', parent='{parent[:19]}...', "
+        "hazard_dependence='data', combine='table', components=['rain', 'heat'])"
+    )
+
+
+def test_the_repr_of_a_provenance_on_curves_counts_its_random_steps() -> None:
+    provenance = _curve_sample(n=100_000).provenance
+    assert provenance.rng and provenance.lineage is not None
+    text = repr(provenance)
+    assert text == (
+        "SampleProvenance(source_kind='monte_carlo', semantics_source='dataset', "
+        f"hazard_name=None, n_sources=1, n_random_steps={len(provenance.rng)}, "
+        f"selection=[], lineage='{provenance.lineage[:19]}...', parent=None)"
+    )
+    assert len(text) < 250
+
+
+def _large_provenance(n: int) -> SampleProvenance:
+    names = [f"name-{i:05d}" for i in range(n)]
+    return _provenance(
+        sources=tuple({"role": "hazard", "number": i} for i in range(n)),
+        rng=tuple(
+            {"step": "hazard", "bit_generator": "PCG64", "state": "{}"}
+            for _ in range(n)
+        ),
+        licences=tuple({"licence": "CC0-1.0"} for _ in range(n)),
+        details={"dropped_years": list(range(n))},
+        notes=tuple("a note" for _ in range(n)),
+        selection=tuple({"kind": "select", "periods": i} for i in range(n)),
+        lineage="sha256:" + "a" * 64,
+        parent="sha256:" + "b" * 64,
+        dependence={"kind": "data"},
+        parts={name: {"source_kind": "table"} for name in names},
+        trend={"kind": "as_recorded"},
+        pool={
+            "pathway": "ssp245",
+            "runs": [
+                {"model": name, "member": "r1i1p1f1", "lineage": "x"} for name in names
+            ],
+            "year": list(range(n)),
+            "run": list(range(n)),
+        },
+        hazard_dependence={"kind": "data"},
+        combine={"kind": "table"},
+        components={name: {"source_kind": "table"} for name in names},
+        source_lineages={name: "sha256:c" for name in names},
+        hazard={"name": "rx1day", "from": "stated"},
+    )
+
+
+def test_the_repr_of_a_provenance_stays_short_at_any_size() -> None:
+    small, large = _large_provenance(10), _large_provenance(1000)
+    # Three counts grow by two digits each; nothing else grows.
+    assert len(repr(large)) - len(repr(small)) == 3 * (len("1000") - len("10"))
+    text = repr(large)
+    assert len(text) < 600
+    for shown in (
+        "n_sources=1000",
+        "n_random_steps=1000",
+        "selection=['select', 'select', ..., 'select']",
+        "lineage='sha256:aaaaaaaaaaaa...'",
+        "parent='sha256:bbbbbbbbbbbb...'",
+        "dependence='data'",
+        "parts=['name-00000', 'name-00001', ..., 'name-00999']",
+        "trend='as_recorded'",
+        "pool_runs=1000",
+        "hazard_dependence='data'",
+        "combine='table'",
+        "components=['name-00000', 'name-00001', ..., 'name-00999']",
+        "source_lineages=['name-00000', 'name-00001', ..., 'name-00999']",
+    ):
+        assert shown in text
+    assert "note" not in text and "CC0" not in text and "PCG64" not in text
+
+
+def test_a_repr_changes_no_document_or_hash() -> None:
+    sample = _two_hazards()
+    document, digest = sample.provenance.to_document(), sample.content_hash
+    repr(sample), repr(sample.provenance), repr(sample.index_components)
+    assert sample.provenance.to_document() == document
+    assert sample.content_hash == digest

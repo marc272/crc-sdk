@@ -329,6 +329,10 @@ class DesignResult:
     `evaluate` and `compare` take a `DesignResult` in place of a cover: its
     rows use the design premium and carry `unique`, `ties` and
     `degenerate_tail`, and `to_record()` goes into their metadata.
+
+    `result.cover.terms_text()` states the designed terms in words, every
+    designed amount spelled exactly, for a report or a broker. The record says
+    how they were chosen.
     """
 
     cover: Cover
