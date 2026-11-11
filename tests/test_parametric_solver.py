@@ -343,7 +343,6 @@ def test_every_qp_solve_has_a_limit() -> None:
     assert _solver.ACTIVE_SET_ITERATION_LIMIT > 0
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="TEMPORARY diagnostic")
 @pytest.mark.parametrize(
     "case", [STALLS, FALSE_UNBOUNDED, SEMIDEFINITE], ids=["stall", "unbounded", "psd"]
 )
