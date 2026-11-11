@@ -1668,7 +1668,48 @@ with its own provenance; a reordering is a step of its `selection`.
 The dependence model is what you assume about the assets, and the module does
 not choose it. The same generators give the same draws under every model, so
 the lineage doesn't depend on the model: evaluating out of sample needs other
-generators, whichever models the two samples state. On a plan,
+generators, whichever models the two samples state. Disjoint periods don't
+change that: a row's period is its draw number only in draw order, so blocks of
+two samples from the same generators, under two models or one model and none,
+raise `LeakageError` whatever their periods, and the error names how each side
+placed its rows.
+
+**Cuts of one sample.** `Comonotonic()` and `GaussianCopula` put a moved
+asset's draw of rank r in the row whose rank over every row is r: the first
+asset's rank there, or that of the mixed normal scores. A block cut from such a
+sample (`select`, `holdout`, `year_block_kfold`) then holds the moved asset's
+draws at the ranks its other assets take among both blocks, so the two blocks
+depend on each other. A synthetic study measured it: two assets with Gumbel
+curves (locations 50 and 80, scale 10), losses on a linear impact ramp from 20
+to 140 mm/day of a value of 1e6, no basis risk, the first half of the draws
+against the second, and the Spearman correlation across replications between a
+statistic of each block. Fresh draws give 0 up to the Monte Carlo error, about
+0.02 here.
+
+| Model | Second asset's mean in the first block, first asset's in the second | Mean total loss of each block | Second asset's mean of each block |
+| --- | --- | --- | --- |
+| `Independent()` | −0.02 to −0.01 | −0.04 to −0.01 | −0.02 to 0.01 |
+| `Comonotonic()` | −0.50 to −0.48 | −0.36 to −0.33 | −0.04 to 0.01 |
+| `GaussianCopula(0.5)` | −0.26 to −0.23 | −0.22 to −0.19 | −0.03 to 0.01 |
+| `GaussianCopula(0.9)` | −0.46 to −0.44 | −0.34 to −0.31 | −0.03 to 0.01 |
+
+The ranges span 100, 1,000 and 10,000 draws, with 2,000 replications each. With
+100,000 draws and 500 replications, the second asset's mean against the first
+asset's reads −0.52, −0.31 and −0.49 under the three models that move draws.
+The dependence doesn't shrink as the draws grow. These numbers describe this
+synthetic setup, nothing more.
+
+- Two cuts of one such sample raise `LeakageError` at an out-of-sample
+  evaluation when either reads several assets or hazards: the sample of every
+  asset, or one hazard's view on the combined loss.
+- The same asset's or hazard's own rows of each cut pass: these models treat
+  every row alike, so one column's rows are a random share of its draws (the
+  last column above).
+- Under a model of your own even one column's cuts raise, as nothing says how
+  its reorder treats the rows. Under every model the out-of-sample test is a
+  fresh sample: new generators, the same model.
+
+On a plan,
 `.dependence(model)` states it and `.joint_sample()` returns the sample; the
 plan takes `Independent()`, `Comonotonic()` and `EmpiricalCopula(reference)`.
 The same models, `GaussianCopula` and a model of your own included, put the
@@ -1884,6 +1925,15 @@ draws; the fold for k-fold, which must match the sample's own split).
   sample, or from one asset's or one hazard's view of it, as each column's draws
   were dealt to the reference years by their rank over every row (see
   [several assets from fitted curves](#several-assets-from-fitted-curves)).
+- A period is a draw number only in draw order. Two samples of separate calls
+  that share a source or a generator state, and whose rows a dependence model
+  moved on either side (two models, or one model and none), may hold the same
+  draws in disjoint periods, and raise `LeakageError`, which names how each side
+  placed its rows. So do two cuts of one sample whose assets or hazards
+  `Comonotonic()` or `GaussianCopula` moved, when either reads several of them,
+  and under a model of your own even on one; the same asset's or hazard's own
+  rows of each cut pass ([cuts of one
+  sample](#several-assets-from-fitted-curves)).
 - In sample, a known design sample must be the evaluation sample itself.
 - The metadata records how the split was made: `holdout` (with the train
   fraction), `kfold` (with k), `fresh_draws` (Monte Carlo samples from
@@ -2627,12 +2677,16 @@ joint_result.allocated_output       # joint-comparison.allocated.parquet, beside
       .monte_carlo(5_000, seed=42)
       .scopes(Joint())
       .dependence(Comonotonic())          # Independent(), EmpiricalCopula(reference)
-      .split(FreshDraws(5_000, seed=7))   # the test of an EmpiricalCopula
+      .split(FreshDraws(5_000, seed=7))   # the test of a moved dependence
   ```
 
   `.joint_sample()` returns the sample and `.samples()` each asset's view of it.
   `EmpiricalCopula` takes `FreshDraws`: `Holdout` and `KFold` raise `SampleError`,
-  as a block of its rows is a set of reference years.
+  as a block of its rows is a set of reference years. Under `Comonotonic()`, a
+  `Holdout` or `KFold` raises `LeakageError` when the plan runs, at the joint
+  design's held-out block: the moved assets' draws were placed by the first
+  asset's ranks over both blocks ([cuts of one
+  sample](#several-assets-from-fitted-curves)). Take `FreshDraws` there.
 - **The covers.** A cover must be written for no asset, as it applies to every
   asset (the plan raises otherwise); `design_joint` takes different terms per
   asset. A resolved cover is evaluated as one contract per asset, with
@@ -2923,7 +2977,11 @@ setup text calls it one.
 - **Splits.** `select`, `holdout` and `year_block_kfold` act on every
   component. On an `EmpiricalCopula` sample `holdout` and `year_block_kfold`
   raise, and two blocks cut with `select` raise `LeakageError` at an
-  out-of-sample evaluation, as on several assets.
+  out-of-sample evaluation, as on several assets. Under `Comonotonic()` or
+  `GaussianCopula` two blocks of the sample, or of one component's view on the
+  combined loss, raise `LeakageError` there too, while one component's view on
+  its own loss passes. A view on the combined loss records the reorder of every
+  hazard it reads, as a step of its `selection`.
 - **Hashes and tables.** With components, `content_hash` covers each one's name,
   unit, tail, values, hazard and own loss, and `to_table` adds the columns
   `index[<name>]`, `hazard[<name>]` and `own_loss[<name>]`, with
