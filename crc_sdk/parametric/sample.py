@@ -3231,7 +3231,10 @@ def holdout(
     run holds out the same latest years. Each block's probabilities are
     rescaled to sum to 1. Both blocks share the sample's lineage, so
     evaluating a design on a block that overlaps its design block raises
-    `LeakageError`.
+    `LeakageError`. On a sample whose columns `Comonotonic()` or
+    `GaussianCopula` moved, a design or an evaluation that reads several of
+    its columns raises `LeakageError` too, while one asset's or one hazard's
+    view of each block passes; see `crc_sdk.parametric.dependence`.
 
     Raises `SampleError` unless `train_fraction` is a number in (0, 1) that
     leaves at least one period in each block, for an `EmpiricalCopula`
@@ -3281,7 +3284,9 @@ def year_block_kfold(
     is split by its `n` distinct years instead of its rows, so every run holds
     out the same years in each fold, and the last fold the latest. Returns one
     `(design, held_out)` pair per fold, in fold order; each sample's
-    probabilities are rescaled to sum to 1.
+    probabilities are rescaled to sum to 1. As for `holdout`, on a sample whose
+    columns `Comonotonic()` or `GaussianCopula` moved, a design or an
+    evaluation that reads several of its columns raises `LeakageError`.
 
     Raises `SampleError` unless `k` is an integer with `2 <= k <= n`, for
     an `EmpiricalCopula` sample, whose rows come in reference-year blocks: use
@@ -3545,6 +3550,18 @@ def _check_out_of_sample(design: OutcomeSample, evaluation: OutcomeSample) -> No
     this catches blocks taken with `select`, of the sample or of one asset's or
     one hazard's view of it. Its out-of-sample test is a fresh sample with new
     generators and the same reference.
+
+    A period is a draw number only in draw order. Any other dependence model
+    moves a column's draw to the row its ranks over every row choose, so two
+    samples of separate calls that share a source or a generator state, and
+    whose rows a model moved on either side (under two models, or one model and
+    none), may hold the same draws in disjoint periods: they are refused, and
+    the error names how each side placed its rows. Two cuts of one sample whose
+    columns `Comonotonic()` or `GaussianCopula` moved are refused when either
+    reads several columns, as a moved column's draws were placed by the ranks
+    of the other columns over both blocks; the same column's rows alone pass,
+    being a random share of its draws. A model of the caller's is refused on
+    one column too, as nothing says how its reorder treats the rows.
     """
     design = _require_sample(design)
     evaluation = _require_sample(evaluation)

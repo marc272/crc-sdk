@@ -22,6 +22,18 @@ models use no random numbers of their own.
   where correlated normal scores of the columns' own uniforms have rank r.
 - A model of the caller's implements `DependenceModel`.
 
+The same generators give the same draws under every model, and a row's period
+is its draw number only in draw order. So blocks of two samples from the same
+generators, under two models or one model and none, raise `LeakageError` at an
+out-of-sample evaluation whatever their periods. So do two cuts of one sample
+under `EmpiricalCopula`, and under `Comonotonic()` or `GaussianCopula` when
+either cut reads several columns: a moved column's draws were placed by ranks
+over both cuts. Under those two, one column's own rows are a random share of
+its draws, so the same asset's or hazard's view of each cut passes. Under a
+model of the caller's it raises too, as nothing says how its reorder treats the
+rows. The out-of-sample test of a dependence is a fresh sample: new generators,
+the same model.
+
 Every model, built in or not, passes one gate before its sample is returned.
 Its document and record are plain JSON with a `kind`, which a user's model cannot
 take from a built-in. Its sentence is a non-empty string, written after the
@@ -146,7 +158,10 @@ class Comonotonic:
 
     The first column stays in draw order. Ranks are those of the uniforms, so
     the rank correlation of the uniforms between any two columns is 1, whatever
-    atoms or flat stretches the curves have.
+    atoms or flat stretches the curves have. A moved column's draw in a row is
+    chosen by the first column's rank over every row, so two cuts of one such
+    sample that read several columns raise `LeakageError` at an out-of-sample
+    evaluation; the same column's rows of each cut pass.
     """
 
     def to_document(self) -> dict[str, Any]:
@@ -440,7 +455,10 @@ class GaussianCopula:
     The model is a function of the uniforms and uses no random numbers beyond
     the draws. `rho = 0` is `Independent()` and `rho = 1` is `Comonotonic()`,
     row for row. `correlation` is the copula's parameter, and the rows' Spearman
-    rank correlation is about `6 / pi * arcsin(rho / 2)`.
+    rank correlation is about `6 / pi * arcsin(rho / 2)`. As under
+    `Comonotonic()`, two cuts of one such sample that read several columns
+    raise `LeakageError` at an out-of-sample evaluation, and the same column's
+    rows of each cut pass.
 
     Raises `SampleError` for any other `correlation`.
     """
