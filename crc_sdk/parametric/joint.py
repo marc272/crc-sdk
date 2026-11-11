@@ -312,7 +312,7 @@ def _check_problem(
             f"{len(templates)} for the {len(assets)} assets {list(assets)}"
         )
     for asset, template in zip(assets, templates, strict=True):
-        _check_units(template, sample)
+        _check_units(template, sample, asset)
         if template.asset_id is not None and template.asset_id != asset:
             raise SampleError(
                 f"the template for asset {asset!r} is written for asset "

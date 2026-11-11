@@ -130,6 +130,7 @@ from pydantic import Strict, model_validator
 from crc_sdk.impacts._types import FiniteFloat
 from crc_sdk.parametric import _solver
 from crc_sdk.parametric._canonical import content_hash
+from crc_sdk.parametric._pairing import _check_reads
 from crc_sdk.parametric.constraints import Budget, Limit
 from crc_sdk.parametric.cover import Cover
 from crc_sdk.parametric.errors import (
@@ -157,7 +158,6 @@ from crc_sdk.parametric.payouts import (
 from crc_sdk.parametric.pricing import CostOfCapitalLoad, Pricing, PurePremium
 from crc_sdk.parametric.sample import (
     OutcomeSample,
-    _check_cover_index,
     _cover_index_values,
     _require_one_asset,
 )
@@ -1467,13 +1467,20 @@ def _check_template(template: Cover, sample: OutcomeSample) -> None:
         )
 
 
-def _check_units(template: Cover, sample: OutcomeSample) -> None:
+def _check_units(
+    template: Cover, sample: OutcomeSample, asset: str | None = None
+) -> None:
+    """Raise `SampleError` unless `template` reads `sample`, for `asset`'s column.
+
+    The payout unit must be the loss unit, and the index must read what the
+    sample holds: its unit and, where the sample records one, its hazard.
+    """
     if template.payout_unit != sample.loss_unit:
         raise SampleError(
             f"the cover pays in {template.payout_unit!r}, but the sample's loss "
             f"is in {sample.loss_unit!r}"
         )
-    _check_cover_index(template.index_definition, sample)
+    _check_reads(template.index_definition, sample, asset)
 
 
 def _tail_flags(
@@ -1525,8 +1532,9 @@ def design(
     `SolverLimitError` when a solve stops at its iteration or time limit;
     `DesignError` for any other failed solve or check; `SampleError` when the
     sample holds several assets (take one with `sample.asset(asset_id)`), the
-    template's units or asset differ from the sample's, or the sample lacks a
-    component the template reads; `ValueError` for a template without free
+    template's units or asset differ from the sample's, its index's
+    `hazard_name` differs from the hazard the sample records, or the sample
+    lacks a component the template reads; `ValueError` for a template without free
     parameters; and `TypeError` for arguments of the wrong type.
     """
     _check_inputs(template, sample, objective, pricing, budget, limit, options)
