@@ -231,7 +231,7 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
   .covers(*covers)                            # resolved covers and templates
   .objective(*objectives, pricing=None, budget=None, limit=None,
              options=DesignOptions())         # to design the templates
-  .pricing(PurePremium() | CostOfCapitalLoad(rate, q))   # optional
+  .pricing(pricing)                           # optional: one pricing for every premium
   .split(FreshDraws(n_draws, seed=...) | Holdout(train_fraction) | KFold(k))
   .metrics(MetricOptions(...))                # optional
   .scopes(Individual() | Joint())             # optional; default Individual()
@@ -288,7 +288,7 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
 | `.basis_risk(model)` | How index and loss differ: `HazardNoise(sigma)`, `ImpactNoise(sigma, upper=...)`, `NoBasisRisk()` (warns with `ComonotoneIndexWarning`) or a `BasisRisk` of your own ([what each can change](#basis-risk-models)). Required: no model is assumed |
 | `.covers(*covers)` | The covers to compare. A template is designed; a resolved cover is evaluated as it is. A cover written for no asset applies to every asset, as a copy written for that asset; one written for an asset applies to it only. Each cover pays in the loss unit, on an index read at the asset (`AtAsset()`), in the hazard's unit, or as [`.index(...)`](#an-index-read-elsewhere) states |
 | `.objective(*objectives, pricing, budget, limit, options)` | Designs every template under each objective, with `design`'s terms. `pricing` is the plan's pricing, below |
-| `.pricing(pricing)` | The plan's pricing, `PurePremium()` or `CostOfCapitalLoad(rate, q)`, for a plan of resolved covers that has no `.objective(...)` |
+| `.pricing(pricing)` | The plan's pricing, `PurePremium()`, `CostOfCapitalLoad(rate, q)` or `ExpectedPayoutMultiple(multiple, expense)` ([pricing](#pricing-and-the-premium-used)), for a plan of resolved covers that has no `.objective(...)` |
 | `.split(rule)` | `FreshDraws(n_draws, seed=...)` (fitted curves), `Holdout(train_fraction)` or `KFold(k)`, below |
 | `.metrics(options)` | The `MetricOptions` of every row |
 | `.scopes(*scopes)` | `Individual()`, the default, designs each asset on its own; `Joint()` designs each template on the owner's total ([joint design](#joint-design-over-several-assets)) |

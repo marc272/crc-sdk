@@ -29,6 +29,7 @@ from crc_sdk.parametric import (
     CostOfCapitalLoad,
     Cover,
     EvaluationMetadata,
+    ExpectedPayoutMultiple,
     ExpectedUncovered,
     Free,
     H3Cell,
@@ -1251,6 +1252,62 @@ def test_pricing_and_the_objectives_pricing_must_agree() -> None:
         plan.pricing(COC).objective(MSE()).objective(MSE()).explain(format="json")
     )
     assert restated["designs"]["pricing"] == COC.to_document()
+
+
+def test_a_plan_takes_a_multiple_with_an_expense(tmp_path: Path) -> None:
+    pricing = ExpectedPayoutMultiple(1.5, 100.0)
+    base = (
+        _plan(assets=_assets("warehouse-a"))
+        .basis_risk(NoBasisRisk())
+        .covers(_linear())
+        .split(Holdout(0.7))
+        .metrics(OPTIONS)
+    )
+    plan = base.pricing(pricing)
+    document: Any = plan.explain(format="json")
+    assert [e["pricing"] for e in document["setup"]["evaluations"]] == [
+        pricing.to_document()
+    ] * 2
+    assert "P = 1.5 E[payout] + 100" in setup_text(document["setup"])
+    result = plan.write_parquet(tmp_path / "multiple.parquet")
+    train, test = holdout(result.samples["warehouse-a"], 0.7)
+    blocks: tuple[tuple[Literal["in_sample", "out_of_sample"], Any], ...] = (
+        ("in_sample", train),
+        ("out_of_sample", test),
+    )
+    for split, block in blocks:
+        by_hand = compare(
+            [_linear("warehouse-a")],
+            block,
+            split=split,
+            pricing=pricing,
+            design_sample=train,
+            options=OPTIONS,
+        ).to_pylist()[0]
+        row = next(r for r in result.table.to_pylist() if r["split"] == split)
+        assert row["premium"] == by_hand["premium"]
+        assert row["premium"] == pytest.approx(1.5 * row["expected_payout"] + 100.0)
+    # The designs are priced with it, through either builder.
+    with_designs = base.covers(_step()).objective(
+        ExpectedUncovered(), pricing=pricing, budget=Budget(ratio=1.0)
+    )
+    planned: Any = with_designs.explain(format="json")
+    assert planned["designs"]["pricing"] == pricing.to_document()
+    designed = with_designs.designs()
+    stated = (
+        base.covers(_step())
+        .pricing(pricing)
+        .objective(ExpectedUncovered(), budget=Budget(ratio=1.0))
+    )
+    assert [d.design_id for d in designed] == [d.design_id for d in stated.designs()]
+    bound = Cover(
+        INDEX, _step().payout, payout_unit="EUR", asset_id="warehouse-a", label="step"
+    )
+    by_hand_design = design(
+        bound, train, ExpectedUncovered(), pricing=pricing, budget=Budget(ratio=1.0)
+    )
+    assert designed[0].design_id == by_hand_design.design_id
+    assert designed[0].premium == by_hand_design.premium
 
 
 # -- samples and seeding -------------------------------------------------------
