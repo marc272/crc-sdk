@@ -18,6 +18,7 @@ from crc_sdk.parametric import (
     Cover,
     EvaluationError,
     EvaluationMetadata,
+    ExpectedPayoutMultiple,
     Free,
     IndexDefinition,
     LeakageError,
@@ -179,6 +180,37 @@ def test_pricing_and_a_stated_premium() -> None:
     for name in ("var_net_loss_b0_9", "cvar_net_loss_b0_99", "net_loss_rp10"):
         assert stated[name] == pytest.approx(free[name] + 50.0)
     assert stated["var_uncovered_b0_9"] == free["var_uncovered_b0_9"]
+
+
+def test_a_multiple_and_an_expense_price_the_premium_columns() -> None:
+    sample = _sample()
+    pricing = ExpectedPayoutMultiple(1.5, 40.0)
+    pure = evaluate(_linear(), sample, split="in_sample").to_pylist()[0]
+    priced = evaluate(_linear(), sample, split="in_sample", pricing=pricing)
+    row = priced.to_pylist()[0]
+    payout = _linear().payout_values(sample.index[:, 0])
+    assert row["premium_basis"] == "evaluation"
+    assert row["premium"] == pytest.approx(1.5 * payout.mean() + 40.0)
+    assert row["premium"] == pytest.approx(1.5 * pure["expected_payout"] + 40.0)
+    # The net-loss columns carry the whole premium; the other metrics don't
+    # read it.
+    loading = row["premium"] - pure["premium"]
+    for name in ("var_net_loss_b0_9", "cvar_net_loss_b0_99", "net_loss_rp10"):
+        assert row[name] == pytest.approx(pure[name] + loading)
+    for name in ("expected_payout", "expected_uncovered", "var_uncovered_b0_9"):
+        assert row[name] == pure[name]
+    metadata = EvaluationMetadata.from_table(priced)
+    assert metadata.setup.evaluations[0]["pricing"] == pricing.to_document()
+    # compare prices each cover given as is alike, and a design keeps the
+    # premium it was priced at.
+    design = _Design(_binary("designed"), design_sample=sample, premium=99.0)
+    rows = compare(
+        [_linear(), _binary(), design], sample, split="in_sample", pricing=pricing
+    ).to_pylist()
+    for cover, compared in zip((_linear(), _binary()), rows, strict=False):
+        expected = cover.payout_values(sample.index[:, 0]).mean()
+        assert compared["premium"] == pytest.approx(1.5 * expected + 40.0)
+    assert (rows[2]["premium"], rows[2]["premium_basis"]) == (99.0, "design")
 
 
 def test_options_change_the_columns() -> None:

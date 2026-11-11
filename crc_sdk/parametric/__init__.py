@@ -44,6 +44,8 @@ budget, and reads the designs on one block, one row per budget.
 and refuses a set in which anything but the hazard differs. `compare_scenarios`
 puts every cover or design on every scenario's block in one table, and `to_drift`
 adds each row's difference and ratio against a reference scenario.
+`PurePremium`, `CostOfCapitalLoad` and `ExpectedPayoutMultiple` price the
+premiums, a design's budget bounds and a comparison reads.
 
 `ParametricPlan` chains these steps as a lazy plan, to a written
 comparison: `ParametricPlan.for_evaluation(request)` from the fitted hazard
@@ -154,7 +156,11 @@ from crc_sdk.parametric.plan import (
     ParametricResult,
     StationColumn,
 )
-from crc_sdk.parametric.pricing import CostOfCapitalLoad, PurePremium
+from crc_sdk.parametric.pricing import (
+    CostOfCapitalLoad,
+    ExpectedPayoutMultiple,
+    PurePremium,
+)
 from crc_sdk.parametric.sample import (
     IndexComponent,
     OutcomeSample,
@@ -202,6 +208,7 @@ __all__ = [
     "EmpiricalCopula",
     "EvaluationError",
     "EvaluationMetadata",
+    "ExpectedPayoutMultiple",
     "ExpectedUncovered",
     "Free",
     "FreshDraws",

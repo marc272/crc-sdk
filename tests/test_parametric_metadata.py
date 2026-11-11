@@ -25,6 +25,7 @@ from crc_sdk.parametric import (
     DesignResult,
     EvaluationError,
     EvaluationMetadata,
+    ExpectedPayoutMultiple,
     ExpectedUncovered,
     Free,
     ImpactNoise,
@@ -722,6 +723,30 @@ def test_setup_text_writes_shared_statements_once() -> None:
     assert lines["Pricing"][0].startswith("Pricing: as each split states,")
 
 
+MULTIPLE_TEXT = (
+    "a multiple of the expected payout plus a fixed expense in the payout unit, "
+    "P = 1.5 E[payout] + 10,000"
+)
+
+
+def test_setup_text_states_a_multiple_and_its_expense() -> None:
+    train, test = holdout(_sample())
+    pricing = ExpectedPayoutMultiple(1.5, 10_000.0)
+    priced = _metadata(
+        evaluate(
+            LINEAR, test, split="out_of_sample", design_sample=train, pricing=pricing
+        )
+    )
+    lines = _lines(setup_text(priced))
+    assert lines["Pricing"][0].startswith(
+        f"Pricing: {MULTIPLE_TEXT}, on the evaluation sample, for the covers given "
+        "as is;"
+    )
+    plain = _metadata(evaluate(LINEAR, train, split="in_sample"))
+    lines = _lines(setup_text(EvaluationMetadata.merge(plain, priced)))
+    assert lines["Split"][1].endswith(f" Pricing: {MULTIPLE_TEXT}.")
+
+
 def test_setup_text_describes_samples_that_differ() -> None:
     first = _metadata(evaluate(COVER, _sample(), split="in_sample"))
     usd = _sample(start=2100)
@@ -797,6 +822,10 @@ def test_setup_text_describes_samples_that_differ() -> None:
             },
             "pricing: a cost-of-capital load, P = (1 - 0.1) E[payout] + 0.1 "
             "CVaR_0.99(payout);",
+        ),
+        (
+            {"record": {"pricing": ExpectedPayoutMultiple(1.5, 1e4).to_document()}},
+            f"pricing: {MULTIPLE_TEXT};",
         ),
         ({"premium": 0.000012345678}, "design premium: 0.0000123457 EUR"),
     ],
@@ -935,6 +964,14 @@ def test_setup_text_of_a_setup_known_before_drawing() -> None:
         (
             {"evaluations": [{"pricing": {"kind": "cost_of_capital", "q": 0.9}}]},
             r"pricing\.rate must be a number",
+        ),
+        (
+            {
+                "evaluations": [
+                    {"pricing": {"kind": "expected_payout_multiple", "multiple": 2}}
+                ]
+            },
+            r"pricing\.expense must be a number",
         ),
         (
             {"evaluations": [{"split": "out_of_sample", "design_samples": "a"}]},

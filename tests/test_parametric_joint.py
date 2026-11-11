@@ -28,6 +28,7 @@ from crc_sdk.parametric import (
     Cover,
     DesignError,
     DesignOptions,
+    ExpectedPayoutMultiple,
     ExpectedUncovered,
     Free,
     IndexDefinition,
@@ -407,6 +408,39 @@ def test_a_loaded_premium_is_priced_on_the_total_payout() -> None:
     assert result.objective_value == pytest.approx(20.0)
 
 
+def test_a_multiple_prices_one_contract_on_the_total_with_one_expense() -> None:
+    # As above, E[U] = (120 - a - b) / 4. The premium of the one contract on
+    # the total is 1.5 (a + b) / 4 + 6, its expense paid once: a budget of 21
+    # gives a + b = 40, in any split.
+    sample = _sample(
+        [[0.0, 0.0], [3.0, 0.0], [0.0, 3.0], [0.0, 0.0]],
+        [[0.0, 0.0], [60.0, 0.0], [0.0, 60.0], [0.0, 0.0]],
+    )
+    pricing = ExpectedPayoutMultiple(1.5, 6.0)
+    result = design_joint(
+        _pair(),
+        sample,
+        ExpectedUncovered(),
+        pricing=pricing,
+        budget=Budget(amount=21.0),
+    )
+    assert _level(result, "A") + _level(result, "B") == pytest.approx(40.0)
+    assert result.premium == pytest.approx(21.0)
+    assert result.objective_value == pytest.approx(20.0)
+    assert result.pricing == pricing.to_document()
+    with pytest.raises(
+        InfeasibleDesignError, match="the joint design: the budget 5 is below"
+    ) as raised:
+        design_joint(
+            _pair(),
+            sample,
+            ExpectedUncovered(),
+            pricing=pricing,
+            budget=Budget(amount=5.0),
+        )
+    assert raised.value.asset_id is None and raised.value.status == "infeasible"
+
+
 def test_the_covers_stay_separate_contracts_with_their_own_terms() -> None:
     # MSE, closed form per band, unique. A's two bands are pooled by its
     # monotone levels (30 and 10 become 20 and 20); B's are not pooled, and
@@ -555,11 +589,15 @@ def _book(seed: int, n: int = 60) -> OutcomeSample:
 
 
 OBJECTIVES = [MSE(), ExpectedUncovered(), WeightedCVaR(0.9, 0.9)]
-PRICINGS: list[Pricing] = [PurePremium(), CostOfCapitalLoad(0.06, 0.95)]
+PRICINGS: list[Pricing] = [
+    PurePremium(),
+    CostOfCapitalLoad(0.06, 0.95),
+    ExpectedPayoutMultiple(1.3, 0.01),
+]
 
 
 @pytest.mark.parametrize("seed", range(4))
-@pytest.mark.parametrize("pricing", PRICINGS, ids=["pure", "coc"])
+@pytest.mark.parametrize("pricing", PRICINGS, ids=["pure", "coc", "multiple"])
 @pytest.mark.parametrize("objective", OBJECTIVES, ids=["mse", "eu", "wcvar"])
 def test_under_a_ratio_budget_the_individual_designs_are_a_feasible_point(
     objective: MSE | ExpectedUncovered | WeightedCVaR, pricing: Pricing, seed: int

@@ -5,10 +5,16 @@
   CVaR_q(payout)`, with `rate` in [0, 1] and `q` in (0, 1). The load is the
   cost of holding capital against the payout's tail. It is convex in the
   payout, so a design under it stays a linear or quadratic programme.
+- `ExpectedPayoutMultiple(multiple, expense=0.0)`: `P = multiple *
+  E[payout] + expense`, with `multiple >= 1` and `expense >= 0`, a fixed
+  amount in the payout unit of the covers it prices. It is the price an
+  insurer or a broker usually states first: a multiple of the expected
+  payout and a fixed expense per contract and year. It is linear in the
+  payout, so a design's budget stays one linear row.
 
 The CVaR is over the years of the sample, as everywhere in this module (see
 `crc_sdk.parametric.metrics`); it is not crc-framework's CVaR over binary
-outcomes. Both pricings are frozen value objects with a JSON document
+outcomes. The pricings are frozen value objects with a JSON document
 (`to_document()`), which evaluation metadata records next to every premium.
 """
 
@@ -25,7 +31,13 @@ from crc_sdk.parametric._risk import Draws
 from crc_sdk.parametric.errors import CoverDefinitionError
 from crc_sdk.parametric.parameters import _DefinitionModel
 
-__all__ = ["CostOfCapitalLoad", "Pricing", "PurePremium", "pricing_from_document"]
+__all__ = [
+    "CostOfCapitalLoad",
+    "ExpectedPayoutMultiple",
+    "Pricing",
+    "PurePremium",
+    "pricing_from_document",
+]
 
 
 class PurePremium(_DefinitionModel):
@@ -85,8 +97,72 @@ class CostOfCapitalLoad(_DefinitionModel):
         return {"kind": "cost_of_capital", "q": self.q, "rate": self.rate}
 
 
-Pricing: TypeAlias = PurePremium | CostOfCapitalLoad
+class ExpectedPayoutMultiple(_DefinitionModel):
+    """A multiple of the expected payout plus a fixed expense.
+
+    `P = multiple * E[payout] + expense`, with `multiple >= 1` and
+    `expense >= 0`. `expense` is a fixed amount per contract and year, in the
+    payout unit of the covers it prices; it defaults to 0. `multiple` has no
+    default: 1 with no expense is the pure premium, which `PurePremium()`
+    states. Raises `CoverDefinitionError` for terms out of range.
+    """
+
+    kind: Literal["expected_payout_multiple"] = "expected_payout_multiple"
+    multiple: FiniteFloat
+    expense: FiniteFloat = 0.0
+
+    def __init__(self, multiple: float, expense: float = 0.0) -> None:
+        super().__init__(multiple=multiple, expense=expense)
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        if self.multiple < 1.0:
+            raise CoverDefinitionError(
+                f"multiple must be at least 1, got {self.multiple!r}"
+            )
+        if self.expense < 0.0:
+            raise CoverDefinitionError(f"expense must be >= 0, got {self.expense!r}")
+        return self
+
+    def premium(self, payout: ArrayLike, probability: ArrayLike) -> float:
+        """Return `multiple * sum(probability * payout) + expense`.
+
+        Raises `ValueError` for arrays of different shapes, non-finite
+        payouts or non-positive probabilities.
+        """
+        return self.multiple * Draws(payout, probability).mean() + self.expense + 0.0
+
+    def to_document(self) -> dict[str, Any]:
+        """Return the kind, `expense` and `multiple`, as plain JSON types."""
+        return {
+            "expense": self.expense,
+            "kind": "expected_payout_multiple",
+            "multiple": self.multiple,
+        }
+
+
+Pricing: TypeAlias = PurePremium | CostOfCapitalLoad | ExpectedPayoutMultiple
 """The pricings a cover's premium can be computed with."""
+
+_PRICINGS = (PurePremium, CostOfCapitalLoad, ExpectedPayoutMultiple)
+_PRICINGS_TEXT = (
+    "PurePremium(), CostOfCapitalLoad(rate, q) or "
+    "ExpectedPayoutMultiple(multiple, expense)"
+)
+
+
+def _check_pricing(pricing: Any) -> Pricing:
+    """Return `pricing` if it is one of the pricings; raise `TypeError` if not."""
+    if not isinstance(pricing, _PRICINGS):
+        raise TypeError(
+            f"pricing must be {_PRICINGS_TEXT}, got {type(pricing).__name__}"
+        )
+    return pricing
+
+
+def _expense(pricing: Pricing) -> float:
+    """The fixed part of a pricing's premium: what a cover that never pays costs."""
+    return pricing.expense if isinstance(pricing, ExpectedPayoutMultiple) else 0.0
 
 
 def pricing_from_document(document: Any) -> Pricing:
@@ -107,4 +183,11 @@ def pricing_from_document(document: Any) -> Pricing:
                 "a cost-of-capital document has the keys kind, q and rate"
             )
         return CostOfCapitalLoad(document["rate"], document["q"])
+    if kind == "expected_payout_multiple":
+        if set(document) != {"expense", "kind", "multiple"}:
+            raise CoverDefinitionError(
+                "an expected-payout-multiple document has the keys expense, kind "
+                "and multiple"
+            )
+        return ExpectedPayoutMultiple(document["multiple"], document["expense"])
     raise CoverDefinitionError(f"unknown pricing kind {kind!r}")
