@@ -925,6 +925,7 @@ def test_replicates_against_literal_values_of_the_reference_bootstrap() -> None:
     evaluated = _Evaluated(
         table=None,
         reads=(_Read(_Arrays(loss, payout, None, (payout,)), 0.0, None),),
+        together=(frozenset(),),
         probability=np.full(8, 1.0 / 8.0),
         year=np.arange(8),
         n_years=8,
@@ -1039,6 +1040,7 @@ def test_the_table_has_to_longs_columns_and_the_bounds() -> None:
         "n_bootstrap",
         "n_undefined",
         "short_block",
+        "built_together",
     ]
     assert tuple(table.column_names[: len(IDENTITY_COLUMNS)]) == IDENTITY_COLUMNS
     assert table.select(long.column_names).to_pylist() == long.to_pylist()
@@ -1048,6 +1050,8 @@ def test_the_table_has_to_longs_columns_and_the_bounds() -> None:
     assert schema.field("n_bootstrap").type == pa.int32()
     assert schema.field("n_undefined").type == pa.int32()
     assert schema.field("short_block").type == pa.bool_()
+    assert schema.field("built_together").type == pa.bool_()
+    assert table.column("built_together").to_pylist() == [False] * table.num_rows
     assert set(table.column("ci_level").to_pylist()) == {0.9}
     assert set(table.column("n_bootstrap").to_pylist()) == {40}
     assert EVALUATION_METADATA_KEY.encode() in schema.metadata
@@ -1536,6 +1540,7 @@ def test_the_metadata_records_the_intervals_and_the_generator() -> None:
     assert {
         key: intervals[key] for key in intervals if key != "short_block_columns"
     } == {
+        "built_together": [],
         "ci_level": 0.8,
         "method": "percentile",
         "n_bootstrap": 15,

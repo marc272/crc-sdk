@@ -23,8 +23,9 @@ with sorted keys. It holds:
   sample entry for the pooled rows, and writes one evaluation with `fold` null,
   `method` `"kfold_pooled"` and `details` with `k` and the held-out blocks'
   hashes in fold order. `bootstrap_intervals` adds `intervals`: the method, the
-  resampling unit, the number of resamples, the level and the columns whose
-  level reaches the block's worst row. `intervals` is null otherwise.
+  resampling unit, the number of resamples, the level, the columns whose
+  level reaches the block's worst row and, under `built_together`, how the
+  rows it flags were built. `intervals` is null otherwise.
   `design_frontier` adds `frontier`, one entry per call: the template's hash, the
   objective, the budgets as stated and each one's design, the design sample and
   the block read, with its split and fold.
@@ -185,8 +186,42 @@ _INTERVAL_COLUMNS = (
     "n_bootstrap",
     "n_undefined",
     "short_block",
+    "built_together",
 )
 """The columns of an intervals table beside the identity columns."""
+
+_ADDED_INTERVAL_COLUMNS = ("built_together",)
+"""The columns of an intervals table that a table written earlier doesn't have."""
+
+_BUILT_TOGETHER = {
+    "empirical_copula": (
+        "they read two or more assets or hazards whose draws an EmpiricalCopula "
+        "dealt to its reference years by their rank over every row"
+    ),
+    "comonotonic": (
+        "they read two or more assets or hazards whose draws Comonotonic() placed "
+        "by their rank over every row, where interval coverage is unmeasured"
+    ),
+    "gaussian_copula": (
+        "they read two or more assets or hazards whose draws a GaussianCopula "
+        "placed by their rank over every row, where interval coverage is "
+        "unmeasured"
+    ),
+    "dependence_model": (
+        "they read two or more assets or hazards whose draws a dependence model "
+        "of the caller's placed by a rule over every row, where interval coverage "
+        "is unmeasured"
+    ),
+    "hazard_distribution": (
+        "they read a hazard at the asset whose values HazardNoise(..., "
+        "hold='hazard_distribution') gave by rank over every row"
+    ),
+}
+"""How the rows an intervals table flags `built_together` were built, by kind.
+
+`setup.intervals.built_together` lists the kinds of a table's flagged rows, in
+this order.
+"""
 
 KEY_COLUMNS = (
     "cover_hash",
@@ -391,7 +426,15 @@ def _merged_intervals(
         for record in stated
         for column in record.get("short_block_columns") or ()
     )
-    return {**first, "short_block_columns": list(flagged)}
+    merged = {**first, "short_block_columns": list(flagged)}
+    if any("built_together" in record for record in stated):
+        # A record written before `built_together` existed flags no row.
+        merged["built_together"] = list(
+            dict.fromkeys(
+                kind for record in stated for kind in record.get("built_together") or ()
+            )
+        )
+    return merged
 
 
 _FRONTIER_KEYS = frozenset(
@@ -814,7 +857,8 @@ class EvaluationMetadata(_EvaluationModel):
         `unidentified_share` was
         added may lack that column. An intervals table has one row per wide row
         and metric column instead, and its `column` holds metric columns of
-        `columns`. Its key
+        `columns`; one written before `built_together` was added may lack that
+        column. Its key
         (`cover_hash`, `design_id`, `asset_id`, `level`, `scenario`,
         `design_scenario`, `split`, `fold`, `part` on a payout breakdown and
         `column` on an intervals table, a column it lacks reading as null) must
@@ -828,7 +872,11 @@ class EvaluationMetadata(_EvaluationModel):
             raise EvaluationError(f"the comparison table lacks the columns {missing}")
         intervals = "ci_low" in names
         if intervals:
-            lacking = [name for name in _INTERVAL_COLUMNS if name not in names]
+            lacking = [
+                name
+                for name in _INTERVAL_COLUMNS
+                if name not in names and name not in _ADDED_INTERVAL_COLUMNS
+            ]
             if lacking:
                 raise EvaluationError(
                     f"the intervals table lacks the columns {lacking}"
@@ -1947,7 +1995,8 @@ def _of_rows(
     are evaluated or designed on, the held-out blocks of a pooled evaluation
     among them, and the source records those of the samples kept. A pooled
     row's design lists the designs of its folds, which are kept too. An
-    intervals table's flagged columns are those of the rows it still holds, and
+    intervals table's flagged columns are those of the rows it still holds, its
+    rows built together are stated only if one of those rows is flagged, and
     a frontier's budgets those its rows still name. A table without those
     columns, or without rows, names no evaluation: then the setup is that of the
     whole comparison, and the last item says so.
@@ -2075,6 +2124,13 @@ def _of_rows(
             if row["short_block"]
         )
         intervals = {**intervals, "short_block_columns": flagged}
+    if (
+        intervals is not None
+        and intervals.get("built_together")
+        and "built_together" in table.column_names
+        and not any(table.column("built_together").to_pylist())
+    ):
+        intervals = {**intervals, "built_together": []}
     return (
         {
             **setup,
@@ -3060,6 +3116,22 @@ def _intervals(intervals: Mapping[str, Any]) -> str:
             f" The level of these columns reaches the block's worst row, so their "
             "bounds cannot reach beyond the block's largest rows and understate how "
             f"far the number could move: {', '.join(short)}."
+        )
+    kinds = [str(kind) for kind in _list(intervals, "built_together", where)]
+    unknown = [kind for kind in kinds if kind not in _BUILT_TOGETHER]
+    if unknown:
+        raise EvaluationError(
+            f"{where}.built_together names kinds of rows it doesn't know: {unknown}; "
+            f"it takes {list(_BUILT_TOGETHER)}"
+        )
+    if kinds:
+        text += (
+            " The rows with built_together true read draws that were built "
+            f"together: {'; or '.join(_BUILT_TOGETHER[kind] for kind in kinds)}. "
+            "Resampling treats them as independent, so on these rows an interval "
+            "is not the sampling error of the number, and it can be narrower or "
+            "wider; crc-sdk's docs/parametric.md, "
+            '"Rows built together", gives a synthetic coverage study.'
         )
     return text
 
