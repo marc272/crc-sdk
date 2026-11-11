@@ -29,7 +29,16 @@ objective at every candidate is kept (`DesignResult.profile`).
 **Solver.** The LP and QP routes use HiGHS from the optional extra
 `crc-sdk[parametric]` (`pip install crc-sdk[parametric]`), imported only
 when needed; without it they raise `SolverUnavailableError`. A grid
-evaluated in numpy needs no solver.
+evaluated in numpy needs no solver. Every QP solve has an iteration and a
+time limit, because HiGHS's active-set QP solver can cycle at a degenerate
+vertex. When HiGHS stops at its limit, or ends a QP with any outcome but
+optimal or infeasible, a QP of at most 500 columns (one per amount, unless a
+cost-of-capital premium adds a column per draw) is solved again by a dense
+active-set method in numpy, whose steps at a degenerate vertex are LPs
+solved by HiGHS's simplex. `DesignResult.solved_by` says which one solved
+the design (`"highs"` or `"active_set"`) and `fallbacks` how many of its
+solves the fallback finished. A solve that stops at a limit raises
+`SolverLimitError`, which names the limit.
 
 **Scaling.** Losses and payouts are divided by the largest loss of a draw
 (1 if that is at most 1e-6) before solving; results are in payout units.
@@ -40,8 +49,9 @@ parameters, with the relative tolerance `DesignOptions.feasibility_tolerance`
 (relative to the larger of the bound and the scale). A violation, or a
 solver status other than optimal, raises `DesignError`,
 `InfeasibleDesignError` or `UnboundedDesignError`, with the asset id and the
-solver's message. Free amounts below 1e-9 of the scale are set to 0 and
-listed (`DesignResult.zeroed`).
+solver's message. A mean squared error is never below 0, so a QP reported
+unbounded raises `DesignError`, not `UnboundedDesignError`. Free amounts below
+1e-9 of the scale are set to 0 and listed (`DesignResult.zeroed`).
 
 **Non-unique optima** are reported, not hidden:
 
@@ -125,6 +135,7 @@ from crc_sdk.parametric.errors import (
     DesignError,
     InfeasibleDesignError,
     SampleError,
+    SolverLimitError,
     UnboundedDesignError,
 )
 from crc_sdk.parametric.objectives import (
@@ -272,6 +283,10 @@ class DesignResult:
     - `solver` (`{"name", "version"}`, or `None` for a grid in numpy),
       `status`, `solver_message`, `iterations`, `solves`, `seconds` (solver
       time) and `solver_options`.
+    - `solved_by`: what solved the design's amounts, `"highs"` or
+      `"active_set"` (the dense fallback of a QP that HiGHS left unsolved),
+      or `None` for a grid in numpy; `fallbacks`: how many of the design's
+      solves the fallback finished, over every candidate of a grid.
     - The non-uniqueness report: `unidentified` amounts and the `fill` rule
       that set them, `zeroed` amounts, `ranges` (wide ranges in payout
       units, with `ranges=True` on the LP route), `unique`, `ties`, and the
@@ -321,6 +336,8 @@ class DesignResult:
     tail_outcomes: float | None
     degenerate_tail: str | None
     design_sample: OutcomeSample = field(repr=False)
+    solved_by: _solver.Method | None = None
+    fallbacks: int = 0
 
     @property
     def sample_hash(self) -> str:
@@ -332,9 +349,10 @@ class DesignResult:
 
         The record holds the ids and hashes, the objective, pricing, budget,
         limit and options, the values, the solve (`solver` with the name and
-        version; `solve` with the status, message, iterations, solves, time
-        and options), the non-uniqueness report and the degenerate-tail
-        flags. `evaluate` writes it to its metadata's `designs`.
+        version; `solve` with the status, message, iterations, solves, time,
+        options, `solved_by` and `fallbacks`), the non-uniqueness report and
+        the degenerate-tail flags. `evaluate` writes it to its metadata's
+        `designs`.
         """
         ranges = (
             None
@@ -367,6 +385,8 @@ class DesignResult:
                 "solves": self.solves,
                 "seconds": self.seconds,
                 "options": copy.deepcopy(dict(self.solver_options)),
+                "solved_by": self.solved_by,
+                "fallbacks": self.fallbacks,
             },
             "unidentified": list(self.unidentified),
             "fill": self.fill,
@@ -441,12 +461,14 @@ class _Solves:
     iterations: int = 0
     count: int = 0
     seconds: float = 0.0
+    fallbacks: int = 0
     last: _solver.Solution | None = None
 
     def add(self, solution: _solver.Solution) -> _solver.Solution:
         self.iterations += solution.iterations
         self.count += 1
         self.seconds += solution.seconds
+        self.fallbacks += int(solution.method == "active_set")
         self.last = solution
         return solution
 
@@ -459,6 +481,7 @@ class _Amounts:
     values: dict[str, float]
     objective_value: float
     route: Literal["lp", "qp"]
+    method: _solver.Method
     unidentified: tuple[str, ...]
     zeroed: tuple[str, ...]
     unique: bool | None
@@ -651,7 +674,8 @@ def _solve(
 ) -> _solver.Solution:
     """Solve; raise the typed error of any status other than optimal.
 
-    With `keep_basis`, an LP's solution carries its optimal basis.
+    With `keep_basis`, an LP's solution carries its optimal basis. The QP
+    route's objective, a mean squared error, is bounded below by 0.
     """
 
     def run(chosen: Mapping[str, Any] | None) -> _solver.Solution:
@@ -659,7 +683,7 @@ def _solve(
             return _solver.solve_qp(programme, chosen)
         return _solver.solve_lp(programme, chosen, keep_basis=keep_basis)
 
-    return _checked(run, context, solves, options)
+    return _checked(run, context, solves, options, bounded_below=route == "qp")
 
 
 def _checked(
@@ -667,14 +691,37 @@ def _checked(
     context: _Context,
     solves: _Solves,
     options: Mapping[str, Any] | None = None,
+    *,
+    bounded_below: bool = False,
 ) -> _solver.Solution:
-    """Call `run(options)`; raise the typed error of any status but optimal."""
+    """Call `run(options)`; raise the typed error of any status but optimal.
+
+    A solve stopped at a limit raises `SolverLimitError`, named by the limit.
+    With `bounded_below`, an objective that can't be unbounded, an unbounded
+    status is a solver failure and raises `DesignError`.
+    """
     solution = solves.add(run(options))
     if solution.status == "infeasible_or_unbounded":
         # Presolve may not tell the two apart; the solve without it does.
         solution = solves.add(run({**(options or {}), "presolve": "off"}))
     if solution.status == "optimal":
         return solution
+    if solution.status == "limit":
+        raise context.error(
+            SolverLimitError,
+            f"the solve stopped at its limit {solution.limit} before it found an "
+            f"optimum ({solution.message})",
+            status=solution.limit,
+            solver_message=solution.message,
+        )
+    if solution.status == "unbounded" and bounded_below:
+        raise context.error(
+            DesignError,
+            "the solver reported an unbounded objective, but a mean squared "
+            f"error is never below 0: the solve failed ({solution.message})",
+            status=solution.status,
+            solver_message=solution.message,
+        )
     kinds: dict[str, type[DesignError]] = {
         "infeasible": InfeasibleDesignError,
         "unbounded": UnboundedDesignError,
@@ -1161,6 +1208,7 @@ def _design_amounts(
         values=values,
         objective_value=value,
         route=solved.route,
+        method=solved.solution.method,
         unidentified=_masked_names(block.names, solved.unidentified),
         zeroed=_masked_names(block.names, solved.zeroed),
         unique=unique,
@@ -1335,6 +1383,22 @@ def _grid_status(
 # -- the public function -----------------------------------------------------
 
 
+def _solver_options(route: Literal["lp", "qp"], ranging: bool) -> dict[str, Any]:
+    """The solver options of a design on the LP or QP route, for its record."""
+    return {
+        "solve": dict(_solver.QP_OPTIONS if route == "qp" else _solver.LP_OPTIONS),
+        "ranging": dict(_solver.RANGING_OPTIONS) if ranging else None,
+        "active_set": (
+            {
+                "max_columns": _solver.ACTIVE_SET_MAX_COLUMNS,
+                "iteration_limit": _solver.ACTIVE_SET_ITERATION_LIMIT,
+            }
+            if route == "qp"
+            else None
+        ),
+    }
+
+
 def _check_inputs(
     template: Any,
     sample: Any,
@@ -1452,11 +1516,12 @@ def design(
     Returns a `DesignResult` with the resolved cover and its record. Raises
     `SolverUnavailableError` without the `parametric` extra on the LP and QP
     routes; `InfeasibleDesignError` when no payout meets the constraints;
-    `UnboundedDesignError` for an unbounded objective; `DesignError` for any
-    other failed solve or check; `SampleError` when the sample holds several
-    assets (take one with `sample.asset(asset_id)`), the template's units or
-    asset differ from the sample's, or the sample lacks a component the
-    template reads; `ValueError` for a template without free
+    `UnboundedDesignError` for an unbounded objective (never for `MSE`);
+    `SolverLimitError` when a solve stops at its iteration or time limit;
+    `DesignError` for any other failed solve or check; `SampleError` when the
+    sample holds several assets (take one with `sample.asset(asset_id)`), the
+    template's units or asset differ from the sample's, or the sample lacks a
+    component the template reads; `ValueError` for a template without free
     parameters; and `TypeError` for arguments of the wrong type.
     """
     _check_inputs(template, sample, objective, pricing, budget, limit, options)
@@ -1511,13 +1576,9 @@ def design(
             unique = False
         solver: dict[str, str] | None = _solver.identity()
         ranging = amounts.route == "lp" and options.ranges
-        solver_options: dict[str, Any] = {
-            "solve": dict(
-                _solver.QP_OPTIONS if amounts.route == "qp" else _solver.LP_OPTIONS
-            ),
-            "ranging": dict(_solver.RANGING_OPTIONS) if ranging else None,
-        }
+        solver_options = _solver_options(amounts.route, ranging)
         message = "" if solves.last is None else solves.last.message
+        solved_by: _solver.Method | None = amounts.method
     else:
         outcome = _grid(template, free, context, solves, inner=False)
         cover, ties, profile, counts = (
@@ -1530,6 +1591,7 @@ def design(
         route, amounts_route = "grid", "grid"
         unique = False if ties else None
         solver, solver_options, message = None, {}, "best grid candidate"
+        solved_by = None
     _, objective_value, premium = _verify(context, cover, np.zeros(0), None, None)
     p_zero, tail, flag = _tail_flags(objective, loss, probability)
     values = cover.payout.parameters()
@@ -1584,4 +1646,6 @@ def design(
         tail_outcomes=tail,
         degenerate_tail=flag,
         design_sample=sample,
+        solved_by=solved_by,
+        fallbacks=solves.fallbacks,
     )

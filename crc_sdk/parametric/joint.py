@@ -16,7 +16,10 @@ pays by its own terms.
 **How it is solved.** The LP or QP of `design`, on the block basis
 `[B_1 | ... | B_m]` with the amounts in asset order, the covers' constraints
 stacked block by block and the summed loss. The scale is the largest summed
-loss of a draw.
+loss of a draw. The QP has the limits and the dense active-set fallback of
+`design`, so a joint MSE design that HiGHS leaves unsolved is solved again in
+numpy when it has at most 500 columns, and otherwise raises
+`SolverLimitError`; `solved_by` and `fallbacks` record it.
 
 **Fixed thresholds.** Only amounts are free in a joint design. A free
 threshold, a `UserObjective` or a payout without `LinearInAmounts` raises
@@ -67,6 +70,7 @@ from crc_sdk.parametric.design import (
     _read_block,
     _resolve_amounts,
     _solve_block,
+    _solver_options,
     _Solves,
     _tail_flags,
     _uniqueness,
@@ -146,7 +150,9 @@ class JointDesignResult:
       `budget_use`, `p_zero_loss`, `tail_outcomes` and `degenerate_tail` are
       on the total: the sum over the assets, draw by draw;
     - `route` and `amounts` are `"lp"` or `"qp"`; there is no grid, so `ties`
-      is 0 and `profile` and `grid` are `None`.
+      is 0 and `profile` and `grid` are `None`;
+    - `solved_by` is `"highs"` or `"active_set"` and `fallbacks` is 0 or 1:
+      the joint design is one solve.
 
     Unless `unique` is true, the per-asset amounts are one member of an
     optimal set: they are the solver's choice of how to split the total
@@ -190,6 +196,8 @@ class JointDesignResult:
     tail_outcomes: float | None
     degenerate_tail: str | None
     design_sample: OutcomeSample = field(repr=False)
+    solved_by: _solver.Method | None = None
+    fallbacks: int = 0
 
     @property
     def asset_ids(self) -> tuple[str, ...]:
@@ -244,6 +252,8 @@ class JointDesignResult:
                 "solves": self.solves,
                 "seconds": self.seconds,
                 "options": copy.deepcopy(dict(self.solver_options)),
+                "solved_by": self.solved_by,
+                "fallbacks": self.fallbacks,
             },
             "unidentified": {
                 asset: list(names) for asset, names in self.unidentified.items()
@@ -401,7 +411,9 @@ def design_joint(
 
     Returns a `JointDesignResult`. Raises `SolverUnavailableError` without the
     `parametric` extra; `InfeasibleDesignError` when no payout meets the
-    constraints; `UnboundedDesignError` for an unbounded objective;
+    constraints; `UnboundedDesignError` for an unbounded objective (never for
+    `MSE`); `SolverLimitError` when the solve stops at its iteration or time
+    limit;
     `DesignError` for a sample of one asset, a free threshold, a
     `UserObjective`, a payout without `LinearInAmounts`, or any failed solve
     or check; `SampleError` when the templates' number, assets or units don't
@@ -554,12 +566,7 @@ def design_joint(
         iterations=solves.iterations,
         solves=solves.count,
         seconds=solves.seconds,
-        solver_options={
-            "solve": dict(
-                _solver.QP_OPTIONS if solved.route == "qp" else _solver.LP_OPTIONS
-            ),
-            "ranging": dict(_solver.RANGING_OPTIONS) if solved.ranging else None,
-        },
+        solver_options=_solver_options(solved.route, solved.ranging),
         unidentified=unidentified,
         fill=options.fill,
         zeroed=zeroed,
@@ -572,4 +579,6 @@ def design_joint(
         tail_outcomes=tail,
         degenerate_tail=flag,
         design_sample=sample,
+        solved_by=solved.solution.method,
+        fallbacks=solves.fallbacks,
     )
