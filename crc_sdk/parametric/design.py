@@ -15,7 +15,12 @@ built-in family is) has its amounts solved exactly:
   the Rockafellar-Uryasev form;
 - MSE: one quadratic programme in the amounts (`route="qp"`);
 - a cost-of-capital premium adds the Rockafellar-Uryasev auxiliaries of the
-  premium's CVaR to either.
+  premium's CVaR to either;
+- a premium that is a multiple of the expected payout plus an expense
+  (`ExpectedPayoutMultiple`) keeps the budget one linear row in the amounts,
+  `multiple * E[payout] <= bound - expense`, so the QP stays one in the
+  amounts only. A budget below the expense raises `InfeasibleDesignError`
+  before solving, on every route: a cover that never pays still costs it.
 
 Free thresholds (attachment, exhaustion, breakpoints, knots, trigger) are
 searched on their stated grids, with the LP or QP above at each grid point
@@ -155,7 +160,15 @@ from crc_sdk.parametric.payouts import (
     SumOf,
     _has_amounts,
 )
-from crc_sdk.parametric.pricing import CostOfCapitalLoad, Pricing, PurePremium
+from crc_sdk.parametric.pricing import (
+    _PRICINGS,
+    _PRICINGS_TEXT,
+    CostOfCapitalLoad,
+    ExpectedPayoutMultiple,
+    Pricing,
+    PurePremium,
+    _expense,
+)
 from crc_sdk.parametric.sample import (
     OutcomeSample,
     _cover_index_values,
@@ -414,6 +427,10 @@ class _Context:
     `asset_id` is `None` when the problem is on several assets' total; its
     `index` then has one column per asset. A cover with a `CompositeIndex`
     has one column per component.
+
+    A budget `bound` below the pricing's fixed expense raises
+    `InfeasibleDesignError` here, before any route runs: a cover that never
+    pays still costs the expense.
     """
 
     asset_id: str | None
@@ -427,6 +444,17 @@ class _Context:
     objective: Objective
     pricing: Pricing
     options: DesignOptions
+
+    def __post_init__(self) -> None:
+        expense = _expense(self.pricing)
+        if self.bound is not None and self.bound < expense:
+            raise self.error(
+                InfeasibleDesignError,
+                f"the budget {self.bound:.10g} is below the pricing's fixed expense "
+                f"{expense:.10g}: a cover that never pays still costs the expense, "
+                "so no payout keeps the premium within the budget",
+                status="infeasible",
+            )
 
     def scaled(self, value: float) -> float:
         """An objective value in scaled units."""
@@ -647,6 +675,12 @@ def _programme(
             builder.entries(np.full(k, row), np.arange(k), (1.0 - rate) * expected)
             builder.entries([row], [eta], rate)
             builder.entries(np.full(n, row), tail + np.arange(n), rate * p / (1.0 - q))
+        elif isinstance(pricing, ExpectedPayoutMultiple):
+            # multiple * E[payout] + expense <= bound, with bound >= expense.
+            row = builder.constraints(
+                1, -math.inf, (context.bound - pricing.expense) / scale
+            )
+            builder.entries(np.full(k, row), np.arange(k), pricing.multiple * expected)
         else:
             row = builder.constraints(1, -math.inf, context.bound / scale)
             builder.entries(np.full(k, row), np.arange(k), expected)
@@ -1435,12 +1469,7 @@ def _check_terms(
             (MSE, ExpectedUncovered, WeightedCVaR, UserObjective),
             "MSE(), ExpectedUncovered(), WeightedCVaR(alpha, beta) or a UserObjective",
         ),
-        (
-            "pricing",
-            pricing,
-            (PurePremium, CostOfCapitalLoad),
-            "PurePremium() or CostOfCapitalLoad(rate, q)",
-        ),
+        ("pricing", pricing, _PRICINGS, _PRICINGS_TEXT),
         ("options", options, DesignOptions, "DesignOptions"),
     )
     for name, value, kind, text in checks:
@@ -1527,7 +1556,8 @@ def design(
 
     Returns a `DesignResult` with the resolved cover and its record. Raises
     `SolverUnavailableError` without the `parametric` extra on the LP and QP
-    routes; `InfeasibleDesignError` when no payout meets the constraints;
+    routes; `InfeasibleDesignError` when no payout meets the constraints,
+    such as a budget below the pricing's fixed expense;
     `UnboundedDesignError` for an unbounded objective (never for `MSE`);
     `SolverLimitError` when a solve stops at its iteration or time limit;
     `DesignError` for any other failed solve or check; `SampleError` when the

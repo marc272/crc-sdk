@@ -34,6 +34,7 @@ PUBLIC = [
     "EmpiricalCopula",
     "EvaluationError",
     "EvaluationMetadata",
+    "ExpectedPayoutMultiple",
     "ExpectedUncovered",
     "Free",
     "FreshDraws",

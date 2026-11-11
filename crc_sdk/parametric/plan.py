@@ -13,7 +13,7 @@ ParametricPlan.for_annual_extremes(source, assets, impact=, unit=, provenance=)
   .basis_risk(model)                    # required: how index and loss differ
   .covers(*covers)                      # resolved covers and templates
   .objective(*objectives, pricing=, budget=, limit=, options=)
-  .pricing(PurePremium() | CostOfCapitalLoad(rate, q))     # optional
+  .pricing(pricing)                     # optional: one pricing for every premium
   .split(FreshDraws(n, seed=) | Holdout(0.7) | KFold(5))   # optional
   .metrics(MetricOptions(...))          # optional: levels and thresholds
   .scopes(Individual() | Joint())       # optional: asset by asset, or on the total
@@ -212,7 +212,7 @@ from crc_sdk.parametric.objectives import (
     UserObjective,
     WeightedCVaR,
 )
-from crc_sdk.parametric.pricing import CostOfCapitalLoad, Pricing, PurePremium
+from crc_sdk.parametric.pricing import Pricing, PurePremium, _check_pricing
 from crc_sdk.parametric.sample import (
     OutcomeSample,
     _arrow_table,
@@ -612,18 +612,6 @@ class _DesignSpec:
             "options": self.options.to_document(),
             "pricing": pricing.to_document(),
         }
-
-
-_PRICINGS = (PurePremium, CostOfCapitalLoad)
-
-
-def _check_pricing(pricing: Any) -> Pricing:
-    if not isinstance(pricing, _PRICINGS):
-        raise TypeError(
-            "pricing must be PurePremium() or CostOfCapitalLoad(rate, q), "
-            f"got {type(pricing).__name__}"
-        )
-    return pricing
 
 
 def _same_pricing(first: Pricing, second: Pricing) -> bool:
@@ -1948,12 +1936,14 @@ class ParametricPlan:
         return dataclasses.replace(self, design_spec=spec)
 
     def pricing(self, pricing: Pricing) -> ParametricPlan:
-        """Price the premiums: `PurePremium()` or `CostOfCapitalLoad(rate, q)`.
+        """State the pricing of every premium of the plan.
 
-        One pricing prices every premium of the plan: the resolved covers'
-        on each evaluation block and the designs' on their design block, so
-        that every row of the comparison is priced alike. This builder
-        states it for a plan of resolved covers, which needs no
+        `pricing` is `PurePremium()`, `CostOfCapitalLoad(rate, q)` or
+        `ExpectedPayoutMultiple(multiple, expense)`. One pricing prices every
+        premium of the plan: the resolved covers' on each evaluation block
+        and the designs' on their design block, so that every row of the
+        comparison is priced alike. This builder states it for a plan of
+        resolved covers, which needs no
         `.objective(...)`; `.objective(..., pricing=...)` states it too, and
         both may be given when they state the same pricing. Without either,
         the premiums are pure (`PurePremium()`). `explain()` shows the

@@ -3,7 +3,11 @@
 - `Budget(ratio=k)`: the premium is at most `k * E[L]`, the expected loss on
   the design sample. `Budget(amount=B)`: the premium is at most `B`, in
   payout units. Exactly one of the two. The premium is the design's pricing
-  (`PurePremium` or `CostOfCapitalLoad`) on the design sample.
+  (`PurePremium`, `CostOfCapitalLoad` or `ExpectedPayoutMultiple`) on the
+  design sample, its loads and any fixed expense included. So under
+  `ExpectedPayoutMultiple(m, e)` a ratio is still the whole premium's ratio
+  to the expected loss: the expected payout is at most `(k * E[L] - e) / m`,
+  and a bound below `e` admits no cover.
 - `Limit(amount)`: the payout never exceeds `amount`, in payout units. For
   a payout linear in its amounts (`LinearInAmounts`) it bounds the amounts
   through the family's `amount_constraints`; for the built-in families that
@@ -35,6 +39,8 @@ class Budget(_DefinitionModel):
     `Budget(ratio=k)` means premium <= `k * E[L]` and `Budget(amount=B)`
     means premium <= `B`, both on the design sample, with `k >= 0` and
     `B >= 0` in payout units. Exactly one of `ratio` and `amount` is given.
+    The premium is the whole price under the design's pricing, any fixed
+    expense included.
 
     Raises `CoverDefinitionError` otherwise.
     """

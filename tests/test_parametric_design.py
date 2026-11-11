@@ -31,6 +31,7 @@ from crc_sdk.parametric import (
     DesignOptions,
     DesignResult,
     EvaluationMetadata,
+    ExpectedPayoutMultiple,
     ExpectedUncovered,
     Free,
     IndexComponent,
@@ -1718,13 +1719,19 @@ def _knots(levels: int) -> Cover:
 
 
 def _mse_optimum(
-    template: Cover, sample: OutcomeSample, bound: float, limit: float
+    template: Cover,
+    sample: OutcomeSample,
+    bound: float,
+    limit: float,
+    *,
+    multiple: float = 1.0,
+    expense: float = 0.0,
 ) -> float:
     """The design's MSE optimum, by enumerating the active sets of its QP.
 
-    The QP in the amounts (non-decreasing, in [0, limit], with the premium at
-    most `bound`) is built here from the payout's basis; every KKT point of a
-    convex QP is a global minimum.
+    The QP in the amounts (non-decreasing, in [0, limit], with the premium
+    `multiple * E[payout] + expense` at most `bound`) is built here from the
+    payout's basis; every KKT point of a convex QP is a global minimum.
     """
     payout = cast(LinearInAmounts, template.payout)
     index = np.asarray(sample.index[:, 0])
@@ -1734,8 +1741,10 @@ def _mse_optimum(
     q = 2.0 * basis.T @ (basis * p[:, None])
     c = -2.0 * basis.T @ (p * loss)
     order = [np.eye(k)[j] - np.eye(k)[j + 1] for j in range(k - 1)]
-    g = np.vstack([p @ basis, *order, np.eye(k), -np.eye(k)])
-    h = np.concatenate([[bound], np.zeros(k - 1), np.full(k, limit), np.zeros(k)])
+    g = np.vstack([multiple * (p @ basis), *order, np.eye(k), -np.eye(k)])
+    h = np.concatenate(
+        [[bound - expense], np.zeros(k - 1), np.full(k, limit), np.zeros(k)]
+    )
     best = math.inf
     for size in range(k + 1):
         for chosen in itertools.combinations(range(h.shape[0]), size):
@@ -1957,3 +1966,207 @@ def test_a_budget_frontier_of_mse_designs_comes_through(
             split="in_sample",
         )
     assert raised.value.status == "qp_iteration_limit"
+
+
+# -- a multiple of the expected payout plus an expense ------------------------
+
+MULTIPLE = ExpectedPayoutMultiple(1.5, 10.0)
+
+
+@pytest.mark.parametrize(
+    "budget", [Budget(amount=40.0), Budget(ratio=2.0)], ids=["amount", "ratio"]
+)
+def test_the_budget_bounds_the_whole_premium_with_its_expense(budget: Budget) -> None:
+    # E[L] = 20, so the ratio 2 bounds the premium by 40, as the amount does.
+    # 1.5 E[payout] + 10 <= 40 leaves an expected payout of at most 20, whose
+    # closed form is that of a pure premium of 20: levels 20 and 40, E[U] 2.5.
+    result = design(
+        _step([Free(), Free()]),
+        SAMPLE,
+        ExpectedUncovered(),
+        pricing=MULTIPLE,
+        budget=budget,
+        options=DesignOptions(ranges=True),
+    )
+    assert result.route == "lp" and result.amounts == "lp"
+    assert result.parameters == pytest.approx({"levels[0]": 20.0, "levels[1]": 40.0})
+    assert result.objective_value == pytest.approx(2.5)
+    payout = result.cover.payout_values(SAMPLE.index[:, 0])
+    assert payout.mean() == pytest.approx(20.0)
+    assert result.premium == pytest.approx(1.5 * payout.mean() + 10.0)
+    assert result.premium == pytest.approx(40.0)
+    assert result.budget_bound == 40.0 and result.budget_use == pytest.approx(1.0)
+    assert result.unique is True
+    assert result.pricing == MULTIPLE.to_document()
+
+
+@pytest.mark.parametrize(
+    "objective", [ExpectedUncovered(), WeightedCVaR(0.7, 0.5)], ids=["eu", "wcvar"]
+)
+def test_a_design_under_a_multiple_matches_a_brute_force_search(
+    objective: ExpectedUncovered | WeightedCVaR,
+) -> None:
+    pricing = ExpectedPayoutMultiple(1.25, 3.0)
+    result = design(
+        _step([Free(upper=40.0), Free(upper=40.0)]),
+        SAMPLE,
+        objective,
+        pricing=pricing,
+        budget=Budget(amount=18.0),
+    )
+    # Every pair of levels on a grid of 0.25, priced here by hand.
+    loss = SAMPLE.loss[:, 0]
+    best = math.inf
+    for low, high in itertools.product(np.arange(0.0, 40.25, 0.25), repeat=2):
+        if low > high:
+            continue
+        payout = np.array([0.0, low, low, high])
+        if 1.25 * payout.mean() + 3.0 > 18.0 + 1e-12:
+            continue
+        best = min(best, objective.value(loss, payout, SAMPLE.probability))
+    assert result.objective_value <= best + 1e-9
+    assert result.objective_value == pytest.approx(best, abs=1e-6)
+    payout = result.cover.payout_values(SAMPLE.index[:, 0])
+    assert result.premium == pytest.approx(1.25 * payout.mean() + 3.0)
+    assert result.premium <= 18.0 * (1 + 1e-9)
+
+
+def test_an_mse_design_under_a_multiple_stays_a_qp_in_the_amounts() -> None:
+    # 2 E[payout] + 5 <= 25 is E[payout] <= 10, where the Lagrange conditions
+    # give 20/3 and 80/3 (as in test_mse_closed_forms).
+    result = design(
+        _step([Free(), Free()]),
+        SAMPLE,
+        MSE(),
+        pricing=ExpectedPayoutMultiple(2.0, 5.0),
+        budget=Budget(amount=25.0),
+    )
+    assert result.route == "qp" and result.solved_by == "active_set"
+    assert result.parameters == pytest.approx(
+        {"levels[0]": 20 / 3, "levels[1]": 80 / 3}, rel=1e-9
+    )
+    assert result.objective_value == pytest.approx(550 / 3, rel=1e-9)
+    assert result.premium == pytest.approx(25.0, rel=1e-9)
+    # Without a budget the premium is priced, and bounds nothing.
+    free = design(
+        _step([Free(), Free()]), SAMPLE, MSE(), pricing=ExpectedPayoutMultiple(2.0, 5.0)
+    )
+    assert free.parameters == pytest.approx({"levels[0]": 20.0, "levels[1]": 40.0})
+    assert free.premium == pytest.approx(2.0 * 20.0 + 5.0)
+    assert free.budget_bound is None and free.budget_use is None
+
+
+def test_an_mse_design_under_a_multiple_matches_its_kkt_points() -> None:
+    # 200 draws: a cost-of-capital premium would add 201 columns and send the
+    # QP to HiGHS. The multiple adds none, so the six amounts go to the dense
+    # method, and every KKT point of the QP is enumerated here.
+    sample = _rainfall(200, 30)
+    template = _knots(6)
+    pricing = ExpectedPayoutMultiple(1.4, 2_000.0)
+    result = design(
+        template,
+        sample,
+        MSE(),
+        pricing=pricing,
+        budget=Budget(ratio=0.3),
+        limit=Limit(1e6),
+    )
+    assert (result.route, result.solved_by, result.fallbacks) == ("qp", "active_set", 0)
+    assert result.budget_bound is not None
+    optimum = _mse_optimum(
+        template, sample, result.budget_bound, 1e6, multiple=1.4, expense=2_000.0
+    )
+    assert result.objective_value == pytest.approx(optimum, rel=1e-9)
+    assert result.budget_use == pytest.approx(1.0, rel=1e-9)
+    payout = result.cover.payout_values(sample.index[:, 0])
+    assert result.premium == pytest.approx(
+        pricing.premium(payout, sample.probability), rel=1e-12
+    )
+
+
+def _mean_absolute(loss: Any, payout: Any, probability: Any) -> float:
+    return float(np.sum(probability * np.abs(loss - payout)))
+
+
+GRID = [0.0, 10.0, 20.0, 30.0, 40.0]
+ROUTES: dict[str, tuple[Cover, Any]] = {
+    "lp": (_step([Free(), Free()]), ExpectedUncovered()),
+    "qp": (_step([Free(), Free()]), MSE()),
+    "grid": (
+        _step([Free(), Free()], breakpoints=(Free(0.0, 1.0, grid=[0.5, 1.0]), 2.5)),
+        WeightedCVaR(0.5, 0.5),
+    ),
+    "numpy": (
+        _step([Free(0.0, 40.0, grid=GRID), Free(0.0, 40.0, grid=GRID)]),
+        UserObjective(_mean_absolute, name="mae"),
+    ),
+}
+
+
+@pytest.mark.parametrize("route", list(ROUTES))
+@pytest.mark.parametrize(
+    "budget", [Budget(amount=9.5), Budget(ratio=0.45), Budget(amount=0.0)]
+)
+def test_a_budget_below_the_expense_is_refused_on_every_route(
+    route: str, budget: Budget
+) -> None:
+    template, objective = ROUTES[route]
+    with pytest.raises(
+        InfeasibleDesignError, match="is below the pricing's fixed expense 10"
+    ) as raised:
+        design(template, SAMPLE, objective, pricing=MULTIPLE, budget=budget)
+    assert raised.value.asset_id == "A"
+    assert raised.value.status == "infeasible"
+
+
+@pytest.mark.parametrize("route", list(ROUTES))
+def test_a_budget_of_the_expense_buys_a_cover_that_never_pays(route: str) -> None:
+    template, objective = ROUTES[route]
+    result = design(
+        template, SAMPLE, objective, pricing=MULTIPLE, budget=Budget(amount=10.0)
+    )
+    payout = result.cover.payout_values(SAMPLE.index[:, 0])
+    assert payout.max() == pytest.approx(0.0, abs=1e-9)
+    assert result.premium == pytest.approx(10.0)
+    assert result.budget_use == pytest.approx(1.0)
+
+
+def test_the_record_and_the_id_hold_the_multiple(tmp_path: Path) -> None:
+    template = _step([Free(), Free()])
+    result = design(
+        template, SAMPLE, ExpectedUncovered(), pricing=MULTIPLE, budget=Budget(ratio=2)
+    )
+    record = result.to_record()
+    assert json.loads(json.dumps(record, allow_nan=False)) == record
+    assert record["pricing"] == {
+        "expense": 10.0,
+        "kind": "expected_payout_multiple",
+        "multiple": 1.5,
+    }
+    assert pricing_from_document(record["pricing"]) == MULTIPLE
+    ids = {
+        result.design_id,
+        design(template, SAMPLE, ExpectedUncovered(), budget=Budget(ratio=2)).design_id,
+        design(
+            template,
+            SAMPLE,
+            ExpectedUncovered(),
+            pricing=ExpectedPayoutMultiple(1.5, 10.5),
+            budget=Budget(ratio=2),
+        ).design_id,
+        design(
+            template,
+            SAMPLE,
+            ExpectedUncovered(),
+            pricing=ExpectedPayoutMultiple(1.6, 10.0),
+            budget=Budget(ratio=2),
+        ).design_id,
+    }
+    assert len(ids) == 4
+    table = compare([result], SAMPLE, split="in_sample")
+    write_comparison(table, tmp_path / "multiple.parquet")
+    written = EvaluationMetadata.from_table(
+        pq.read_table(tmp_path / "multiple.parquet")
+    )
+    assert written.designs[0]["pricing"] == record["pricing"]
+    assert written.designs[0]["premium"] == result.premium

@@ -29,6 +29,7 @@ from crc_sdk.parametric import (
     DesignOptions,
     EvaluationError,
     EvaluationMetadata,
+    ExpectedPayoutMultiple,
     ExpectedUncovered,
     Free,
     IndexDefinition,
@@ -470,6 +471,34 @@ def test_the_total_premium_of_a_set_is_one_per_contract() -> None:
     ).to_pylist()
     assert [row["premium"] for row in rows] == pytest.approx([15.0, 5.0, 20.0])
     assert rows[-1]["premium_basis"] == "evaluation"
+    # Each contract pays its own expense: 1.5 x 6 + 2 and 1.5 x 2 + 2. One
+    # contract on the total would pay it once, 1.5 x 8 + 2.
+    rows = evaluate(
+        covers, sample, split="in_sample", pricing=ExpectedPayoutMultiple(1.5, 2.0)
+    ).to_pylist()
+    assert [row["premium"] for row in rows] == pytest.approx([11.0, 5.0, 16.0])
+
+
+def test_a_joint_designs_total_row_pays_one_expense() -> None:
+    sample = _sample(
+        [[0.0, 0.0], [3.0, 0.0], [0.0, 3.0], [0.0, 0.0]],
+        [[0.0, 0.0], [40.0, 0.0], [0.0, 20.0], [0.0, 0.0]],
+    )
+    pricing = ExpectedPayoutMultiple(1.5, 2.0)
+    joint = design_joint(
+        [_step(Free(), asset="A"), _step(Free(), asset="B")],
+        sample,
+        ExpectedUncovered(),
+        pricing=pricing,
+        budget=Budget(amount=14.0),
+    )
+    # 1.5 (a + b) / 4 + 2 <= 14 buys a + b = 32 of the 60 to cover.
+    assert joint.premium == pytest.approx(14.0)
+    (total,) = evaluate(joint, sample, split="in_sample").to_pylist()
+    assert (total["level"], total["premium_basis"]) == ("total", "design")
+    assert total["premium"] == joint.premium
+    assert total["expected_payout"] == pytest.approx(8.0)
+    assert total["premium"] == pytest.approx(1.5 * total["expected_payout"] + 2.0)
 
 
 def test_a_stated_premium_states_the_total_of_a_set_only() -> None:

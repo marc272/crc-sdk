@@ -29,6 +29,7 @@ from crc_sdk.parametric import (
     DesignOptions,
     EvaluationError,
     EvaluationMetadata,
+    ExpectedPayoutMultiple,
     ExpectedUncovered,
     Free,
     IndexComponent,
@@ -250,6 +251,42 @@ def test_a_fold_a_limit_a_pricing_and_design_options_reach_every_row() -> None:
     assert all(record["options"]["ranges"] is True for record in metadata.designs)
     assert metadata.setup.evaluations[0]["pricing"] == pricing.to_document()
     assert table.column("premium_basis").to_pylist() == ["design", "design"]
+
+
+def test_a_multiple_with_an_expense_prices_every_row_and_its_bound() -> None:
+    train, test = holdout(_years())
+    pricing = ExpectedPayoutMultiple(1.4, 25.0)
+    budgets = _ratios((0.5, 1.0))
+    table = design_frontier(
+        _template(),
+        train,
+        OBJECTIVES[0],
+        budgets=budgets,
+        evaluate_on=test,
+        split="out_of_sample",
+        pricing=pricing,
+        metric_options=FEW,
+    )
+    for position, budget in enumerate(budgets):
+        result = design(
+            _template(), train, OBJECTIVES[0], pricing=pricing, budget=budget
+        )
+        by_hand = evaluate(result, test, split="out_of_sample", options=FEW)
+        assert (
+            table.slice(position, 1).drop_columns(FRONTIER).equals(by_hand.slice(0, 1))
+        )
+        payout = result.cover.payout_values(train.index[:, 0])
+        assert result.premium == pytest.approx(
+            1.4 * float(train.probability @ payout) + 25.0
+        )
+    # E[U] spends the whole budget, expense included.
+    assert table.column("budget_use").to_pylist() == pytest.approx([1.0, 1.0])
+    metadata = _metadata(table)
+    assert metadata.setup.evaluations[0]["pricing"] == pricing.to_document()
+    assert all(
+        record["pricing"] == pricing.to_document() for record in metadata.designs
+    )
+    assert "P = 1.4 E[payout] + 25" in setup_text(metadata)
 
 
 def test_rows_keep_the_order_given_and_do_not_depend_on_it() -> None:
@@ -681,6 +718,24 @@ def test_a_ratio_the_template_cannot_meet_is_named_too() -> None:
             evaluate_on=SAMPLE,
             split="in_sample",
         )
+
+
+def test_a_budget_below_the_pricings_expense_is_named() -> None:
+    with pytest.raises(
+        InfeasibleDesignError,
+        match=r"at budget amount=5\.0: asset 'A': the budget 5 is below the "
+        r"pricing's fixed expense 10",
+    ) as raised:
+        design_frontier(
+            _step([Free(), Free()]),
+            SAMPLE,
+            OBJECTIVES[0],
+            budgets=[Budget(amount=20.0), Budget(amount=5.0)],
+            evaluate_on=SAMPLE,
+            split="in_sample",
+            pricing=ExpectedPayoutMultiple(1.5, 10.0),
+        )
+    assert raised.value.status == "infeasible"
 
 
 def test_a_sample_of_several_assets_raises_sample_error() -> None:

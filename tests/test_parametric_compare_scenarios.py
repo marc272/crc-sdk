@@ -29,6 +29,7 @@ from crc_sdk.parametric import (
     EmpiricalCopula,
     EvaluationError,
     EvaluationMetadata,
+    ExpectedPayoutMultiple,
     ExpectedUncovered,
     Free,
     ImpactNoise,
@@ -65,6 +66,7 @@ from crc_sdk.parametric import (
 )
 from crc_sdk.parametric.metadata import _read_at
 from crc_sdk.parametric.metrics import metric_values
+from crc_sdk.parametric.pricing import Pricing
 from crc_sdk.parametric.sample import _check_out_of_sample
 from crc_sdk.types import HazardDatasetMetadata, SourceProvenance
 
@@ -772,9 +774,13 @@ def test_premium_repriced_equals_expected_payout_under_pure_premium() -> None:
         assert row["premium_repriced"] == row["expected_payout"]
 
 
-def test_premium_repriced_follows_the_pricing_on_this_block() -> None:
+@pytest.mark.parametrize(
+    "pricing",
+    [CostOfCapitalLoad(0.1, 0.9), ExpectedPayoutMultiple(1.5, 250.0)],
+    ids=["coc", "multiple"],
+)
+def test_premium_repriced_follows_the_pricing_on_this_block(pricing: Pricing) -> None:
     train, scenarios, designed = _pair_set()
-    pricing = CostOfCapitalLoad(0.1, 0.9)
     table = compare_scenarios([GIVEN], scenarios, design_sample=train, pricing=pricing)
     block = scenarios.sample("late")
     payout = GIVEN.payout_values(block.index[:, 0])
