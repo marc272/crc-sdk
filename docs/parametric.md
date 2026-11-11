@@ -1754,7 +1754,8 @@ print(setup_text(table))
 ```
 
 With real curves, `rows_2030s` and `rows_2050s` are the dataset's own rows of one
-cell at those horizons. `ScenarioSet` refuses a set in which anything but the hazard's values differs.
+cell at those horizons. `ScenarioSet` refuses a set in which anything but the
+hazard's values differs.
 
 - **The rows.** One row per entry and scenario, the reference first, and every
   row has `split="out_of_sample"`. `scenario` says where a row is evaluated and
@@ -1886,7 +1887,7 @@ function does not, so give each function its own name.
 - `Budget(ratio=k)` means premium ≤ k · E[L] on the design sample;
   `Budget(amount=B)` means premium ≤ B, in payout units. Exactly one of the two.
 - **No objective counts the premium**, so nothing in a design trades premium
-  against cover: the budget is the price you state, not one the design chooses.
+  against cover: the budget is a bound you state, not one the design chooses.
   Under E[U] and the weighted CVaR more payout never raises the objective, so a
   design spends its whole budget (`budget_use` 1) as long as more payout still
   lowers the objective, which is the usual case below the budget at which every
