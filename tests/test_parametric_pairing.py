@@ -298,6 +298,15 @@ def test_a_set_of_covers_and_a_joint_design_check_each_asset() -> None:
     assert evaluate(result, book, split="in_sample").num_rows == 1
 
 
+def test_design_joint_names_the_hazard_among_its_sample_errors() -> None:
+    documented = " ".join((design_joint.__doc__ or "").split())
+    assert (
+        "`SampleError` when the templates' number, assets or units don't suit the "
+        "sample, or a template's index `hazard_name` differs from the hazard the "
+        "sample records for its asset" in documented
+    )
+
+
 def test_an_index_series_is_compared_with_its_own_source() -> None:
     hazard = _series({"provider": "fixture", "recipe": "rx1day"})
     index = _series({"provider": "fixture", "recipe": "wind"}, seed=4)
