@@ -20,25 +20,28 @@ A programme is `minimise 1/2 x'Qx + c'x + offset` subject to `row_lower <=
 A x <= row_upper` and `col_lower <= x <= col_upper`, with infinite bounds as
 `inf`. `Q` is given as its lower triangle; an LP has none.
 
-**Limits.** Every QP solve has a limit: HiGHS stops at `QP_ITERATION_LIMIT`
-iterations or `QP_TIME_LIMIT` seconds, whichever comes first, with the status
-`"limit"` and the limit's name in `Solution.limit`. HiGHS's active-set QP
-solver can cycle at a degenerate vertex, and without a limit it never returns.
+**QPs.** HiGHS's active-set QP solver can cycle at a degenerate vertex of a
+small, well-posed QP, and it has reported "unbounded" for one whose variables
+are all bounded; on Windows that report also corrupts the process's heap
+(highspy 1.15.1), so it can't be caught after the fact. `solve_qp` therefore
+gives a QP of at most `ACTIVE_SET_FIRST_COLUMNS` columns to a dense
+active-set method in numpy and never to HiGHS's QP solver. A larger QP goes
+to HiGHS, which stops at `QP_ITERATION_LIMIT` iterations or `QP_TIME_LIMIT`
+seconds, whichever comes first; when it ends with any outcome but optimal or
+infeasible, a QP of at most `ACTIVE_SET_MAX_COLUMNS` columns is solved again
+by the dense method (`Solution.fallback`). A solve that stops at a limit has
+the status `"limit"` and the limit's name in `Solution.limit`.
 
-**The fallback.** When HiGHS's QP solver stops at its limit, or ends with any
-outcome but optimal or infeasible (it has reported "unbounded" for a QP whose
-variables are all bounded), `solve_qp` solves a QP of at most
-`ACTIVE_SET_MAX_COLUMNS` columns again with a dense active-set method in numpy:
-from a feasible point found by HiGHS's simplex, it minimises the objective on
-the face of its working constraints, and at the minimum of a face it asks a
-small LP, solved by HiGHS's simplex at the tolerances of `RANGING_OPTIONS`,
-for a feasible descent direction over every active constraint. A degenerate
-vertex is thus left through an LP, whose simplex does not cycle, and every
-step along an LP's direction lowers the objective, so no face is visited
-twice. It stops when that LP finds no descent direction, which is the
-optimality condition of a convex QP, or at `ACTIVE_SET_ITERATION_LIMIT`
-iterations. `Solution.method` says which method gave the outcome: `"highs"`
-or `"active_set"`.
+**The dense active-set method.** From a feasible point found by HiGHS's
+simplex, it minimises the objective on the face of its working constraints,
+and at the minimum of a face it asks a small LP, solved by HiGHS's simplex at
+the tolerances of `RANGING_OPTIONS`, for a feasible descent direction over
+every active constraint. A degenerate vertex is thus left through an LP,
+whose simplex does not cycle, and every step along an LP's direction lowers
+the objective, so no face is visited twice. It stops when that LP finds no
+descent direction, which is the optimality condition of a convex QP, or at
+`ACTIVE_SET_ITERATION_LIMIT` iterations. `Solution.method` says which method
+gave the outcome: `"highs"` or `"active_set"`.
 """
 
 from __future__ import annotations
@@ -56,6 +59,7 @@ from numpy.typing import NDArray
 from crc_sdk.parametric.errors import SolverUnavailableError
 
 __all__ = [
+    "ACTIVE_SET_FIRST_COLUMNS",
     "ACTIVE_SET_ITERATION_LIMIT",
     "ACTIVE_SET_MAX_COLUMNS",
     "EXTRA",
@@ -115,16 +119,23 @@ keeps the semi-definite design QPs solvable without that bias. The limits
 stop a solve that cycles (`QP_ITERATION_LIMIT`, `QP_TIME_LIMIT`).
 """
 
-ACTIVE_SET_MAX_COLUMNS = 500
-"""The most columns of a QP that the dense active-set fallback solves.
+ACTIVE_SET_FIRST_COLUMNS = 100
+"""A QP of at most this many columns is solved by the dense active-set method.
 
-Each of its iterations works on dense matrices of that size: a design QP of
-one column per amount takes milliseconds, and a cost-of-capital QP of 480
-draws (one column per draw) about 4 seconds.
+It never reaches HiGHS's QP solver. A design QP of one column per amount has
+that few unless its payout has more than 100 amounts; the method takes about
+2 ms on 6 columns and 25 ms on 100, against HiGHS's 0.3 ms and 1.4 ms.
+"""
+
+ACTIVE_SET_MAX_COLUMNS = 500
+"""The most columns of a QP that the dense method solves after HiGHS failed.
+
+Each of its iterations works on dense matrices of that size: a cost-of-capital
+QP of 480 draws (one column per draw) takes about 4 seconds.
 """
 
 ACTIVE_SET_ITERATION_LIMIT = 10_000
-"""The most iterations of the dense active-set fallback in one solve.
+"""The most iterations of the dense active-set method in one solve.
 
 A design QP of one column per amount needs tens, and a cost-of-capital QP of
 480 draws about 400.
@@ -147,11 +158,11 @@ SolveStatus = Literal[
 """
 
 Method = Literal["highs", "active_set"]
-"""What gave a solve's outcome: HiGHS, or the dense active-set fallback."""
+"""What gave a solve's outcome: HiGHS, or the dense active-set method."""
 
 _REJECTED = "HiGHS rejected the model"
 
-# The dense active-set fallback works on rows of unit length. A row is active
+# The dense active-set method works on rows of unit length. A row is active
 # when its slack is at most _ACTIVE times max(1, |x|); rows are independent
 # above _RANK times the largest singular value; a direction has no curvature
 # below _CURVATURE times the Hessian's largest entry; and a slope below
@@ -321,9 +332,10 @@ class Solution:
     interior point and QP iterations together) and `seconds` the wall time.
     `basis` is the optimal basis of an LP solved with `keep_basis=True`, and
     `None` otherwise, or when the solver has no valid basis to give.
-    `method` is `"highs"`, or `"active_set"` when the dense fallback gave the
-    outcome (its `iterations` and `seconds` then include HiGHS's). `limit`
-    names the limit a `"limit"` status stopped at: `"qp_iteration_limit"`,
+    `method` is `"highs"`, or `"active_set"` when the dense method gave the
+    outcome; `fallback` is true when it did so after HiGHS failed (its
+    `iterations` and `seconds` then include HiGHS's). `limit` names the limit
+    a `"limit"` status stopped at: `"qp_iteration_limit"`,
     `"simplex_iteration_limit"`, `"time_limit"` or
     `"active_set_iteration_limit"`; the message gives its value.
     """
@@ -337,6 +349,7 @@ class Solution:
     basis: Basis | None = None
     method: Method = "highs"
     limit: str | None = None
+    fallback: bool = False
 
 
 def _options(
@@ -626,19 +639,24 @@ def solve_lp(
 def solve_qp(
     programme: Programme, options: Mapping[str, bool | int | float | str] | None = None
 ) -> Solution:
-    """Solve a convex quadratic programme with HiGHS, or with the fallback.
+    """Solve a convex quadratic programme with the dense method or with HiGHS.
 
-    The Hessian must be positive semi-definite. `options` are HiGHS options
-    on top of `QP_OPTIONS`, whose limits stop a solve that cycles. When HiGHS
-    ends with any outcome but optimal or infeasible, a programme of at most
-    `ACTIVE_SET_MAX_COLUMNS` columns is solved again by the dense active-set
-    fallback (the module docstring describes it), and its outcome is
-    returned with `method="active_set"`; a larger one keeps HiGHS's outcome.
-    Raises `SolverUnavailableError` without highspy, and `ValueError` for a
-    programme without a Hessian or an option HiGHS rejects.
+    The Hessian must be positive semi-definite. A programme of at most
+    `ACTIVE_SET_FIRST_COLUMNS` columns is solved by the dense active-set
+    method (the module docstring describes it). A larger one goes to HiGHS's
+    QP solver, with `options` on top of `QP_OPTIONS`, whose limits stop a
+    solve that cycles; when HiGHS ends with any outcome but optimal or
+    infeasible, a programme of at most `ACTIVE_SET_MAX_COLUMNS` columns is
+    solved again by the dense method, and its outcome is returned with
+    `method="active_set"` and `fallback=True`; a larger one keeps HiGHS's
+    outcome. Raises `SolverUnavailableError` without highspy, and
+    `ValueError` for a programme without a Hessian or an option HiGHS
+    rejects.
     """
     if programme.hessian is None:
         raise ValueError("solve_qp takes a programme with a hessian")
+    if programme.n_columns <= ACTIVE_SET_FIRST_COLUMNS:
+        return _active_set(programme, ACTIVE_SET_ITERATION_LIMIT)
     highs = _run(programme, QP_OPTIONS, options)
     if highs.status in ("optimal", "infeasible") or highs.message == _REJECTED:
         return highs
@@ -646,19 +664,19 @@ def solve_qp(
         return replace(
             highs,
             message=f"{highs.message}; the QP has {programme.n_columns} columns, "
-            f"more than the active-set fallback takes ({ACTIVE_SET_MAX_COLUMNS})",
+            f"more than the dense method takes after HiGHS ({ACTIVE_SET_MAX_COLUMNS})",
         )
-    fallback = _active_set(programme, ACTIVE_SET_ITERATION_LIMIT)
+    dense = _active_set(programme, ACTIVE_SET_ITERATION_LIMIT)
     return replace(
-        fallback,
-        message=f"{fallback.message}, by the active-set fallback after HiGHS: "
-        f"{highs.message}",
-        iterations=highs.iterations + fallback.iterations,
-        seconds=highs.seconds + fallback.seconds,
+        dense,
+        message=f"{dense.message}, after HiGHS: {highs.message}",
+        iterations=highs.iterations + dense.iterations,
+        seconds=highs.seconds + dense.seconds,
+        fallback=True,
     )
 
 
-# -- the dense active-set fallback --------------------------------------------
+# -- the dense active-set method ----------------------------------------------
 
 
 def _dense(matrix: SparseColumns) -> FloatArray:
@@ -846,7 +864,7 @@ def _active_set(programme: Programme, limit: int) -> Solution:
 
     start = _start(programme)
     if start.status == "infeasible":
-        return outcome("infeasible", "Infeasible", 0)
+        return outcome("infeasible", "Infeasible (active set)", 0)
     if start.status != "optimal" or start.values is None:
         return outcome("error", f"no feasible start ({start.message})", 0)
     lower = np.tril(_dense(programme.hessian))
@@ -880,7 +898,7 @@ def _active_set(programme: Programme, limit: int) -> Solution:
                 cap = _line_minimum(hessian, gradient, step, curvature) if ray else 1.0
                 alpha, block = _ratio(rows, bounds, x, step, working, cap)
                 if math.isinf(alpha):
-                    return outcome("unbounded", "Unbounded", iteration)
+                    return outcome("unbounded", "Unbounded (active set)", iteration)
                 x = x + alpha * step
                 if block is not None:
                     working = np.append(working, block)
@@ -894,16 +912,16 @@ def _active_set(programme: Programme, limit: int) -> Solution:
             return outcome("error", "a direction LP failed", iteration)
         direction, value = found
         if value >= -_SLOPE:
-            return outcome("optimal", "Optimal", iteration, x)
+            return outcome("optimal", "Optimal (active set)", iteration, x)
         keep = on[rows[on] @ direction > -_KEEP]
         space, _ = _row_space(rows[keep])
         direction = direction - space.T @ (space @ direction)
         if float(gradient @ direction) >= -_SLOPE * scale:
-            return outcome("optimal", "Optimal", iteration, x)
+            return outcome("optimal", "Optimal (active set)", iteration, x)
         cap = _line_minimum(hessian, gradient, direction, curvature)
         alpha, block = _ratio(rows, bounds, x, direction, keep, cap)
         if math.isinf(alpha):
-            return outcome("unbounded", "Unbounded", iteration)
+            return outcome("unbounded", "Unbounded (active set)", iteration)
         x = x + alpha * direction
         working = keep if block is None else np.append(keep, block)
         stationary = False

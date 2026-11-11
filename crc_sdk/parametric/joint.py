@@ -16,10 +16,11 @@ pays by its own terms.
 **How it is solved.** The LP or QP of `design`, on the block basis
 `[B_1 | ... | B_m]` with the amounts in asset order, the covers' constraints
 stacked block by block and the summed loss. The scale is the largest summed
-loss of a draw. The QP has the limits and the dense active-set fallback of
-`design`, so a joint MSE design that HiGHS leaves unsolved is solved again in
-numpy when it has at most 500 columns, and otherwise raises
-`SolverLimitError`; `solved_by` and `fallbacks` record it.
+loss of a draw. The QP is solved as `design` solves it: by the dense
+active-set method up to 100 columns, and by HiGHS, with its limits and the
+dense method as its fallback up to 500 columns, above that; a solve that
+stops at a limit raises `SolverLimitError`. `solved_by` and `fallbacks`
+record it.
 
 **Fixed thresholds.** Only amounts are free in a joint design. A free
 threshold, a `UserObjective` or a payout without `LinearInAmounts` raises

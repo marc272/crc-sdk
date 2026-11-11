@@ -1694,7 +1694,7 @@ def test_the_label_is_kept() -> None:
     assert DESIGN_SEMANTICS_VERSION == "crc-parametric-design/1"
 
 
-# -- QP limits and the active-set fallback -----------------------------------
+# -- QP limits and the dense active-set method --------------------------------
 
 DAMAGE = ([40.0, 50.0, 60.0, 75.0, 100.0], [0.0, 0.02, 0.06, 0.15, 0.30])
 
@@ -1760,45 +1760,56 @@ def _mse_optimum(
     [(200, 30, 6, 0.2), (500, 26, 4, 0.1)],
     ids=["false-unbounded", "stall"],
 )
-def test_mse_designs_that_highs_leaves_unsolved_are_solved(
+def test_mse_designs_on_which_highs_fails_are_solved(
     n: int, seed: int, levels: int, ratio: float
 ) -> None:
     # On these samples HiGHS 1.15's QP solver reports "unbounded" for a QP
-    # whose amounts are all bounded (the first), or cycles at a degenerate
-    # vertex until its iteration limit (the second). Whether it does depends
-    # on its version; the design must come out right either way.
+    # whose amounts are all bounded (the first; on Windows it then corrupts
+    # the heap), or cycles at a degenerate vertex (the second). A QP this
+    # small goes to the dense active-set method, never to HiGHS's QP solver.
     sample = _rainfall(n, seed)
     template = _knots(levels)
     result = design(
         template, sample, MSE(), budget=Budget(ratio=ratio), limit=Limit(1e6)
     )
-    assert result.solved_by in ("highs", "active_set")
-    assert result.fallbacks == (result.solved_by == "active_set")
+    assert (result.solved_by, result.fallbacks) == ("active_set", 0)
+    assert result.solver_message == "Optimal (active set)"
     assert result.budget_bound is not None
     optimum = _mse_optimum(template, sample, result.budget_bound, 1e6)
-    assert result.objective_value == pytest.approx(optimum, rel=1e-7)
+    assert result.objective_value == pytest.approx(optimum, rel=1e-9)
 
 
-def _force_highs_limit(monkeypatch: pytest.MonkeyPatch, iterations: int = 1) -> None:
-    monkeypatch.setattr(
-        _solver, "QP_OPTIONS", {**_solver.QP_OPTIONS, "qp_iteration_limit": iterations}
-    )
+def _highs_first(
+    monkeypatch: pytest.MonkeyPatch, *, iterations: int | None = None
+) -> None:
+    """Send every QP to HiGHS first, stopping it at `iterations` if given."""
+    monkeypatch.setattr(_solver, "ACTIVE_SET_FIRST_COLUMNS", 0)
+    if iterations is not None:
+        monkeypatch.setattr(
+            _solver,
+            "QP_OPTIONS",
+            {**_solver.QP_OPTIONS, "qp_iteration_limit": iterations},
+        )
 
 
-def test_the_fallback_designs_what_highs_stops_at_its_limit(
+def test_the_dense_method_designs_what_highs_stops_at_its_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     template = _step([Free(), Free()])
+    dense = design(template, SAMPLE, MSE(), budget=Budget(amount=10.0))
+    assert (dense.solved_by, dense.fallbacks) == ("active_set", 0)
+    _highs_first(monkeypatch)
     by_highs = design(template, SAMPLE, MSE(), budget=Budget(amount=10.0))
     assert (by_highs.solved_by, by_highs.fallbacks) == ("highs", 0)
-    _force_highs_limit(monkeypatch)
+    _highs_first(monkeypatch, iterations=1)
     result = design(template, SAMPLE, MSE(), budget=Budget(amount=10.0))
     assert (result.route, result.solved_by, result.fallbacks) == ("qp", "active_set", 1)
-    assert result.parameters == pytest.approx(by_highs.parameters, abs=1e-9)
-    assert result.objective_value == pytest.approx(by_highs.objective_value)
-    assert result.design_id == by_highs.design_id
+    for other in (dense, by_highs):
+        assert result.parameters == pytest.approx(other.parameters, abs=1e-9)
+        assert result.objective_value == pytest.approx(other.objective_value)
+        assert result.design_id == other.design_id
     assert result.unique is True
-    assert "by the active-set fallback after HiGHS" in result.solver_message
+    assert "Optimal (active set), after HiGHS" in result.solver_message
     record = result.to_record()
     assert json.loads(json.dumps(record, allow_nan=False)) == record
     assert (record["solve"]["solved_by"], record["solve"]["fallbacks"]) == (
@@ -1807,6 +1818,7 @@ def test_the_fallback_designs_what_highs_stops_at_its_limit(
     )
     assert record["solve"]["options"]["solve"]["qp_iteration_limit"] == 1
     assert record["solve"]["options"]["active_set"] == {
+        "first_columns": 0,
         "max_columns": _solver.ACTIVE_SET_MAX_COLUMNS,
         "iteration_limit": _solver.ACTIVE_SET_ITERATION_LIMIT,
     }
@@ -1815,7 +1827,7 @@ def test_the_fallback_designs_what_highs_stops_at_its_limit(
 def test_a_qp_at_its_limit_raises_a_solver_limit_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _force_highs_limit(monkeypatch)
+    _highs_first(monkeypatch, iterations=1)
     monkeypatch.setattr(_solver, "ACTIVE_SET_MAX_COLUMNS", 0)
     with pytest.raises(SolverLimitError) as raised:
         design(_step([Free(), Free()]), SAMPLE, MSE(), budget=Budget(amount=10.0))
@@ -1827,10 +1839,9 @@ def test_a_qp_at_its_limit_raises_a_solver_limit_error(
     assert isinstance(raised.value, DesignError)
 
 
-def test_the_fallbacks_own_limit_raises_a_solver_limit_error(
+def test_the_dense_methods_limit_raises_a_solver_limit_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _force_highs_limit(monkeypatch)
     monkeypatch.setattr(_solver, "ACTIVE_SET_ITERATION_LIMIT", 1)
     with pytest.raises(SolverLimitError) as raised:
         design(_step([Free(), Free()]), SAMPLE, MSE(), budget=Budget(amount=10.0))
@@ -1854,18 +1865,20 @@ def test_a_false_unbounded_mse_is_solved_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     template = _step([Free(), Free()])
-    by_highs = design(template, SAMPLE, MSE(), budget=Budget(amount=10.0))
+    dense = design(template, SAMPLE, MSE(), budget=Budget(amount=10.0))
+    _highs_first(monkeypatch)
     _highs_qp_reports(monkeypatch, "unbounded")
     result = design(template, SAMPLE, MSE(), budget=Budget(amount=10.0))
-    assert result.solved_by == "active_set"
+    assert (result.solved_by, result.fallbacks) == ("active_set", 1)
     assert result.solver_message.endswith("after HiGHS: Unbounded")
-    assert result.parameters == pytest.approx(by_highs.parameters, abs=1e-9)
+    assert result.parameters == pytest.approx(dense.parameters, abs=1e-9)
 
 
 def test_an_mse_reported_unbounded_is_never_an_unbounded_design(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Without the fallback, HiGHS's "unbounded" stands, and is a solver failure.
+    # Without the dense method, HiGHS's "unbounded" stands: a solver failure.
+    _highs_first(monkeypatch)
     _highs_qp_reports(monkeypatch, "unbounded")
     monkeypatch.setattr(_solver, "ACTIVE_SET_MAX_COLUMNS", 0)
     with pytest.raises(DesignError, match="never below 0") as raised:
@@ -1876,30 +1889,39 @@ def test_an_mse_reported_unbounded_is_never_an_unbounded_design(
 
 def test_fallbacks_are_counted_over_a_grid(monkeypatch: pytest.MonkeyPatch) -> None:
     template = _step([Free(), Free()], breakpoints=(Free(0.5, 1.5, grid=3), 2.5))
-    by_highs = design(template, SAMPLE, MSE(), budget=Budget(amount=10.0))
-    _force_highs_limit(monkeypatch)
+    dense = design(template, SAMPLE, MSE(), budget=Budget(amount=10.0))
+    assert (dense.route, dense.solved_by, dense.fallbacks) == ("grid", "active_set", 0)
+    _highs_first(monkeypatch, iterations=1)
     result = design(template, SAMPLE, MSE(), budget=Budget(amount=10.0))
     assert result.route == "grid" and result.solved_by == "active_set"
     # Each of the three candidates, and the chosen one again for its report.
     assert result.fallbacks == result.solves == 4
-    assert result.objective_value == pytest.approx(by_highs.objective_value)
-    assert result.parameters == pytest.approx(by_highs.parameters, abs=1e-9)
+    assert result.objective_value == pytest.approx(dense.objective_value)
+    assert result.parameters == pytest.approx(dense.parameters, abs=1e-9)
 
 
-def test_the_record_says_what_solved_the_design() -> None:
-    qp = design(_step([Free(), Free()]), SAMPLE, MSE(), budget=Budget(amount=10.0))
-    lp = design(
-        _step([Free(), Free()]), SAMPLE, ExpectedUncovered(), budget=Budget(amount=10.0)
-    )
-    for result in (qp, lp):
-        assert (result.solved_by, result.fallbacks) == ("highs", 0)
-        assert result.to_record()["solve"]["solved_by"] == "highs"
+def test_the_record_says_what_solved_the_design(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    template = _step([Free(), Free()])
+    qp = design(template, SAMPLE, MSE(), budget=Budget(amount=10.0))
+    lp = design(template, SAMPLE, ExpectedUncovered(), budget=Budget(amount=10.0))
+    assert (qp.solved_by, qp.fallbacks) == ("active_set", 0)
+    assert (lp.solved_by, lp.fallbacks) == ("highs", 0)
+    assert qp.to_record()["solve"]["solved_by"] == "active_set"
+    assert lp.to_record()["solve"]["solved_by"] == "highs"
     assert qp.solver_options["solve"]["qp_iteration_limit"] == (
         _solver.QP_ITERATION_LIMIT
     )
     assert qp.solver_options["solve"]["time_limit"] == _solver.QP_TIME_LIMIT
-    assert qp.solver_options["active_set"] is not None
+    assert qp.solver_options["active_set"]["first_columns"] == (
+        _solver.ACTIVE_SET_FIRST_COLUMNS
+    )
     assert lp.solver_options["active_set"] is None
+    _highs_first(monkeypatch)
+    assert design(template, SAMPLE, MSE(), budget=Budget(amount=10.0)).solved_by == (
+        "highs"
+    )
 
     def mean_absolute(loss: Any, payout: Any, probability: Any) -> float:
         return float(np.sum(probability * np.abs(loss - payout)))
@@ -1919,7 +1941,7 @@ def test_a_budget_frontier_of_mse_designs_comes_through(
 ) -> None:
     template = _step([Free(), Free()])
     budgets = [Budget(amount=5.0), Budget(amount=10.0)]
-    _force_highs_limit(monkeypatch)
+    _highs_first(monkeypatch, iterations=1)
     table = design_frontier(
         template, SAMPLE, MSE(), budgets=budgets, evaluate_on=SAMPLE, split="in_sample"
     )

@@ -1926,21 +1926,23 @@ function does not, so give each function its own name.
   `"infeasible"`, `"invalid"`, `"over_budget"`, `"over_limit"`).
 - **Scaling.** Losses and payouts are divided by the largest loss of a draw (1
   if that is at most 1e-6) before solving; results are in payout units.
-- **Solver settings.** HiGHS's simplex for the LPs (a vertex solution), its QP
-  solver with a Hessian regularisation of 1e-12 for the QPs. Every QP solve
-  stops at 100,000 iterations or 600 seconds, whichever comes first: HiGHS's
-  active-set QP solver can cycle at a degenerate vertex, and it has reported an
-  unbounded objective for a QP whose amounts are all bounded. When it stops at
-  a limit, or ends with any outcome but optimal or infeasible, a QP of at most
-  500 columns (one per amount; a cost-of-capital premium adds one per draw) is
-  solved again by a dense active-set method in numpy. That method leaves a
-  degenerate vertex through a small LP, solved by HiGHS's simplex, and stops
-  at 10,000 iterations. `DesignResult.solved_by` says which method solved the
-  design (`"highs"` or `"active_set"`), and `DesignResult.fallbacks` how many
-  of its solves the fallback finished. A solve that stops at a limit raises
-  `SolverLimitError`. The record holds the solver's name and version, the
-  options (the limits among them), the status, the iterations, the solver
-  time, `solved_by` and `fallbacks`.
+- **Solver settings.** HiGHS's simplex for the LPs (a vertex solution). HiGHS's
+  active-set QP solver can cycle at a degenerate vertex of a small QP, and it
+  has reported an unbounded objective for a QP whose amounts are all bounded
+  (on Windows, ending the process). So a QP of at most 100 columns (one per
+  amount; a cost-of-capital premium adds one per draw) is solved by a dense
+  active-set method in numpy, which leaves a degenerate vertex through a small
+  LP solved by HiGHS's simplex, and stops at 10,000 iterations. A larger QP
+  goes to HiGHS's QP solver, with a Hessian regularisation of 1e-12, stopping
+  at 100,000 iterations or 600 seconds, whichever comes first; when it stops
+  at a limit, or ends with any outcome but optimal or infeasible, a QP of at
+  most 500 columns is solved again by the dense method. `DesignResult.solved_by`
+  says which method solved the design (`"highs"` or `"active_set"`), and
+  `DesignResult.fallbacks` how many of its solves the dense method finished
+  after HiGHS failed. A solve that stops at a limit raises `SolverLimitError`.
+  The record holds the solver's name and version, the options (the limits
+  among them), the status, the iterations, the solver time, `solved_by` and
+  `fallbacks`.
 
 ### Checks and errors
 

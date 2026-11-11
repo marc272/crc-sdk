@@ -161,7 +161,7 @@ def test_importing_the_interface_loads_no_solver() -> None:
     assert result.stdout.strip() == "False"
 
 
-# -- limits and the dense active-set fallback --------------------------------
+# -- limits and the dense active-set method -----------------------------------
 
 # Two QPs of an MSE design of a six-knot piecewise-linear payout under a budget
 # and a limit, built from synthetic samples (Gumbel annual maxima through a
@@ -325,14 +325,23 @@ def _case_optimum(case: Any) -> float:
     return _REFERENCES[id(case)]
 
 
-def _no_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(_solver, "ACTIVE_SET_MAX_COLUMNS", 0)
+def _highs_first(monkeypatch: pytest.MonkeyPatch, *, fallback: bool = True) -> None:
+    """Send every QP to HiGHS first, and with `fallback=False` keep its outcome."""
+    monkeypatch.setattr(_solver, "ACTIVE_SET_FIRST_COLUMNS", 0)
+    if not fallback:
+        monkeypatch.setattr(_solver, "ACTIVE_SET_MAX_COLUMNS", 0)
 
 
-def _force_highs_limit(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        _solver, "QP_OPTIONS", {**_solver.QP_OPTIONS, "qp_iteration_limit": 1}
-    )
+def _highs_qp_reports(monkeypatch: pytest.MonkeyPatch, status: str) -> None:
+    """Replace HiGHS's QP outcome by `status`; its LPs run as they are."""
+    real = _solver._run
+
+    def run(programme: _solver.Programme, *args: Any) -> _solver.Solution:
+        if programme.hessian is None:
+            return real(programme, *args)
+        return _solver.Solution(status, None, None, "Unbounded", 7, 0.0)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(_solver, "_run", run)
 
 
 def test_every_qp_solve_has_a_limit() -> None:
@@ -340,41 +349,49 @@ def test_every_qp_solve_has_a_limit() -> None:
     assert _solver.QP_OPTIONS["time_limit"] == _solver.QP_TIME_LIMIT
     assert 0 < _solver.QP_ITERATION_LIMIT < 2**31 - 1
     assert 0.0 < _solver.QP_TIME_LIMIT < math.inf
-    assert _solver.ACTIVE_SET_ITERATION_LIMIT > 0
+    assert 0 < _solver.ACTIVE_SET_ITERATION_LIMIT < 2**31 - 1
+    assert 0 < _solver.ACTIVE_SET_FIRST_COLUMNS <= _solver.ACTIVE_SET_MAX_COLUMNS
 
 
 @pytest.mark.parametrize(
     "case", [STALLS, FALSE_UNBOUNDED, SEMIDEFINITE], ids=["stall", "unbounded", "psd"]
 )
-def test_qps_that_highs_leaves_unsolved_are_solved(case: Any) -> None:
+def test_small_qps_are_solved_without_highs_qp_solver(
+    monkeypatch: pytest.MonkeyPatch, case: Any
+) -> None:
+    real = _solver._run
+
+    def lps_only(programme: _solver.Programme, *args: Any) -> _solver.Solution:
+        assert programme.hessian is None, "a small QP reached HiGHS's QP solver"
+        return real(programme, *args)
+
+    monkeypatch.setattr(_solver, "_run", lps_only)
     programme = _design_qp(case)
     solution = _solver.solve_qp(programme)
-    assert solution.status == "optimal"
+    assert (solution.status, solution.method) == ("optimal", "active_set")
+    assert solution.fallback is False and solution.limit is None
+    assert solution.message == "Optimal (active set)"
     assert solution.values is not None and solution.objective is not None
-    # Whether HiGHS fails on these depends on its version; the outcome doesn't.
-    assert solution.method in ("highs", "active_set")
-    tolerance = 1e-12 if solution.method == "active_set" else 1e-7
-    if solution.method == "active_set":
-        assert "by the active-set fallback after HiGHS" in solution.message
-    reference = _case_optimum(case)
-    assert solution.objective == pytest.approx(reference, rel=tolerance, abs=1e-15)
+    assert solution.objective == pytest.approx(
+        _case_optimum(case), rel=1e-12, abs=1e-15
+    )
     g, h = _inequalities(programme)
-    assert (g @ solution.values - h).max() <= tolerance
+    assert (g @ solution.values - h).max() <= 1e-12
 
 
 def test_a_qp_stops_at_its_iteration_limit(monkeypatch: pytest.MonkeyPatch) -> None:
-    _no_fallback(monkeypatch)
+    _highs_first(monkeypatch, fallback=False)
     solution = _solver.solve_qp(_design_qp(STALLS), {"qp_iteration_limit": 3})
     assert solution.status == "limit"
     assert solution.limit == "qp_iteration_limit"
     assert "qp_iteration_limit=3" in solution.message
-    assert "more than the active-set fallback takes (0)" in solution.message
+    assert "more than the dense method takes after HiGHS (0)" in solution.message
     assert solution.values is None and solution.method == "highs"
-    assert solution.iterations >= 3
+    assert solution.iterations >= 3 and solution.fallback is False
 
 
 def test_a_qp_stops_at_its_time_limit(monkeypatch: pytest.MonkeyPatch) -> None:
-    _no_fallback(monkeypatch)
+    _highs_first(monkeypatch, fallback=False)
     solution = _solver.solve_qp(_design_qp(STALLS), {"time_limit": 0.0})
     assert (solution.status, solution.limit) == ("limit", "time_limit")
     assert "time_limit=0.0" in solution.message
@@ -388,41 +405,55 @@ def test_an_lp_names_its_limit() -> None:
     assert (solution.status, solution.limit) == ("limit", "simplex_iteration_limit")
 
 
-def test_the_fallback_solves_a_qp_that_highs_stops(
+def test_the_dense_method_solves_a_qp_that_highs_stops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    solution = _solver.solve_qp(_design_qp(FALSE_UNBOUNDED), {"qp_iteration_limit": 1})
+    _highs_first(monkeypatch)
+    solution = _solver.solve_qp(_design_qp(STALLS), {"qp_iteration_limit": 1})
     assert (solution.status, solution.method) == ("optimal", "active_set")
-    assert solution.message.startswith("Optimal, by the active-set fallback after")
+    assert solution.fallback is True
+    assert solution.message.startswith("Optimal (active set), after HiGHS:")
     assert "qp_iteration_limit=1" in solution.message
     assert solution.iterations > 1
-    assert solution.objective == pytest.approx(
-        _case_optimum(FALSE_UNBOUNDED), rel=1e-12
-    )
+    assert solution.objective == pytest.approx(_case_optimum(STALLS), rel=1e-12)
 
 
-def test_the_fallback_has_its_own_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_qp_on_which_highs_cycles_is_solved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # HiGHS 1.15's QP solver cycles on this QP until its iteration limit;
+    # whether it does depends on its version, the outcome doesn't.
+    _highs_first(monkeypatch)
+    solution = _solver.solve_qp(_design_qp(STALLS))
+    assert solution.status == "optimal" and solution.objective is not None
+    if solution.method == "active_set":
+        assert solution.fallback is True
+        assert f"qp_iteration_limit={_solver.QP_ITERATION_LIMIT}" in solution.message
+    tolerance = 1e-12 if solution.method == "active_set" else 1e-7
+    assert solution.objective == pytest.approx(_case_optimum(STALLS), rel=tolerance)
+
+
+def test_the_dense_method_has_its_own_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_solver, "ACTIVE_SET_ITERATION_LIMIT", 1)
-    solution = _solver.solve_qp(_design_qp(STALLS), {"qp_iteration_limit": 1})
+    solution = _solver.solve_qp(_design_qp(STALLS))
     assert (solution.status, solution.method) == ("limit", "active_set")
     assert solution.limit == "active_set_iteration_limit"
     assert "active_set_iteration_limit=1" in solution.message
 
 
 def test_a_false_unbounded_is_solved_again(monkeypatch: pytest.MonkeyPatch) -> None:
-    # HiGHS's QP outcome is replaced by "unbounded"; its LPs run as they are.
-    real = _solver._run
-
-    def unbounded(programme: _solver.Programme, *args: Any) -> _solver.Solution:
-        if programme.hessian is None:
-            return real(programme, *args)
-        return _solver.Solution("unbounded", None, None, "Unbounded", 7, 0.0)
-
-    monkeypatch.setattr(_solver, "_run", unbounded)
+    # On Windows a real one would end the process, so HiGHS's QP outcome is
+    # replaced here, and its LPs run as they are.
+    _highs_first(monkeypatch)
+    _highs_qp_reports(monkeypatch, "unbounded")
     solution = _solver.solve_qp(_design_qp(STALLS))
     assert (solution.status, solution.method) == ("optimal", "active_set")
+    assert solution.fallback is True
     assert solution.message.endswith("after HiGHS: Unbounded")
     assert solution.objective == pytest.approx(_case_optimum(STALLS), rel=1e-12)
+    _highs_first(monkeypatch, fallback=False)
+    kept = _solver.solve_qp(_design_qp(STALLS))
+    assert (kept.status, kept.method) == ("unbounded", "highs")
 
 
 def _random_qp(rng: np.random.Generator) -> _solver.Programme:
@@ -446,7 +477,7 @@ def _random_qp(rng: np.random.Generator) -> _solver.Programme:
     )
 
 
-def test_the_fallback_matches_an_exact_solve_on_random_qps() -> None:
+def test_the_dense_method_matches_an_exact_solve_on_random_qps() -> None:
     rng = np.random.default_rng(20261111)
     for _ in range(40):
         programme = _random_qp(rng)
@@ -459,7 +490,7 @@ def test_the_fallback_matches_an_exact_solve_on_random_qps() -> None:
         assert solution.objective == pytest.approx(reference, rel=1e-9, abs=1e-12)
 
 
-def test_the_fallback_at_a_degenerate_vertex() -> None:
+def test_the_dense_method_at_a_degenerate_vertex() -> None:
     # min (x0 - 1)^2 + (x1 - 1)^2 on x0 + x1 <= 1, x0 <= 0.5, x1 <= 0.5,
     # x0 - x1 <= 0 and x1 - x0 <= 0: four rows meet at the optimum (0.5, 0.5).
     programme = _qp(
@@ -474,7 +505,7 @@ def test_the_fallback_at_a_degenerate_vertex() -> None:
     assert solution.values.tolist() == pytest.approx([0.5, 0.5], abs=1e-12)
 
 
-def test_the_fallback_follows_directions_without_curvature() -> None:
+def test_the_dense_method_follows_directions_without_curvature() -> None:
     # min x0^2 - x1: x1 has no curvature and is bounded above by x0 + x1 <= 3.
     hessian = np.diag([2.0, 0.0])
     bounded = _qp(hessian, [0.0, -1.0], [[1.0, 1.0]], [3.0], col_lower=-np.inf)
@@ -485,14 +516,14 @@ def test_the_fallback_follows_directions_without_curvature() -> None:
     assert _solver._active_set(unbounded, 100).status == "unbounded"
 
 
-def test_the_fallback_reports_an_infeasible_qp() -> None:
+def test_the_dense_method_reports_an_infeasible_qp() -> None:
     programme = _qp(np.eye(1), [0.0], [[1.0]], [-1.0])
     solution = _solver._active_set(programme, 100)
     assert (solution.status, solution.method) == ("infeasible", "active_set")
     assert solution.values is None
 
 
-def test_the_fallback_without_constraints() -> None:
+def test_the_dense_method_without_constraints() -> None:
     programme = _qp(np.eye(2), [-1.0, 2.0], [], [], col_lower=-np.inf)
     solution = _solver._active_set(programme, 100)
     assert solution.status == "optimal" and solution.values is not None

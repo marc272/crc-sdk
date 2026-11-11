@@ -29,16 +29,18 @@ objective at every candidate is kept (`DesignResult.profile`).
 **Solver.** The LP and QP routes use HiGHS from the optional extra
 `crc-sdk[parametric]` (`pip install crc-sdk[parametric]`), imported only
 when needed; without it they raise `SolverUnavailableError`. A grid
-evaluated in numpy needs no solver. Every QP solve has an iteration and a
-time limit, because HiGHS's active-set QP solver can cycle at a degenerate
-vertex. When HiGHS stops at its limit, or ends a QP with any outcome but
-optimal or infeasible, a QP of at most 500 columns (one per amount, unless a
-cost-of-capital premium adds a column per draw) is solved again by a dense
-active-set method in numpy, whose steps at a degenerate vertex are LPs
-solved by HiGHS's simplex. `DesignResult.solved_by` says which one solved
-the design (`"highs"` or `"active_set"`) and `fallbacks` how many of its
-solves the fallback finished. A solve that stops at a limit raises
-`SolverLimitError`, which names the limit.
+evaluated in numpy needs no solver. HiGHS's active-set QP solver can cycle
+at a degenerate vertex of a small QP, and has reported a bounded one
+unbounded (on Windows, corrupting the process's heap). So a QP of at most 100
+columns (one per amount, unless a cost-of-capital premium adds a column per
+draw) is solved by a dense active-set method in numpy, whose steps at a
+degenerate vertex are LPs solved by HiGHS's simplex. A larger QP goes to
+HiGHS with an iteration and a time limit; when HiGHS stops at its limit, or
+ends with any outcome but optimal or infeasible, a QP of at most 500 columns
+is solved again by the dense method. `DesignResult.solved_by` says which
+method solved the design (`"highs"` or `"active_set"`) and `fallbacks` how
+many of its solves the dense method finished after HiGHS failed. A solve
+that stops at a limit raises `SolverLimitError`, which names the limit.
 
 **Scaling.** Losses and payouts are divided by the largest loss of a draw
 (1 if that is at most 1e-6) before solving; results are in payout units.
@@ -284,9 +286,10 @@ class DesignResult:
       `status`, `solver_message`, `iterations`, `solves`, `seconds` (solver
       time) and `solver_options`.
     - `solved_by`: what solved the design's amounts, `"highs"` or
-      `"active_set"` (the dense fallback of a QP that HiGHS left unsolved),
-      or `None` for a grid in numpy; `fallbacks`: how many of the design's
-      solves the fallback finished, over every candidate of a grid.
+      `"active_set"` (the dense method of a small QP, or of one that HiGHS
+      left unsolved), or `None` for a grid in numpy; `fallbacks`: how many
+      of the design's solves the dense method finished after HiGHS failed,
+      over every candidate of a grid.
     - The non-uniqueness report: `unidentified` amounts and the `fill` rule
       that set them, `zeroed` amounts, `ranges` (wide ranges in payout
       units, with `ranges=True` on the LP route), `unique`, `ties`, and the
@@ -468,7 +471,7 @@ class _Solves:
         self.iterations += solution.iterations
         self.count += 1
         self.seconds += solution.seconds
-        self.fallbacks += int(solution.method == "active_set")
+        self.fallbacks += int(solution.fallback)
         self.last = solution
         return solution
 
@@ -1391,6 +1394,7 @@ def _solver_options(route: Literal["lp", "qp"], ranging: bool) -> dict[str, Any]
         "ranging": dict(_solver.RANGING_OPTIONS) if ranging else None,
         "active_set": (
             {
+                "first_columns": _solver.ACTIVE_SET_FIRST_COLUMNS,
                 "max_columns": _solver.ACTIVE_SET_MAX_COLUMNS,
                 "iteration_limit": _solver.ACTIVE_SET_ITERATION_LIMIT,
             }
