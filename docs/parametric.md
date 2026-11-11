@@ -1767,7 +1767,7 @@ contract and one year:
 | Pricing | P | Terms | In a design |
 | --- | --- | --- | --- |
 | `PurePremium()` | E[π] | none | the budget is one linear row in the amounts |
-| `CostOfCapitalLoad(rate, q)` | (1 − rate) · E[π] + rate · CVaR_q(π) | rate ∈ [0, 1], q ∈ (0, 1) | convex in π: the CVaR enters in the Rockafellar–Uryasev form, with n + 1 more columns and n more rows for n draws |
+| `CostOfCapitalLoad(rate, q)` | (1 − rate) · E[π] + rate · CVaR_q(π) | rate ∈ [0, 1], q ∈ (0, 1) | convex in π: in an LP the CVaR enters in the Rockafellar–Uryasev form, with n + 1 more columns and n more rows for n draws; an MSE design stays a QP in the amounts only, and cutting planes add the budget |
 | `ExpectedPayoutMultiple(multiple, expense=0.0)` | multiple · E[π] + expense | multiple ≥ 1; expense ≥ 0, a fixed amount in the payout unit | linear in π: one row, multiple · E[π] ≤ bound − expense, so an MSE design stays a QP in the amounts only |
 
 `ExpectedPayoutMultiple` is the price an insurer or a broker usually states
@@ -2199,8 +2199,9 @@ function does not, so give each function its own name.
 - The premium is priced on the design sample with `pricing`: `PurePremium()`,
   `CostOfCapitalLoad(rate, q)` or `ExpectedPayoutMultiple(multiple, expense)`
   ([the pricings](#pricing-and-the-premium-used)). Each is convex in the
-  payout, so the design stays an LP or a QP; the cost-of-capital CVaR enters
-  in the Rockafellar–Uryasev form too.
+  payout, so the design stays an LP or a QP: the cost-of-capital CVaR enters
+  an LP in the Rockafellar–Uryasev form, and an MSE design through cutting
+  planes (see "Solver settings" below).
 - `Budget(ratio=k)` means premium ≤ k · E[L] on the design sample;
   `Budget(amount=B)` means premium ≤ B, in payout units. Exactly one of the two.
   The premium is the whole price, its loads and any expense included. So under
@@ -2243,7 +2244,7 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
 | Template | Objective | Route |
 | --- | --- | --- |
 | amounts free, thresholds fixed (any built-in family, or a `LinearInAmounts` user family) | E[U], weighted CVaR | one LP (`route="lp"`) |
-| the same | MSE | one QP in the amounts (`route="qp"`) |
+| the same | MSE | one QP in the amounts (`route="qp"`); under a cost-of-capital budget, cutting planes over such QPs |
 | free thresholds on grids (attachment, exhaustion, breakpoints, knots, trigger) | any built-in | a grid over the thresholds, with the LP or QP at each point (`route="grid"`) |
 | a `UserObjective`, or a payout not linear in its amounts | any | a grid over every free parameter, evaluated in numpy; candidates that break the budget or the limit are dropped |
 | `SumOf`, `MaxOf`, `StepGrid` over several indices | any | one of the routes above, as [design on several indices](#design-on-several-indices) says |
@@ -2260,22 +2261,34 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
 - **Scaling.** Losses and payouts are divided by the largest loss of a draw (1
   if that is at most 1e-6) before solving; results are in payout units.
 - **Solver settings.** HiGHS's simplex for the LPs (a vertex solution). HiGHS's
-  active-set QP solver can cycle at a degenerate vertex of a small QP, and it
-  has reported an unbounded objective for a QP whose amounts are all bounded
-  (on Windows, ending the process). So a QP of at most 100 columns (one per
-  amount; a cost-of-capital premium adds one per draw) is solved by a dense
-  active-set method in numpy, which leaves a degenerate vertex through a small
-  LP solved by HiGHS's simplex, and stops at 10,000 iterations. A larger QP
-  goes to HiGHS's QP solver, with a Hessian regularisation of 1e-12, stopping
-  at 100,000 iterations or 600 seconds, whichever comes first; when it stops
-  at a limit, or ends with any outcome but optimal or infeasible, a QP of at
-  most 500 columns is solved again by the dense method. `DesignResult.solved_by`
-  says which method solved the design (`"highs"` or `"active_set"`), and
+  active-set QP solver can cycle at a degenerate vertex of a QP, and it has
+  reported an unbounded objective for a QP whose amounts are all bounded (on
+  Windows, ending the process). So a QP of at most 100 columns (one per
+  amount) is solved by a dense active-set method in numpy, which leaves a
+  degenerate vertex through a small LP solved by HiGHS's simplex, and stops at
+  10,000 iterations. A larger QP goes to HiGHS's QP solver, with a Hessian
+  regularisation of 1e-12, stopping at 100,000 iterations or 600 seconds,
+  whichever comes first; when it stops at a limit, or ends with any outcome
+  but optimal or infeasible, a QP of at most 500 columns is solved again by
+  the dense method.
+- **MSE under a cost-of-capital budget.** The premium's CVaR would add a
+  column per draw to the QP, and HiGHS's QP solver cycles on such QPs too. So
+  the design is solved by cutting planes: the CVaR is the largest of finitely
+  many means of the payout over the draws of a tail, each linear in the
+  amounts. Each step solves the QP in the amounts with the budget's cuts found
+  so far, as above, then adds the cut of the tail of its solution's payout.
+  It stops when the solution's premium exceeds the budget by at most 1e-9 of
+  the larger of the scale and the budget; each QP relaxes the budget, so the
+  design's MSE is then at most the optimum. A design usually needs two or
+  three QPs, and the method stops after 1,000. Its QPs reach HiGHS's QP solver
+  only when the payout has more than 100 amounts.
+- **The record.** `DesignResult.solved_by` says which method solved the design
+  (`"highs"`, `"active_set"` or `"cutting_planes"`), and
   `DesignResult.fallbacks` how many of its solves the dense method finished
   after HiGHS failed. A solve that stops at a limit raises `SolverLimitError`.
-  The record holds the solver's name and version, the options (the limits
-  among them), the status, the iterations, the solver time, `solved_by` and
-  `fallbacks`.
+  The record holds the solver's name and version, the options (the limits and
+  the cutting planes' tolerance among them), the status, the iterations, the
+  solver time, `solved_by` and `fallbacks`.
 
 ### Checks and errors
 
@@ -2288,7 +2301,7 @@ the larger of the bound and the scale). Nothing is returned that fails them.
 | --- | --- |
 | `InfeasibleDesignError` | no payout meets the constraints, including a fixed amount or a lower bound above the limit, a budget below the pricing's fixed expense, and a grid without a feasible candidate |
 | `UnboundedDesignError` | the solver reports an unbounded objective; never for `MSE()`, which is at least 0, so a QP reported unbounded raises `DesignError` |
-| `SolverLimitError` | a solve stopped at its iteration or time limit before it found an optimum; its `status` names the limit: `"qp_iteration_limit"`, `"time_limit"` or `"active_set_iteration_limit"` |
+| `SolverLimitError` | a solve stopped at its iteration or time limit before it found an optimum; its `status` names the limit: `"qp_iteration_limit"`, `"time_limit"`, `"active_set_iteration_limit"` or `"cutting_plane_limit"` |
 | `DesignError` | any other solver status, a failed check, a missing grid, a grid above the cap, E[U] or weighted CVaR without a budget or bounds |
 | `SolverUnavailableError` | the LP or QP route without `crc-sdk[parametric]` |
 
