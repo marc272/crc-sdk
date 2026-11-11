@@ -42,6 +42,22 @@ the objective, so no face is visited twice. It stops when that LP finds no
 descent direction, which is the optimality condition of a convex QP, or at
 `ACTIVE_SET_ITERATION_LIMIT` iterations. `Solution.method` says which method
 gave the outcome: `"highs"` or `"active_set"`.
+
+**A CVaR row by cutting planes.** `solve_qp_cvar` solves a QP with one more
+row, `linear @ x + weight * CVaR_q(basis @ x) <= upper` (`CVaRRow`), which is
+convex and piecewise linear in `x`: the CVaR is the largest of the linear
+functions `w @ basis @ x` over the vertices `w` of the set of tail weights.
+In the Rockafellar-Uryasev form it adds a column per draw to the QP, which
+then goes to HiGHS's QP solver above 100 columns. Cutting planes keep the QP
+in `x` only: each step solves the QP with the cuts found so far by
+`solve_qp`, takes the vertex `w` of the solution's tail, and adds its cut
+`(linear + weight * w @ basis) @ x <= upper`, which every point that meets
+the row meets too. It stops when the solution meets the row within
+`CUTTING_PLANE_TOLERANCE * max(1, |upper|)`; the solution is then optimal for
+a relaxation of the QP, so its objective is at most the QP's optimum. A new
+cut is never one already added, and the vertices are finitely many, so the
+method ends; `CUTTING_PLANE_LIMIT` bounds its steps. `Solution.method` is then
+`"cutting_planes"`.
 """
 
 from __future__ import annotations
@@ -62,6 +78,8 @@ __all__ = [
     "ACTIVE_SET_FIRST_COLUMNS",
     "ACTIVE_SET_ITERATION_LIMIT",
     "ACTIVE_SET_MAX_COLUMNS",
+    "CUTTING_PLANE_LIMIT",
+    "CUTTING_PLANE_TOLERANCE",
     "EXTRA",
     "LP_OPTIONS",
     "LPSession",
@@ -71,6 +89,7 @@ __all__ = [
     "RANGING_OPTIONS",
     "SOLVER_NAME",
     "Basis",
+    "CVaRRow",
     "Method",
     "Programme",
     "Solution",
@@ -80,6 +99,7 @@ __all__ = [
     "require",
     "solve_lp",
     "solve_qp",
+    "solve_qp_cvar",
     "sparse_columns",
 ]
 
@@ -141,6 +161,20 @@ A design QP of one column per amount needs tens, and a cost-of-capital QP of
 480 draws about 400.
 """
 
+CUTTING_PLANE_TOLERANCE = 1e-9
+"""Cutting planes stop when the CVaR row holds within this share of `max(1, |upper|)`.
+
+A design states its budget in units of its scale (the largest loss of a
+draw), and checks it to 1e-7 of the larger of the scale and the budget.
+"""
+
+CUTTING_PLANE_LIMIT = 1_000
+"""The most QPs that the cutting-plane method solves in one solve.
+
+A design under a cost-of-capital budget needs two or three: the QP without
+the budget, then one with the cut of its solution's tail, rarely a third.
+"""
+
 RANGING_OPTIONS: Mapping[str, bool | int | float | str] = {
     "solver": "simplex",
     "primal_feasibility_tolerance": 1e-10,
@@ -157,8 +191,8 @@ SolveStatus = Literal[
 `Solution.limit` names.
 """
 
-Method = Literal["highs", "active_set"]
-"""What gave a solve's outcome: HiGHS, or the dense active-set method."""
+Method = Literal["highs", "active_set", "cutting_planes"]
+"""What gave a solve's outcome: HiGHS, the dense method, or cutting planes."""
 
 _REJECTED = "HiGHS rejected the model"
 
@@ -332,12 +366,14 @@ class Solution:
     interior point and QP iterations together) and `seconds` the wall time.
     `basis` is the optimal basis of an LP solved with `keep_basis=True`, and
     `None` otherwise, or when the solver has no valid basis to give.
-    `method` is `"highs"`, or `"active_set"` when the dense method gave the
-    outcome; `fallback` is true when it did so after HiGHS failed (its
-    `iterations` and `seconds` then include HiGHS's). `limit` names the limit
-    a `"limit"` status stopped at: `"qp_iteration_limit"`,
-    `"simplex_iteration_limit"`, `"time_limit"` or
-    `"active_set_iteration_limit"`; the message gives its value.
+    `method` is `"highs"`, `"active_set"` when the dense method gave the
+    outcome, or `"cutting_planes"` for `solve_qp_cvar`; `fallback` is true
+    when the dense method gave it after HiGHS failed (its `iterations` and
+    `seconds` then include HiGHS's), or, for cutting planes, when it did so
+    for any of their QPs. `limit` names the limit a `"limit"` status stopped
+    at: `"qp_iteration_limit"`, `"simplex_iteration_limit"`, `"time_limit"`,
+    `"active_set_iteration_limit"` or `"cutting_plane_limit"`; the message
+    gives its value.
     """
 
     status: SolveStatus
@@ -673,6 +709,194 @@ def solve_qp(
         iterations=highs.iterations + dense.iterations,
         seconds=highs.seconds + dense.seconds,
         fallback=True,
+    )
+
+
+# -- a CVaR row by cutting planes ---------------------------------------------
+
+
+@dataclass(frozen=True, eq=False)
+class CVaRRow:
+    """The convex row `linear @ x + weight * CVaR_q(basis @ x) <= upper`.
+
+    `basis` has one row per draw and one column per variable; `probability`
+    holds the draws' probabilities. The CVaR at level `q` is the
+    Rockafellar-Uryasev one, `min_eta eta + sum(p (v - eta)^+) / (1 - q)` of
+    the draws' values `v = basis @ x`: the mean of their worst `1 - q` of the
+    probability. Raises `ValueError` unless the shapes agree, everything is
+    finite, the probabilities are positive, `q` lies in (0, 1) and `weight`
+    is at least 0.
+    """
+
+    linear: FloatArray
+    basis: FloatArray
+    probability: FloatArray
+    q: float
+    weight: float
+    upper: float
+
+    def __post_init__(self) -> None:
+        linear = np.asarray(self.linear, dtype=np.float64)
+        basis = np.asarray(self.basis, dtype=np.float64)
+        probability = np.asarray(self.probability, dtype=np.float64)
+        if basis.ndim != 2 or linear.shape != (basis.shape[1],):
+            raise ValueError("linear must have one entry per column of the basis")
+        if probability.shape != (basis.shape[0],):
+            raise ValueError("probability must have one entry per row of the basis")
+        numbers = (self.q, self.weight, self.upper)
+        if not (
+            np.isfinite(linear).all()
+            and np.isfinite(basis).all()
+            and np.isfinite(probability).all()
+            and all(math.isfinite(number) for number in numbers)
+        ):
+            raise ValueError("a CVaR row must be finite")
+        if (probability <= 0.0).any():
+            raise ValueError("the probabilities must be positive")
+        if not 0.0 < self.q < 1.0:
+            raise ValueError(f"q must lie in (0, 1), got {self.q!r}")
+        if self.weight < 0.0:
+            raise ValueError(f"weight must be at least 0, got {self.weight!r}")
+        object.__setattr__(self, "linear", linear)
+        object.__setattr__(self, "basis", basis)
+        object.__setattr__(self, "probability", probability)
+
+    def cut(self, x: FloatArray) -> tuple[float, FloatArray]:
+        """The row's left side at `x`, and the coefficients `c` of its cut there.
+
+        `c = linear + weight * w @ basis`, with `w` the tail weights of
+        `basis @ x`: `p / (1 - q)` on its largest values, in order (ties in
+        draw order), until they sum to 1, the last one cut short. `w` is a
+        vertex of the weights over which the CVaR is the largest mean, so
+        `c @ y` is at most the left side at every `y`, and equals it at `x`.
+        """
+        values = self.basis @ x
+        order = np.argsort(-values, kind="stable")
+        ordered = self.probability[order]
+        before = np.cumsum(ordered) - ordered
+        mass = 1.0 - self.q
+        weights = np.zeros_like(values)
+        weights[order] = np.clip(mass - before, 0.0, ordered) / mass
+        coefficients = self.linear + self.weight * (weights @ self.basis)
+        return float(coefficients @ x), coefficients
+
+
+def _with_cuts(programme: Programme, cuts: list[FloatArray], upper: float) -> Programme:
+    """The programme with the rows `cut @ x <= upper` after its own rows."""
+    if not cuts:
+        return programme
+    matrix = programme.matrix
+    added = np.vstack(cuts)
+    rows, columns = np.nonzero(added)
+    return replace(
+        programme,
+        matrix=sparse_columns(
+            np.concatenate([matrix.index, matrix.n_rows + rows]),
+            np.concatenate(
+                [np.repeat(np.arange(matrix.n_columns), np.diff(matrix.start)), columns]
+            ),
+            np.concatenate([matrix.value, added[rows, columns]]),
+            (matrix.n_rows + len(cuts), programme.n_columns),
+        ),
+        row_lower=np.concatenate([programme.row_lower, np.full(len(cuts), -math.inf)]),
+        row_upper=np.concatenate([programme.row_upper, np.full(len(cuts), upper)]),
+    )
+
+
+def solve_qp_cvar(
+    programme: Programme,
+    row: CVaRRow,
+    options: Mapping[str, bool | int | float | str] | None = None,
+) -> Solution:
+    """Solve a convex QP with one more row, a `CVaRRow`, by cutting planes.
+
+    The module docstring describes the method. Each step's QP, the programme
+    with the cuts as rows `cut @ x <= row.upper`, goes to `solve_qp` with
+    `options`: to the dense method up to `ACTIVE_SET_FIRST_COLUMNS` columns,
+    and to HiGHS above. Returns, with `method="cutting_planes"`:
+
+    - `"optimal"`, with the last QP's values and objective, once they meet
+      the row within `CUTTING_PLANE_TOLERANCE * max(1, |row.upper|)`, or when
+      the cut of the solution is one its QP already holds: the QP's solver
+      then met that cut only to its own tolerance, which the message gives;
+    - `"infeasible"` when a QP is: the cuts only relax the row;
+    - `"limit"`, naming the limit, when a QP stops at its own, or after
+      `CUTTING_PLANE_LIMIT` QPs (`"cutting_plane_limit"`);
+    - `"error"` for any other outcome of a QP, which the message gives. An
+      unbounded QP with cuts says nothing of the QP with the row.
+
+    `iterations` and `fallback` cover every QP. Raises
+    `SolverUnavailableError` without highspy, and `ValueError` for a
+    programme without a Hessian or a row of another width.
+    """
+    if programme.hessian is None:
+        raise ValueError("solve_qp_cvar takes a programme with a hessian")
+    if row.linear.shape != (programme.n_columns,):
+        raise ValueError("the CVaR row must have one column per variable")
+    began = time.perf_counter()
+    allowance = CUTTING_PLANE_TOLERANCE * max(1.0, abs(row.upper))
+    cuts: list[FloatArray] = []
+    added: set[bytes] = set()
+    iterations = 0
+    fallback = False
+
+    def outcome(
+        status: SolveStatus,
+        message: str,
+        solution: Solution | None = None,
+        limit: str | None = None,
+    ) -> Solution:
+        return Solution(
+            status,
+            None if solution is None else solution.values,
+            None if solution is None else solution.objective,
+            message,
+            iterations,
+            time.perf_counter() - began,
+            method="cutting_planes",
+            limit=limit,
+            fallback=fallback,
+        )
+
+    for step in range(1, CUTTING_PLANE_LIMIT + 1):
+        relaxed = _with_cuts(programme, cuts, row.upper)
+        solution = solve_qp(relaxed, options)
+        if solution.status == "infeasible_or_unbounded":
+            iterations += solution.iterations
+            solution = solve_qp(relaxed, {**(options or {}), "presolve": "off"})
+        iterations += solution.iterations
+        fallback = fallback or solution.fallback
+        plural = "" if len(cuts) == 1 else "s"
+        where = f"cutting planes: QP {step}, {len(cuts)} cut{plural}"
+        if solution.status in ("infeasible", "limit"):
+            return outcome(
+                solution.status,
+                f"{solution.message} ({where})",
+                limit=solution.limit,
+            )
+        if solution.status != "optimal" or solution.values is None:
+            return outcome("error", f"a QP ended {solution.message} ({where})")
+        value, cut = row.cut(solution.values)
+        excess = value - row.upper
+        if excess <= allowance:
+            return outcome(
+                "optimal",
+                f"Optimal ({where}; the last QP: {solution.message})",
+                solution,
+            )
+        if cut.tobytes() in added:
+            return outcome(
+                "optimal",
+                f"Optimal ({where}; the last QP: {solution.message}; it meets "
+                f"its cuts only to its own tolerance, the row by {excess:.3g})",
+                solution,
+            )
+        cuts.append(cut)
+        added.add(cut.tobytes())
+    return outcome(
+        "limit",
+        f"Cutting plane limit reached (cutting_plane_limit={CUTTING_PLANE_LIMIT})",
+        limit="cutting_plane_limit",
     )
 
 

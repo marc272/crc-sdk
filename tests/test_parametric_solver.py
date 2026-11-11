@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import math
 import subprocess
@@ -11,7 +12,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from crc_sdk.parametric import SolverUnavailableError, _solver
+from crc_sdk.parametric import CostOfCapitalLoad, SolverUnavailableError, _solver
 
 
 def _matrix(dense: list[list[float]]) -> _solver.SparseColumns:
@@ -528,3 +529,356 @@ def test_the_dense_method_without_constraints() -> None:
     solution = _solver._active_set(programme, 100)
     assert solution.status == "optimal" and solution.values is not None
     assert solution.values.tolist() == pytest.approx([1.0, -2.0], abs=1e-12)
+
+
+# -- a CVaR row by cutting planes ----------------------------------------------
+
+
+def _tail_vertices(probability: np.ndarray, q: float) -> np.ndarray:
+    """Every vertex of {w : 0 <= w <= p / (1 - q), sum(w) = 1}, by enumeration.
+
+    A vertex has at most one weight strictly between its bounds: the draws of
+    a subset take their cap, and one more draw takes what is left.
+    """
+    cap = probability / (1.0 - q)
+    n = probability.shape[0]
+    found: list[np.ndarray] = []
+    for chosen in itertools.product([False, True], repeat=n):
+        full = np.array(chosen)
+        rest = 1.0 - cap[full].sum()
+        if rest < -1e-12:
+            continue
+        for j in np.flatnonzero(~full):
+            if rest <= cap[j] + 1e-12:
+                weights = np.where(full, cap, 0.0)
+                weights[j] = max(rest, 0.0)
+                found.append(weights)
+    return np.unique(np.round(np.array(found), 14), axis=0)
+
+
+def _cvar(values: np.ndarray, probability: np.ndarray, q: float) -> float:
+    """Rockafellar-Uryasev: min over eta of eta + E[(v - eta)^+] / (1 - q)."""
+    return min(
+        float(eta) + float(probability @ np.maximum(values - eta, 0.0)) / (1.0 - q)
+        for eta in values
+    )
+
+
+def _mse_problem(
+    rng: np.random.Generator, n: int, k: int
+) -> tuple[_solver.Programme, _solver.CVaRRow]:
+    """An MSE QP in `k` amounts on `n` draws, under a binding CVaR row.
+
+    The basis has no order: the draws' payouts change rank with the amounts,
+    so the tail that the row's CVaR takes changes too.
+    """
+    basis = rng.uniform(0.0, 1.0, (n, k))
+    basis[rng.random((n, k)) < 0.3] = 0.0
+    loss = rng.uniform(0.0, 1.0, n) * (rng.random(n) < 0.8)
+    probability = rng.dirichlet(np.full(n, 2.0))
+    hessian = 2.0 * basis.T @ (basis * probability[:, None])
+    programme = _qp(
+        hessian,
+        list(-2.0 * basis.T @ (probability * loss)),
+        [],
+        [],
+        col_upper=2.0,
+    )
+    programme = dataclasses.replace(programme, offset=float(probability @ loss**2))
+    rate, q = float(rng.uniform(0.05, 0.9)), float(rng.choice([0.5, 0.7, 0.9]))
+    free = _solver.solve_qp(programme)
+    assert free.values is not None
+    linear = (1.0 - rate) * (probability @ basis)
+    unbound = float(linear @ free.values) + rate * _cvar(
+        basis @ free.values, probability, q
+    )
+    row = _solver.CVaRRow(
+        linear=linear,
+        basis=basis,
+        probability=probability,
+        q=q,
+        weight=rate,
+        upper=float(rng.uniform(0.2, 0.8)) * unbound,
+    )
+    return programme, row
+
+
+def _with_vertex_rows(
+    programme: _solver.Programme, row: _solver.CVaRRow
+) -> _solver.Programme:
+    """The QP with the CVaR row written out: one linear row per tail vertex."""
+    vertices = _tail_vertices(row.probability, row.q)
+    rows = row.linear + row.weight * vertices @ row.basis
+    written = _qp(
+        _hessian(programme),
+        list(programme.cost),
+        rows.tolist(),
+        [row.upper] * rows.shape[0],
+        col_lower=list(programme.col_lower),
+        col_upper=list(programme.col_upper),
+    )
+    return dataclasses.replace(written, offset=programme.offset)
+
+
+def _with_auxiliaries(
+    programme: _solver.Programme, row: _solver.CVaRRow
+) -> _solver.Programme:
+    """The QP with the CVaR row in the Rockafellar-Uryasev form.
+
+    The columns are the amounts, eta and a tail column per draw: the QP that
+    a design under a cost-of-capital budget solved before cutting planes.
+    """
+    n, k = row.basis.shape
+    columns = k + 1 + n
+    tail_rows = np.hstack([-row.basis, np.ones((n, 1)), np.eye(n)])
+    budget = np.concatenate(
+        [row.linear, [row.weight], row.weight * row.probability / (1.0 - row.q)]
+    )
+    hessian = np.zeros((columns, columns))
+    hessian[:k, :k] = _hessian(programme)
+    written = _qp(
+        hessian,
+        list(np.concatenate([programme.cost, np.zeros(1 + n)])),
+        [*tail_rows.tolist(), budget.tolist()],
+        [np.inf] * n + [row.upper],
+        row_lower=[0.0] * n + [-np.inf],
+        col_lower=list(programme.col_lower) + [-np.inf] + [0.0] * n,
+        col_upper=list(programme.col_upper) + [np.inf] * (1 + n),
+    )
+    return dataclasses.replace(written, offset=programme.offset)
+
+
+def test_a_cvar_rows_cut_is_tight_and_below_it() -> None:
+    rng = np.random.default_rng(7)
+    for _ in range(20):
+        _, row = _mse_problem(rng, 6, 3)
+        vertices = _tail_vertices(row.probability, row.q)
+        for _ in range(5):
+            x = rng.uniform(0.0, 2.0, 3)
+            value, cut = row.cut(x)
+            values = row.basis @ x
+            cvar = _cvar(values, row.probability, row.q)
+            assert value == pytest.approx(row.linear @ x + row.weight * cvar)
+            assert cvar == pytest.approx(float((vertices @ values).max()))
+            assert cut @ x == pytest.approx(value, abs=1e-15)
+            # Below the row at every other point.
+            for y in rng.uniform(0.0, 2.0, (10, 3)):
+                at_y = row.linear @ y + row.weight * _cvar(
+                    row.basis @ y, row.probability, row.q
+                )
+                assert cut @ y <= at_y + 1e-12
+
+
+def test_a_cvar_rows_value_is_the_cost_of_capital_premium() -> None:
+    rng = np.random.default_rng(3)
+    probability = rng.dirichlet(np.ones(40))
+    basis = rng.uniform(0.0, 1.0, (40, 4))
+    pricing = CostOfCapitalLoad(0.3, 0.9)
+    row = _solver.CVaRRow(
+        linear=(1.0 - pricing.rate) * (probability @ basis),
+        basis=basis,
+        probability=probability,
+        q=pricing.q,
+        weight=pricing.rate,
+        upper=1.0,
+    )
+    x = rng.uniform(0.0, 1.0, 4)
+    value, _ = row.cut(x)
+    assert value == pytest.approx(pricing.premium(basis @ x, probability), rel=1e-13)
+
+
+def test_a_cvar_row_is_checked() -> None:
+    good: dict[str, Any] = {
+        "linear": np.zeros(2),
+        "basis": np.ones((3, 2)),
+        "probability": np.full(3, 1.0 / 3.0),
+        "q": 0.5,
+        "weight": 0.1,
+        "upper": 1.0,
+    }
+    _solver.CVaRRow(**good)
+    for change, message in (
+        ({"linear": np.zeros(3)}, "one entry per column"),
+        ({"basis": np.ones(3)}, "one entry per column"),
+        ({"probability": np.full(2, 0.5)}, "one entry per row"),
+        ({"upper": math.inf}, "finite"),
+        ({"basis": np.full((3, 2), np.nan)}, "finite"),
+        ({"probability": np.array([0.5, 0.5, 0.0])}, "positive"),
+        ({"q": 1.0}, "q must lie"),
+        ({"q": 0.0}, "q must lie"),
+        ({"weight": -0.1}, "weight must be"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            _solver.CVaRRow(**{**good, **change})
+    programme, row = _mse_problem(np.random.default_rng(1), 5, 2)
+    with pytest.raises(ValueError, match="one column per variable"):
+        _solver.solve_qp_cvar(
+            programme,
+            dataclasses.replace(row, linear=np.zeros(3), basis=np.ones((5, 3))),
+        )
+    with pytest.raises(ValueError, match="hessian"):
+        _solver.solve_qp_cvar(_lp([1.0, 1.0], [[1.0, 1.0]], [1.0]), row)
+
+
+def _lps_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail the test if a QP reaches HiGHS's QP solver; its LPs run as they are."""
+    real = _solver._run
+
+    def run(programme: _solver.Programme, *args: Any) -> _solver.Solution:
+        assert programme.hessian is None, "a QP reached HiGHS's QP solver"
+        return real(programme, *args)
+
+    monkeypatch.setattr(_solver, "_run", run)
+
+
+def test_cutting_planes_match_an_exact_solve_with_every_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The CVaR row written out as one linear row per vertex of the tail
+    # weights, and the QP solved by enumerating its active sets.
+    _lps_only(monkeypatch)
+    rng = np.random.default_rng(20261111)
+    steps = []
+    for _ in range(25):
+        programme, row = _mse_problem(rng, 5, int(rng.integers(2, 4)))
+        solution = _solver.solve_qp_cvar(programme, row)
+        assert (solution.status, solution.method) == ("optimal", "cutting_planes")
+        assert solution.values is not None and solution.objective is not None
+        assert solution.fallback is False and solution.limit is None
+        reference = _reference_optimum(_with_vertex_rows(programme, row))
+        assert solution.objective == pytest.approx(reference, rel=1e-9, abs=1e-12)
+        value, _ = row.cut(solution.values)
+        assert value <= row.upper + _solver.CUTTING_PLANE_TOLERANCE
+        steps.append(int(solution.message.split("QP ")[1].split(",")[0]))
+    # The budget binds, so every solve takes more than the QP without it.
+    assert min(steps) >= 2 and max(steps) > 2
+
+
+def test_cutting_planes_match_the_qp_with_auxiliaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # What a cost-of-capital budget was solved as: the dense method on the QP
+    # with a column per draw.
+    _lps_only(monkeypatch)
+    rng = np.random.default_rng(11)
+    for _ in range(10):
+        programme, row = _mse_problem(rng, int(rng.integers(10, 40)), 4)
+        solution = _solver.solve_qp_cvar(programme, row)
+        assert solution.status == "optimal" and solution.objective is not None
+        auxiliaries = _solver._active_set(
+            _with_auxiliaries(programme, row), _solver.ACTIVE_SET_ITERATION_LIMIT
+        )
+        assert auxiliaries.status == "optimal" and auxiliaries.objective is not None
+        assert solution.objective == pytest.approx(
+            auxiliaries.objective, rel=1e-9, abs=1e-12
+        )
+
+
+def test_cutting_planes_stop_at_once_when_the_row_holds() -> None:
+    programme, row = _mse_problem(np.random.default_rng(5), 8, 2)
+    loose = dataclasses.replace(row, upper=1e3)
+    solution = _solver.solve_qp_cvar(programme, loose)
+    assert solution.status == "optimal" and solution.values is not None
+    assert solution.message == (
+        "Optimal (cutting planes: QP 1, 0 cuts; the last QP: Optimal (active set))"
+    )
+    plain = _solver.solve_qp(programme)
+    assert plain.values is not None
+    assert solution.values.tolist() == plain.values.tolist()
+
+
+def test_cutting_planes_report_an_infeasible_row() -> None:
+    programme, row = _mse_problem(np.random.default_rng(5), 8, 2)
+    # Every amount at least 1 and a budget the cheapest of them breaks.
+    raised = dataclasses.replace(programme, col_lower=np.ones(2))
+    cheapest, _ = row.cut(np.ones(2))
+    solution = _solver.solve_qp_cvar(
+        raised, dataclasses.replace(row, upper=0.5 * cheapest)
+    )
+    assert (solution.status, solution.method) == ("infeasible", "cutting_planes")
+    assert solution.values is None
+    assert "(cutting planes: QP 2, 1 cut)" in solution.message
+
+
+def test_cutting_planes_stop_at_their_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    programme, row = _mse_problem(np.random.default_rng(5), 8, 2)
+    monkeypatch.setattr(_solver, "CUTTING_PLANE_LIMIT", 1)
+    solution = _solver.solve_qp_cvar(programme, row)
+    assert (solution.status, solution.limit) == ("limit", "cutting_plane_limit")
+    assert solution.method == "cutting_planes" and solution.values is None
+    assert "cutting_plane_limit=1" in solution.message
+    monkeypatch.setattr(_solver, "CUTTING_PLANE_LIMIT", 1_000)
+    monkeypatch.setattr(_solver, "ACTIVE_SET_ITERATION_LIMIT", 1)
+    inner = _solver.solve_qp_cvar(programme, row)
+    assert (inner.status, inner.limit) == ("limit", "active_set_iteration_limit")
+    assert inner.method == "cutting_planes"
+    assert inner.message == (
+        "Iteration limit reached (active set, active_set_iteration_limit=1) "
+        "(cutting planes: QP 1, 0 cuts)"
+    )
+
+
+def test_a_cutting_plane_qp_that_highs_fails_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Above ACTIVE_SET_FIRST_COLUMNS the QPs go to HiGHS, with the dense
+    # method as their fallback; a false "unbounded" is replaced here.
+    programme, row = _mse_problem(np.random.default_rng(5), 8, 2)
+    exact = _solver.solve_qp_cvar(programme, row)
+    _highs_first(monkeypatch)
+    _highs_qp_reports(monkeypatch, "unbounded")
+    solution = _solver.solve_qp_cvar(programme, row)
+    assert (solution.status, solution.method) == ("optimal", "cutting_planes")
+    assert solution.fallback is True
+    assert "after HiGHS: Unbounded" in solution.message
+    assert solution.objective == pytest.approx(exact.objective, rel=1e-12)
+    _highs_first(monkeypatch, fallback=False)
+    failed = _solver.solve_qp_cvar(programme, row)
+    assert (failed.status, failed.method) == ("error", "cutting_planes")
+    assert failed.message.startswith("a QP ended Unbounded; the QP has 2 columns")
+    assert failed.message.endswith("(cutting planes: QP 1, 0 cuts)")
+
+
+def test_cutting_planes_retry_a_qp_without_presolve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    programme, row = _mse_problem(np.random.default_rng(5), 8, 2)
+    exact = _solver.solve_qp_cvar(programme, row)
+    real = _solver.solve_qp
+    seen: list[Any] = []
+
+    def undecided_once(
+        relaxed: _solver.Programme, options: Any = None
+    ) -> _solver.Solution:
+        seen.append(options)
+        if len(seen) == 1:
+            return _solver.Solution("infeasible_or_unbounded", None, None, "?", 3, 0.0)
+        return real(relaxed, options)
+
+    monkeypatch.setattr(_solver, "solve_qp", undecided_once)
+    solution = _solver.solve_qp_cvar(programme, row, {"time_limit": 9.0})
+    assert solution.status == "optimal"
+    assert seen[:2] == [{"time_limit": 9.0}, {"time_limit": 9.0, "presolve": "off"}]
+    assert solution.iterations == exact.iterations + 3
+    assert solution.objective == pytest.approx(exact.objective, rel=1e-12)
+
+
+def test_cutting_planes_stop_at_a_repeated_cut(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A QP solver that meets its rows only to a tolerance can return a point
+    # beyond a cut it holds: that cut comes again, and the method stops.
+    programme, row = _mse_problem(np.random.default_rng(5), 8, 2)
+    real = _solver.solve_qp
+
+    def loose(relaxed: _solver.Programme, options: Any = None) -> _solver.Solution:
+        solution = real(relaxed, options)
+        assert solution.values is not None
+        return dataclasses.replace(solution, values=solution.values * (1.0 + 1e-6))
+
+    monkeypatch.setattr(_solver, "solve_qp", loose)
+    solution = _solver.solve_qp_cvar(programme, row)
+    assert solution.status == "optimal" and solution.values is not None
+    assert "it meets its cuts only to its own tolerance, the row by" in (
+        solution.message
+    )
+    value, _ = row.cut(solution.values)
+    assert 0.0 < value - row.upper < 1e-5 * row.upper

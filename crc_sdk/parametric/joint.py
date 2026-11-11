@@ -18,9 +18,10 @@ pays by its own terms.
 stacked block by block and the summed loss. The scale is the largest summed
 loss of a draw. The QP is solved as `design` solves it: by the dense
 active-set method up to 100 columns, and by HiGHS, with its limits and the
-dense method as its fallback up to 500 columns, above that; a solve that
-stops at a limit raises `SolverLimitError`. `solved_by` and `fallbacks`
-record it.
+dense method as its fallback up to 500 columns, above that; under a
+cost-of-capital budget, by cutting planes on the premium's CVaR, each step
+such a QP in the amounts. A solve that stops at a limit raises
+`SolverLimitError`. `solved_by` and `fallbacks` record it.
 
 **Fixed thresholds.** Only amounts are free in a joint design. A free
 threshold, a `UserObjective` or a payout without `LinearInAmounts` raises
@@ -152,8 +153,8 @@ class JointDesignResult:
       on the total: the sum over the assets, draw by draw;
     - `route` and `amounts` are `"lp"` or `"qp"`; there is no grid, so `ties`
       is 0 and `profile` and `grid` are `None`;
-    - `solved_by` is `"highs"` or `"active_set"` and `fallbacks` is 0 or 1:
-      the joint design is one solve.
+    - `solved_by` is `"highs"`, `"active_set"` or `"cutting_planes"` and
+      `fallbacks` is 0 or 1: the joint design is one solve.
 
     Unless `unique` is true, the per-asset amounts are one member of an
     optimal set: they are the solver's choice of how to split the total

@@ -1700,12 +1700,19 @@ def test_the_label_is_kept() -> None:
 DAMAGE = ([40.0, 50.0, 60.0, 75.0, 100.0], [0.0, 0.02, 0.06, 0.15, 0.30])
 
 
-def _rainfall(n: int, seed: int) -> OutcomeSample:
-    """Synthetic annual maxima through a tabulated damage curve, without basis risk."""
+def _rainfall(n: int, seed: int, noise: float = 0.0) -> OutcomeSample:
+    """Synthetic annual maxima through a tabulated damage curve.
+
+    With `noise`, each year's loss is multiplied by a lognormal factor of that
+    log-scale, a basis risk.
+    """
     rng = np.random.default_rng(seed)
     location, scale = 40.0 + 10.0 * rng.random(), 6.0 + 6.0 * rng.random()
     index = rng.gumbel(location, scale, n)
-    return _sample(index.tolist(), (5e6 * np.interp(index, *DAMAGE)).tolist())
+    loss = 5e6 * np.interp(index, *DAMAGE)
+    if noise:
+        loss = loss * rng.lognormal(0.0, noise, n)
+    return _sample(index.tolist(), loss.tolist())
 
 
 def _knots(levels: int) -> Cover:
@@ -1726,12 +1733,14 @@ def _mse_optimum(
     *,
     multiple: float = 1.0,
     expense: float = 0.0,
+    premium_row: np.ndarray | None = None,
 ) -> float:
     """The design's MSE optimum, by enumerating the active sets of its QP.
 
     The QP in the amounts (non-decreasing, in [0, limit], with the premium
     `multiple * E[payout] + expense` at most `bound`) is built here from the
-    payout's basis; every KKT point of a convex QP is a global minimum.
+    payout's basis; every KKT point of a convex QP is a global minimum. A
+    `premium_row` replaces `multiple * E[payout]` by `premium_row @ amounts`.
     """
     payout = cast(LinearInAmounts, template.payout)
     index = np.asarray(sample.index[:, 0])
@@ -1741,7 +1750,8 @@ def _mse_optimum(
     q = 2.0 * basis.T @ (basis * p[:, None])
     c = -2.0 * basis.T @ (p * loss)
     order = [np.eye(k)[j] - np.eye(k)[j + 1] for j in range(k - 1)]
-    g = np.vstack([multiple * (p @ basis), *order, np.eye(k), -np.eye(k)])
+    premium = multiple * (p @ basis) if premium_row is None else premium_row
+    g = np.vstack([premium, *order, np.eye(k), -np.eye(k)])
     h = np.concatenate(
         [[bound - expense], np.zeros(k - 1), np.full(k, limit), np.zeros(k)]
     )
@@ -2170,3 +2180,309 @@ def test_the_record_and_the_id_hold_the_multiple(tmp_path: Path) -> None:
     )
     assert written.designs[0]["pricing"] == record["pricing"]
     assert written.designs[0]["premium"] == result.premium
+
+
+# -- MSE under a cost-of-capital budget: cutting planes ------------------------
+
+
+def _no_highs_qp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail the test if a QP reaches HiGHS's QP solver; its LPs run as they are."""
+    real = _solver._run
+
+    def run(programme: _solver.Programme, *args: Any) -> _solver.Solution:
+        assert programme.hessian is None, "a QP reached HiGHS's QP solver"
+        return real(programme, *args)
+
+    monkeypatch.setattr(_solver, "_run", run)
+
+
+def _loaded_row(
+    template: Cover, sample: OutcomeSample, pricing: CostOfCapitalLoad
+) -> np.ndarray:
+    """The cost-of-capital premium per unit of each amount, for monotone levels.
+
+    Non-decreasing levels make a payout that never falls as the index rises,
+    so the CVaR's tail is the years of the largest index, whatever the
+    amounts, and the premium is linear in them: `(1 - rate) * E[payout] +
+    rate * w @ payout`, with `w` the tail's weights in index order.
+    """
+    payout = cast(LinearInAmounts, template.payout)
+    index = np.asarray(sample.index[:, 0])
+    p = np.asarray(sample.probability)
+    basis = np.asarray(payout.basis(index))
+    order = np.argsort(-index)
+    before = np.cumsum(p[order]) - p[order]
+    mass = 1.0 - pricing.q
+    weights = np.zeros_like(p)
+    weights[order] = np.clip(mass - before, 0.0, p[order]) / mass
+    return (1.0 - pricing.rate) * (p @ basis) + pricing.rate * (weights @ basis)
+
+
+@pytest.mark.parametrize(
+    ("levels", "pricing", "ratio"),
+    [
+        (6, CostOfCapitalLoad(0.06, 0.9), 0.3),
+        (6, CostOfCapitalLoad(0.5, 0.75), 0.05),
+        (6, CostOfCapitalLoad(0.5, 0.75), 0.3),
+        (4, CostOfCapitalLoad(0.5, 0.75), 0.3),
+    ],
+    ids=["pwl6-0.06-0.9-0.3", "pwl6-0.5-0.75-0.05", "pwl6-0.5-0.75-0.3", "step4"],
+)
+def test_mse_under_a_cost_of_capital_budget_is_solved_by_cutting_planes(
+    monkeypatch: pytest.MonkeyPatch,
+    levels: int,
+    pricing: CostOfCapitalLoad,
+    ratio: float,
+) -> None:
+    # 1,000 years with basis risk. With the premium's CVaR in the
+    # Rockafellar-Uryasev form, the QP had a column per year (1,007 or 1,005),
+    # and HiGHS 1.15's QP solver stopped at its iteration limit on each of
+    # these: the designs raised SolverLimitError. Cutting planes solve QPs in
+    # the amounts only, by the dense method. HiGHS's QP solver isn't run
+    # here: on Windows a false "unbounded" from it ends the process.
+    _no_highs_qp(monkeypatch)
+    sample = _rainfall(1000, 3, noise=0.3)
+    template = _knots(levels)
+    result = design(
+        template,
+        sample,
+        MSE(),
+        pricing=pricing,
+        budget=Budget(ratio=ratio),
+        limit=Limit(1e6),
+    )
+    assert (result.route, result.solved_by, result.fallbacks) == (
+        "qp",
+        "cutting_planes",
+        0,
+    )
+    assert result.solver_message.startswith("Optimal (cutting planes: QP ")
+    assert result.solver_message.endswith("the last QP: Optimal (active set))")
+    assert result.budget_bound is not None
+    optimum = _mse_optimum(
+        template,
+        sample,
+        result.budget_bound,
+        1e6,
+        premium_row=_loaded_row(template, sample, pricing),
+    )
+    assert result.objective_value == pytest.approx(optimum, rel=1e-9)
+    payout = result.cover.payout_values(sample.index[:, 0])
+    assert result.premium == pytest.approx(
+        pricing.premium(payout, sample.probability), rel=1e-12
+    )
+    assert result.premium <= result.budget_bound * (1.0 + 1e-9)
+    assert result.budget_use == pytest.approx(1.0, rel=1e-9)
+
+
+@pytest.mark.parametrize("monotone", [True, False], ids=["monotone", "free-order"])
+def test_a_cost_of_capital_budget_at_the_kink_of_its_cvar(
+    monkeypatch: pytest.MonkeyPatch, monotone: bool
+) -> None:
+    # The payouts are (0, a, a, b). Under CostOfCapitalLoad(0.5, 0.75) the
+    # premium is (2a + b) / 8 + max(a, b) / 2: the CVaR's tail is the one year
+    # of the largest payout. With a budget of 10, each tail alone gives an
+    # optimum in which the other year pays more (Lagrange: b = 280/27 < a, or
+    # a = 140/19 < b), so the optimum is at the kink a = b, where 7a/8 = 10:
+    # a = b = 80/7, and the MSE is (10/7)^2 + (130/7)^2 + (200/7)^2 over 4.
+    # Without the order constraint, the cutting planes need both tails' cuts.
+    _no_highs_qp(monkeypatch)
+    template = Cover(
+        INDEX,
+        StepPayout((1.0, 2.5), [Free(), Free()], monotone=monotone),
+        payout_unit="EUR",
+        asset_id="A",
+    )
+    result = design(
+        template,
+        SAMPLE,
+        MSE(),
+        pricing=CostOfCapitalLoad(0.5, 0.75),
+        budget=Budget(amount=10.0),
+    )
+    assert result.solved_by == "cutting_planes"
+    assert result.parameters == pytest.approx(
+        {"levels[0]": 80 / 7, "levels[1]": 80 / 7}, rel=1e-9
+    )
+    assert result.objective_value == pytest.approx(57_000 / 196, rel=1e-9)
+    assert result.premium == pytest.approx(10.0, rel=1e-9)
+    assert result.unique is True
+    qps, cuts = (2, "1 cut") if monotone else (3, "2 cuts")
+    assert result.solver_message == (
+        f"Optimal (cutting planes: QP {qps}, {cuts}; the last QP: Optimal (active set))"
+    )
+
+
+def _auxiliary_optimum(
+    template: Cover,
+    sample: OutcomeSample,
+    pricing: CostOfCapitalLoad,
+    bound: float,
+    limit: float,
+) -> float:
+    """MSE under a cost-of-capital budget, in its Rockafellar-Uryasev form.
+
+    The QP that such a design solved before cutting planes, built here from
+    the payout's basis for amounts in [0, limit] in any order: the amounts,
+    eta and a tail column per year, in units of the largest loss. It is
+    solved by the dense active-set method, which is exact on a QP this small.
+    """
+    payout = cast(LinearInAmounts, template.payout)
+    loss, p = np.asarray(sample.loss[:, 0]), np.asarray(sample.probability)
+    scale = float(loss.max())
+    loss = loss / scale
+    basis = np.asarray(payout.basis(np.asarray(sample.index[:, 0])))
+    n, k = basis.shape
+    rate, q = pricing.rate, pricing.q
+    matrix = np.vstack(
+        [
+            np.hstack([-basis, np.ones((n, 1)), np.eye(n)]),
+            np.concatenate([(1.0 - rate) * (p @ basis), [rate], rate * p / (1.0 - q)]),
+        ]
+    )
+    hessian = np.zeros((k + 1 + n, k + 1 + n))
+    hessian[:k, :k] = 2.0 * basis.T @ (basis * p[:, None])
+    rows, columns = np.nonzero(matrix)
+    lower_rows, lower_columns = np.nonzero(np.tril(hessian))
+    programme = _solver.Programme(
+        cost=np.concatenate([-2.0 * basis.T @ (p * loss), np.zeros(1 + n)]),
+        col_lower=np.concatenate([np.zeros(k), [-np.inf], np.zeros(n)]),
+        col_upper=np.concatenate([np.full(k, limit / scale), np.full(1 + n, np.inf)]),
+        matrix=_solver.sparse_columns(
+            rows, columns, matrix[rows, columns], matrix.shape
+        ),
+        row_lower=np.concatenate([np.zeros(n), [-np.inf]]),
+        row_upper=np.concatenate([np.full(n, np.inf), [bound / scale]]),
+        offset=float(p @ loss**2),
+        hessian=_solver.sparse_columns(
+            lower_rows,
+            lower_columns,
+            hessian[lower_rows, lower_columns],
+            hessian.shape,
+        ),
+    )
+    solution = _solver._active_set(programme, _solver.ACTIVE_SET_ITERATION_LIMIT)
+    assert solution.status == "optimal" and solution.objective is not None
+    return solution.objective * scale**2
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_mse_under_a_cost_of_capital_budget_matches_its_auxiliary_form(
+    monkeypatch: pytest.MonkeyPatch, seed: int
+) -> None:
+    # Levels in any order: the payout's ranking of the years, and so the
+    # CVaR's tail, moves with the amounts.
+    _no_highs_qp(monkeypatch)
+    sample = _rainfall(60, seed, noise=0.5)
+    template = Cover(
+        INDEX,
+        PiecewiseLinearPayout(
+            [45.0, 50.0, 55.0, 60.0, 70.0, 85.0], [Free()] * 6, monotone=False
+        ),
+        payout_unit="EUR",
+    )
+    pricing = CostOfCapitalLoad(0.3, 0.9)
+    result = design(
+        template,
+        sample,
+        MSE(),
+        pricing=pricing,
+        budget=Budget(ratio=0.2),
+        limit=Limit(1e6),
+    )
+    assert result.solved_by == "cutting_planes"
+    assert result.budget_bound is not None
+    optimum = _auxiliary_optimum(template, sample, pricing, result.budget_bound, 1e6)
+    assert result.objective_value == pytest.approx(optimum, rel=1e-9)
+    assert result.premium <= result.budget_bound * (1.0 + 1e-9)
+
+
+def test_the_record_names_the_cutting_planes() -> None:
+    template = _step([Free(), Free()])
+    loaded = design(
+        template,
+        SAMPLE,
+        MSE(),
+        pricing=CostOfCapitalLoad(0.5, 0.75),
+        budget=Budget(amount=10.0),
+    )
+    record = loaded.to_record()
+    assert json.loads(json.dumps(record, allow_nan=False)) == record
+    assert (record["solve"]["solved_by"], record["solve"]["fallbacks"]) == (
+        "cutting_planes",
+        0,
+    )
+    assert record["solve"]["solves"] == 1
+    assert record["solve"]["options"]["cutting_planes"] == {
+        "tolerance": _solver.CUTTING_PLANE_TOLERANCE,
+        "limit": _solver.CUTTING_PLANE_LIMIT,
+    }
+    assert record["solve"]["options"]["active_set"] is not None
+    # A pure premium's budget is one row: the QP alone, by the dense method.
+    pure = design(template, SAMPLE, MSE(), budget=Budget(amount=10.0))
+    assert pure.solved_by == "active_set"
+    # A cost-of-capital LP keeps the Rockafellar-Uryasev form.
+    lp = design(
+        template,
+        SAMPLE,
+        ExpectedUncovered(),
+        pricing=CostOfCapitalLoad(0.5, 0.75),
+        budget=Budget(amount=10.0),
+    )
+    assert lp.solved_by == "highs"
+    assert lp.solver_options["cutting_planes"] is None
+    # Without a budget the premium is priced, and bounds nothing.
+    free = design(template, SAMPLE, MSE(), pricing=CostOfCapitalLoad(0.5, 0.75))
+    assert free.solved_by == "active_set"
+
+
+def test_cutting_planes_at_their_limit_raise_a_solver_limit_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_solver, "CUTTING_PLANE_LIMIT", 1)
+    with pytest.raises(SolverLimitError) as raised:
+        design(
+            _step([Free(), Free()]),
+            SAMPLE,
+            MSE(),
+            pricing=CostOfCapitalLoad(0.5, 0.75),
+            budget=Budget(amount=10.0),
+        )
+    assert raised.value.status == "cutting_plane_limit"
+    assert "cutting_plane_limit=1" in str(raised.value)
+
+
+def test_cutting_planes_find_an_infeasible_budget() -> None:
+    # Levels of at least 20 cost at least (40 + 20) / 8 + 20 / 2 = 17.5.
+    with pytest.raises(InfeasibleDesignError) as raised:
+        design(
+            _step([Free(lower=20.0), Free(lower=20.0)]),
+            SAMPLE,
+            MSE(),
+            pricing=CostOfCapitalLoad(0.5, 0.75),
+            budget=Budget(amount=10.0),
+        )
+    assert raised.value.status == "infeasible"
+    assert "cutting planes: QP 2, 1 cut" in str(raised.value)
+
+
+def test_cutting_planes_at_every_point_of_a_grid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_highs_qp(monkeypatch)
+    template = _step([Free(), Free()], breakpoints=(Free(0.5, 1.5, grid=3), 2.5))
+    result = design(
+        template,
+        SAMPLE,
+        MSE(),
+        pricing=CostOfCapitalLoad(0.5, 0.75),
+        budget=Budget(amount=10.0),
+    )
+    assert (result.route, result.amounts, result.solved_by) == (
+        "grid",
+        "qp",
+        "cutting_planes",
+    )
+    # Each of the three candidates, and the chosen one again for its report.
+    assert result.solves == 4 and result.fallbacks == 0
+    assert result.premium <= 10.0 * (1.0 + 1e-9)
