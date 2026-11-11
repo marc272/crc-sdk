@@ -824,9 +824,19 @@ def test_holdout_splits_the_other_models_on_every_asset(model: Any) -> None:
     assert design.lineage == held_out.lineage == sample.lineage
     assert design.provenance.dependence is not None
     assert dict(design.provenance.dependence) == model.to_document()
-    _check_out_of_sample(design, held_out)
+    _check_out_of_sample(design.asset("site-c"), held_out.asset("site-c"))
+    _check_split_blocks(model, design, held_out)
     with pytest.raises(LeakageError):
         _check_out_of_sample(design, sample)
+
+
+def _check_split_blocks(model: Any, design: OutcomeSample, held: OutcomeSample) -> None:
+    """Blocks of every asset are out of sample unless a model moved their draws."""
+    if isinstance(model, Independent):
+        _check_out_of_sample(design, held)
+        return
+    with pytest.raises(LeakageError, match="depend on the other block"):
+        _check_out_of_sample(design, held)
 
 
 @pytest.mark.parametrize("model", OTHER_MODELS)
@@ -840,7 +850,8 @@ def test_year_block_kfold_splits_the_other_models_on_every_asset(model: Any) -> 
         assert design.asset_ids == held_out.asset_ids == ASSETS
         assert np.array_equal(design.index, sample.index[design.period])
         assert np.array_equal(held_out.loss, sample.loss[held_out.period])
-        _check_out_of_sample(design, held_out)
+        _check_split_blocks(model, design, held_out)
+        _check_out_of_sample(design.asset("site-c"), held_out.asset("site-c"))
 
 
 @pytest.mark.parametrize("model", OTHER_MODELS)

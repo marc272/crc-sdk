@@ -1289,6 +1289,10 @@ class OutcomeSample:
             if loss == "combined"
             else set()
         )
+        if own.components is not None:
+            # The combined loss holds the other components' rows as they were
+            # placed, so a reorder of any of them is a step of this view too.
+            earlier = (*earlier, *_moved_by(own.components, read - {name}, earlier))
         provenance = dataclasses.replace(
             own if part is None else part,
             parent=own.parent or self.content_hash,
@@ -3022,6 +3026,27 @@ def _hazard_reorder(provenance: SampleProvenance) -> tuple[Mapping[str, Any], ..
     return ({"kind": "reorder", "dependence": model["kind"]},)
 
 
+def _moved_by(
+    components: Mapping[str, Mapping[str, Any]],
+    names: Iterable[str],
+    earlier: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    """The `reorder` steps of the named components that `earlier` lacks, once each.
+
+    A view of one component on the combined loss reads the other components'
+    impacts in the rows a dependence model put them in, so their reorder is a
+    step of the view too, even where the view's own component stayed in place.
+    """
+    found: list[dict[str, Any]] = [dict(step) for step in earlier]
+    added: list[dict[str, Any]] = []
+    for name in sorted(names):
+        for step in components[name].get("selection") or ():
+            if step.get("kind") == "reorder" and dict(step) not in found:
+                found.append(dict(step))
+                added.append(dict(step))
+    return tuple(added)
+
+
 def _reorders_by_reference(document: Mapping[str, Any]) -> bool:
     """Whether a provenance document states the reorder of an `EmpiricalCopula`.
 
@@ -3040,6 +3065,93 @@ def _reorders_by_reference(document: Mapping[str, Any]) -> bool:
         for key in ("parts", "components")
         for own in (document.get(key) or {}).values()
     )
+
+
+_MODEL_NAMES = {
+    "comonotonic": "Comonotonic()",
+    "empirical_copula": "EmpiricalCopula",
+    "gaussian_copula": "GaussianCopula",
+    "independent": "Independent()",
+}
+
+_RANKED_ALIKE = frozenset({"comonotonic", "gaussian_copula"})
+"""The models whose reorder treats every row alike, whichever draw it holds.
+
+Permuting the rows' draws permutes the reorder with them, so the rows of one
+column they moved are exchangeable: a block of that column's rows alone is a
+random share of its draws. An `EmpiricalCopula` ties rows to reference years,
+and a model of the caller's may do anything, so neither is one of them.
+"""
+
+
+def _model_name(kind: str) -> str:
+    """A dependence model's name for a message, from its `kind`."""
+    return _MODEL_NAMES.get(kind, f"a model of the caller's ({kind!r})")
+
+
+def _reorder_kinds(document: Mapping[str, Any]) -> frozenset[str]:
+    """The dependence models that moved rows of a provenance document's sample.
+
+    That is the model of each `reorder` step of its `selection`, an
+    `EmpiricalCopula` it states, whose rows always come in reference-year
+    blocks, and the same in its parts and components. A column a model left in
+    draw order has no step, so a sample under `Independent()` names none, and
+    one asset's or one hazard's view of a column that stayed in place names
+    none either.
+    """
+    kinds = {
+        str(step.get("dependence"))
+        for step in document.get("selection") or ()
+        if step.get("kind") == "reorder"
+    }
+    if _reorders_by_reference(document):
+        kinds.add("empirical_copula")
+    for key in ("parts", "components"):
+        for own in (document.get(key) or {}).values():
+            kinds |= _reorder_kinds(own)
+    return frozenset(kinds)
+
+
+def _columns_read(document: Mapping[str, Any], lineage: str) -> frozenset[str]:
+    """The streams of draws a sample's rows read, each by its own lineage.
+
+    An asset of a sample of several assets is its part, and a hazard of a
+    sample of several hazards its entry in `source_lineages`, which one
+    hazard's view on the combined loss keeps for every hazard it reads. A
+    sample with neither reads one stream, `lineage`.
+    """
+    parts: Mapping[str, Mapping[str, Any]] = document.get("parts") or {}
+    if parts:
+        return frozenset().union(
+            *(
+                _columns_read(part, str(part.get("lineage") or f"asset {asset}"))
+                for asset, part in parts.items()
+            )
+        )
+    own: Mapping[str, str] = document.get("source_lineages") or {}
+    if own:
+        return frozenset(own.values())
+    return frozenset({lineage})
+
+
+def _placed(document: Mapping[str, Any]) -> str:
+    """How a sample's rows were placed: the models that moved them, or none."""
+    kinds = _reorder_kinds(document)
+    if kinds:
+        return "reordered by " + " and ".join(
+            _model_name(kind) for kind in sorted(kinds)
+        )
+    stated = [
+        model["kind"]
+        for model in (document.get("dependence"), document.get("hazard_dependence"))
+        if isinstance(model, Mapping) and model.get("kind") not in (None, "data")
+    ]
+    return "in draw order" + (f" under {_model_name(stated[0])}" if stated else "")
+
+
+def _root(sample: OutcomeSample) -> str:
+    """The sample a sample was cut from, by content hash: itself if it wasn't."""
+    return sample.provenance.parent or sample.content_hash
 
 
 def _refuse_reference_year_blocks(sample: OutcomeSample, function: str) -> None:
@@ -3361,6 +3473,38 @@ def _check_generators_not_reused(
             "one uniform, whatever the curve; build each block with a new generator "
             "from one seed sequence, as reusing one generator state repeats its draws"
         )
+    _check_placed_alike(
+        design, evaluation, "a generator state (a hazard step of each has its record)"
+    )
+
+
+def _check_placed_alike(
+    design: OutcomeSample, evaluation: OutcomeSample, shared: str
+) -> None:
+    """Raise `LeakageError` for separate samples of shared draws that a model moved.
+
+    `shared` names what the two samples share. Row d of a column holds draw d
+    only while the column is in draw order. A dependence model moves a column's
+    draw to the row its ranks over every row choose, so in two samples made by
+    separate calls, under two models or one model in one and none in the
+    other, disjoint periods may hold the same draws, and a moved column's rows
+    depend on the draws of every row it was ranked with. Two cuts of one sample
+    have their rows placed alike; `_check_not_cut_from_one_sample` checks them.
+    """
+    if _root(design) == _root(evaluation):
+        return
+    documents = [sample.provenance.to_document() for sample in (design, evaluation)]
+    if not any(_reorder_kinds(document) for document in documents):
+        return
+    raise LeakageError(
+        f"the design and the evaluation samples share {shared}, and their rows "
+        f"were placed apart: {_placed(documents[0])} in the design sample, "
+        f"{_placed(documents[1])} in the evaluation sample. A row's period is its "
+        "draw number only in draw order, and a model moves a column's draws by "
+        "their ranks over every row, so disjoint periods don't keep the draws "
+        "apart; test the design on fresh draws, with new generators, whichever "
+        "model they state"
+    )
 
 
 def _check_out_of_sample(design: OutcomeSample, evaluation: OutcomeSample) -> None:
@@ -3436,6 +3580,12 @@ def _check_out_of_sample(design: OutcomeSample, evaluation: OutcomeSample) -> No
             "evaluate out of sample on a held-out block or on fresh draws"
         )
     common_rows = np.logical_or.reduce([held[lineage].rows for lineage in common])
+    common_names = list(
+        dict.fromkeys(
+            max(designed[lineage].name, held[lineage].name, key=len)
+            for lineage in common
+        )
+    )
     for role, sample in (("design", design), ("evaluation", evaluation)):
         fitted = _trend_of(sample).get("fit_years")
         if fitted is None:
@@ -3451,6 +3601,8 @@ def _check_out_of_sample(design: OutcomeSample, evaluation: OutcomeSample) -> No
                 "LinearTrend(fit_years=...), or let a plan fit the trend per fold"
             )
     _check_not_cut_from_one_sample(design, evaluation)
+    sources = "; ".join(common_names[:3]) + ("; ..." if len(common_names) > 3 else "")
+    _check_placed_alike(design, evaluation, f"the draws of one source ({sources})")
 
 
 def _check_not_cut_from_one_sample(
@@ -3460,12 +3612,15 @@ def _check_not_cut_from_one_sample(
 
     That is a sample whose hazard at the asset was ranked over its rows, by
     the held form of `HazardNoise`, or whose draws an `EmpiricalCopula` dealt
-    to the reference years by their rank over its rows.
+    to the reference years by their rank over its rows. So is a sample whose
+    columns another model reordered, when either cut reads several columns:
+    a moved column's draw in a row is the one whose rank over every row
+    matches that row's, so a block's values of one column depend on the other
+    block's values of the others. One column's rows alone, under a model that
+    treats every row alike, are a random share of its draws, so two cuts of the
+    same column of a `Comonotonic()` or `GaussianCopula` sample pass.
     """
-    roots = {
-        sample.provenance.parent or sample.content_hash
-        for sample in (design, evaluation)
-    }
+    roots = {_root(sample) for sample in (design, evaluation)}
     if len(roots) > 1:
         return
     documents = [sample.provenance.to_document() for sample in (design, evaluation)]
@@ -3486,3 +3641,30 @@ def _check_not_cut_from_one_sample(
             "sample_curves or sample_curve_hazards with new generators and the same "
             "reference)"
         )
+    kinds = frozenset().union(*(_reorder_kinds(document) for document in documents))
+    if not kinds:
+        return
+    columns = {
+        _columns_read(document, sample.lineage)
+        for document, sample in zip(documents, (design, evaluation), strict=True)
+    }
+    one_column = len(columns) == 1 and len(next(iter(columns))) == 1
+    if kinds <= _RANKED_ALIKE and one_column:
+        return
+    models = " and ".join(_model_name(kind) for kind in sorted(kinds))
+    reason = (
+        f"{models} placed a moved column's draw in the row whose rank over every "
+        "row matches its own, so each block's values of one column depend on the "
+        "other block's values of the others; take the same asset's or hazard's "
+        "sample of each block, whose own rows are a random share of its draws, or "
+        "test the design on fresh draws"
+        if kinds <= _RANKED_ALIKE
+        else f"{models} reordered its rows, and the check cannot tell whether the "
+        "rows of one of its columns are a random share of that column's draws; "
+        "test the design on fresh draws"
+    )
+    raise LeakageError(
+        "the design and the evaluation samples are cut from one sample whose "
+        f"rows a dependence model reordered, and {reason} (FreshDraws on a plan, "
+        "or sample_curves or sample_curve_hazards with new generators)"
+    )
