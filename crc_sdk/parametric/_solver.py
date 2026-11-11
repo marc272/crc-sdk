@@ -31,13 +31,14 @@ variables are all bounded), `solve_qp` solves a QP of at most
 `ACTIVE_SET_MAX_COLUMNS` columns again with a dense active-set method in numpy:
 from a feasible point found by HiGHS's simplex, it minimises the objective on
 the face of its working constraints, and at the minimum of a face it asks a
-small LP, solved by HiGHS's simplex, for a feasible descent direction over
-every active constraint. A degenerate vertex is thus left through an LP, whose
-simplex does not cycle, and every step along an LP's direction lowers the
-objective, so no face is visited twice. It stops when that LP finds no descent
-direction, which is the optimality condition of a convex QP, or at
-`ACTIVE_SET_ITERATION_LIMIT` iterations. `Solution.method` says which method
-gave the outcome: `"highs"` or `"active_set"`.
+small LP, solved by HiGHS's simplex at the tolerances of `RANGING_OPTIONS`,
+for a feasible descent direction over every active constraint. A degenerate
+vertex is thus left through an LP, whose simplex does not cycle, and every
+step along an LP's direction lowers the objective, so no face is visited
+twice. It stops when that LP finds no descent direction, which is the
+optimality condition of a convex QP, or at `ACTIVE_SET_ITERATION_LIMIT`
+iterations. `Solution.method` says which method gave the outcome: `"highs"`
+or `"active_set"`.
 """
 
 from __future__ import annotations
@@ -115,10 +116,19 @@ stop a solve that cycles (`QP_ITERATION_LIMIT`, `QP_TIME_LIMIT`).
 """
 
 ACTIVE_SET_MAX_COLUMNS = 500
-"""The most columns of a QP that the dense active-set fallback solves."""
+"""The most columns of a QP that the dense active-set fallback solves.
+
+Each of its iterations works on dense matrices of that size: a design QP of
+one column per amount takes milliseconds, and a cost-of-capital QP of 480
+draws (one column per draw) about 4 seconds.
+"""
 
 ACTIVE_SET_ITERATION_LIMIT = 10_000
-"""The most iterations of the dense active-set fallback in one solve."""
+"""The most iterations of the dense active-set fallback in one solve.
+
+A design QP of one column per amount needs tens, and a cost-of-capital QP of
+480 draws about 400.
+"""
 
 RANGING_OPTIONS: Mapping[str, bool | int | float | str] = {
     "solver": "simplex",
@@ -703,10 +713,10 @@ def _face_step(
 ) -> tuple[FloatArray, bool]:
     """The step to the minimum on the face `rows @ step = 0`.
 
-    Returns the Newton step and `False`; or, when a direction without
-    curvature has a slope above `slope`, a descent direction within those
-    directions and `True` (the face is then not bounded below by its own
-    terms).
+    Returns the Newton step and `False`; or, when a direction of the face
+    without curvature has a slope above `slope`, a descent direction among
+    those directions and `True`: the objective falls linearly along it, so
+    only a constraint can stop a step along it.
     """
     _, null = _row_space(rows)
     if null.shape[1] == 0:

@@ -697,8 +697,9 @@ def _checked(
     """Call `run(options)`; raise the typed error of any status but optimal.
 
     A solve stopped at a limit raises `SolverLimitError`, named by the limit.
-    With `bounded_below`, an objective that can't be unbounded, an unbounded
-    status is a solver failure and raises `DesignError`.
+    `bounded_below` says that the objective can't be unbounded (a mean squared
+    error); an unbounded status is then a solver failure and raises
+    `DesignError`.
     """
     solution = solves.add(run(options))
     if solution.status == "infeasible_or_unbounded":
