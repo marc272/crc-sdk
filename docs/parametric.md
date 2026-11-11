@@ -1640,9 +1640,16 @@ rows, each model-year taking a block of its own, and `first_year` and
   there. Dependence finer than one year in `m` is assumed, not observed.
 - The rows come in reference-year blocks, so `holdout` and `year_block_kfold`
   raise `SampleError` on such a sample and on one asset's sample taken from it.
-  The out-of-sample test is a fresh sample: call `sample_curves` again with new
-  generators and the same reference. The reference is part of the stated model,
-  so the two samples share it.
+  Two blocks cut from one such sample with `select` raise `LeakageError` at an
+  out-of-sample evaluation, whatever their periods, because each asset's draws
+  were dealt to the reference years by their rank over every row. A block of
+  whole reference years holds the rank blocks the other lacks: with `k = 1`,
+  the years above the median of an asset's reference hold that asset's larger
+  half of the draws, whatever the seed. A reference year with rows in both
+  blocks puts draws of one rank block in each, so each block nearly repeats the
+  other. The out-of-sample test is a fresh sample: call `sample_curves` again
+  with new generators and the same reference. The reference is part of the
+  stated model, so the two samples share it.
 
 **The record.** `sample.provenance.dependence` holds the model's document:
 `{"kind": "independent"}`, `{"kind": "comonotonic"}`, or for `EmpiricalCopula`
@@ -1867,7 +1874,10 @@ draws; the fold for k-fold, which must match the sample's own split).
 - Two samples cut from one sample built with `HazardNoise(...,
   hold="hazard_distribution")`, as with `select`, share rows whatever their
   periods, as each row's hazard at the asset is an index value chosen over every
-  row, and raise `LeakageError`.
+  row, and raise `LeakageError`. So do two samples cut from one `EmpiricalCopula`
+  sample, or from one asset's or one hazard's view of it, as each column's draws
+  were dealt to the reference years by their rank over every row (see
+  [several assets from fitted curves](#several-assets-from-fitted-curves)).
 - In sample, a known design sample must be the evaluation sample itself.
 - The metadata records how the split was made: `holdout` (with the train
   fraction), `kfold` (with k), `fresh_draws` (Monte Carlo samples from
@@ -2006,6 +2016,32 @@ difference between them.
   curve sample, and every run's row of one calendar year in a pool. Rows of
   several assets or hazards in a year stay together. An `EmpiricalCopula` block
   is resampled by row, because its reference is part of the stated model.
+- **Rows built together.** Resampling rows treats them as independent draws. The
+  rows of an `EmpiricalCopula` block, and of a block built with
+  `HazardNoise(..., hold="hazard_distribution")`, are not: each asset's or
+  hazard's draws, or each row's hazard at the asset, were assigned by their rank
+  over every row of the block. There an interval is not the Monte Carlo error of
+  the draws, and it can be narrower or wider. A synthetic study measured how
+  often 90% intervals held the true value: Gumbel curves, linear covers given as
+  is, 300 rows, 1,000 replications, the true value from 600,000 rows or more.
+  Each share below has a Monte Carlo error of at most 0.025.
+
+  | Block | Rows or columns | Share that held the true value |
+  | --- | --- | --- |
+  | Independent rows: one asset, or two under `Independent()` | every row and column | 0.86 to 0.92 |
+  | `EmpiricalCopula` of two assets, 30 reference years, 10 draws each | an asset's own row | 0.86 to 0.92 |
+  | The same | the `"total"` row | 0.55 to 0.97, lowest for `payout_frequency` and `false_negative_rate`, and lower overall when the reference's columns move in opposite directions |
+  | `HazardNoise(0.3, hold="hazard_distribution")` | `expected_uncovered`, `rmse`, `coverage_ratio` | 0.96 to 0.99 |
+  | The same | `false_positive_rate` | 0.78 |
+  | The same | the other columns | 0.88 to 0.95 |
+
+  An asset's own row of an `EmpiricalCopula` block reads that asset's draws
+  alone, which are independent, so its intervals are those of independent rows.
+  Resampling whole reference years instead made most intervals of the block too
+  wide, up to about four times the Monte Carlo error. These numbers describe
+  this synthetic setup, nothing more. Read the intervals of a row that reads
+  several assets or hazards of an `EmpiricalCopula` block, and those of a held
+  `HazardNoise` block, as indicative only.
 - **Replicates.** One call `rng.integers(0, Y, size=(n_bootstrap, Y))` draws the
   block's Y years. A replicate reweights the rows by how often their year was
   drawn, which gives the metrics of the concatenated years. One set of replicates
@@ -2856,7 +2892,9 @@ setup text calls it one.
   `loss="combined"`. The view keeps the sample's lineage, so the leakage check
   still sees its source.
 - **Splits.** `select`, `holdout` and `year_block_kfold` act on every
-  component. On an `EmpiricalCopula` sample they raise, as on several assets.
+  component. On an `EmpiricalCopula` sample `holdout` and `year_block_kfold`
+  raise, and two blocks cut with `select` raise `LeakageError` at an
+  out-of-sample evaluation, as on several assets.
 - **Hashes and tables.** With components, `content_hash` covers each one's name,
   unit, tail, values, hazard and own loss, and `to_table` adds the columns
   `index[<name>]`, `hazard[<name>]` and `own_loss[<name>]`, with
