@@ -169,6 +169,7 @@ from crc_sdk.parametric.metadata import (
     EvaluationMetadata,
     EvaluationSetup,
     _identity_columns,
+    _join,
     _reaches_worst_row,
     _reference_years,
     _tail_in_one_block,
@@ -184,7 +185,14 @@ from crc_sdk.parametric.metrics import (
 from crc_sdk.parametric.metrics import (
     _label as _metric_label,
 )
-from crc_sdk.parametric.payouts import LinearInAmounts, MaxOf, StepGrid, SumOf
+from crc_sdk.parametric.payouts import (
+    LinearInAmounts,
+    MaxOf,
+    StepGrid,
+    SumOf,
+    _built_in,
+    _most_words,
+)
 from crc_sdk.parametric.pricing import Pricing, PurePremium, _check_pricing
 from crc_sdk.parametric.sample import (
     OutcomeSample,
@@ -480,7 +488,9 @@ class CoverPackage:
     - `payout`: the `SumOf` of the covers as designed, every amount fixed;
     - `as_cover()`: the same payout as one contract;
     - `package_hash`: `covers_hash` of `covers`, so it cannot collide with the
-      `definition_hash` of a one-contract `SumOf` of the same terms.
+      `definition_hash` of a one-contract `SumOf` of the same terms;
+    - `terms_text()`: each contract's terms in words, under one heading, with
+      the package's hash.
 
     `evaluate` and `compare` take a package as an entry and give one row per
     contract and one `"package"` row: the premium there is the sum of the
@@ -571,6 +581,54 @@ class CoverPackage:
             asset_id=first.asset_id,
             label=self.label,
         )
+
+    def terms_text(self) -> str:
+        """Return the package's terms in plain text, for a report or a broker.
+
+        One statement a line, in this order:
+
+        - `Label`, when the package has one: a display name, not a term;
+        - `Package`: how many contracts it holds and on which components, in
+          order, and that each keeps its own terms and premium;
+        - one `Contract` heading per contract, in order, naming the component
+          it reads, with that cover's `terms_text()` below it, indented: its
+          own label, asset, index, payout, most paid in a year, free
+          parameters (none) and `definition_hash`;
+        - `Most paid in a year by the package`: the sum of the contracts' most
+          paid, as the package has no limit of its own, or why it is not known;
+        - `Hash`: `package_hash`, the hash of each contract's
+          `definition_hash` by component name.
+
+        A design's contract is stated by its resolved cover. The text is a
+        view of the terms: it depends only on the covers, their labels and the
+        package's label, and it reads or writes nothing.
+        """
+        covers = self.covers
+        lines = (
+            []
+            if self.label is None
+            else [f"Label: {self.label} (a display name, not part of the terms)"]
+        )
+        lines.append(
+            f"Package: {len(covers)} separate contracts, on the components "
+            f"{_join(list(covers))}, in this order; each has its own terms and "
+            "premium, and a year pays the sum of what they pay"
+        )
+        for number, (name, cover) in enumerate(covers.items(), 1):
+            lines.append(
+                f"Contract {number} of {len(covers)}, on the component {name}:"
+            )
+            lines += [f"  {line}" for line in cover.terms_text().splitlines()]
+        unit = next(iter(covers.values())).payout_unit
+        most = _most_words(self.payout, unit)
+        if _built_in(self.payout):
+            most += ", the sum of its contracts'"
+        lines.append(f"Most paid in a year by the package: {most}")
+        lines.append(
+            f"Hash: {self.package_hash}, of the package: each contract's hash, by "
+            "the component it reads"
+        )
+        return "\n".join(lines)
 
     @property
     def _designed(self) -> bool:
@@ -2503,6 +2561,12 @@ def split_budget(
     an assumption. `"own_loss"` takes each component's share of the summed
     expected own losses, over every component of the sample. A mapping states
     the shares of the components named, which must sum to 1.
+
+    Each contract's design prices its own premium. Under
+    `ExpectedPayoutMultiple(multiple, expense)` every contract pays the
+    expense, so each component's share of the bound must cover it: a share
+    below the expense admits no cover, and that contract's `design` raises
+    `InfeasibleDesignError`.
 
     Raises `SampleError` for a sample without index components and for
     `"own_loss"` on a component with no own loss or on own losses that are all

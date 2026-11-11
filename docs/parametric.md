@@ -1213,6 +1213,13 @@ Hash: sha256:d6d4fb6ee74366eb0fe226b0dcecf07f992c23e4d5051953a9b0c9ffef9cf1e5, o
   `kind` and its parameters as `parameters()` names them, with its amounts in
   the payout unit when it is `LinearInAmounts`. The most it pays in a year is
   not known.
+- **Designs and packages.** A design states its terms through its resolved
+  cover, `result.cover.terms_text()`, every designed amount spelled exactly. A
+  `CoverPackage` states each contract's terms in turn, with the package's hash,
+  through `package.terms_text()` ([separate
+  contracts](#separate-contracts-coverpackage-and-split_budget)). A
+  `ScenarioSet` holds samples and no terms: a cover keeps its terms in every
+  scenario.
 
 ## User-defined payouts
 
@@ -1414,7 +1421,14 @@ column and unit, not the value itself), the basis-risk model, the generator's
 state before each random step (`provenance.generator()` rebuilds it), what was
 counted (draws outside the support, atom draws, dropped years), a per-year
 sample's treatment of the trend (`provenance.trend`), a pool's rows
-(`provenance.pool`) and notes for the setup text. `sample.content_hash` is `sha256:` plus the SHA-256 of the
+(`provenance.pool`) and notes for the setup text. `repr(sample.provenance)`
+prints no documents, so it stays short at any size: the source kind, who stated
+the semantics, the hazard's name, the number of sources and of random steps,
+each selection step's kind, the start of the lineage and the parent, and, when
+they are set, the fields of several assets or hazards, of a trend and of a pool,
+a document by its kind and a list by its first two items and its last above
+three; `provenance.to_document()` holds every field. `sample.content_hash` is
+`sha256:` plus the SHA-256 of the
 canonical long table with its units, semantics and scenario.
 `sample.to_table()` returns that long table, with the metadata under the
 Parquet key `crc.parametric.sample`, and `OutcomeSample.from_written_table(table)`
@@ -2512,6 +2526,8 @@ the budget, the limit, the options and the design sample's `content_hash`
 `objective_value`, the design `premium`, `expected_loss`, `budget_bound` and
 `budget_use`; the `route`; the solver's identity, status and work; the
 non-uniqueness report and the degenerate-tail flags; and the `design_sample`.
+`result.cover.terms_text()` states the designed terms in words ([the terms in
+words](#the-terms-in-words)), and the record says how they were chosen.
 
 `evaluate` and `compare` take a `DesignResult` in place of a cover: its rows
 use the design premium (`premium_basis` `"design"`), carry its `design_id`,
@@ -2958,7 +2974,9 @@ setup text calls it one.
   more, in order, and is `None` on a sample of one hazard. `values` is the
   component's index, `(n, 1)`; `hazard` is the value its loss model read, when
   it differs from the index; `own_loss` is the loss of that hazard alone, in the
-  sample's loss unit, and `None` for a component with no impact.
+  sample's loss unit, and `None` for a component with no impact. Its repr prints
+  no arrays: the shape of `values`, the unit, the tail, and `hazard` and
+  `own_loss` as `...` when held and `None` when not.
 - **The primary.** The first component is the sample's `index`, `index_unit` and
   `hazard`, so code that reads one index reads it. `loss` is the combined loss.
 - **Names** are non-empty, without surrounding whitespace and without `.`, `+`,
@@ -3207,6 +3225,12 @@ row key, and `compare` raises.
   `shares` has no default, because how to split a budget between hazards is an
   assumption: `"own_loss"` takes each component's share of the summed expected
   own losses, and a mapping states the shares, which must sum to 1.
+- **An expense per contract.** Each contract's design prices its own premium,
+  so under `ExpectedPayoutMultiple(m, e)` every contract pays the expense e,
+  and each component's share of the bound must cover it: a share below e admits
+  no cover, and that contract's `design` raises `InfeasibleDesignError`
+  ([pricing and constraints](#pricing-and-constraints)). One contract on both
+  hazards pays e once.
 
 | Contract on both hazards | Separate contracts | The sum of their budgets |
 | --- | --- | --- |
@@ -3216,6 +3240,48 @@ row key, and `compare` raises.
 
 The third row states a different total budget. `compare` neither refuses nor
 adjusts it, and the setup text gives the numbers.
+
+**The terms in words.** `package.terms_text()` states a package's terms, the
+form a broker would get for it: a `Package` line, then each contract's
+`terms_text()` in turn, indented under a heading that names its component, the
+most the package pays in a year, which is the sum of its contracts' as it has
+no limit of its own, and `package_hash`. A design's contract is stated by its
+resolved cover. Here the two contracts of the example above, with their levels
+stated rather than designed:
+
+```python
+stated = CoverPackage({"rx1day": rain_step.with_values({"levels[0]": 2e5}),
+                       "txx": heat_step.with_values({"levels[0]": 1e5})},
+                      label="separate")
+print(stated.terms_text())
+```
+
+```text
+Label: separate (a display name, not part of the terms)
+Package: 2 separate contracts, on the components rx1day and txx, in this order; each has its own terms and premium, and a year pays the sum of what they pay
+Contract 1 of 2, on the component rx1day:
+  Label: rain (a display name, not part of the terms)
+  Asset: not named
+  Index: rx1day, in mm/day, read at the asset; larger values are more severe (tail upper); aggregation: annual_maximum; source: not stated
+  Payout per year, in EUR: steps, the levels never decrease (kind "step", monotone=True)
+    - nothing when rx1day is below 70 mm/day
+    - 200,000 EUR when rx1day is at or above 70 mm/day
+  Most paid in a year: 200,000 EUR
+  Free parameters: none
+  Hash: sha256:4a27d42a1ef401184c85a6fef793a754cda7256cb8ccb19c18c32e193837112b, of the cover document (schema 1.0, semantics crc-parametric-cover/1)
+Contract 2 of 2, on the component txx:
+  Label: heat (a display name, not part of the terms)
+  Asset: not named
+  Index: txx, in degC, read at the asset; larger values are more severe (tail upper); aggregation: annual_maximum; source: not stated
+  Payout per year, in EUR: steps, the levels never decrease (kind "step", monotone=True)
+    - nothing when txx is below 36 degC
+    - 100,000 EUR when txx is at or above 36 degC
+  Most paid in a year: 100,000 EUR
+  Free parameters: none
+  Hash: sha256:c235eebc933ed3634604ba9ba4139ab0f0bfd0a4ba604a58959009236599e7a8, of the cover document (schema 1.0, semantics crc-parametric-cover/1)
+Most paid in a year by the package: 300,000 EUR, the sum of its contracts'
+Hash: sha256:d415585b582cb80d9f4cae44ad2e328dad4bf137351a5bc4e96c401e0e6caf64, of the package: each contract's hash, by the component it reads
+```
 
 ### `payout_breakdown`
 

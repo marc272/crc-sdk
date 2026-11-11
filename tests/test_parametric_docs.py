@@ -137,7 +137,7 @@ def test_every_python_example_on_the_page_runs(
         for block in fenced
         if block.startswith("text\n") and "\nHash: sha256:" in block
     ]
-    assert len(shown) == 2
+    assert len(shown) == 3  # a step cover, a grid and a package
     for terms in shown:
         assert f"{terms}\n" in printed
 

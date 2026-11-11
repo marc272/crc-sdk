@@ -30,10 +30,12 @@ from crc_sdk.parametric import (
     CoverPackage,
     EvaluationError,
     EvaluationMetadata,
+    ExpectedPayoutMultiple,
     ExpectedUncovered,
     Free,
     IndexComponent,
     IndexDefinition,
+    InfeasibleDesignError,
     LeakageError,
     Limit,
     MaxOf,
@@ -224,6 +226,21 @@ def test_a_package_pickles() -> None:
     package = _as_is_package(label="separate")
     read = pickle.loads(pickle.dumps(package))
     assert read.package_hash == package.package_hash and read.label == "separate"
+
+
+def test_a_package_of_designs_states_its_designed_covers() -> None:
+    designs = _Designs()
+    text = designs.package.terms_text()
+    resolved = CoverPackage(
+        {"rain": designs.rain.cover, "heat": designs.heat.cover}, label="separate"
+    )
+    assert text == resolved.terms_text()
+    for name, result in (("rain", designs.rain), ("heat", designs.heat)):
+        terms = result.cover.terms_text().splitlines()
+        indented = "\n".join(f"  {line}" for line in terms)
+        assert f"on the component {name}:\n{indented}\n" in text
+    assert text.count("  Free parameters: none\n") == 2
+    assert text.splitlines()[-1].startswith(f"Hash: {designs.package.package_hash}, ")
 
 
 def test_a_package_keeps_each_key_as_the_component_it_reads() -> None:
@@ -830,6 +847,49 @@ def test_split_budget_of_own_losses_all_zero_raises() -> None:
     )
     with pytest.raises(SampleError, match="are zero"):
         split_budget(Budget(amount=1.0), sample, shares="own_loss")
+
+
+def test_under_an_expense_each_share_must_cover_it() -> None:
+    train, _ = holdout(_sample(), train_fraction=0.75)
+    pricing = ExpectedPayoutMultiple(1.0, expense=1.0)
+    budgets = split_budget(Budget(amount=3.0), train, shares={"rain": 0.8, "heat": 0.2})
+    assert budgets["heat"].amount == pytest.approx(0.6)  # below the expense
+    with pytest.raises(InfeasibleDesignError, match="below the pricing's fixed"):
+        design(
+            _heat_cover(Free(), label="heat"),
+            train.component("heat"),
+            ExpectedUncovered(),
+            pricing=pricing,
+            budget=budgets["heat"],
+        )
+    rain = design(
+        _rain_cover(Free(), label="rain"),
+        train.component("rain"),
+        ExpectedUncovered(),
+        pricing=pricing,
+        budget=budgets["rain"],
+    )
+    assert rain.premium <= 2.4 + 1e-9
+    # One contract on both hazards pays the expense once.
+    both = design(
+        Cover(
+            TWO,
+            SumOf(
+                {"rain": BinaryPayout(50.0, Free()), "heat": BinaryPayout(38.0, Free())}
+            ),
+            payout_unit="EUR",
+        ),
+        train,
+        ExpectedUncovered(),
+        pricing=pricing,
+        budget=Budget(amount=3.0),
+    )
+    components = train.index_components
+    assert components is not None
+    index = np.hstack([components["rain"].values, components["heat"].values])
+    expected = float(train.probability @ both.cover.payout_values(index))
+    assert both.premium == pytest.approx(expected + 1.0)
+    assert both.premium <= 3.0 + 1e-9
 
 
 # -- payout_breakdown --------------------------------------------------------
