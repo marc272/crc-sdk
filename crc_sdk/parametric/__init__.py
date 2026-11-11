@@ -32,8 +32,10 @@ objective (`MSE`, `ExpectedUncovered`, `WeightedCVaR` or a `UserObjective`)
 under a `Budget` and a `Limit`; its LP and QP routes need the optional extra
 `crc-sdk[parametric]`. `design_joint` designs one cover per asset of a
 sample of several assets, for one objective and one budget on the asset
-owner's total. `evaluate` and `compare` assess covers and designs, and
-`payout_breakdown` splits each one's expected payout into its parts. A
+owner's total. `evaluate` and `compare` assess covers and designs,
+`allocate` shares a joint design's total payout out over its assets in a table
+of its own, and `payout_breakdown` splits each one's expected payout into its
+parts. A
 `CoverPackage` is separately designed contracts on one asset's hazards, as one
 row of a comparison, and `split_budget` splits one budget between them.
 `compare_pooled` computes each metric once over all the held-out years of a

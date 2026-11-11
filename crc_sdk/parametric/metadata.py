@@ -68,7 +68,8 @@ as recorded, and a sample without `pool` is no pool. A comparison without the
 metric column `payout_frequency` or `unidentified_share` reads as null there, as
 does one without the column `design_scenario`, `pathway`, `horizon`, `product` or
 `n_rows`, or without the rank-block columns `copula_reference_years` and
-`copula_block_tail_b<beta>`, and a document without `intervals` has no intervals.
+`copula_block_tail_b<beta>` or the short-block flags `short_block_b<beta>` and
+`short_block_rp<T>`, and a document without `intervals` has no intervals.
 
 The module claims no licence of its own for a comparison: it is derived data
 under its inputs' terms, which `licences` lists.
@@ -808,8 +809,9 @@ class EvaluationMetadata(_EvaluationModel):
         The table must have the identity columns and exactly the metric
         columns of `columns`; a table written before `scope`, `components`,
         `design_budget`, `design_scenario`, `pathway`, `horizon`, `product`,
-        `n_rows` or the rank-block columns were added may lack them, and a
-        comparison written before `payout_frequency` or `unidentified_share` was
+        `n_rows`, the rank-block columns or the short-block flags were added may
+        lack them, and a comparison written before `payout_frequency` or
+        `unidentified_share` was
         added may lack that column. An intervals table has one row per wide row
         and metric column instead, and its `column` holds metric columns of
         `columns`. Its key
@@ -3758,7 +3760,9 @@ def setup_text(
       of the counts. A note that several assets share is written once, naming
       them;
     - `Pricing`: the pricing of the covers given as is; a design keeps its
-      design premium, and a row's `premium_basis` says which premium it uses;
+      design premium, and a row's `premium_basis` says which premium it uses.
+      Rows that are all allocated, as `allocate` returns them, hold no premium,
+      and the line says so;
     - `Design`, one line per design: the objective, pricing, budget and
       limit, the design premium, the route, the non-uniqueness report
       (`unique`, `ties`, amounts no design year reaches) and a degenerate
@@ -3777,6 +3781,16 @@ def setup_text(
       `EmpiricalCopula` reordered: the number of reference years m, the betas of
       the metric options flagged by `(1 - beta) * m <= 1` and those not, and
       whether the weighted-CVaR beta of a row's design is flagged too;
+    - `Short blocks`, outside a table of `compare_scenarios`, which has its own:
+      for each block whose rows the text describes, the betas and return periods
+      of the metric options that reach the block's worst row, as the rows'
+      `short_block_b<beta>` and `short_block_rp<T>` flag them, and how each kind
+      of tail column then reads: at such a beta, `(1 - beta) * n <= 1`, a CVaR,
+      tail-coverage or CVaR-ratio column reads the worst row and a VaR column
+      the largest value, or the second largest where `(1 - beta) * n` is 1; at
+      such a return period, `T > n`, a return-period column reads the largest
+      value, not a 1-in-T value. The block's n is its sample's `draws`, so a
+      table written before the flags states them too;
     - `Payout breakdown`, for a breakdown holding a `MaxOf` cover: that its rows
       are an attribution;
     - `Frontier`, one line per call of `design_frontier`: the budgets, the

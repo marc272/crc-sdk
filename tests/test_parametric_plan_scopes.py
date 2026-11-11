@@ -1082,6 +1082,9 @@ def test_joint_rows_are_the_total_only_without_an_allocation(tmp_path: Path) -> 
     stored = EvaluationMetadata.from_table(pq.read_table(result.output))
     assert stored == result.metadata
     assert stored.assets["count"] == len(ALL)
+    # No rule, no allocated rows and no second file.
+    assert result.allocated is None and result.allocated_output is None
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["out.parquet"]
 
 
 @pytest.mark.parametrize("rule", ["value", "loss"])
