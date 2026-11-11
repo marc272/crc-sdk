@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import itertools
+import math
 import subprocess
 import sys
+from typing import Any
 
 import numpy as np
 import pytest
@@ -156,3 +159,372 @@ def test_importing_the_interface_loads_no_solver() -> None:
         [sys.executable, "-c", code], capture_output=True, text=True, check=True
     )
     assert result.stdout.strip() == "False"
+
+
+# -- limits and the dense active-set method -----------------------------------
+
+# Two QPs of an MSE design of a six-knot piecewise-linear payout under a budget
+# and a limit, built from synthetic samples (Gumbel annual maxima through a
+# tabulated damage curve, no basis risk), in scaled units: on them HiGHS 1.15's
+# QP solver cycles until its iteration limit, or reports "unbounded" although
+# every variable is bounded. Each is (cost, Hessian diagonal, Hessian below
+# the diagonal, budget row, budget, upper bound).
+STALLS = (
+    [-0.01105739029501826, -0.03591255090484234, -0.047624440747157444]
+    + [-0.08450488995076025, -0.10811452256107398, -0.020756010925984496],
+    [0.09468294446334641, 0.20354686560211405, 0.12183508455511649]
+    + [0.1439940830561492, 0.10792178428462679, 0.007875911899011701],
+    [0.04530071578701637, 0.037344540044348305, 0.03933245975190873]
+    + [0.03289342840755935, 0.01520051907898494],
+    [0.0699918301251814, 0.14309606071673936, 0.09925604217568676]
+    + [0.10810998560780863, 0.07800786588558553, 0.01153821548899832],
+    0.015934528275732978,
+    1.1935588452193666,
+)
+FALSE_UNBOUNDED = (
+    [-0.016686303473545844, -0.046711983331344936, -0.04912441847203521]
+    + [-0.0654177858272584, -0.06823000764017788, -0.01379980618529632],
+    [0.12182608675966415, 0.25928888639147224, 0.14191770253564773]
+    + [0.12160543969421655, 0.06938862459109667, 0.006120159486591107],
+    [0.07814725509464474, 0.04546288200032437, 0.026698246775252774]
+    + [0.021160977104313243, 0.008457189296120687],
+    [0.09998667092715444, 0.19144951174322067, 0.10703941565561241]
+    + [0.0847323317868913, 0.049503395495765296, 0.0072886743913558975],
+    0.02732850397858923,
+    1.1999329540205508,
+)
+# The last amount is reached by no draw: a zero row and column of the Hessian.
+SEMIDEFINITE = (
+    [-0.04799973441298773, -0.12170560558166621, -0.11897572060229658]
+    + [-0.13740369954330306, -0.011441039807482034, 0.0],
+    [0.1531680060438168, 0.30147750179173105, 0.1412533017547253]
+    + [0.12654709999880898, 0.002277461399753872, 0.0],
+    [0.10168234419902591, 0.049842056694223896, 0.036505199884597966]
+    + [0.009608713727734258, 0.0],
+    [0.12742517512142135, 0.22650095134249038, 0.11380027916677357]
+    + [0.0863305068055706, 0.005943087563744065, 0.0],
+    0.023242662644572344,
+    2.692585289443289,
+)
+
+
+def _qp(
+    hessian: np.ndarray,
+    cost: list[float],
+    dense: list[list[float]],
+    row_upper: list[float],
+    *,
+    col_lower: list[float] | float = 0.0,
+    col_upper: list[float] | float = np.inf,
+    row_lower: list[float] | None = None,
+) -> _solver.Programme:
+    n = len(cost)
+    lower = np.tril(np.asarray(hessian, dtype=np.float64))
+    rows, columns = np.nonzero(lower)
+    return _solver.Programme(
+        cost=np.asarray(cost, dtype=np.float64),
+        col_lower=np.broadcast_to(np.asarray(col_lower, dtype=np.float64), (n,)),
+        col_upper=np.broadcast_to(np.asarray(col_upper, dtype=np.float64), (n,)),
+        matrix=_matrix(dense)
+        if dense
+        else _solver.SparseColumns(
+            np.zeros(n + 1, dtype=np.int32),
+            np.zeros(0, dtype=np.int32),
+            np.zeros(0),
+            0,
+        ),
+        row_lower=(
+            np.full(len(row_upper), -np.inf)
+            if row_lower is None
+            else np.asarray(row_lower, dtype=np.float64)
+        ),
+        row_upper=np.asarray(row_upper, dtype=np.float64),
+        hessian=_solver.sparse_columns(rows, columns, lower[rows, columns], (n, n)),
+    )
+
+
+def _design_qp(
+    case: tuple[list[float], list[float], list[float], list[float], float, float],
+) -> _solver.Programme:
+    """A case's QP: budget row, then non-decreasing amounts, amounts in [0, upper]."""
+    cost, diagonal, below, budget, bound, upper = case
+    hessian = np.diag(diagonal) + np.diag(below, -1)
+    order = [[0.0] * 6 for _ in range(5)]
+    for i in range(5):
+        order[i][i], order[i][i + 1] = 1.0, -1.0
+    return _qp(hessian, cost, [budget, *order], [bound] + [0.0] * 5, col_upper=upper)
+
+
+def _inequalities(programme: _solver.Programme) -> tuple[np.ndarray, np.ndarray]:
+    """`G x <= h`, written out here rather than taken from the module."""
+    n = programme.n_columns
+    a = np.zeros((programme.matrix.n_rows, n))
+    for j in range(n):
+        span = slice(programme.matrix.start[j], programme.matrix.start[j + 1])
+        a[programme.matrix.index[span], j] = programme.matrix.value[span]
+    rows: list[np.ndarray] = []
+    bounds: list[float] = []
+    for block, upper, lower in (
+        (a, programme.row_upper, programme.row_lower),
+        (np.eye(n), programme.col_upper, programme.col_lower),
+    ):
+        for row, high, low in zip(block, upper, lower, strict=True):
+            if np.isfinite(high):
+                rows.append(row)
+                bounds.append(high)
+            if np.isfinite(low):
+                rows.append(-row)
+                bounds.append(-low)
+    return np.array(rows).reshape(-1, n), np.array(bounds)
+
+
+def _hessian(programme: _solver.Programme) -> np.ndarray:
+    assert programme.hessian is not None
+    n = programme.n_columns
+    full = np.zeros((n, n))
+    for j in range(n):
+        span = slice(programme.hessian.start[j], programme.hessian.start[j + 1])
+        full[programme.hessian.index[span], j] = programme.hessian.value[span]
+    return full + np.tril(full, -1).T
+
+
+def _reference_optimum(programme: _solver.Programme) -> float:
+    """The optimum by enumerating active sets: an exact, independent solve.
+
+    Every set of at most n independent rows gives an equality-constrained
+    QP; a solution of its KKT system that meets every row with multipliers
+    >= 0 is a KKT point of the QP, and so a global minimum of the convex QP.
+    """
+    q, c = _hessian(programme), programme.cost
+    g, h = _inequalities(programme)
+    n, best = programme.n_columns, math.inf
+    for size in range(n + 1):
+        for chosen in itertools.combinations(range(h.shape[0]), size):
+            rows = g[list(chosen)]
+            if size and np.linalg.matrix_rank(rows) < size:
+                continue
+            kkt = np.block([[q, rows.T], [rows, np.zeros((size, size))]])
+            rhs = np.concatenate([-c, h[list(chosen)]])
+            solution, *_ = np.linalg.lstsq(kkt, rhs, rcond=None)
+            if np.abs(kkt @ solution - rhs).max() > 1e-10:
+                continue
+            x, multipliers = solution[:n], solution[n:]
+            if (g @ x - h).max(initial=-1.0) > 1e-10 or (multipliers < -1e-12).any():
+                continue
+            best = min(best, 0.5 * x @ q @ x + c @ x + programme.offset)
+    return best
+
+
+_REFERENCES: dict[int, float] = {}
+
+
+def _case_optimum(case: Any) -> float:
+    """`_reference_optimum` of a case's QP, computed once per case."""
+    if id(case) not in _REFERENCES:
+        _REFERENCES[id(case)] = _reference_optimum(_design_qp(case))
+    return _REFERENCES[id(case)]
+
+
+def _highs_first(monkeypatch: pytest.MonkeyPatch, *, fallback: bool = True) -> None:
+    """Send every QP to HiGHS first, and with `fallback=False` keep its outcome."""
+    monkeypatch.setattr(_solver, "ACTIVE_SET_FIRST_COLUMNS", 0)
+    if not fallback:
+        monkeypatch.setattr(_solver, "ACTIVE_SET_MAX_COLUMNS", 0)
+
+
+def _highs_qp_reports(monkeypatch: pytest.MonkeyPatch, status: str) -> None:
+    """Replace HiGHS's QP outcome by `status`; its LPs run as they are."""
+    real = _solver._run
+
+    def run(programme: _solver.Programme, *args: Any) -> _solver.Solution:
+        if programme.hessian is None:
+            return real(programme, *args)
+        return _solver.Solution(status, None, None, "Unbounded", 7, 0.0)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(_solver, "_run", run)
+
+
+def test_every_qp_solve_has_a_limit() -> None:
+    assert _solver.QP_OPTIONS["qp_iteration_limit"] == _solver.QP_ITERATION_LIMIT
+    assert _solver.QP_OPTIONS["time_limit"] == _solver.QP_TIME_LIMIT
+    assert 0 < _solver.QP_ITERATION_LIMIT < 2**31 - 1
+    assert 0.0 < _solver.QP_TIME_LIMIT < math.inf
+    assert 0 < _solver.ACTIVE_SET_ITERATION_LIMIT < 2**31 - 1
+    assert 0 < _solver.ACTIVE_SET_FIRST_COLUMNS <= _solver.ACTIVE_SET_MAX_COLUMNS
+
+
+@pytest.mark.parametrize(
+    "case", [STALLS, FALSE_UNBOUNDED, SEMIDEFINITE], ids=["stall", "unbounded", "psd"]
+)
+def test_small_qps_are_solved_without_highs_qp_solver(
+    monkeypatch: pytest.MonkeyPatch, case: Any
+) -> None:
+    real = _solver._run
+
+    def lps_only(programme: _solver.Programme, *args: Any) -> _solver.Solution:
+        assert programme.hessian is None, "a small QP reached HiGHS's QP solver"
+        return real(programme, *args)
+
+    monkeypatch.setattr(_solver, "_run", lps_only)
+    programme = _design_qp(case)
+    solution = _solver.solve_qp(programme)
+    assert (solution.status, solution.method) == ("optimal", "active_set")
+    assert solution.fallback is False and solution.limit is None
+    assert solution.message == "Optimal (active set)"
+    assert solution.values is not None and solution.objective is not None
+    assert solution.objective == pytest.approx(
+        _case_optimum(case), rel=1e-12, abs=1e-15
+    )
+    g, h = _inequalities(programme)
+    assert (g @ solution.values - h).max() <= 1e-12
+
+
+def test_a_qp_stops_at_its_iteration_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    _highs_first(monkeypatch, fallback=False)
+    solution = _solver.solve_qp(_design_qp(STALLS), {"qp_iteration_limit": 3})
+    assert solution.status == "limit"
+    assert solution.limit == "qp_iteration_limit"
+    assert "qp_iteration_limit=3" in solution.message
+    assert "more than the dense method takes after HiGHS (0)" in solution.message
+    assert solution.values is None and solution.method == "highs"
+    assert solution.iterations >= 3 and solution.fallback is False
+
+
+def test_a_qp_stops_at_its_time_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    _highs_first(monkeypatch, fallback=False)
+    solution = _solver.solve_qp(_design_qp(STALLS), {"time_limit": 0.0})
+    assert (solution.status, solution.limit) == ("limit", "time_limit")
+    assert "time_limit=0.0" in solution.message
+
+
+def test_an_lp_names_its_limit() -> None:
+    solution = _solver.solve_lp(
+        _lp([-1.0, -2.0], [[1.0, 1.0]], [1.0]),
+        {"simplex_iteration_limit": 0, "presolve": "off"},
+    )
+    assert (solution.status, solution.limit) == ("limit", "simplex_iteration_limit")
+
+
+def test_the_dense_method_solves_a_qp_that_highs_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _highs_first(monkeypatch)
+    solution = _solver.solve_qp(_design_qp(STALLS), {"qp_iteration_limit": 1})
+    assert (solution.status, solution.method) == ("optimal", "active_set")
+    assert solution.fallback is True
+    assert solution.message.startswith("Optimal (active set), after HiGHS:")
+    assert "qp_iteration_limit=1" in solution.message
+    assert solution.iterations > 1
+    assert solution.objective == pytest.approx(_case_optimum(STALLS), rel=1e-12)
+
+
+def test_a_qp_on_which_highs_cycles_is_solved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # HiGHS 1.15's QP solver cycles on this QP until its iteration limit;
+    # whether it does depends on its version, the outcome doesn't.
+    _highs_first(monkeypatch)
+    solution = _solver.solve_qp(_design_qp(STALLS))
+    assert solution.status == "optimal" and solution.objective is not None
+    if solution.method == "active_set":
+        assert solution.fallback is True
+        assert f"qp_iteration_limit={_solver.QP_ITERATION_LIMIT}" in solution.message
+    tolerance = 1e-12 if solution.method == "active_set" else 1e-7
+    assert solution.objective == pytest.approx(_case_optimum(STALLS), rel=tolerance)
+
+
+def test_the_dense_method_has_its_own_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_solver, "ACTIVE_SET_ITERATION_LIMIT", 1)
+    solution = _solver.solve_qp(_design_qp(STALLS))
+    assert (solution.status, solution.method) == ("limit", "active_set")
+    assert solution.limit == "active_set_iteration_limit"
+    assert "active_set_iteration_limit=1" in solution.message
+
+
+def test_a_false_unbounded_is_solved_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    # On Windows a real one would end the process, so HiGHS's QP outcome is
+    # replaced here, and its LPs run as they are.
+    _highs_first(monkeypatch)
+    _highs_qp_reports(monkeypatch, "unbounded")
+    solution = _solver.solve_qp(_design_qp(STALLS))
+    assert (solution.status, solution.method) == ("optimal", "active_set")
+    assert solution.fallback is True
+    assert solution.message.endswith("after HiGHS: Unbounded")
+    assert solution.objective == pytest.approx(_case_optimum(STALLS), rel=1e-12)
+    _highs_first(monkeypatch, fallback=False)
+    kept = _solver.solve_qp(_design_qp(STALLS))
+    assert (kept.status, kept.method) == ("unbounded", "highs")
+
+
+def _random_qp(rng: np.random.Generator) -> _solver.Programme:
+    n = int(rng.integers(2, 5))
+    rank = int(rng.integers(1, n + 1))
+    factor = rng.normal(size=(rank, n))
+    m = int(rng.integers(1, 4))
+    dense = rng.normal(size=(m, n))
+    dense[np.abs(dense) < 0.3] = 0.0
+    # Rows through a known feasible point, some of them tight there, so that
+    # optima at degenerate vertices are common.
+    point = rng.uniform(0.0, 1.0, n)
+    row_upper = dense @ point + rng.choice([0.0, 0.5], m)
+    return _qp(
+        factor.T @ factor,
+        list(rng.normal(size=n)),
+        dense.tolist(),
+        list(row_upper),
+        col_lower=list(np.where(rng.random(n) < 0.8, 0.0, -np.inf)),
+        col_upper=list(np.where(rng.random(n) < 0.8, 2.0, np.inf)),
+    )
+
+
+def test_the_dense_method_matches_an_exact_solve_on_random_qps() -> None:
+    rng = np.random.default_rng(20261111)
+    for _ in range(40):
+        programme = _random_qp(rng)
+        solution = _solver._active_set(programme, _solver.ACTIVE_SET_ITERATION_LIMIT)
+        reference = _reference_optimum(programme)
+        if math.isinf(reference):
+            assert solution.status == "unbounded"
+            continue
+        assert solution.status == "optimal" and solution.objective is not None
+        assert solution.objective == pytest.approx(reference, rel=1e-9, abs=1e-12)
+
+
+def test_the_dense_method_at_a_degenerate_vertex() -> None:
+    # min (x0 - 1)^2 + (x1 - 1)^2 on x0 + x1 <= 1, x0 <= 0.5, x1 <= 0.5,
+    # x0 - x1 <= 0 and x1 - x0 <= 0: four rows meet at the optimum (0.5, 0.5).
+    programme = _qp(
+        np.eye(2) * 2.0,
+        [-2.0, -2.0],
+        [[1.0, 1.0], [1.0, 0.0], [0.0, 1.0], [1.0, -1.0], [-1.0, 1.0]],
+        [1.0, 0.5, 0.5, 0.0, 0.0],
+        col_lower=-np.inf,
+    )
+    solution = _solver._active_set(programme, 100)
+    assert solution.status == "optimal" and solution.values is not None
+    assert solution.values.tolist() == pytest.approx([0.5, 0.5], abs=1e-12)
+
+
+def test_the_dense_method_follows_directions_without_curvature() -> None:
+    # min x0^2 - x1: x1 has no curvature and is bounded above by x0 + x1 <= 3.
+    hessian = np.diag([2.0, 0.0])
+    bounded = _qp(hessian, [0.0, -1.0], [[1.0, 1.0]], [3.0], col_lower=-np.inf)
+    solution = _solver._active_set(bounded, 100)
+    assert solution.status == "optimal" and solution.values is not None
+    assert solution.values.tolist() == pytest.approx([-0.5, 3.5], abs=1e-12)
+    unbounded = _qp(hessian, [0.0, -1.0], [[1.0, 0.0]], [3.0], col_lower=-np.inf)
+    assert _solver._active_set(unbounded, 100).status == "unbounded"
+
+
+def test_the_dense_method_reports_an_infeasible_qp() -> None:
+    programme = _qp(np.eye(1), [0.0], [[1.0]], [-1.0])
+    solution = _solver._active_set(programme, 100)
+    assert (solution.status, solution.method) == ("infeasible", "active_set")
+    assert solution.values is None
+
+
+def test_the_dense_method_without_constraints() -> None:
+    programme = _qp(np.eye(2), [-1.0, 2.0], [], [], col_lower=-np.inf)
+    solution = _solver._active_set(programme, 100)
+    assert solution.status == "optimal" and solution.values is not None
+    assert solution.values.tolist() == pytest.approx([1.0, -2.0], abs=1e-12)
