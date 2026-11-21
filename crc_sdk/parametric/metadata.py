@@ -2875,6 +2875,9 @@ def _design(
         parts.append(f"design premium: {premium} {unit}{on_total}")
     if record.get("route") is not None:
         parts.append(f"route: {record['route']}")
+    refinement = _get(record, "refinement", Mapping, where)
+    if refinement is not None:
+        parts.append(_refinement(refinement, f"{where}.refinement"))
     unique = _get(record, "unique", bool, where)
     answer = "not checked" if unique is None else "yes" if unique else "no"
     parts.append(f"unique optimum: {answer}")
@@ -2902,6 +2905,49 @@ def _design(
         parts.append("tail: not degenerate")
     name = f"{label} ({design_id})" if label else design_id
     return f"Design {name}: {'; '.join(parts)}."
+
+
+_REFINE_METHODS = {"compass_search": "a compass search"}
+"""How the setup text names a refinement's method."""
+
+
+def _refinement(refinement: Mapping[str, Any], where: str) -> str:
+    """A design's refinement after its grid, in words.
+
+    It names the method and its settings, the grid's best point it started
+    from, where it ended, the gain, the points it evaluated and, if it
+    stopped at its cap, that it did.
+    """
+
+    def point(key: str) -> str:
+        values = _get(refinement, key, Mapping, where) or {}
+        return ", ".join(
+            f"{name} {_number(value, f'{where}.{key}.{name}')}"
+            for name, value in values.items()
+        )
+
+    method = _get(refinement, "method", str, where)
+    named = _REFINE_METHODS.get(str(method), f"the method {method}")
+    start = _number(refinement.get("start_objective"), f"{where}.start_objective")
+    text = f"refined by {named} from the grid's best point ({point('start')}, "
+    text += f"objective {start})"
+    moves = _get(refinement, "moves", int, where)
+    if moves:
+        objective = _number(refinement.get("objective"), f"{where}.objective")
+        gain = _number(refinement.get("gain"), f"{where}.gain")
+        text += f" to {point('end')}, objective {objective}, a gain of {gain}"
+    else:
+        text += ", not moved"
+    points = _get(refinement, "points", int, where)
+    tolerance = _number(refinement.get("tolerance"), f"{where}.tolerance")
+    most = _number(refinement.get("max_points"), f"{where}.max_points")
+    text += (
+        f", after {points} points (smallest step {tolerance} of each "
+        f"parameter's bounds, at most {most} points"
+    )
+    if _get(refinement, "stopped", str, where) == "max_points":
+        text += "; it stopped at that cap"
+    return text + ")"
 
 
 def _planned_designs(
@@ -3982,7 +4028,9 @@ def setup_text(
       Rows that are all allocated, as `allocate` returns them, hold no premium,
       and the line says so;
     - `Design`, one line per design: the objective, pricing, budget and
-      limit, the design premium, the route, the non-uniqueness report
+      limit, the design premium, the route, a refinement after the grid (its
+      method and settings, the grid's best point it started from, where it
+      ended, the gain and the points it evaluated), the non-uniqueness report
       (`unique`, `ties`, amounts no design year reaches) and a degenerate
       tail; for a joint design also its scope and which assets it covers,
       and for a design on a sample of several hazards the loss it read.
