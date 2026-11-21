@@ -55,15 +55,19 @@ those rows each replicate builds the rows again as the block built them:
 A row of both is re-dealt and re-ranked. A replicate holds the rows rebuilt,
 not reweighted: a row drawn twice can take two places in the reference, or two
 hazards at the asset. Across hazards the combined loss is made again by the
-sample's rule. That needs the rule's terms and the value its result is
-multiplied by, which a record never holds, so only a sample with one impact, or
-a built-in rule on damage ratios (a value of 1), can be rebuilt.
+sample's rule, from each hazard's damage, which the sample keeps beside its own
+loss, times the asset's value: the one number whose product with each damage
+is that hazard's own loss, as the loss model made it. So a sample with one
+impact, and a built-in rule (`CappedSum`, `CompoundDamage`) whatever the
+value, can be rebuilt. A sample without damages, written before samples kept
+them, is rebuilt under a built-in rule on damage ratios (a value of 1) only.
 
 **Rows that can't be built again keep today's method**, with today's draws and
 numbers, and `setup.intervals.kept_today` lists each kind of them with the
 reason, which the setup text states: a sample of several hazards whose
-combined loss can't be made again (a stated value or a value column, a rule of
-the caller's, a table's loss), a one-hazard view whose combined loss reads
+combined loss can't be made again (a rule of the caller's, a table's loss, or
+a stated value or a value column on a sample without damages), a one-hazard
+view whose combined loss reads
 hazards it doesn't hold, a selection of a held sample, whose hazards at the
 asset came from rows it doesn't hold, a record of an `EmpiricalCopula` without
 its draws per reference year, and pooled rows of such blocks.
@@ -1339,6 +1343,10 @@ _BUILT_IN_RULES: Mapping[str, Callable[[Mapping[str, Any]], CombineRule]] = {
 """The built-in rules for a combined loss, made again from what a sample records."""
 
 
+_Combine = Callable[[Mapping[str, FloatArray], Mapping[str, FloatArray]], FloatArray]
+"""Makes a row's combined loss from its hazards' own losses and their damages."""
+
+
 def _method(kinds: frozenset[str]) -> _Method:
     """How a row of these kinds is resampled: re-dealt, re-ranked, or as today."""
     if _REDEALT in kinds:
@@ -1354,16 +1362,19 @@ class _Column:
 
     `hazard` is the hazard at the asset, `None` where it is the index. `loss`
     is the column's own loss: an asset's loss, a hazard's own loss, or `None`
-    for a hazard with no impact. `by_hazard` holds, on a held column with a
-    loss, the block's hazards at the asset sorted and the loss of each.
+    for a hazard with no impact. `damage` is a hazard's damage before the rule
+    for the combined loss, `None` for an asset and where the sample keeps
+    none. `by_hazard` holds, on a held column with a loss, the block's hazards
+    at the asset sorted, and the loss and the damage of each.
     """
 
     name: str
     index: FloatArray
     hazard: FloatArray | None
     loss: FloatArray | None
+    damage: FloatArray | None
     held: bool
-    by_hazard: tuple[FloatArray, FloatArray] | None
+    by_hazard: tuple[FloatArray, FloatArray, FloatArray | None] | None
 
 
 @dataclass(frozen=True, eq=False)
@@ -1375,7 +1386,7 @@ class _Builder:
     each row. `year_rows` holds the rows of each year, for re-ranking, and
     `year_row` the one row of each year where every year has one. `combine`
     makes a sample of several hazards' combined loss from its hazards' own
-    losses.
+    losses and damages.
     """
 
     sample: OutcomeSample
@@ -1383,7 +1394,7 @@ class _Builder:
     members: tuple[tuple[IntArray, IntArray], ...]
     year_rows: tuple[IntArray, ...]
     year_row: IntArray | None
-    combine: Callable[[Mapping[str, FloatArray]], FloatArray] | None
+    combine: _Combine | None
     provenance: SampleProvenance
 
     def drawn_rows(self, years: IntArray) -> IntArray:
@@ -1408,6 +1419,7 @@ _COMBINED_LOSS_NEEDS_VALUE = "combined_loss_needs_value"
 _CALLER_RULE = "caller_rule"
 _TABLE_LOSS = "table_loss"
 _COMBINED_LOSS_NOT_REPRODUCED = "combined_loss_not_reproduced"
+_VALUE_NOT_FOUND = "value_not_found"
 _HELD_SELECT = "held_select"
 _HELD_LOSS_NOT_ONE = "held_loss_not_one"
 _COPULA_WITHOUT_K = "copula_without_k"
@@ -1428,6 +1440,7 @@ def _block_columns(sample: OutcomeSample) -> list[_Column]:
                 sample.index[:, j],
                 None if sample.hazard is None else sample.hazard[:, j],
                 sample.loss[:, j],
+                None,
                 asset in held,
                 None,
             )
@@ -1440,6 +1453,7 @@ def _block_columns(sample: OutcomeSample) -> list[_Column]:
             component.values[:, 0],
             None if component.hazard is None else component.hazard[:, 0],
             None if component.own_loss is None else component.own_loss[:, 0],
+            None if component.damage is None else component.damage[:, 0],
             name in held,
             None,
         )
@@ -1447,36 +1461,42 @@ def _block_columns(sample: OutcomeSample) -> list[_Column]:
     ]
 
 
-def _by_hazard(column: _Column) -> tuple[FloatArray, FloatArray]:
-    """A held column's hazards at the asset, sorted, and the loss of each.
+def _by_hazard(column: _Column) -> tuple[FloatArray, FloatArray, FloatArray | None]:
+    """A held column's hazards at the asset, sorted, and the loss and damage of each.
 
     The held form gives each row one of the index values of the rows the call
     built, so on a block of all those rows every index value is a row's hazard
-    at the asset, and that row's loss is the loss of the value. Raises unless
-    every index value is one, and unless rows of one hazard have one loss.
+    at the asset, and that row's loss and damage are those of the value. Raises
+    unless every index value is one, and unless rows of one hazard have one
+    loss and one damage.
     """
     assert column.loss is not None
     hazard = column.index if column.hazard is None else column.hazard
     order = np.argsort(hazard, kind="stable")
     hazards, losses = hazard[order], column.loss[order]
+    damages = None if column.damage is None else column.damage[order]
     same = hazards[1:] == hazards[:-1]
-    if (losses[1:][same] != losses[:-1][same]).any():
-        # The loss of a new hazard can't be read from these rows.
-        raise _Unbuildable(_HELD_LOSS_NOT_ONE)
+    for values in (losses, damages):
+        if values is not None and (values[1:][same] != values[:-1][same]).any():
+            # The loss of a new hazard can't be read from these rows.
+            raise _Unbuildable(_HELD_LOSS_NOT_ONE)
     found = np.minimum(np.searchsorted(hazards, column.index), hazards.size - 1)
     if not (hazards[found] == column.index).all():
         # The held form gives each row one of the index values of its call's
         # rows, and this block doesn't hold them all, as a selection doesn't.
         raise _Unbuildable(_HELD_SELECT)
-    return hazards, losses
+    return hazards, losses, damages
 
 
-def _loss_of(column: _Column, hazard: FloatArray) -> FloatArray:
-    """The loss of each hazard at the asset, from the block's rows that hold it."""
+def _loss_of(
+    column: _Column, hazard: FloatArray
+) -> tuple[FloatArray, FloatArray | None]:
+    """The loss and damage of each hazard at the asset, from the block's rows."""
     assert column.by_hazard is not None
-    hazards, losses = column.by_hazard
-    found: FloatArray = losses[np.searchsorted(hazards, hazard)]
-    return found
+    hazards, losses, damages = column.by_hazard
+    found = np.searchsorted(hazards, hazard)
+    loss: FloatArray = losses[found]
+    return loss, None if damages is None else damages[found]
 
 
 def _values_are_one(sample: OutcomeSample) -> bool:
@@ -1498,10 +1518,12 @@ def _values_are_one(sample: OutcomeSample) -> bool:
     return len(sources) == len(listed) and all(source == "none" for source in sources)
 
 
-def _own_loss_of(name: str) -> Callable[[Mapping[str, FloatArray]], FloatArray]:
+def _own_loss_of(name: str) -> _Combine:
     """The combined loss of a sample with one impact: that hazard's own loss."""
 
-    def combined(own: Mapping[str, FloatArray]) -> FloatArray:
+    def combined(
+        own: Mapping[str, FloatArray], damage: Mapping[str, FloatArray]
+    ) -> FloatArray:
         return own[name]
 
     return combined
@@ -1509,42 +1531,129 @@ def _own_loss_of(name: str) -> Callable[[Mapping[str, FloatArray]], FloatArray]:
 
 def _rule_on_damage_ratios(
     rule: CombineRule, kind: str, impacted: Sequence[str]
-) -> Callable[[Mapping[str, FloatArray]], FloatArray]:
-    """A rule's combined loss where the value is 1, so each own loss is an impact."""
+) -> _Combine:
+    """A rule's combined loss where the value is 1, so each own loss is an impact.
 
-    def combined(own: Mapping[str, FloatArray]) -> FloatArray:
+    For a sample that keeps no damage, as one written before samples kept it.
+    """
+
+    def combined(
+        own: Mapping[str, FloatArray], damage: Mapping[str, FloatArray]
+    ) -> FloatArray:
         return _combined_impact(rule, kind, {name: own[name] for name in impacted})
 
     return combined
 
 
-def _combine(
-    sample: OutcomeSample, columns: Sequence[_Column]
-) -> Callable[[Mapping[str, FloatArray]], FloatArray]:
-    """The combined loss of a sample of several hazards, from their own losses.
+def _rule_times_value(
+    rule: CombineRule, kind: str, impacted: Sequence[str], value: float
+) -> _Combine:
+    """A rule's result on the hazards' damages, times the asset's value.
 
-    A sample with one impact has that hazard's own loss. A built-in rule's
-    result is multiplied by the value, which a record never holds, so it is
-    made again on damage ratios only, where the value is 1. Raises
-    `_Unbuildable` for any other sample, and unless the rule gives the sample's
-    own combined loss on its rows.
+    The product is the loss model's, `impact * value`, so on the block's own
+    rows it gives the sample's combined loss exactly.
+    """
+
+    def combined(
+        own: Mapping[str, FloatArray], damage: Mapping[str, FloatArray]
+    ) -> FloatArray:
+        result = _combined_impact(rule, kind, {name: damage[name] for name in impacted})
+        loss: FloatArray = result * value
+        return loss
+
+    return combined
+
+
+_CANDIDATE_VALUES = 3
+"""How many of the most frequent quotients `_value_of` tries, with their neighbours."""
+
+
+def _value_of(
+    pairs: Sequence[tuple[FloatArray, FloatArray]],
+    combined: tuple[FloatArray, FloatArray],
+) -> float:
+    """The asset's value: the one number whose product with each damage is its loss.
+
+    `pairs` holds each hazard's damage and own loss, and `combined` the rule's
+    result on the block and the sample's combined loss. A loss model multiplies
+    each damage by the value, so the value is read back from the quotients of
+    the rows, each tried with its floating-point neighbours: the first that
+    gives every own loss exactly, and the combined loss too, is it. A block
+    whose damages are all 0 has losses of 0 whatever the value, and so does
+    every replicate of it, so its value is taken as 0.
+
+    Raises `_Unbuildable` unless a value gives every own loss exactly. One that
+    gives every own loss but not the combined loss is returned, and the caller's
+    check of the combined loss then refuses it.
+    """
+    damage = np.concatenate([each for each, _ in pairs])
+    loss = np.concatenate([each for _, each in pairs])
+    positive = damage > 0.0
+    if not positive.any():
+        if loss.any():
+            raise _Unbuildable(_VALUE_NOT_FOUND)
+        return 0.0
+    quotients, counts = np.unique(loss[positive] / damage[positive], return_counts=True)
+    frequent = quotients[np.argsort(-counts, kind="stable")[:_CANDIDATE_VALUES]]
+    found: float | None = None
+    for quotient in frequent:
+        for value in (
+            quotient,
+            np.nextafter(quotient, -np.inf),
+            np.nextafter(quotient, np.inf),
+        ):
+            if not np.array_equal(damage * value, loss):
+                continue
+            if np.array_equal(combined[0] * value, combined[1]):
+                return float(value)
+            found = float(value) if found is None else found
+    if found is None:
+        raise _Unbuildable(_VALUE_NOT_FOUND)
+    return found
+
+
+def _combine(sample: OutcomeSample, columns: Sequence[_Column]) -> _Combine:
+    """The combined loss of a sample of several hazards, from its hazards' rows.
+
+    A sample with one impact has that hazard's own loss. A built-in rule takes
+    the hazards' damages, and its result is multiplied by the asset's value,
+    read from the block as the one number whose product with each damage is
+    that hazard's own loss. A sample that keeps no damage is made again on
+    damage ratios only, where the value is 1 and each own loss is an impact.
+    Raises `_Unbuildable` for any other sample, and unless the rule gives the
+    sample's own combined loss on its rows.
     """
     record = sample.provenance.combine or {}
     kind = str(record.get("kind"))
     impacted = [column.name for column in columns if column.loss is not None]
-    rule: Callable[[Mapping[str, FloatArray]], FloatArray]
+    own = {column.name: column.loss for column in columns if column.loss is not None}
+    damage = {
+        column.name: column.damage for column in columns if column.damage is not None
+    }
+    rule: _Combine
     if kind == _ONE_IMPACT:
         only = str(record.get("component"))
         rule = _own_loss_of(only)
     elif kind in _BUILT_IN_RULES:
-        # The rule's result is multiplied by the value, which a record never holds.
-        if not _values_are_one(sample):
+        built = _BUILT_IN_RULES[kind](record)
+        if impacted and set(damage) == set(impacted):
+            value = _value_of(
+                [(damage[name], own[name]) for name in impacted],
+                (
+                    _combined_impact(built, kind, {n: damage[n] for n in impacted}),
+                    sample.loss[:, 0],
+                ),
+            )
+            rule = _rule_times_value(built, kind, impacted, value)
+        elif _values_are_one(sample):
+            rule = _rule_on_damage_ratios(built, kind, impacted)
+        else:
+            # Without the damages, the value can't be read from the rows, and a
+            # record never holds it.
             raise _Unbuildable(_COMBINED_LOSS_NEEDS_VALUE)
-        rule = _rule_on_damage_ratios(_BUILT_IN_RULES[kind](record), kind, impacted)
     else:
         raise _Unbuildable(_TABLE_LOSS if kind == "table" else _CALLER_RULE)
-    own = {column.name: column.loss for column in columns if column.loss is not None}
-    if not np.array_equal(rule(own), sample.loss[:, 0]):
+    if not np.array_equal(rule(own, damage), sample.loss[:, 0]):
         raise _Unbuildable(_COMBINED_LOSS_NOT_REPRODUCED)
     return rule
 
@@ -1739,19 +1848,25 @@ def _redeal_draws(
     return sources
 
 
-def _reranked(column: _Column, rows: IntArray) -> tuple[FloatArray, FloatArray | None]:
+def _reranked(
+    column: _Column, rows: IntArray
+) -> tuple[FloatArray, FloatArray | None, FloatArray | None]:
     """A held column's hazard at the asset ranked again over `rows`, and its loss.
 
     The rows are ranked by their hazard at the asset, which holds the rank the
     held form gave them, ties by the index and then by row, and the row of rank
-    r takes the r-th smallest index value among them.
+    r takes the r-th smallest index value among them. Returns the hazards at
+    the asset, and the loss and the damage of each, `None` where the column has
+    none.
     """
     index = column.index[rows]
     hazard = index if column.hazard is None else column.hazard[rows]
     order = np.lexsort((np.arange(rows.size), index, hazard))
     placed = np.empty_like(index)
     placed[order] = np.sort(index)
-    return placed, None if column.loss is None else _loss_of(column, placed)
+    if column.loss is None:
+        return placed, None, None
+    return placed, *_loss_of(column, placed)
 
 
 def _rebuilt_sample(
@@ -1760,27 +1875,31 @@ def _rebuilt_sample(
     """The block's columns with each column's rows taken from `sources`.
 
     A held column's hazard at the asset is ranked again over its rows, and a
-    sample of several hazards takes its combined loss again from its rule.
+    sample of several hazards takes its combined loss again from its rule. A
+    component's view stays that component's view, as a block of it does.
     """
     sample = builder.sample
     index: list[FloatArray] = []
     hazard: list[FloatArray] = []
     loss: list[FloatArray | None] = []
+    damage: list[FloatArray | None] = []
     for column, rows in zip(builder.columns, sources, strict=True):
         index.append(column.index[rows])
         if column.held:
-            placed, own = _reranked(column, rows)
+            placed, own, harm = _reranked(column, rows)
         else:
             placed = index[-1] if column.hazard is None else column.hazard[rows]
             own = None if column.loss is None else column.loss[rows]
+            harm = None if column.damage is None else column.damage[rows]
         hazard.append(placed)
         loss.append(own)
+        damage.append(harm)
     n = probability.shape[0]
     components = sample.index_components
     if components is None:
         # Every asset has a loss.
         losses = [value for value in loss if value is not None]
-        return OutcomeSample(
+        one_hazard = OutcomeSample(
             asset_ids=sample.asset_ids,
             period=np.arange(n, dtype=np.int64),
             probability=probability,
@@ -1793,6 +1912,8 @@ def _rebuilt_sample(
             provenance=builder.provenance,
             scenario=sample.scenario,
         )
+        object.__setattr__(one_hazard, "_view_of", sample._view_of)
+        return one_hazard
     rebuilt = {
         column.name: IndexComponent(
             index[j],
@@ -1800,18 +1921,24 @@ def _rebuilt_sample(
             tail=components[column.name].tail,
             hazard=None if column.hazard is None else hazard[j],
             own_loss=loss[j],
+            damage=damage[j],
         )
         for j, column in enumerate(builder.columns)
     }
-    impacts = {
+    own_losses = {
         name: value
         for name, value in zip(rebuilt, loss, strict=True)
+        if value is not None
+    }
+    damages = {
+        name: value
+        for name, value in zip(rebuilt, damage, strict=True)
         if value is not None
     }
     combined = (
         sample.loss[sources[0], 0]
         if builder.combine is None
-        else builder.combine(impacts)
+        else builder.combine(own_losses, damages)
     )
     first = next(iter(rebuilt.values()))
     return OutcomeSample(
@@ -2134,10 +2261,12 @@ def bootstrap_intervals(
     block) or `"year"` otherwise. A row built together that can't be built
     again, as the block doesn't hold what that needs, reads that call as
     before, and `setup.intervals.kept_today` lists `{"kind", "reason"}` for
-    each kind of such rows: `"combined_loss_needs_value"`, `"caller_rule"`,
-    `"table_loss"`, `"combined_loss_not_reproduced"`, `"combined_view"`,
-    `"held_select"`, `"held_loss_not_one"`, `"copula_without_k"` or
-    `"pooled_by_hand"`. The key is left out when there is none.
+    each kind of such rows: `"combined_loss_needs_value"` (a sample without
+    damages, with a stated value or a value column), `"caller_rule"`,
+    `"table_loss"`, `"combined_loss_not_reproduced"`, `"value_not_found"`,
+    `"combined_view"`, `"held_select"`, `"held_loss_not_one"`,
+    `"copula_without_k"` or `"pooled_by_hand"`. The key is left out when there
+    is none.
 
     The table has `to_long`'s columns and, for each wide row and metric column:
 

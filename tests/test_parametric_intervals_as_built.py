@@ -69,9 +69,12 @@ from crc_sdk.parametric.intervals import (
     _by_hazard,
     _plan,
     _pooled,
+    _rebuilt_sample,
     _redeal_draws,
     _replicates,
     _reranked,
+    _Unbuildable,
+    _value_of,
     _year_counts,
 )
 from crc_sdk.parametric.metrics import metric_columns, metric_values
@@ -245,13 +248,36 @@ def _hazards(
     )
 
 
-def _package(unit: str = "1") -> CoverPackage:
+def _package(unit: str = "1", limit: float = 0.6) -> CoverPackage:
     return CoverPackage(
         {
-            name: _cover(index=INDICES[name], label=f"on {name}", limit=0.6, unit=unit)
+            name: _cover(
+                index=INDICES[name], label=f"on {name}", limit=limit, unit=unit
+            )
             for name in HAZARDS
         },
         label="package",
+    )
+
+
+def _valued(combine: Any = CappedSum(1.0), **arguments: Any) -> OutcomeSample:
+    """Two hazards at one asset, each hazard's loss on a stated value of 100 EUR."""
+    return _hazards(
+        loss_models={name: _loss(name) for name in HAZARDS},
+        combine=combine,
+        **arguments,
+    )
+
+
+def _without_damage(sample: OutcomeSample) -> OutcomeSample:
+    """The sample as one written before samples kept each hazard's damage."""
+    assert sample.index_components is not None
+    return dataclasses.replace(
+        sample,
+        index_components={
+            name: dataclasses.replace(component, damage=None)
+            for name, component in sample.index_components.items()
+        },
     )
 
 
@@ -647,8 +673,10 @@ def test_a_re_ranked_replicate_holds_the_drawn_rows_index_values() -> None:
     column = _block_columns(sample)[0]
     column = dataclasses.replace(column, by_hazard=_by_hazard(column))
     rows = np.random.default_rng(1).integers(0, 40, size=40)
-    placed, loss = _reranked(column, rows)
+    placed, loss, damage = _reranked(column, rows)
     assert loss is not None
+    # An asset keeps no damage: only a hazard of several does.
+    assert damage is None
     assert sorted(placed) == sorted(sample.index[rows, 0])
     for value, own in zip(placed, loss, strict=True):
         given = sample.loss[sample.hazard[:, 0] == value, 0]
@@ -736,6 +764,230 @@ def test_one_impact_across_hazards_is_re_dealt_with_that_hazards_loss() -> None:
     assert _intervals_record(table)["unit"] == "as_built"
 
 
+def _combined(rule: Any, damage: dict[str, np.ndarray]) -> np.ndarray:
+    """The rule's result on two hazards' damages, written apart from the module."""
+    if isinstance(rule, CappedSum):
+        capped: np.ndarray = np.minimum(damage["rain"] + damage["wind"], rule.cap)
+        return capped
+    compounded: np.ndarray = 1.0 - (1.0 - damage["rain"]) * (1.0 - damage["wind"])
+    return compounded
+
+
+@pytest.mark.parametrize("rule", [CappedSum(1.0), CompoundDamage()], ids=repr)
+def test_a_stated_value_across_hazards_is_re_dealt_with_its_rule(rule: Any) -> None:
+    # Each hazard keeps its damage, so the rule's result is made again from the
+    # re-dealt damages and multiplied by the value, 100 EUR.
+    sample = _valued(rule)
+    package = _package("EUR", 60.0)
+    table = UNTYPED_INTERVALS(
+        [package],
+        sample,
+        split="in_sample",
+        rng=np.random.default_rng(17),
+        n_bootstrap=1,
+        options=FEW,
+    )
+    copy = np.random.default_rng(17)
+    copy.integers(0, N, size=(1, N), dtype=np.int64)
+    components = sample.index_components
+    assert components is not None
+    values = np.column_stack([components[name].values[:, 0] for name in HAZARDS])
+    sources = _expected_redeal(values, K, copy, 1)
+    damage = {
+        name: components[name].damage[sources[j][0], 0]  # type: ignore[index]
+        for j, name in enumerate(HAZARDS)
+    }
+    combined = 100.0 * _combined(rule, damage)
+    payouts = [
+        package._items[name].cover.payout_values(values[sources[j][0], j])
+        for j, name in enumerate(HAZARDS)
+    ]
+    probability = np.full(N, 1.0 / N)
+    expected = metric_values(
+        combined,
+        payouts[0] + payouts[1],
+        probability,
+        premium=_premium(payouts, probability),
+        options=FEW,
+    )
+    _check_single_replicate(_bounds(table, "package"), expected)
+    rain = metric_values(
+        combined,
+        payouts[0],
+        probability,
+        premium=_premium(payouts[:1], probability),
+        options=FEW,
+    )
+    _check_single_replicate(_bounds(table, "asset", "on rain"), rain)
+    record = _intervals_record(table)
+    assert record["unit"] == "as_built"
+    assert "kept_today" not in record
+    line = _intervals_line(table)
+    assert REDEALT_TEXT in line and UNMEASURED_TEXT not in line
+
+
+def test_a_held_block_of_several_hazards_with_a_value_is_re_ranked() -> None:
+    # Each row takes the own loss and the damage of its new hazard at the asset,
+    # and the combined loss is the rule's result on the damages times the value.
+    sample = _valued(basis_risk=HELD, dependence=Independent())
+    package = _package("EUR", 60.0)
+    table = UNTYPED_INTERVALS(
+        [package],
+        sample,
+        split="in_sample",
+        rng=np.random.default_rng(13),
+        n_bootstrap=1,
+        options=FEW,
+    )
+    rows = np.random.default_rng(13).integers(0, N, size=(1, N), dtype=np.int64)[0]
+    components = sample.index_components
+    assert components is not None
+    damage = {}
+    for name in HAZARDS:
+        component = components[name]
+        assert component.hazard is not None and component.damage is not None
+        index, hazard = component.values[rows, 0], component.hazard[rows, 0]
+        placed = _expected_rerank(index, hazard)
+        damage[name] = np.array(
+            [
+                component.damage[component.hazard[:, 0] == value, 0][0]
+                for value in placed
+            ]
+        )
+    combined = 100.0 * _combined(CappedSum(1.0), damage)
+    payouts = [
+        package._items[name].cover.payout_values(components[name].values[rows, 0])
+        for name in HAZARDS
+    ]
+    probability = np.full(N, 1.0 / N)
+    expected = metric_values(
+        combined,
+        payouts[0] + payouts[1],
+        probability,
+        premium=_premium(payouts, probability),
+        options=FEW,
+    )
+    _check_single_replicate(_bounds(table, "package"), expected)
+    record = _intervals_record(table)
+    assert record["unit"] == "as_built"
+    assert "kept_today" not in record
+    assert RERANKED_TEXT in _intervals_line(table)
+
+
+@pytest.mark.parametrize("rule", [CappedSum(1.0), CompoundDamage()], ids=repr)
+def test_damage_ratios_are_rebuilt_alike_with_and_without_damages(rule: Any) -> None:
+    # With no value the damage is the own loss, so the rows rebuilt from the
+    # damages are those rebuilt from the own losses, number for number.
+    blocks: list[dict[str, Any]] = [
+        {},
+        {"basis_risk": HELD, "dependence": Independent()},
+    ]
+    for arguments in blocks:
+        sample = _hazards(combine=rule, **arguments)
+        found = _intervals([_package()], sample, n_bootstrap=20)
+        before = _intervals([_package()], _without_damage(sample), n_bootstrap=20)
+        assert found.column("ci_low").equals(before.column("ci_low"))
+        assert found.column("ci_high").equals(before.column("ci_high"))
+        assert _intervals_record(found)["unit"] == "as_built"
+
+
+def test_the_value_is_read_from_the_damages_exactly() -> None:
+    rng = np.random.default_rng(3)
+    damage = rng.uniform(0.0, 1.0, 200)
+    damage[:5] = 0.0
+    for value in (1.0, 100.0, 2_000_000.0, 1234567.891, 0.1, 0.0):
+        loss = damage * value
+        combined = np.minimum(damage + damage[::-1], 1.0)
+        found = _value_of([(damage, loss)], (combined, combined * value))
+        assert np.array_equal(damage * found, loss)
+        assert np.array_equal(combined * found, combined * value)
+    # Damages of 0 give losses of 0 whatever the value.
+    zeros = np.zeros(4)
+    assert _value_of([(zeros, zeros)], (zeros, zeros)) == 0.0
+    # Own losses that aren't the damages times one value.
+    with pytest.raises(_Unbuildable) as caught:
+        _value_of([(damage, damage * np.linspace(1.0, 2.0, 200))], (damage, damage))
+    assert caught.value.reason == "value_not_found"
+    with pytest.raises(_Unbuildable) as caught:
+        _value_of([(zeros, zeros + 1.0)], (zeros, zeros))
+    assert caught.value.reason == "value_not_found"
+
+
+def test_a_sample_whose_losses_contradict_its_damages_keeps_todays_method() -> None:
+    sample = _valued()
+    components = sample.index_components
+    assert components is not None
+    rain = components["rain"]
+    assert rain.damage is not None
+    moved = dataclasses.replace(
+        sample,
+        index_components={
+            **components,
+            "rain": dataclasses.replace(rain, damage=np.sqrt(rain.damage)),
+        },
+    )
+    _kept(
+        [_package("EUR", 60.0)],
+        moved,
+        [{"kind": "empirical_copula", "reason": "value_not_found"}],
+    )
+    # One value gives every own loss, but not the sample's combined loss.
+    raised = dataclasses.replace(sample, loss=sample.loss + 1.0)
+    table = _kept(
+        [_package("EUR", 60.0)],
+        raised,
+        [{"kind": "empirical_copula", "reason": "combined_loss_not_reproduced"}],
+    )
+    assert "no one value gives" not in _intervals_line(table)
+    assert "no one value gives" in _intervals_line(
+        _intervals([_package("EUR", 60.0)], moved)
+    )
+
+
+def test_a_rebuilt_replicate_of_a_view_keeps_its_component() -> None:
+    # A component's view of a held sample is re-ranked; its replicates stay
+    # that component's view, as its blocks do.
+    view = _valued(basis_risk=HELD, dependence=Independent()).component("rain")
+    assert view._view_of == ("rain", "upper")
+    evaluated = _block(
+        [_cover(index=INDICES["rain"], limit=60.0)],
+        view,
+        split="in_sample",
+        fold=0,
+        pricing=PurePremium(),
+        premiums=None,
+        options=FEW,
+        design_sample=None,
+        allocation=None,
+        values=None,
+    )
+    plan = _plan(evaluated)
+    assert plan.methods == ("rerank",)
+    assert plan.builder is not None
+    rows = np.arange(N)[::-1]
+    replicate = _rebuilt_sample(plan.builder, [rows], np.full(N, 1.0 / N))
+    assert replicate._view_of == ("rain", "upper")
+    plain = _plan(
+        _block(
+            [_cover(limit=60.0)],
+            _curve_sample(),
+            split="in_sample",
+            fold=0,
+            pricing=PurePremium(),
+            premiums=None,
+            options=FEW,
+            design_sample=None,
+            allocation=None,
+            values=None,
+        )
+    )
+    assert plain.builder is not None
+    rows = np.arange(12)
+    assert (
+        _rebuilt_sample(plain.builder, [rows], np.full(12, 1.0 / 12))._view_of is None
+    )
+
+
 # -- what is kept on today's method --------------------------------------------
 
 
@@ -819,12 +1071,12 @@ def _todays_years(entries: list[Any], on: Any) -> int:
     return int(sum(len(test) for _, test in on))
 
 
-def test_a_stated_value_across_hazards_keeps_todays_method() -> None:
-    sample = _hazards(
-        loss_models={name: _loss(name) for name in HAZARDS}, combine=CappedSum(100.0)
-    )
+def test_a_sample_without_damages_and_a_value_keeps_todays_method() -> None:
+    # Written before samples kept the damage, the sample holds no damage to
+    # read the value from, and a record never holds it.
+    sample = _without_damage(_valued())
     table = _kept(
-        [_package("EUR")],
+        [_package("EUR", 60.0)],
         sample,
         [{"kind": "empirical_copula", "reason": "combined_loss_needs_value"}],
     )
@@ -833,6 +1085,7 @@ def test_a_stated_value_across_hazards_keeps_todays_method() -> None:
     assert REBUILT_TEXT not in line
     assert "couldn't be built again on each replicate" in line
     assert "which a record never holds" in line
+    assert "keeps no damage of its hazards" in line
 
 
 class _Larger:
@@ -856,16 +1109,11 @@ def test_a_rule_of_the_callers_across_hazards_keeps_todays_method() -> None:
     )
 
 
-def test_a_held_block_of_several_hazards_with_a_value_keeps_todays_method() -> None:
+def test_a_held_sample_without_damages_and_a_value_keeps_todays_method() -> None:
     # Re-ranking moves each hazard's own loss, so the combined loss is needed.
-    sample = _hazards(
-        loss_models={name: _loss(name) for name in HAZARDS},
-        combine=CappedSum(100.0),
-        basis_risk=HELD,
-        dependence=Independent(),
-    )
+    sample = _without_damage(_valued(basis_risk=HELD, dependence=Independent()))
     _kept(
-        [_package("EUR")],
+        [_package("EUR", 60.0)],
         sample,
         [{"kind": "hazard_distribution", "reason": "combined_loss_needs_value"}],
         unit="year",
@@ -978,19 +1226,9 @@ def test_rows_kept_beside_rows_rebuilt_are_stated_apart() -> None:
 
 
 def test_kept_rows_merge_and_filter_away() -> None:
-    kept = _intervals(
-        [_package("EUR")],
-        _hazards(
-            loss_models={name: _loss(name) for name in HAZARDS},
-            combine=CappedSum(100.0),
-        ),
-    )
+    kept = _intervals([_package("EUR", 60.0)], _without_damage(_valued()))
     view = _intervals(
-        [_cover(index=INDICES["rain"])],
-        _hazards(
-            loss_models={name: _loss(name) for name in HAZARDS},
-            combine=CappedSum(100.0),
-        ).component("rain", loss="combined"),
+        [_cover(index=INDICES["rain"])], _valued().component("rain", loss="combined")
     )
     merged = EvaluationMetadata.merge(
         EvaluationMetadata.from_table(kept), EvaluationMetadata.from_table(view)
