@@ -21,6 +21,11 @@ where a row is evaluated and `design_scenario` where it was designed.
 row of the same cover or design on a reference scenario. Neither ranks anything:
 a row is a measurement of a stated setup, and `setup_text` states it.
 
+A plan reads its scenarios rather than taking built samples: a set given to
+`ParametricPlan.scenarios` describes them, with `labels=` for the selection of a
+plan on fitted curves, `CurveScenario` for another canonical dataset and
+`AnnualScenario` for another per-year source.
+
 This module does no I/O.
 """
 

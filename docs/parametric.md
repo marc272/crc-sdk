@@ -17,7 +17,8 @@ There are two ways to use the module:
   crc-sdk plan: builders and `explain()` do no I/O, and the data is read only
   at the execution points `samples()`, `designs()` and `write_parquet()`. The
   same plan also runs on per-year values, such as ERA5's annual extremes
-  ([next step](#next-step-per-year-values)).
+  ([next step](#next-step-per-year-values)), and on several scenarios at once,
+  such as windows of horizons ([scenarios on the plan](#scenarios-on-the-plan)).
 - **The functions.** Every step is also a function on numpy arrays and Arrow
   tables that does no I/O (`sample_curve`, `sample_annual`, `design`,
   `compare`, ...), for your own tables, fitted curves and chains. Only
@@ -41,6 +42,7 @@ There are two ways to use the module:
 | Design | `design`, `DesignResult` | A template's resolved cover and its design record |
 | Scope | `Individual()`, `Joint()` | Whether each asset's cover is designed on its own or several together, for one objective on the owner's total ([joint design](#joint-design-over-several-assets)) |
 | Comparison | `compare`, a `pyarrow.Table` | Covers as rows, metrics as columns, in and out of sample |
+| Scenarios | `ScenarioSet`, `AnnualScenario`, `CurveScenario`, `compare_scenarios`, `to_drift` | Every cover or design on every scenario's block, such as windows of horizons, in one table, and each row's difference from a reference scenario ([scenarios on the plan](#scenarios-on-the-plan)) |
 | Pooled folds and intervals | `compare_pooled`, `bootstrap_intervals` | Metrics computed once over all the held-out years of a k-fold split, and how much a number moves with the years drawn ([pooled folds and intervals](#pooled-folds-and-intervals)) |
 | Budget frontier | `design_frontier` | One design per budget, read on one block, one row per budget ([a budget frontier](#a-budget-frontier)) |
 | Plan | `ParametricPlan`, `ParametricResult` | The lazy workflow from a portfolio evaluation's curves (or per-year values) to a written comparison |
@@ -224,7 +226,7 @@ ParametricPlan.for_evaluation(request, *, value_column=None, value_unit="1")
   .monte_carlo(n_draws, *, seed, assume_semantics=None, outside_support="raise")
 ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
                                    trend=AsRecorded(), scenario="baseline",
-                                   pool=None, ...)
+                                   pool=None, hazard_name=None, ...)
   .index(source, *, location, unit, provenance, ...)   # optional: read elsewhere
 # then, on either plan:
   .basis_risk(model)                          # required
@@ -238,8 +240,11 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
   .dependence(Independent() | Comonotonic() | EmpiricalCopula(reference))
                                               # fitted curves; required with Joint()
   .allocation("value" | "loss")               # optional: allocated rows, own file
+  .scenarios(ScenarioSet(...), *, design_on="each", premiums=None)
+                                              # optional: several scenarios
   .explain(format="text")                     # no I/O
   .samples() / .joint_sample() / .designs() / .write_parquet(path)   # execution
+  .scenario_samples()                         # execution, with .scenarios(...)
 ```
 
 ### Fitted curves
@@ -255,7 +260,9 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
   exact geometry where the source has it); an asset without a curve, or with
   several for one scenario, raises. The plan samples one curve per asset, so
   the selection must leave one hazard, horizon and pathway; several raise
-  `SampleError`.
+  `SampleError`. A selection of several horizons or pathways is for
+  [`.scenarios(...)`](#scenarios-on-the-plan), and without it `explain()` and
+  every execution point raise `ValueError`.
 - **`.monte_carlo(n_draws, *, seed, assume_semantics=None,
   outside_support="raise")`** is required: each asset's sample is `n_draws`
   simulated years drawn from its curve by `sample_curve`, each with
@@ -294,6 +301,7 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
 | `.scopes(*scopes)` | `Individual()`, the default, designs each asset on its own; `Joint()` designs each template on the owner's total ([joint design](#joint-design-over-several-assets)) |
 | `.dependence(model)` | Fitted curves only, and required there with `Joint()`: how the assets' draws are put side by side (`Independent()`, `Comonotonic()` or `EmpiricalCopula(reference)`). A plan on per-year values raises: its dependence is the data's own |
 | `.allocation(rule)` | With `Joint()`: adds a joint design's allocated rows, under `"value"` or `"loss"`, in a table and a file of their own ([allocated rows](#allocated-rows-in-a-table-of-their-own)) |
+| `.scenarios(set, *, design_on, premiums)` | Several scenarios, such as windows of horizons, each cover and design evaluated on every scenario's block, out of sample ([scenarios on the plan](#scenarios-on-the-plan)) |
 
 A designed cover keeps the template's label (or the first 12 hex digits of its
 hash) followed by the objective, for example `"step (mse)"`; its hash and
@@ -374,8 +382,9 @@ semantics the caller states and the fresh draws; the dataset's own metadata
 | --- | --- |
 | `.samples()` | One `OutcomeSample` per asset, all draws or years, in asset order; with `Joint()`, each asset's view of `.joint_sample()` |
 | `.joint_sample()` | With `Joint()` only: the `OutcomeSample` of all the assets, all draws or years |
-| `.designs()` | Every `DesignResult`, in asset, fold, cover and objective order; with `Joint()`, every `JointDesignResult`, in fold, cover and objective order |
-| `.write_parquet(path)` | A `ParametricResult`: `output`, `table`, `metadata`, `samples`, `designs`, `fresh_samples`, `joint_sample`, `fresh_joint_sample` and `row_count` |
+| `.designs()` | Every `DesignResult`, in asset, fold, cover and objective order; with `Joint()`, every `JointDesignResult`, in fold, cover and objective order; with `.scenarios(...)`, by scenario first |
+| `.scenario_samples()` | With `.scenarios(...)` only: every scenario's samples, by label and then by asset |
+| `.write_parquet(path)` | A `ParametricResult`: `output`, `table`, `metadata`, `samples`, `designs`, `fresh_samples`, `joint_sample`, `fresh_joint_sample`, `allocated`, `allocated_output`, `scenario_samples`, `scenario_fresh_samples` and `row_count` |
 
 `write_parquet` writes the rows of every asset, split and fold to one local
 Parquet file through a temporary sibling and `os.replace`, and creates the
@@ -607,7 +616,11 @@ names a hazard: a canonical row's `hazard_name`, a source document's `recipe` or
 `hazard_name`, or a one-valued `recipe` column. Then the two must agree, or
 `ScenarioError` names both. `sample.provenance.hazard` records the name and what
 states it, and the hashes and the lineage leave it out. A cover is then read only
-on its own hazard ([the hazard a cover reads](#the-hazard-a-cover-reads)).
+on its own hazard ([the hazard a cover reads](#the-hazard-a-cover-reads)). On the
+plan, `for_annual_extremes(..., hazard_name=...)` states it for the plan's own
+source; `explain()` checks it against a source plan's `recipe`, and execution
+against a table's. A plan with [scenarios](#scenarios-on-the-plan) names every
+scenario's hazard, so a source that states none needs it there.
 
 ### An index read elsewhere
 
@@ -843,6 +856,279 @@ execution, `plan.explain(format="json")` states the pool's columns in
 `setup.samples` and in each entry of `sources`. A `scenario=` label is the name
 of the rows: without one, rows under `ssp245` are labelled `"baseline"`, and the
 `Source` line states the pathway.
+
+## Scenarios on the plan
+
+A scenario is one block of rows a cover can be evaluated on. On fitted curves it
+is usually a *window of horizons*: several horizons of one pathway, read as one
+scenario. A single horizon is allowed too, and the setup text says which each
+scenario is. On per-year values it is a series or a pool of model-years, such as
+another pathway's years. `.scenarios(ScenarioSet(...))` puts every cover and
+design on every scenario's block in one table, out of sample, as
+[`compare_scenarios`](#several-scenarios-in-one-table) does on the function
+route, and the plan's rows are that function's. Nothing in the table says that a
+pathway, a horizon, a window or a design is better: a row is a measurement of a
+stated setup, and `setup_text` states it.
+
+```python
+from crc_sdk.parametric import ScenarioSet, to_drift
+
+# A synthetic canonical dataset of the curve quick start's cell at nine horizons
+# of one pathway, its location moved by 0.1 mm/day a year, to illustrate. Real
+# curves come from a source plan: HazardDataset.crc_open(...)...materialize(path).
+horizons = (2025, 2030, 2035, 2045, 2050, 2055, 2075, 2080, 2085)
+write_hazard_dataset(
+    pa.Table.from_pylist(
+        [{**curve, "pathway": "ssp585", "horizon": year,
+          "curve_location": 50.0 + 0.1 * (year - 2030)} for year in horizons],
+        schema=hazard_arrow_schema(),
+    ),
+    "rx1day-horizons.parquet", metadata,
+)
+windows = {                                     # a label and its (pathway, horizon)
+    "2030s": [("ssp585", 2025), ("ssp585", 2030), ("ssp585", 2035)],
+    "2050s": [("ssp585", 2045), ("ssp585", 2050), ("ssp585", 2055)],
+    "2080s": [("ssp585", 2075), ("ssp585", 2080), ("ssp585", 2085)],
+}
+horizons_request = (
+    HazardDataset.local("rx1day-horizons.parquet")
+    .for_assets(assets)
+    .select(hazard_names=["rx1day"], horizons=list(horizons), pathways=["ssp585"])
+    .impact(PiecewiseLinearImpact([40.0, 120.0], [0.0, 0.5]),
+            name="rx1day_damage", value_unit="1", value_semantics="damage ratio")
+)
+scenario_plan = (
+    ParametricPlan.for_evaluation(horizons_request, value_column="value_eur",
+                                  value_unit="EUR")
+    .monte_carlo(3_000, seed=42)          # a multiple of each window's 3 members
+    .basis_risk(HazardNoise(0.3))
+    .covers(step, linear)
+    .objective(MSE(), budget=Budget(ratio=0.8))
+    .split(FreshDraws(3_000, seed=7))     # required: the rows are out of sample
+    .metrics(MetricOptions(betas=(0.9,), return_periods=(10,)))
+    .scenarios(ScenarioSet(reference="2030s", labels=windows))
+)
+print(setup_text(scenario_plan.explain(format="json")))   # no I/O
+scenario_result = scenario_plan.write_parquet("scenarios.parquet")
+drift = to_drift(scenario_result.table)   # each row against its own on 2030s
+```
+
+`scenario_result.table` has one row per cover or design and scenario: the
+designs made on each window's draws and the fixed linear cover, each evaluated
+on all three windows' fresh draws. `scenario` says where a row is evaluated,
+`design_scenario` where it was designed (null for a cover given as is), and
+`horizon` is a window's centre, 2030, 2050 and 2080 here. How the fixed cover
+drifts across the windows, and a design per window, are slices of this table.
+Any number read from it describes this synthetic dataset under this setup and
+nothing more.
+
+### Windows and single horizons
+
+- **A window** is an equal-weight mixture of its horizons' curves: one simulated
+  year of the window is a draw from one of its members, each member equally
+  likely. It holds one pathway, and every row is a draw from a curve the dataset
+  holds, so nothing interpolates between horizons. With `m` members, row `d`
+  reads member `d mod m` at its uniform, from the one stream of uniforms of a
+  single curve, so every block of a holdout or a k-fold split holds every
+  member, within one row. `.monte_carlo(n_draws)` and `FreshDraws(n)` must be
+  whole multiples of every window's members, which `explain()` checks; a window
+  under `EmpiricalCopula` needs a multiple of its members times the reference's
+  years. A window's `horizon` column is `(first + last) // 2` of its members, a
+  centre no row need be read at.
+- **A single horizon** is one pair under a label, `{"mid-century": [("ssp585",
+  2050)]}`, and a plain sample of that curve. It is allowed, and the setup text
+  says that it is one. A window rests a scenario on several fitted curves of one
+  product rather than on one, which is why this page leads with windows. Where a
+  set holds windows of different widths, or a window beside a single horizon,
+  the setup text says that a difference includes the width.
+- **The labels.** `labels=` maps each label to its (pathway, horizon) pairs and
+  lists exactly the pairs read, each of them selected. Without `labels=`, every
+  selected (pathway, horizon) is one scenario, labelled `<pathway>_<horizon>`,
+  so `ScenarioSet(reference="ssp585_2030")` reads single horizons. The
+  request's `select(...)` must state exactly one hazard in `hazard_names`, and
+  its `horizons` and `pathways`, so that `explain()` lists the scenarios without
+  reading anything. Without `.scenarios(...)`, a request that selects several
+  horizons or pathways raises `ValueError` at `explain()` and every execution
+  point, since the plan samples one curve per asset.
+
+### The reference
+
+The reference is required and named, and the module chooses none: `to_drift`
+takes differences from it, and a cover given as is is priced on its design block.
+This page and the notebook use:
+
+- on CRC Open, the earliest window, here `"2030s"`: CRC Open has no historical
+  baseline, so every scenario is a modelled future of one pathway;
+- on NEX-GDDP-CMIP6, the same models' `historical` years, below.
+
+ERA5 is not a reference of a scenario set. A difference between ERA5 and model
+output always includes the products (their resolution, method and pooling), while
+a difference between two horizons of one product doesn't include them. ERA5 keeps
+its other jobs: the back-test on real years, the per-year route, the reference of
+an `EmpiricalCopula` and an index read elsewhere.
+
+### Per-year scenarios
+
+On a per-year plan the plan's own source is one scenario, under its `scenario=`
+label, and each `AnnualScenario` is another. Here NEX-GDDP-CMIP6's layout, two
+models' `historical` years and the same models' `ssp585` years, pooled as in
+[pooled model-years](#pooled-model-years); the numbers are synthetic:
+
+```python
+from crc_sdk.parametric import AnnualScenario
+
+def model_years(first, pathway, location):     # one row per year, cell and run
+    span = np.arange(first, first + 30)
+    return pa.concat_tables(
+        pa.table({
+            "year": np.repeat(span, 4).astype("int32"),
+            "latitude": np.tile([50.875, 50.875, 51.125, 51.125], len(span)),
+            "longitude": np.tile([6.875, 7.125, 6.875, 7.125], len(span)),
+            "value": rng.gumbel(location, 12.0, 4 * len(span)),   # mm/day
+            "model": [model] * (4 * len(span)),
+            "member": ["r1i1p1f1"] * (4 * len(span)),
+            "scenario": [pathway] * (4 * len(span)),
+            "recipe": ["rx1day"] * (4 * len(span)),
+        })
+        for model in ("model-a", "model-b")
+    )
+
+future_runs = AnnualScenario("ssp585", model_years(2041, "ssp585", 54.0),
+                             provenance=archive)   # the plan's pool= and the rest
+pooled_scenarios = (
+    ParametricPlan.for_annual_extremes(
+        model_years(1985, "historical", 50.0), assets,
+        impact=PiecewiseLinearImpact([40.0, 120.0], [0.0, 0.5]),
+        unit="mm/day", value_column="value_eur", value_unit="EUR",
+        provenance=archive, seed=42, pool=ModelPool(), scenario="historical",
+    )
+    .basis_risk(ImpactNoise(0.3, upper=1.0))
+    .covers(step, linear)
+    .objective(ExpectedUncovered(), budget=Budget(ratio=0.8))
+    .split(Holdout(0.7))                  # each scenario's own years
+    .metrics(MetricOptions(betas=(0.9,), return_periods=(10,)))
+    .scenarios(ScenarioSet([future_runs], reference="historical"))
+    .write_parquet("pooled-scenarios.parquet")
+)
+print(setup_text(pooled_scenarios.metadata))
+```
+
+```text
+AnnualScenario(label, source, *, provenance, unit=None, location=None,
+               year_column=None, hazard_column=None, years=None, missing=None,
+               trend=None, pool=None, pathway=None, hazard_name=None)
+```
+
+- **`source`** takes what `for_annual_extremes` takes, and `provenance` states its
+  terms. A field left `None` takes the plan's value. `impact`, `value_column`,
+  `context`, `cell` and `seed` are always the plan's, so the loss model and the
+  basis-risk draws are the same in every scenario, from the same start of each
+  asset's generator.
+- **`pool=None`** takes the plan's `pool=`, `pool=False` states a series that is
+  not pooled, and a `ModelPool` states one. A series beside pools needs
+  `mixed_products=True` on the set.
+- **`pathway=`** fills the record where the source states none, and must agree
+  with the source where it does.
+- **`hazard_name=`** names the hazard the loss reads. Every scenario of a set
+  names one, compared by exact name, so a source that states none (a plain table
+  or file) needs it, on `AnnualScenario` or on `for_annual_extremes(...,
+  hazard_name=...)`. A source plan's `recipe` and a one-valued `recipe` column
+  state one, as here. The plan's own name is not a default for a scenario.
+- **Splits.** `Holdout` and `KFold` cut each scenario's own years, so blocks may
+  differ in their number of rows; `n_rows` shows it. `FreshDraws` stays refused on
+  per-year values. `.index(...)` reads every scenario's index on that
+  scenario's hazard years, under the plan's `missing=`: a station index has no
+  future years, so a future scenario beside it raises.
+- **A cross row between per-year sources** with no lineage or run in common, as
+  between `historical` and `ssp585` pools, records `leakage_check`
+  `"different_sources"`: no row could be compared. That doesn't say the sources
+  are independent.
+
+### Another dataset on curves
+
+`CurveScenario(label, dataset, *, pathway=None, horizon=None)` reads another
+local canonical dataset (a `HazardDataset` on a local file, or the file's path)
+with the plan's assets, its selected hazard, its impact and its values. `pathway`
+and `horizon` pick its curves, and are required where the dataset holds several;
+several years in `horizon` make a window of that pathway. A dataset with no curve
+of the plan's hazard raises `ScenarioError`, naming the hazards it holds. A
+dataset of another product needs `mixed_products=True`, the reference included,
+and the setup text then says that the difference includes the products.
+
+### What is designed, priced and evaluated
+
+```text
+.scenarios(scenarios, *, design_on="each", premiums=None)
+```
+
+- **`design_on="each"`**, the default, designs every template under every
+  objective on every scenario's design block, so that how a fixed cover drifts
+  and a design per scenario are slices of one table. `"reference"` designs on the
+  reference's design block only. `.designs()` is in scenario, asset, fold, cover
+  and objective order (scenario, fold, cover and objective under `Joint()`).
+- **`.split(...)` is required**, because the rows are out of sample only. One
+  rule makes each scenario's blocks: `FreshDraws` designs on the plan's draws
+  and evaluates on fresh ones (curves); `Holdout` and `KFold` cut each
+  scenario's draws or years.
+- **The premium.** A design keeps its design premium (`premium_basis`
+  `"design"`). A cover given as is is priced once, with the plan's pricing, on the
+  reference's design block (`"reference"`), or at the premium `premiums=` states
+  for its `cover_label` (`"stated"`); a key that matches no such cover raises
+  `EvaluationError`. `premium_repriced` prices the same payouts on each block, and
+  equals `expected_payout` under `PurePremium`. A design's `Budget(ratio=k)` is a
+  share of each design block's expected loss, so it moves with the scenario, and
+  `Budget(amount=B)` doesn't; the setup text says which.
+- **Cross rows.** A row whose `design_scenario` differs from its `scenario`, or a
+  cover given as is on another scenario than the reference, reads the terms on
+  that block as they stand: a threshold set on one scenario's values is read on
+  another's, and nothing rescales it. Its evaluation's `method` is
+  `"other_scenario"`.
+- **Joint designs.** Under `Joint()` each scenario has one sample of all the
+  assets per block, and a joint design gets one `"total"` row per scenario, as in
+  [the rows of a joint design](#the-rows-of-a-joint-design).
+  `.allocation(...)` is not offered with `.scenarios(...)` yet; on the function
+  route `compare_scenarios(..., allocation=...)` gives the allocated rows.
+
+### What stays fixed, and what doesn't
+
+- **Fixed in every scenario:** each cover's or design's terms, the loss model, the
+  values, the basis-risk model, the pricing and the metric options. Anything else
+  that differs between two scenarios, apart from the hazard's values, raises
+  `ScenarioError` at execution, as [`ScenarioSet`](#several-scenarios-in-one-table)
+  does on built samples: the assets, the units, the hazard read, the trend option,
+  a pool's models, the place each asset is read at, the dependence model and, on
+  curves, the draws.
+- **Shared draws on curves.** Each asset's generators are rebuilt per scenario,
+  from the plan's seed and from `FreshDraws.seed`, so the curve scenarios share one
+  set of design draws and one of evaluation draws: row `d` holds one uniform and
+  one noise factor in every scenario, and the two sets stay apart.
+- **The tail.** β is the same in every scenario, while the loss level of the tail
+  isn't: CVaR at β is taken on each scenario's own block, so the tail's loss
+  level moves with the scenario. On a short block, a β with (1 − β)·n ≤ 1 reads
+  the block's worst row and a return period above n its largest value; the
+  `short_block_b<β>` and `short_block_rp<T>` columns flag those levels.
+
+### Explain, execute, write
+
+`explain()` lists the scenarios without I/O: in `scenarios`, the reference, the
+labels (the reference first), `design_on`, `mixed_products`, `premiums` and each
+scenario's kind and members; in `setup.scenarios`, the form the written metadata
+has, with each scenario's hazard, pathway, horizon and members; and one entry of
+`sources` per scenario source, with the labels that read it. The rows, the
+blocks and where each scenario reads the index are known only at execution.
+
+| Execution point | Returns |
+| --- | --- |
+| `.samples()` | The reference's samples |
+| `.scenario_samples()` | Every scenario's samples, by label and then by asset, the reference first |
+| `.write_parquet(path)` | One file, written atomically; `ParametricResult.scenario_samples` and, with `FreshDraws`, `scenario_fresh_samples`, every curve scenario's fresh draws on one set of uniforms |
+
+The written metadata records the set under `setup.scenarios`, with `design_on`,
+each scenario's blocks per asset and fold and where each asset reads the index.
+`source_records` holds each dataset or per-year source once, with the scenarios
+that read it under `scenarios`, and each hazard source in `sources` names its
+`scenario` and its record's checksum. `setup_text` states every scenario next to
+the numbers.
 
 ## The function route
 
@@ -2327,7 +2613,10 @@ carried, and the table has no rank, no best flag and no ordering by a metric.
 The metadata records the set under `setup.scenarios`, and `to_drift` the reference
 it used under `setup.drift`; `setup_text` states both next to the numbers. A joint
 design's rows are the owner's total, per scenario, as in
-[the rows of a joint design](#the-rows-of-a-joint-design).
+[the rows of a joint design](#the-rows-of-a-joint-design). On the plan,
+[`.scenarios(...)`](#scenarios-on-the-plan) builds every scenario's blocks and
+calls this function, one fold and one asset at a time, or once for all the assets
+under `Joint()`.
 
 ## Design a cover
 
@@ -3374,10 +3663,11 @@ rank and no best flag.
   joint design over them, are not offered. A `StepGrid` spans two components,
   a `CoverPackage` holds covers on one index each, and a payout on one hazard
   scaled by another is not built in (a family of your own can be registered).
-- **Several scenarios at once on the plan.** A per-year plan names one
-  `scenario` for its rows, and a plan on fitted curves samples one hazard, horizon
-  and pathway per asset. `ScenarioSet`, `compare_scenarios` and `to_drift` are
-  functions.
+- **Allocated rows, and a design robust over scenarios, on a plan with
+  scenarios.** `.allocation(...)` beside `.scenarios(...)` raises `ValueError`;
+  `compare_scenarios(..., allocation=...)` gives the allocated rows on the
+  function route. A design is made on one scenario's block at a time, and none
+  minimises the worst case over the scenarios.
 - **Several members of one model in a pool.** A model appears once, whatever
   its member. **An index read elsewhere on a pool**, even from the same run at
   another cell, is refused.

@@ -35,6 +35,7 @@ from crc_sdk.parametric import (
     ImpactNoise,
     Independent,
     IndexDefinition,
+    Individual,
     Joint,
     KFold,
     LinearPayout,
@@ -79,6 +80,7 @@ CELLS = {name: point_to_cell(lon, lat, 7) for name, (lon, lat) in POINTS.items()
 EARLY = (2025, 2030, 2035)
 MIDDLE = (2045, 2050, 2055)
 LATE = (2075, 2080, 2085)
+PATHWAYS = ("ssp245", "ssp585")
 WINDOWS = {
     "2030s": [("ssp585", year) for year in EARLY],
     "2050s": [("ssp585", year) for year in MIDDLE],
@@ -423,6 +425,29 @@ def test_without_labels_each_selected_pair_is_a_scenario(curves: Path) -> None:
     document: Any = plan.explain(format="json")
     assert document["scenarios"]["labels"] == ["ssp585_2030", "ssp585_2050"]
     assert list(plan.scenario_samples()) == ["ssp585_2030", "ssp585_2050"]
+
+
+def test_several_pathways_are_scenarios_too(tmp_path: Path) -> None:
+    stated = _metadata()
+    rows = [
+        _curve(asset, 2050, pathway, curve_location=50.0 + 3.0 * k)
+        for asset in POINTS
+        for k, pathway in enumerate(PATHWAYS)
+    ]
+    path = tmp_path / "pathways.parquet"
+    table = pa.Table.from_pylist(rows, schema=hazard_arrow_schema(stated))
+    write_hazard_dataset(table, path, stated, max_workers=1)
+    plan = _curve_plan(path, horizons=[2050], pathways=list(PATHWAYS))
+    with pytest.raises(ValueError, match="selects 2 pathways; select one"):
+        plan.explain()
+    plan = plan.split(FreshDraws(600, seed=7)).scenarios(
+        ScenarioSet(reference="ssp245_2050")
+    )
+    result = plan.write_parquet(tmp_path / "pathways-out.parquet")
+    assert {(r["scenario"], r["pathway"]) for r in result.table.to_pylist()} == {
+        ("ssp245_2050", "ssp245"),
+        ("ssp585_2050", "ssp585"),
+    }
 
 
 def test_joint_designs_on_curves_give_the_function_routes_rows(
@@ -1117,8 +1142,10 @@ class _SourcePlan:
     def __init__(self, table: Any, recipe: str = "rx1day") -> None:
         self.table = table
         self.recipe = recipe
+        self.reads = 0
 
     def annual_extremes(self) -> Any:
+        self.reads += 1
         return self.table
 
     def explain(self, *, format: str = "text") -> Any:
@@ -1132,7 +1159,10 @@ def test_a_source_plan_names_the_hazard(tmp_path: Path) -> None:
     )
     plan = _annual_plan().split(Holdout(0.7))
     samples = plan.scenarios(ScenarioSet([entry], reference="historical"))
+    samples.explain()
+    assert source.reads == 0  # explain() reads no data, the source plan's included
     built = samples.scenario_samples()["ssp585"]["warehouse-a"]
+    assert source.reads == 1
     assert built.provenance.hazard == {"name": "rx1day", "from": "source_plan"}
     document: Any = samples.explain(format="json")
     entries = document["setup"]["scenarios"]["scenarios"]
@@ -1258,3 +1288,64 @@ def test_compare_on_one_scenario_is_unchanged(curves: Path, tmp_path: Path) -> N
     assert [[row[k] for k in keys] for row in plain] == [
         [row[k] for k in keys] for row in scenario
     ]
+
+
+def test_folds_and_both_scopes_run_through_the_scenarios(
+    curves: Path, tmp_path: Path
+) -> None:
+    stated = ScenarioSet(reference="2030s", labels=WINDOWS)
+    folded = _curve_plan(curves).split(KFold(3)).scenarios(stated)
+    result = folded.write_parquet(tmp_path / "folds.parquet")
+    # 2 assets x 3 folds x 2 scenarios x (2 designs + 1 cover)
+    assert result.row_count == 2 * 3 * 2 * 3
+    assert [d.parameters for d in folded.designs()] == [
+        d.parameters for d in result.designs
+    ]
+    blocks = result.metadata.setup.scenarios
+    assert blocks is not None
+    assert len(blocks["scenarios"]["2050s"]["blocks"]) == 2 * 3
+    both = (
+        _curve_plan(curves)
+        .scopes(Individual(), Joint())
+        .dependence(Independent())
+        .split(FreshDraws(600, seed=7))
+        .scenarios(stated)
+    )
+    rows = both.write_parquet(tmp_path / "both.parquet").table.to_pylist()
+    designed = {(row["scope"], row["level"]) for row in rows if row["design_id"]}
+    assert designed == {("joint", "total"), ("individual", "asset")}
+    assert {row["design_scenario"] for row in rows} == {"2030s", "2050s", None}
+
+
+def test_merge_combines_the_assets_of_one_set(curves: Path) -> None:
+    def table(asset_id: str, seed: int) -> Any:
+        evaluated = {
+            label: _drawn(curves, horizons, label, 300, seed)[asset_id]
+            for label, horizons in (("2030s", EARLY), ("2050s", MIDDLE))
+        }
+        designed = _drawn(curves, EARLY, "2030s", 300, 1)[asset_id]
+        return compare_scenarios(
+            [_linear(asset_id)],
+            ScenarioSet(list(evaluated.values()), reference="2030s"),
+            design_sample=designed,
+            options=OPTIONS,
+        )
+
+    first, second = table("warehouse-a", 2), table("depot-b", 2)
+    merged = EvaluationMetadata.merge(
+        EvaluationMetadata.from_table(first), EvaluationMetadata.from_table(second)
+    )
+    assert merged.setup.scenarios is not None
+    entry = merged.setup.scenarios["scenarios"]["2030s"]
+    assert len(entry["blocks"]) == 2
+    assert entry["n_rows"] == 600
+    assert {place["owner"] for place in entry["index_read"]} == {
+        "asset 'warehouse-a'",
+        "asset 'depot-b'",
+    }
+    # One asset's draws from two generators are two sets, not one.
+    with pytest.raises(EvaluationError, match="two generator records"):
+        EvaluationMetadata.merge(
+            EvaluationMetadata.from_table(first),
+            EvaluationMetadata.from_table(table("warehouse-a", 3)),
+        )

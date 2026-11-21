@@ -19,9 +19,11 @@ ParametricPlan.for_annual_extremes(source, assets, impact=, unit=, provenance=)
   .scopes(Individual() | Joint())       # optional: asset by asset, or on the total
   .dependence(Comonotonic() | ...)      # with Joint() on curves: required
   .allocation("value" | "loss")         # optional: a joint design's allocated rows
+  .scenarios(ScenarioSet(...))          # optional: several scenarios, out of sample
   .explain()                            # the setup, no I/O
   .samples()                            # execution: one sample per asset
   .joint_sample()                       # execution: Joint() only
+  .scenario_samples()                   # execution: every scenario's samples
   .designs()                            # execution: the designed covers
   .write_parquet("comparison.parquet")  # execution: written atomically
 ```
@@ -141,6 +143,20 @@ may hold both scopes: each asset is then also designed on its own view, and the
 joint design's allocated rows, with the values the plan's loss model read, in a
 table and a file of their own (`allocate`), so they never sit beside the rows
 of covers that stand on their own. `docs/parametric.md` describes the rows.
+
+**Scenarios.** `.scenarios(ScenarioSet(...))` reads several scenarios: on fitted
+curves each selected (pathway, horizon), or a window of horizons under
+`labels=`, and a `CurveScenario` for another canonical dataset; on per-year
+values the plan's own source and each `AnnualScenario`. Each scenario's samples
+are built as the plan builds its own, from the same generators, and the refusals
+of `ScenarioSet` run on them. Every template is designed on each scenario's
+design block (`design_on="each"`) or the reference's (`"reference"`), and every
+cover and design is evaluated on every scenario's evaluation block with
+`compare_scenarios`, one fold and asset at a time, or once for all the assets
+under `Joint()`, so the rows are out of sample only and `.split(...)` is
+required. A request that selects several horizons or pathways needs
+`.scenarios(...)`: without it `explain()` and every execution point raise
+`ValueError`.
 
 **Output.** `write_parquet(path)` writes one comparison table, as `compare`
 builds it, through a temporary sibling and `os.replace`. Its metadata under
@@ -3245,11 +3261,24 @@ class ParametricPlan:
         evaluation its `level`, `scope` and `allocation`. `format="json"` returns a
         dict, `"text"` its JSON text.
 
+        With `.scenarios(...)`, the document adds `scenarios` (the reference,
+        the labels, `design_on`, `mixed_products`, `premiums` and each
+        scenario's kind and members), `setup.scenarios` in the form the
+        written metadata has, one sample per scenario and asset, the planned
+        evaluations of every design scenario on every scenario's block, and
+        one entry of `sources` per scenario source, with the labels that read
+        it.
+
         Raises `ValueError` for `Joint()` on fitted curves without
         `.dependence(...)`, for a dependence or an allocation without
         `Joint()`, and for a cover written for one asset under `Joint()`;
-        `SampleError` for a draw count or assets that `EmpiricalCopula`'s
-        reference does not fit.
+        for a request that selects several horizons or pathways without
+        `.scenarios(...)`; with `.scenarios(...)`, without `.split(...)` or
+        with `.allocation(...)`; `SampleError` for a draw count or assets that
+        `EmpiricalCopula`'s reference does not fit; `ScenarioError` for a
+        window whose members don't divide `n_draws` or `FreshDraws(n)`, and
+        for a stated `hazard_name` a source plan contradicts; and
+        `EvaluationError` for `premiums=` that name no cover given as is.
         """
         self._check_scopes()
         self._check_scenario_plan()
@@ -4417,25 +4446,32 @@ class ParametricPlan:
                 for row in rows
             )
         )
+        horizons = entry.horizons
+        stated = (
+            None
+            if entry.pathway is None or horizons is None
+            else tuple((entry.pathway, horizon) for horizon in horizons)
+        )
         if not found:
             every = dataclasses.replace(request, selection=HazardSelection())
             hazards = sorted(
                 {str(row["hazard_name"]) for row in every.asset_curves().to_pylist()}
             )
-            raise ScenarioError(
-                f"scenario {entry.label!r} reads the plan's hazard {names[0]!r}, but "
-                f"its dataset {entry.dataset.provider.source} holds no curve of it "
-                f"for the plan's assets"
-                + (
-                    f" at the stated pathway and horizon; it holds {found}"
-                    if entry.pathway is not None or entry.horizons is not None
-                    else ""
+            if names[0] not in hazards:
+                raise ScenarioError(
+                    f"scenario {entry.label!r} reads the plan's hazard {names[0]!r}, "
+                    f"but its dataset {entry.dataset.provider.source} holds no curve "
+                    f"of it for the plan's assets; it holds the hazards {hazards}"
                 )
-                + f"; the dataset holds the hazards {hazards}"
-            )
-        horizons = entry.horizons
-        if entry.pathway is not None and horizons is not None:
-            return tuple((entry.pathway, horizon) for horizon in horizons)
+            if stated is None:
+                raise ScenarioError(
+                    f"scenario {entry.label!r}: its dataset holds no curve of "
+                    f"{names[0]!r} for the plan's assets at the stated pathway or "
+                    "horizon"
+                )
+        if stated is not None:
+            # A pair the dataset doesn't hold is the pairs check's to name.
+            return stated
         pathways = list(dict.fromkeys(pathway for pathway, _ in found))
         if len(pathways) > 1:
             raise ScenarioError(
@@ -4837,6 +4873,16 @@ class ParametricPlan:
         `"comparison.allocated.parquet"`), written atomically in the same way,
         with its own metadata, which records the rule and the hash of the asset
         values. The comparison's own evaluations then record no allocation.
+
+        With `.scenarios(...)`, the rows are `compare_scenarios`' on each fold's
+        blocks of every scenario, one asset at a time, or once for all the
+        assets under `Joint()`, all out of sample, in one file. The metadata
+        records the set under `setup.scenarios`, with `design_on`; each
+        dataset or per-year source is in `source_records` once, with the
+        labels of the scenarios that read it under `scenarios`, and each hazard
+        source names its `scenario`. The result's `samples` are the
+        reference's, and `scenario_samples` and `scenario_fresh_samples` hold
+        every scenario's.
 
         Returns a `ParametricResult`, with the fresh draws in
         `fresh_samples` when the split is `FreshDraws`, and the allocated rows
