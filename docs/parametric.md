@@ -1330,9 +1330,11 @@ statements that every split or sample shares are written once.
   level and the unit, what an interval leaves out, that two rows' intervals are
   not a test of a difference between them, and the columns whose level reaches
   the block's worst row. When a row has `built_together` true, it also says how
-  those rows were built, whether their coverage is unmeasured, that their
-  intervals are not the sampling error of their numbers, and where the
-  [coverage study](#pooled-folds-and-intervals) is.
+  those rows were built and how they were resampled: for rows re-dealt or
+  re-ranked on each replicate, the method and what the
+  [coverage study](#pooled-folds-and-intervals) measured; for the others,
+  whether their coverage is unmeasured, that their intervals are not the
+  sampling error of their numbers, and where the study is.
 - On a table of [`compare_scenarios`](#several-scenarios-in-one-table), one
   `Scenario` line each (its label, whether it is the reference, the hazard it
   reads and whether the caller stated that name, its product, pathway and
@@ -2414,34 +2416,86 @@ difference between them.
 - **The unit** is a year with every row of that year: one row of a series or a
   curve sample, and every run's row of one calendar year in a pool. Rows of
   several assets or hazards in a year stay together. An `EmpiricalCopula` block
-  is resampled by row, because its reference is part of the stated model.
+  is resampled by row, because its reference is part of the stated model. The
+  rows built together, below, are built again on each replicate instead.
 - **Rows built together.** Resampling rows treats them as independent draws. The
   rows of an `EmpiricalCopula` block, and of a block built with
   `HazardNoise(..., hold="hazard_distribution")`, are not: each asset's or
   hazard's draws, or each row's hazard at the asset, were assigned by their rank
-  over every row of the block. There an interval is not the Monte Carlo error of
-  the draws, and it can be narrower or wider. A synthetic study measured how
-  often 90% intervals held the true value: Gumbel curves, linear covers given as
-  is, 300 rows, 1,000 replications, the true value from 600,000 rows or more.
-  Each share below has a Monte Carlo error of at most 0.025.
+  over every row of the block. So on those rows each replicate builds the rows
+  again, as the block built them:
 
-  | Block | Rows or columns | Share that held the true value |
-  | --- | --- | --- |
-  | Independent rows: one asset, or two under `Independent()` | every row and column | 0.86 to 0.92 |
-  | `EmpiricalCopula` of two assets, 30 reference years, 10 draws each | an asset's own row | 0.86 to 0.92 |
-  | The same | the `"total"` row | 0.55 to 0.97, lowest for `payout_frequency` and `false_negative_rate`, and lower overall when the reference's columns move in opposite directions |
-  | `HazardNoise(0.3, hold="hazard_distribution")` | `expected_uncovered`, `rmse`, `coverage_ratio` | 0.96 to 0.99 |
-  | The same | `false_positive_rate` | 0.78 |
-  | The same | the other columns | 0.88 to 0.95 |
+  | A row that reads | Each replicate |
+  | --- | --- |
+  | Two columns or more of an `EmpiricalCopula` block: the `"total"` row of a set of covers, every row of a joint design, and on a sample of several hazards a row whose index and combined loss read two hazards or more | **Re-deals the draws.** It redraws each column's draws on its own, with replacement, and deals them to the reference years again by the copula's rule: the redrawn draws, sorted by their index, fill the ranks that each reference year's rows held in that column, and a year's rows take its draws in the order they were drawn. On a window of horizons, within each member |
+  | A column built with `HazardNoise(..., hold="hazard_distribution")` | **Re-ranks the hazard at the asset.** It resamples by the unit above, and ranks the hazard at the asset again over the resampled rows, as the held form ranks it over the rows of a call. Each row takes the loss of its new hazard at the asset, which the block's own rows give |
+  | Two columns or more of a block that `Comonotonic()`, `GaussianCopula` or a model of your own moved, and no held column | Resamples by the unit above. The coverage of these intervals is unmeasured |
+  | Anything else, which `built_together` leaves unflagged: an asset's own row, one asset's view, a hazard's view on its own loss, and every row under `Independent()` with the default `hold` | Resamples by the unit above, with the same draws and numbers as before |
 
-  An asset's own row of an `EmpiricalCopula` block reads that asset's draws
-  alone, which are independent, so its intervals are those of independent rows.
-  Resampling whole reference years instead made most intervals of the block too
-  wide, up to about four times the Monte Carlo error. These numbers describe
-  this synthetic setup, nothing more.
+  A row of both kinds, on a held `EmpiricalCopula` block, is re-dealt and
+  re-ranked. A rebuilt replicate holds the rows rebuilt, not reweighted: a row
+  drawn twice can take two places in the reference, or two hazards at the asset.
+  The ranks each reference year held are read from the block's rows. Reference
+  years tied in a column, whose pooled ranks the copula dealt in the order
+  drawn, keep the ranks each one's rows held, and draws tied in their index, as
+  at a curve's atom, are ranked by row, where the copula ranked them by their
+  uniforms.
 
-  The column `built_together` flags the rows whose intervals to read as
-  indicative only. It follows how the block was built, not a measured coverage:
+  Across hazards each replicate makes the combined loss again from the hazards'
+  own losses, by the sample's rule. The rule's result is multiplied by the
+  value, which a sample's record never holds, so two kinds of sample can be
+  rebuilt: one with a single impact, whose combined loss is that hazard's own
+  loss, and one under `CappedSum` or `CompoundDamage` whose loss models give the
+  damage ratio, with no value. `bootstrap_intervals` raises `EvaluationError`
+  before any draw for a row it would have to rebuild and can't: on any other
+  sample of several hazards (loss models that state a value or a value column, a
+  rule of your own, a combined loss a table states); on a view
+  `component(name, loss="combined")`, whose loss reads hazards it doesn't hold;
+  on a selection of a held sample, which holds hazards at the asset from rows
+  it lacks; and on pooled folds of these blocks, which `year_block_kfold`
+  refuses to make. Resampling whole reference years is not offered: on a copula
+  block it made most intervals too wide, up to about four times the Monte Carlo
+  error.
+
+  A synthetic study measured how often 90% intervals held the true value:
+  Gumbel curves, linear covers given as is and priced again on each replicate
+  with `PurePremium()`, 300 rows, 1,000 replications, 1,000 resamples each, and
+  the true value from 600,000 rows or more. Each `EmpiricalCopula` had a
+  reference of 30 years whose normal scores were correlated at +0.8 or -0.8, and
+  10 draws a year; the two hazards drew from the two assets' curves, with their
+  losses as damage ratios and a package of one cover each. The held blocks had
+  one asset, at sigma 0.3 and 1. The columns are those of
+  `MetricOptions(betas=(0.9,), return_periods=(10.0,))`: "the means" are
+  `expected_loss`, `expected_payout`, `expected_uncovered` and `coverage_ratio`,
+  and "the tail columns" `tail_coverage`, `cvar_uncovered_to_loss` and the VaR
+  and CVaR columns at 0.9. A column undefined in more than 100 replications is
+  left out, as `false_positive_rate` is under -0.8. Each share has a Monte Carlo
+  error of at most 0.011.
+
+  | Block | Rows | Resampled | Columns | Share that held the true value |
+  | --- | --- | --- | --- | --- |
+  | Independent rows: one asset, or two under `Independent()` | every row | by year | every column | 0.865 to 0.917 |
+  | `EmpiricalCopula` of two assets | an asset's own row | by row | every column | 0.856 to 0.924 |
+  | The same | the `"total"` row | re-dealt | the means, `payout_frequency`, `false_negative_rate`, `rmse` | 0.885 to 0.912 |
+  | The same | the `"total"` row | re-dealt | the tail columns | 0.938 to 0.991 |
+  | The same | the `"total"` row | re-dealt | `false_positive_rate`, under +0.8 | 0.995 |
+  | `EmpiricalCopula` of two hazards, `CompoundDamage()` | the package row and its covers' rows | re-dealt | the means, `payout_frequency`, `false_negative_rate`, `rmse` | 0.884 to 0.919 |
+  | The same | the same | re-dealt | the tail columns, and `false_positive_rate` under +0.8 | 0.890 to 0.994 |
+  | `EmpiricalCopula` of two hazards, `CappedSum(1.0)` | the package row and its covers' rows | re-dealt | the means, `payout_frequency`, `false_negative_rate`, `rmse` | 0.886 to 0.926 |
+  | The same | the same | re-dealt | the tail columns, and `false_positive_rate` under +0.8 | 0.890 to 1.000; `var_loss` and `cvar_loss` 1.000, as the combined loss's tail is at the cap |
+  | `HazardNoise(sigma, hold="hazard_distribution")`, sigma 0.3 and 1 | the asset's row | re-ranked | every column | 0.863 to 0.928 |
+
+  On the rows re-dealt, `correlation` held the true value in 0.890 to 0.960 of
+  the replications.
+
+  On the same setup, with these rows resampled as independent rows as before,
+  an earlier run of the study found the copula's `"total"` rows at 0.55 to
+  0.97, lowest for `payout_frequency` and `false_negative_rate`, and the held
+  blocks' rows at 0.78 to 0.99. These numbers describe this synthetic setup,
+  nothing more.
+
+  The column `built_together` flags the rows built together. It follows how the
+  block was built, not the method or a measured coverage:
 
   - On a block whose columns a dependence model moved, a row that reads two of
     its columns or more: the `"total"` row of a set of covers, and every row of
@@ -2455,14 +2509,14 @@ difference between them.
   - Every row that reads an asset or a hazard built with `HazardNoise(...,
     hold="hazard_distribution")`. On a join, a part with the default `hold`
     keeps its own row unflagged.
-  - Across hazards the study measured nothing, and the flag follows the same
-    construction. Every row of a sample of several hazards reads the combined
-    loss, so a row is flagged when its index and that loss read two hazards or
-    more under a model that moved them. With two impacts or more that is every
-    row. With one impact, a cover on that hazard alone reads one column and
-    isn't flagged. A view `component(name)` reads one hazard and isn't flagged,
-    and `component(name, loss="combined")` is flagged when its loss reads
-    another hazard.
+  - Across hazards the flag follows the same construction. Every row of a
+    sample of several hazards reads the combined loss, so a row is flagged when
+    its index and that loss read two hazards or more under a model that moved
+    them. With two impacts or more that is every row. With one impact, a cover
+    on that hazard alone reads one column and isn't flagged. A view
+    `component(name)` reads one hazard and isn't flagged, and
+    `component(name, loss="combined")` is flagged when its loss reads another
+    hazard.
   - Of the models that move draws, the study measured `EmpiricalCopula` alone.
     Under `Comonotonic()` and `GaussianCopula` the rows of several columns are
     exchangeable, not independent ([cuts of one
@@ -2472,12 +2526,18 @@ difference between them.
     measured, and isn't flagged.
 
   When a row is flagged, the setup text's `Intervals` line says how its rows
-  were built and that their intervals are not the sampling error of their
-  numbers. The flag changes no number.
+  were built and how they were resampled: for rows re-dealt or re-ranked, the
+  method and what the study measured; for the others, that their intervals are
+  not the sampling error of their numbers.
 - **Replicates.** One call `rng.integers(0, Y, size=(n_bootstrap, Y))` draws the
-  block's Y years. A replicate reweights the rows by how often their year was
-  drawn, which gives the metrics of the concatenated years. One set of replicates
-  serves every entry and every metric of a call. Nothing is solved again.
+  block's Y years, and it stays the first draw from `rng`. A replicate of the
+  unit above reweights the rows by how often their year was drawn, which gives
+  the metrics of the concatenated years; a re-ranked replicate holds the drawn
+  years' rows, in the order drawn. A call that re-deals a row then draws, for
+  each column of the block in order and each member of a window in order, one
+  call `rng.integers(0, n_m, size=(n_bootstrap, n_m))` for the member's n_m rows,
+  and every entry's re-dealt rows read them. One set of replicates serves every
+  entry and every metric of a call, within each method. Nothing is solved again.
 - **The premium.** A design's premium is a fixed price, so on one block its
   interval is the value itself. On pooled folds, the mean of the years' premiums
   moves with the years drawn. A cover priced on the block is priced again on each
@@ -2502,7 +2562,10 @@ The bounds of a `short_block` row are computed like any other. They cannot reach
 beyond the block's largest rows, so they understate how far the number could
 move, and the setup text names those columns. The table holds the metadata under
 the same key as a comparison's, with `setup.intervals`, and `write_comparison`
-writes it. Neither function ranks anything.
+writes it. Its `unit` is `"as_built"` when the call built a row again on each
+replicate, and `"row"` or `"year"` as above otherwise, so a call without such a
+row writes the document it wrote before; `merge` takes tables of one unit.
+Neither function ranks anything.
 
 ### Several scenarios in one table
 
@@ -3885,7 +3948,11 @@ rank and no best flag.
 - **Pooled folds and intervals on the plan.** A plan's `KFold` writes rows per
   fold; `compare_pooled` and `bootstrap_intervals` are functions. An interval on
   the difference between two rows is not offered.
-- **Intervals that follow how rows were built together.** `bootstrap_intervals`
-  resamples the rows of a block whose columns a dependence model moved, or of a
-  held `HazardNoise` block, as independent rows, and flags the rows this
-  affects with `built_together`.
+- **Intervals on every row built together.** `bootstrap_intervals` builds the
+  rows of an `EmpiricalCopula` block and of a held `HazardNoise` block again on
+  each replicate, but it refuses those it can't build again: on a sample of
+  several hazards whose loss models state a value or whose rule is your own, on
+  a view whose combined loss reads hazards it doesn't hold, on a selection of a
+  held sample, and on pooled folds of these blocks. It resamples the rows of a
+  block that `Comonotonic()`, `GaussianCopula` or a model of your own moved as
+  independent rows, and flags them with `built_together`.
