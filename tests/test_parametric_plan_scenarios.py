@@ -26,6 +26,7 @@ from crc_sdk.parametric import (
     ComonotoneIndexWarning,
     Cover,
     CurveScenario,
+    EmpiricalCopula,
     EvaluationError,
     EvaluationMetadata,
     ExpectedUncovered,
@@ -1349,3 +1350,39 @@ def test_merge_combines_the_assets_of_one_set(curves: Path) -> None:
             EvaluationMetadata.from_table(first),
             EvaluationMetadata.from_table(table("warehouse-a", 3)),
         )
+
+
+def test_a_window_under_an_empirical_copula_divides_by_the_reference(
+    curves: Path,
+) -> None:
+    years = np.arange(2000, 2006)
+    reference = OutcomeSample.join(
+        OutcomeSample.from_table(
+            pa.table(
+                {
+                    "asset": [asset_id] * 6,
+                    "year": years,
+                    "index": np.linspace(40.0, 90.0, 6)[:: 1 if k else -1],
+                    "loss": np.zeros(6),
+                }
+            ),
+            period="year",
+            asset_id="asset",
+            index="index",
+            loss="loss",
+            index_unit="mm/day",
+            loss_unit="EUR",
+        )
+        for k, asset_id in enumerate(POINTS)
+    )
+    plan = (
+        _curve_plan(curves)
+        .monte_carlo(24, seed=42)
+        .scopes(Joint())
+        .dependence(EmpiricalCopula(reference))
+        .split(FreshDraws(36, seed=7))
+        .scenarios(ScenarioSet(reference="2030s", labels=WINDOWS))
+    )
+    with pytest.raises(ScenarioError, match="its members times the reference's 6"):
+        plan.explain()
+    plan.monte_carlo(36, seed=42).explain()

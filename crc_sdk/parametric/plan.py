@@ -509,7 +509,10 @@ class StationColumn:
     `annual_extremes()` (`station`, `year`, ..., `value`). `name` is the
     asset column holding each asset's station id, and `table_column` the
     table column it is matched against (`"station"`; NOAA water levels use
-    `"station_id"`).
+    `"station_id"`). Each series records `table_column` as its station column
+    (`AnnualSeries.from_table(station=)`), whatever it is called, so a
+    scenario set's place checks and a cover bound with `AtStation` read the
+    station from it.
     """
 
     name: str
