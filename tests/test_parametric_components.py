@@ -581,8 +581,12 @@ def test_a_composite_schema_refuses_a_single_index() -> None:
 def test_the_index_of_a_composite_cover_is_its_definition() -> None:
     cover = _resolved()
     assert cover.index_definition == TWO
-    with pytest.raises(CoverDefinitionError, match="index_definition"):
+    with pytest.raises(CoverDefinitionError, match="index_definition") as raised:
         _ = cover.index
+    # The plan takes covers on several components now, so the error says only
+    # what the cover pays on.
+    assert "for now" not in str(raised.value)
+    assert "CompositeIndex" in str(raised.value)
 
 
 def test_a_plan_of_one_hazard_refuses_a_composite_cover() -> None:

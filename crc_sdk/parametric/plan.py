@@ -158,9 +158,12 @@ design block (`design_on="each"`) or the reference's (`"reference"`), and every
 cover and design is evaluated on every scenario's evaluation block with
 `compare_scenarios`, one fold and asset at a time, or once for all the assets
 under `Joint()`, so the rows are out of sample only and `.split(...)` is
-required. A request that selects several horizons or pathways needs
-`.scenarios(...)`: without it `explain()` and every execution point raise
-`ValueError`.
+required. Under `.allocation(rule)` a joint design's allocated rows on every
+scenario's block go to their own file (`allocate_scenarios`), and
+`.payout_breakdown()` gives each scenario's breakdown
+(`payout_breakdown_scenarios`). A request that selects several horizons or
+pathways needs `.scenarios(...)`: without it `explain()` and every execution
+point raise `ValueError`.
 
 **Several hazards.** `.hazard(name, source, ...)` adds a hazard read at each
 asset, an index component of one sample per asset, as `sample_annual_hazards`
@@ -233,14 +236,18 @@ from crc_sdk.parametric.combine import CombineRule, _rule_record
 from crc_sdk.parametric.constraints import Budget, Limit
 from crc_sdk.parametric.cover import Cover
 from crc_sdk.parametric.dependence import (
+    Comonotonic,
     Dependence,
     DependenceModel,
     EmpiricalCopula,
+    GaussianCopula,
+    Independent,
     _model_record,
 )
 from crc_sdk.parametric.design import DesignOptions, DesignResult, design
 from crc_sdk.parametric.errors import (
     EvaluationError,
+    LeakageError,
     ProbabilitySemanticsError,
     SampleError,
     ScenarioError,
@@ -297,7 +304,9 @@ from crc_sdk.parametric.scenarios import (
     _check_pairs_held,
     _check_scenarios,
     _same_pair,
+    allocate_scenarios,
     compare_scenarios,
+    payout_breakdown_scenarios,
 )
 from crc_sdk.parametric.sources import (
     AnnualSemantics,
@@ -990,6 +999,32 @@ def _copula_split_error(rule: Holdout | KFold) -> SampleError:
         "reference years; test it out of sample with .split(FreshDraws(n_draws, "
         "seed=...)), whose n_draws must be a multiple of the reference's years"
     )
+
+
+def _moved_split_error(
+    rule: Holdout | KFold, model: Dependence | DependenceModel
+) -> LeakageError:
+    """The refusal of a split by rows of draws a model put side by side."""
+    named = type(model).__name__
+    how = (
+        f"{named} put each hazard's draws in the rows by their ranks over every "
+        "row, so each block's values of one hazard depend on the other block's "
+        "values of the others"
+        if isinstance(model, (Comonotonic, GaussianCopula))
+        else f"{named} reordered the hazards' draws, and nothing says how its "
+        "reorder treats the rows"
+    )
+    return LeakageError(
+        f"{type(rule).__name__} cuts one sample of curve draws into blocks, and "
+        f"{how}: every row is on the combined loss, so its out-of-sample rows would "
+        "raise LeakageError once the covers were designed. Test the designs on "
+        "fresh draws under the same model: .split(FreshDraws(n_draws, seed=...))"
+    )
+
+
+def _contract(label: str, packaged: bool) -> str:
+    """A cover, as an error names it: a package's contract, or a cover."""
+    return f"package contract {label!r}" if packaged else f"cover {label!r}"
 
 
 def _json_safe(value: Any) -> Any:
@@ -2520,9 +2555,10 @@ class ParametricPlan:
         to the assets' values and `"loss"` in proportion to their losses in
         that draw. The rows have `level` `"asset_by_value"` or
         `"asset_by_loss"` and no premium or net-loss values, and they go in a
-        table of their own, as `allocate` builds it: `write_parquet` writes them
-        to a second file and returns them in `ParametricResult.allocated`, so
-        they never sit beside an `"asset"` or `"total"` row. The values are
+        table of their own, as `allocate` builds it (`allocate_scenarios` with
+        `.scenarios(...)`): `write_parquet` writes them to a second file and
+        returns them in `ParametricResult.allocated`, so they never sit beside
+        an `"asset"` or `"total"` row. The values are
         those the plan's loss model reads (the asset column `value_column`, or
         1 for a damage ratio); only their hash is written. It applies to joint
         designs only, so `explain()` and every execution point raise without
@@ -3313,13 +3349,6 @@ class ParametricPlan:
                 "only, each scenario's design block apart from its evaluation block "
                 "(FreshDraws on fitted curves, Holdout or KFold on either route)"
             )
-        if self.allocation_rule is not None:
-            raise ValueError(
-                ".allocation(...) is not offered with .scenarios(...) yet: a plan "
-                "writes allocated rows in a file of their own, and compare_scenarios "
-                "puts them beside the totals; compare_scenarios(..., allocation=...) "
-                "gives them on the function route"
-            )
         planned = self._planned_scenarios()
         draws = self.draws
         rule = self.split_rule
@@ -3489,6 +3518,10 @@ class ParametricPlan:
             )
         names = [each.name for each in components]
         rule = self.split_rule
+        if isinstance(rule, (Holdout, KFold)) and not isinstance(
+            model, (Independent, EmpiricalCopula)
+        ):
+            raise _moved_split_error(rule, model)
         for count in (
             None if self.draws is None else self.draws.n_draws,
             rule.n_draws if isinstance(rule, FreshDraws) else None,
@@ -3617,12 +3650,12 @@ class ParametricPlan:
                     f"cover {label!r} pays on an index in {index.unit!r}, but "
                     f"component {component_name!r} is in {component.unit!r}"
                 )
-            if not packaged and component.tail is not None:
-                if index.tail != component.tail:
-                    raise SampleError(
-                        f"cover {label!r} has the tail {index.tail!r} on component "
-                        f"{component_name!r}, whose tail is {component.tail!r}"
-                    )
+            if component.tail is not None and index.tail != component.tail:
+                raise SampleError(
+                    f"{_contract(label, packaged)} has the tail {index.tail!r} on "
+                    f"component {component_name!r}, whose tail is "
+                    f"{component.tail!r}"
+                )
             if label in templates and component.loss_model is None:
                 raise SampleError(
                     f"template {label!r} on one index is designed on the own loss of "
@@ -4247,6 +4280,8 @@ class ParametricPlan:
                 }
             elif variant.hazard_name is not None:
                 hazard = {"name": variant.hazard_name, "from": "stated"}
+        if variant is not None:
+            horizon = variant._stated_horizon()
         return {
             "blocks": [],
             "hazard": hazard,
@@ -4258,6 +4293,19 @@ class ParametricPlan:
             "product": product,
             "source_kind": "monte_carlo" if self._on_curves else "annual",
         }
+
+    def _stated_horizon(self) -> int | None:
+        """A per-year scenario's horizon, where `years=` states it; else `None`.
+
+        A series' horizon is the centre of its whole window, `(first + last) //
+        2`. A stated `years=` is that window when every year must hold a value;
+        under `missing="drop_year"` a year may drop out at either end, so the
+        window is known only at execution.
+        """
+        years = self.years
+        if years is None or self.missing == "drop_year":
+            return None
+        return (years[0] + years[-1]) // 2
 
     def _component_reads(
         self,
@@ -5574,8 +5622,13 @@ class ParametricPlan:
     def _check_component_units(
         self, name: str, metadata: HazardDatasetMetadata
     ) -> None:
-        """Raise `SampleError` for a cover on component `name` in another unit."""
-        for label, component, index, _ in self._cover_reads():
+        """Raise `SampleError` for a cover on component `name` in another unit.
+
+        Or with another tail: a component's tail is its dataset's
+        `return_period_tail`, so a package's contracts are checked here too,
+        before anything is designed.
+        """
+        for label, component, index, packaged in self._cover_reads():
             if component != name:
                 continue
             if index.unit != metadata.value_unit:
@@ -5583,6 +5636,12 @@ class ParametricPlan:
                     f"cover {label!r} pays on an index in {index.unit!r}, but the "
                     f"dataset of component {name!r} holds values in "
                     f"{metadata.value_unit!r}"
+                )
+            if index.tail != metadata.return_period_tail:
+                raise SampleError(
+                    f"{_contract(label, packaged)} has the tail {index.tail!r} on "
+                    f"component {name!r}, whose dataset's return_period_tail is "
+                    f"{metadata.return_period_tail!r}"
                 )
 
     def _cover_reads(self) -> list[tuple[str, str, IndexDefinition, bool]]:
@@ -6058,7 +6117,7 @@ class ParametricPlan:
     def _run(self, *, evaluate: bool, breakdown: bool = False) -> _Run:
         """Build, design and evaluate; with `breakdown`, the payouts' parts instead.
 
-        `breakdown` is for a plan of one scope, `Individual()`, without scenarios.
+        `breakdown` is for a plan of one scope, `Individual()`.
         """
         if not self.cover_list:
             raise ValueError("the plan has no covers; set them with .covers(...)")
@@ -6073,7 +6132,7 @@ class ParametricPlan:
                 ".objective(...), or resolve them with Cover.with_values"
             )
         if self.scenario_set is not None:
-            return self._scenario_run(evaluate=evaluate)
+            return self._scenario_run(evaluate=evaluate, breakdown=breakdown)
         built = self._build_samples(fresh=evaluate, folds=True)
         portfolio, samples = built.portfolio, built.samples
         asset_ids = list(samples)
@@ -6431,33 +6490,55 @@ class ParametricPlan:
             )
         return built
 
+    def _scenario_blocks(self, blocks: Mapping[str, _Block]) -> ScenarioSet:
+        """One fold's evaluation blocks of every scenario, as a `ScenarioSet`."""
+        stated = self.scenario_set
+        assert stated is not None
+        evaluated: list[OutcomeSample] = []
+        for block in blocks.values():
+            assert block[2] is not None
+            evaluated.append(block[2])
+        return ScenarioSet(
+            evaluated, reference=stated.reference, mixed_products=stated.mixed_products
+        )
+
     def _scenario_table(
         self,
         entries: Sequence[Any],
         blocks: Mapping[str, _Block],
         given: Sequence[Cover],
         used: set[str],
+        *,
+        breakdown: bool = False,
+        scenarios: ScenarioSet | None = None,
     ) -> Any:
-        """One fold's rows, for one asset or for all of them: `compare_scenarios`."""
+        """One fold's rows, for one asset or for all of them: `compare_scenarios`.
+
+        With `breakdown`, the parts of each entry's payout instead, as
+        `payout_breakdown_scenarios` gives them, which hold no premium.
+        `scenarios` is the fold's evaluation blocks, if already built.
+        """
         stated = self.scenario_set
         assert stated is not None
         reference = blocks[stated.reference]
-        evaluated: list[OutcomeSample] = []
-        for block in blocks.values():
-            assert block[2] is not None
-            evaluated.append(block[2])
         labels = {_cover_label(cover) for cover in given}
         premiums = {
             key: value for key, value in self.scenario_premiums or () if key in labels
         }
         used.update(premiums)
+        if scenarios is None:
+            scenarios = self._scenario_blocks(blocks)
+        if breakdown:
+            return payout_breakdown_scenarios(
+                entries,
+                scenarios,
+                fold=reference[0],
+                options=self.metric_options,
+                design_sample=reference[1] if given else None,
+            )
         return compare_scenarios(
             entries,
-            ScenarioSet(
-                evaluated,
-                reference=stated.reference,
-                mixed_products=stated.mixed_products,
-            ),
+            scenarios,
             fold=reference[0],
             pricing=self._pricing(),
             premiums=premiums or None,
@@ -6465,8 +6546,41 @@ class ParametricPlan:
             design_sample=reference[1] if given else None,
         )
 
-    def _scenario_run(self, *, evaluate: bool) -> _Run:
-        """`_run` for a plan with scenarios: designs per scenario, one set per fold."""
+    def _allocated_scenarios(
+        self,
+        entries: Sequence[Any],
+        scenarios: ScenarioSet,
+        fold: int,
+        values: Mapping[str, float] | None,
+    ) -> list[Any]:
+        """One fold's allocated rows of the joint designs, in a table of their own."""
+        rule = self.allocation_rule
+        if rule is None or values is None:
+            return []
+        joint = [entry for entry in entries if isinstance(entry, JointDesignResult)]
+        if not joint:
+            raise EvaluationError(
+                ".allocation(...) shares out a joint design's total payout, "
+                "but no entry is a joint design: the plan's covers are all "
+                "resolved, and Joint() evaluates each as a set of contracts"
+            )
+        return [
+            allocate_scenarios(
+                joint,
+                scenarios,
+                allocation=rule,
+                values=values,
+                fold=fold,
+                options=self.metric_options,
+            )
+        ]
+
+    def _scenario_run(self, *, evaluate: bool, breakdown: bool = False) -> _Run:
+        """`_run` for a plan with scenarios: designs per scenario, one set per fold.
+
+        `breakdown` is for a plan of one scope, `Individual()`: the parts of each
+        entry's payout instead of the comparison.
+        """
         built = self._built_scenarios(fresh=evaluate, folds=True)
         stated = self.scenario_set
         assert stated is not None
@@ -6481,8 +6595,14 @@ class ParametricPlan:
         }
         designs: list[Any] = []
         tables: list[Any] = []
+        allocated: list[Any] = []
         used: set[str] = set()
         if self._holds_joint:
+            values = (
+                None
+                if self.allocation_rule is None
+                else self._asset_values(portfolio, asset_ids)
+            )
             blocks = {label: self._joint_blocks(built[label]) for label in labels}
             made: dict[tuple[str, int], list[list[Any]]] = {}
             for label in designed_on:
@@ -6505,7 +6625,15 @@ class ParametricPlan:
                     for label in designed_on:
                         entries += made[(label, fold)][position]
                 fold_blocks = {label: blocks[label][fold] for label in labels}
-                tables.append(self._scenario_table(entries, fold_blocks, given, used))
+                evaluated = self._scenario_blocks(fold_blocks)
+                tables.append(
+                    self._scenario_table(
+                        entries, fold_blocks, given, used, scenarios=evaluated
+                    )
+                )
+                allocated += self._allocated_scenarios(
+                    entries, evaluated, fold_blocks[stated.reference][0], values
+                )
         else:
             per_asset = {
                 (label, asset_id): self._asset_blocks(built[label], asset_id)
@@ -6540,7 +6668,9 @@ class ParametricPlan:
                         label: per_asset[(label, asset_id)][fold] for label in labels
                     }
                     tables.append(
-                        self._scenario_table(entries, fold_blocks, given, used)
+                        self._scenario_table(
+                            entries, fold_blocks, given, used, breakdown=breakdown
+                        )
                     )
         unused = sorted(
             key for key, _ in self.scenario_premiums or () if key not in used
@@ -6556,7 +6686,7 @@ class ParametricPlan:
             else MappingProxyType(reference.fresh),
             designs=tuple(designs),
             tables=tuple(tables),
-            allocated=(),
+            allocated=tuple(allocated),
             source_key=reference.record_key,
             source=reference.record,
             id_column=portfolio.id_column,
@@ -6691,22 +6821,20 @@ class ParametricPlan:
         table's metadata is that of the comparison's evaluations, with the
         plan's source records; nothing is written.
 
+        With `.scenarios(...)`, the rows are `payout_breakdown_scenarios`' on each
+        fold's evaluation blocks of every scenario, one asset at a time, as
+        `write_parquet`'s are `compare_scenarios`', all out of sample: each
+        scenario's breakdown, with `scenario` and `design_scenario`. The metadata
+        records the set under `setup.scenarios`, with `design_on`.
+
         Raises `ValueError` for a plan that holds `Joint()`, whose designs are on
-        the owner's total, and for one with `.scenarios(...)`, which this point
-        doesn't offer yet: take `payout_breakdown` on each block on the function
-        route. Otherwise raises as `write_parquet` does.
+        the owner's total. Otherwise raises as `write_parquet` does.
         """
         if self._holds_joint:
             raise ValueError(
                 "payout_breakdown() breaks down one asset's covers, designs and "
                 "packages, and Joint() designs on the owner's total; take "
                 "payout_breakdown on each asset's own design on the function route"
-            )
-        if self.scenario_set is not None:
-            raise ValueError(
-                "payout_breakdown() is not offered with .scenarios(...) yet; take "
-                "payout_breakdown(entries, block, ...) on each scenario's block on "
-                "the function route"
             )
         run = self._run(evaluate=True, breakdown=True)
         table, _ = self._written(run, run.tables)
@@ -6760,7 +6888,9 @@ class ParametricPlan:
         labels of the scenarios that read it under `scenarios`, and each hazard
         source names its `scenario`. The result's `samples` are the
         reference's, and `scenario_samples` and `scenario_fresh_samples` hold
-        every scenario's.
+        every scenario's. Under `.allocation(rule)` the second file holds each
+        joint design's allocated rows on every scenario's block, one fold at a
+        time, as `allocate_scenarios` gives them, with the same records.
 
         With `.hazard(...)`, every row is on the combined loss of its block: a
         cover on a `CompositeIndex` designed on the combined loss, a cover on one
