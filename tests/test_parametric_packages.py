@@ -321,9 +321,8 @@ def test_a_design_sits_under_the_key_of_the_component_it_was_designed_on() -> No
     table = compare([package], test, split="out_of_sample")
     for name, result in (("rain", rain), ("wet", wet)):
         alone = compare([result], test.component(name), split="out_of_sample")
-        assert _row(table, design_id=result.design_id)["expected_payout"] == (
-            _column(alone, "expected_payout")[0]
-        )
+        row = _row(table, design_id=result.design_id)
+        assert row["expected_payout"] == _column(alone, "expected_payout")[0]
 
 
 def test_a_design_on_no_components_view_takes_its_key_as_before() -> None:

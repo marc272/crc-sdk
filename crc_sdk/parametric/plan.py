@@ -132,7 +132,10 @@ per objective with `design_joint`, as one objective and one budget on the
 owner's total, on one sample of all the assets:
 
 - on fitted curves, `sample_curves` under the model that `.dependence(...)`
-  must state, with the plan's generators, one per asset;
+  must state, with the plan's generators, one per asset. A joint design's rows
+  are on the owner's total, which reads every asset, so a holdout or k-fold
+  takes `Independent()` only: under any other model `explain()` and every
+  execution point raise `LeakageError`, naming `FreshDraws`;
 - on per-year values, `OutcomeSample.join` of the assets' samples, whose
   dependence is the data's own, so `.dependence(...)` raises there. With
   `LinearTrend` and a holdout or k-fold the assets' samples are joined per fold,
@@ -275,7 +278,11 @@ from crc_sdk.parametric.index import (
 )
 from crc_sdk.parametric.joint import Individual, Joint, JointDesignResult, design_joint
 from crc_sdk.parametric.loss import LossModel
-from crc_sdk.parametric.metadata import EVALUATION_METADATA_KEY, EvaluationMetadata
+from crc_sdk.parametric.metadata import (
+    _ACROSS_YEARS,
+    EVALUATION_METADATA_KEY,
+    EvaluationMetadata,
+)
 from crc_sdk.parametric.metrics import MetricOptions
 from crc_sdk.parametric.objectives import (
     MSE,
@@ -292,6 +299,7 @@ from crc_sdk.parametric.sample import (
     _identifier,
     _named_in_source,
     _sample_years,
+    _source_columns,
     _string_values,
     _thaw,
     holdout,
@@ -1002,24 +1010,78 @@ def _copula_split_error(rule: Holdout | KFold) -> SampleError:
 
 
 def _moved_split_error(
-    rule: Holdout | KFold, model: Dependence | DependenceModel
+    rule: Holdout | KFold,
+    model: Dependence | DependenceModel,
+    *,
+    columns: Literal["hazards", "assets"] = "hazards",
 ) -> LeakageError:
-    """The refusal of a split by rows of draws a model put side by side."""
+    """The refusal of a split by rows of draws a model put side by side.
+
+    `columns` is what the model put side by side: the hazards of `.hazard(...)`,
+    whose rows are on the combined loss, or the assets of `Joint()`, whose rows
+    are on the owner's total.
+    """
     named = type(model).__name__
+    one = columns[:-1]
     how = (
-        f"{named} put each hazard's draws in the rows by their ranks over every "
-        "row, so each block's values of one hazard depend on the other block's "
+        f"{named} put each {one}'s draws in the rows by their ranks over every "
+        f"row, so each block's values of one {one} depend on the other block's "
         "values of the others"
         if isinstance(model, (Comonotonic, GaussianCopula))
-        else f"{named} reordered the hazards' draws, and nothing says how its "
+        else f"{named} reordered the {columns}' draws, and nothing says how its "
         "reorder treats the rows"
+    )
+    rows = (
+        "every row is on the combined loss"
+        if columns == "hazards"
+        else "a joint design's rows are on the owner's total, which reads every asset"
     )
     return LeakageError(
         f"{type(rule).__name__} cuts one sample of curve draws into blocks, and "
-        f"{how}: every row is on the combined loss, so its out-of-sample rows would "
-        "raise LeakageError once the covers were designed. Test the designs on "
-        "fresh draws under the same model: .split(FreshDraws(n_draws, seed=...))"
+        f"{how}: {rows}, so its out-of-sample rows would raise LeakageError once "
+        "the covers were designed. Test the designs on fresh draws under the same "
+        "model: .split(FreshDraws(n_draws, seed=...))"
     )
+
+
+def _spanning(asset_id: str, sample: OutcomeSample) -> str:
+    """The asset and the years its series spans, as the merge's refusal names them."""
+    years = sample.provenance.details.get("years")
+    span = (
+        f", whose series spans {years[0]} to {years[1]}"
+        if isinstance(years, (list, tuple)) and len(years) == 2
+        else ""
+    )
+    return f" (asset {asset_id!r}{span})"
+
+
+def _check_scenario_horizons(built: Mapping[str, _Samples]) -> None:
+    """Raise `EvaluationError` if two assets read a per-year scenario at two horizons.
+
+    A per-year scenario's horizon is the centre of each asset's series' whole
+    window, `(first + last) // 2`, and `write_parquet` merges the tables of
+    every asset, which must state one set of scenarios: assets whose series
+    span different years, as `missing="drop_year"` can leave them, would be
+    refused there (`EvaluationMetadata.merge`), after the designs. This raises
+    the same error, word for word, before anything is designed: each asset is
+    compared with the first, in asset order, and the scenarios in the set's
+    order, as the merge compares the tables.
+    """
+    labels = list(built)
+    first, *others = list(built[labels[0]].samples)
+    for asset_id in others:
+        for label in labels:
+            samples = built[label].samples
+            ours = _source_columns(samples[first], strict=False).horizon
+            theirs = _source_columns(samples[asset_id], strict=False).horizon
+            if ours != theirs:
+                raise EvaluationError(
+                    "the metadata differ in their scenarios: only the blocks of one "
+                    "set of scenarios may differ between tables, but scenario "
+                    f"{label!r} has the horizon {ours!r} in one table"
+                    f"{_spanning(first, samples[first])} and {theirs!r} in another"
+                    f"{_spanning(asset_id, samples[asset_id])}{_ACROSS_YEARS}"
+                )
 
 
 def _contract(label: str, packaged: bool) -> str:
@@ -2433,6 +2495,10 @@ class ParametricPlan:
         or fresh draws on per-year values, `ValueError` for fresh draws with
         the plan's seed, and `SampleError` for `Holdout` or `KFold` with
         `.dependence(EmpiricalCopula(...))`, which only fresh draws can test.
+        On fitted curves under `Joint()` or `.hazard(...)`, whose rows read
+        every column the dependence model placed, `Holdout` and `KFold` take
+        `Independent()` only: under any other model `explain()` and every
+        execution point raise `LeakageError`, naming `FreshDraws`.
         """
         if not isinstance(rule, (Holdout, KFold, FreshDraws)):
             raise TypeError(
@@ -2476,10 +2542,11 @@ class ParametricPlan:
         the `scope` column keeps the rows of each scope apart.
 
         `Joint()` needs at least two assets; on fitted curves it also needs
-        `.dependence(...)`, and each cover must be written for no asset, as it
-        applies to every asset. Those are checked by `explain()` and at every
-        execution point, since builders may come in any order. Replaces any
-        scopes stated before.
+        `.dependence(...)`, and with `Holdout` or `KFold` that model must be
+        `Independent()` (`LeakageError` otherwise, naming `FreshDraws`); and
+        each cover must be written for no asset, as it applies to every asset.
+        Those are checked by `explain()` and at every execution point, since
+        builders may come in any order. Replaces any scopes stated before.
 
         Raises `TypeError` for another type, and `ValueError` for no scope, a
         scope given twice, or `Joint()` on fewer than two assets (when the
@@ -2624,7 +2691,13 @@ class ParametricPlan:
           `FreshDraws` on curves, `Holdout` or `KFold` on either route.
 
         The refusals of a `ScenarioSet` run on the samples at execution, through
-        the function `ScenarioSet` itself runs. `explain()` lists the scenarios,
+        the function `ScenarioSet` itself runs. On per-year values every asset
+        must read a scenario at one horizon, the centre of its series' whole
+        window, so assets whose series span different years, as
+        `missing="drop_year"` can leave them, raise `EvaluationError` at every
+        execution point, once the samples are built and before anything is
+        designed: state `years=` that every asset's series holds, or run those
+        assets apart. `explain()` lists the scenarios,
         their sources and members, the reference and `design_on`, without I/O.
         Replaces any scenarios stated before.
 
@@ -3747,6 +3820,16 @@ class ParametricPlan:
                 "move together: state .dependence(Independent()), "
                 ".dependence(Comonotonic()) or .dependence(EmpiricalCopula(reference))"
             )
+        rule = self.split_rule
+        # The joint rows read every asset, so a block of rows that a model placed
+        # by the ranks over both blocks is not out of sample. EmpiricalCopula's
+        # refusal is the builders' (`_copula_split_error`).
+        if (
+            model is not None
+            and isinstance(rule, (Holdout, KFold))
+            and not isinstance(model, (Independent, EmpiricalCopula))
+        ):
+            raise _moved_split_error(rule, model, columns="assets")
         for cover in self.cover_list:
             if cover.asset_id is not None:
                 raise ValueError(
@@ -4576,6 +4659,9 @@ class ParametricPlan:
         Raises `ValueError` for `Joint()` on fitted curves without
         `.dependence(...)`, for a dependence or an allocation without
         `Joint()`, and for a cover written for one asset under `Joint()`;
+        `LeakageError` for `Joint()` on fitted curves with `Holdout` or `KFold`
+        under a dependence model other than `Independent()`, naming
+        `FreshDraws`;
         for a request that selects several horizons or pathways without
         `.scenarios(...)`; with `.scenarios(...)`, without `.split(...)` or
         with `.allocation(...)`; `SampleError` for a draw count or assets that
@@ -6456,7 +6542,9 @@ class ParametricPlan:
 
         The refusals of a `ScenarioSet` run on each asset's samples, or on the
         samples of all the assets under `Joint()`, through the function the set
-        runs at construction.
+        runs at construction. On per-year values one asset at a time, the assets
+        must read each scenario at one horizon, which the merge of their tables
+        requires (`_check_scenario_horizons`), before anything is designed.
         """
         self._check_hazard_plan()
         self._check_scopes()
@@ -6488,6 +6576,8 @@ class ParametricPlan:
             _check_scenarios(
                 group, reference=stated.reference, mixed_products=stated.mixed_products
             )
+        if not self._on_curves and not self._holds_joint:
+            _check_scenario_horizons(built)
         return built
 
     def _scenario_blocks(self, blocks: Mapping[str, _Block]) -> ScenarioSet:
