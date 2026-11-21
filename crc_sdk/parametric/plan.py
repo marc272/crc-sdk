@@ -6510,11 +6510,13 @@ class ParametricPlan:
         used: set[str],
         *,
         breakdown: bool = False,
+        scenarios: ScenarioSet | None = None,
     ) -> Any:
         """One fold's rows, for one asset or for all of them: `compare_scenarios`.
 
         With `breakdown`, the parts of each entry's payout instead, as
         `payout_breakdown_scenarios` gives them, which hold no premium.
+        `scenarios` is the fold's evaluation blocks, if already built.
         """
         stated = self.scenario_set
         assert stated is not None
@@ -6524,7 +6526,8 @@ class ParametricPlan:
             key: value for key, value in self.scenario_premiums or () if key in labels
         }
         used.update(premiums)
-        scenarios = self._scenario_blocks(blocks)
+        if scenarios is None:
+            scenarios = self._scenario_blocks(blocks)
         if breakdown:
             return payout_breakdown_scenarios(
                 entries,
@@ -6546,7 +6549,8 @@ class ParametricPlan:
     def _allocated_scenarios(
         self,
         entries: Sequence[Any],
-        blocks: Mapping[str, _Block],
+        scenarios: ScenarioSet,
+        fold: int,
         values: Mapping[str, float] | None,
     ) -> list[Any]:
         """One fold's allocated rows of the joint designs, in a table of their own."""
@@ -6560,15 +6564,13 @@ class ParametricPlan:
                 "but no entry is a joint design: the plan's covers are all "
                 "resolved, and Joint() evaluates each as a set of contracts"
             )
-        stated = self.scenario_set
-        assert stated is not None
         return [
             allocate_scenarios(
                 joint,
-                self._scenario_blocks(blocks),
+                scenarios,
                 allocation=rule,
                 values=values,
-                fold=blocks[stated.reference][0],
+                fold=fold,
                 options=self.metric_options,
             )
         ]
@@ -6623,8 +6625,15 @@ class ParametricPlan:
                     for label in designed_on:
                         entries += made[(label, fold)][position]
                 fold_blocks = {label: blocks[label][fold] for label in labels}
-                tables.append(self._scenario_table(entries, fold_blocks, given, used))
-                allocated += self._allocated_scenarios(entries, fold_blocks, values)
+                evaluated = self._scenario_blocks(fold_blocks)
+                tables.append(
+                    self._scenario_table(
+                        entries, fold_blocks, given, used, scenarios=evaluated
+                    )
+                )
+                allocated += self._allocated_scenarios(
+                    entries, evaluated, fold_blocks[stated.reference][0], values
+                )
         else:
             per_asset = {
                 (label, asset_id): self._asset_blocks(built[label], asset_id)

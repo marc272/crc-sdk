@@ -628,7 +628,7 @@ def _merged_scenarios(
         ] or [{} for _ in stated]
         raise EvaluationError(
             "the metadata differ in their scenarios: only the blocks of one set of "
-            f"scenarios may differ between tables, but "
+            "scenarios may differ between tables, but "
             f"{_scenarios_difference(stated, by_hash)}"
         )
     first = stated[0]
@@ -841,7 +841,9 @@ class EvaluationMetadata(_EvaluationModel):
         their flagged columns are combined. Tables of `compare_scenarios` must
         state one set of scenarios, of which only the blocks may differ, with
         where each asset reads the index and each asset's generator records, and
-        those are combined, so the folds and the assets of one set merge. The
+        those are combined, so the folds and the assets of one set merge; a
+        refusal names the first field that differs and, for a scenario's field,
+        each table's assets with the years each series spans. The
         entries of `setup.frontier` are combined without repeats. `created_at`
         is the latest one.
 
