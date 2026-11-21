@@ -1,7 +1,8 @@
 """The local refinement after a grid: `DesignOptions(refine=True)`.
 
-A compass search from the grid's best point over the free thresholds, with
-the amounts solved exactly at every point it evaluates. The cases are
+From the grid's best point over the free thresholds, with the amounts solved
+exactly at every point it evaluates: over the sample's index values for a
+step or binary payout, by a compass search otherwise. The cases are
 synthetic: losses made by a payout of the same family, so the optimum is
 known in closed form (an objective of 0 at the generating thresholds).
 """
@@ -20,6 +21,7 @@ import pytest
 
 from crc_sdk.parametric import (
     MSE,
+    BinaryPayout,
     Budget,
     Cover,
     DesignError,
@@ -36,6 +38,7 @@ from crc_sdk.parametric import (
     NoBasisRisk,
     OutcomeSample,
     ParametricPlan,
+    PiecewiseLinearPayout,
     SampleProvenance,
     StepPayout,
     UserObjective,
@@ -47,7 +50,12 @@ from crc_sdk.parametric import (
     evaluate,
     setup_text,
 )
-from crc_sdk.parametric.design import REFINE_MAX_POINTS, REFINE_TOLERANCE
+from crc_sdk.parametric.design import (
+    INDEX_VALUES_METHOD,
+    REFINE_MAX_POINTS,
+    REFINE_METHOD,
+    REFINE_TOLERANCE,
+)
 from crc_sdk.parametric.index import Tail
 from crc_sdk.parametric.objectives import Objective
 from crc_sdk.parametric.parameters import _DefinitionModel
@@ -294,6 +302,7 @@ def test_a_flat_optimum_of_a_step_payout_is_not_moved() -> None:
     refined = design(template, sample, MSE(), options=REFINE)
     assert (plain.ties, plain.unique) == (1, False)
     assert refined.refinement is not None and refined.refinement["moves"] == 0
+    assert refined.refinement["method"] == INDEX_VALUES_METHOD
     assert refined.parameters == plain.parameters
     assert (refined.ties, refined.unique) == (1, False)
 
@@ -336,7 +345,9 @@ def test_a_point_without_a_feasible_payout_is_not_moved_to() -> None:
     # A fixed first level of 20 and a second level of at least 20 (monotone):
     # with the breakpoint at 1 or below, the first level pays years 1 and 2,
     # and the premium of at least (20 + 20 + 20) / 4 = 15 breaks the budget
-    # of 10. Above 2.8 the breakpoints are out of order.
+    # of 10. Above 2.8 the breakpoints are out of order. A step payout is
+    # refined over the index values: 1 and 0 have no feasible payout, 3 makes
+    # no valid cover, and 2 is the start's set of years.
     sample = _sample([0.0, 1.0, 2.0, 3.0], [0.0, 10.0, 30.0, 40.0])
     template = Cover(
         INDEX,
@@ -348,7 +359,7 @@ def test_a_point_without_a_feasible_payout_is_not_moved_to() -> None:
     refined = design(template, sample, ExpectedUncovered(), options=REFINE, **terms)
     rows = _rows(refined)
     by_status = {row["status"] for row in rows}
-    assert {"infeasible", "invalid", "optimal"} <= by_status
+    assert {"infeasible", "invalid"} <= by_status
     for row in rows:
         if row["status"] == "infeasible":
             assert row["objective"] is None and row["breakpoints[0]"] <= 1.0
@@ -356,9 +367,34 @@ def test_a_point_without_a_feasible_payout_is_not_moved_to() -> None:
             assert row["objective"] is None and row["breakpoints[0]"] >= 2.8
     record = refined.refinement
     assert record is not None and record["counts"]["infeasible"] > 0
+    assert record["method"] == INDEX_VALUES_METHOD and record["moves"] == 0
     assert refined.objective_value <= plain.objective_value
     assert refined.premium <= 10.0 * (1.0 + 1e-7)
     assert refined.parameters["breakpoints[0]"] > 1.0
+
+
+def test_the_compass_search_does_not_move_to_a_point_without_a_feasible_payout() -> (
+    None
+):
+    # The limit is at least 80: below an attachment of about 4.5 its premium
+    # breaks the budget of 30, so the search's first step down, to 3.75, has
+    # no feasible payout.
+    template = Cover(
+        INDEX,
+        LinearPayout(Free(0.0, 10.0, grid=GRID), EXHAUSTION, Free(80.0, 100.0)),
+        payout_unit="EUR",
+    )
+    terms: dict[str, Any] = {"budget": Budget(amount=30.0)}
+    plain = design(template, SAMPLE, MSE(), **terms)
+    refined = design(template, SAMPLE, MSE(), options=REFINE, **terms)
+    rows = _rows(refined)
+    assert {row["status"] for row in rows} == {"infeasible", "optimal"}
+    assert rows[1] == {"attachment": 3.75, "objective": None, "status": "infeasible"}
+    record = refined.refinement
+    assert record is not None and record["method"] == REFINE_METHOD
+    assert record["moves"] > 0 and record["counts"]["infeasible"] > 0
+    assert refined.objective_value < plain.objective_value
+    assert refined.premium <= 30.0 * (1.0 + 1e-7)
 
 
 def test_the_point_cap_stops_the_search() -> None:
@@ -661,8 +697,8 @@ def test_the_record_holds_the_refinement_as_plain_json() -> None:
     assert record["solve"]["solves"] > record["refinement"]["points"]
 
 
-def _design_line(result: DesignResult) -> str:
-    table = evaluate(result, SAMPLE, split="in_sample")
+def _design_line(result: DesignResult, sample: OutcomeSample = SAMPLE) -> str:
+    table = evaluate(result, sample, split="in_sample")
     metadata = EvaluationMetadata.from_table(table)
     assert metadata.designs[0].get("refinement") == result.refinement
     (line,) = [
@@ -818,6 +854,299 @@ def test_a_joint_plan_raises() -> None:
         plan.designs()
 
 
+# -- a step or binary payout: the search over the index values ---------------
+
+# Ten years. A threshold pays the years at or beyond it, so the best one pays
+# the years from 4.31 on: between the grid's 0 and 5, and in a set of years
+# that no compass step from 5 reaches (every threshold in (4.31, 6] pays the
+# years from 6 on, and the steps from 5 stay there).
+STEP_INDEX = [1.0, 2.0, 3.0, 4.0, 4.3, 4.31, 6.0, 7.0, 8.0, 9.0]
+STEP_LOSS = [0.0, 0.0, 0.0, 0.0, 0.0, 50.0, 50.0, 50.0, 50.0, 100.0]
+BINARY_LOSS = [0.0, 0.0, 0.0, 0.0, 0.0, 100.0, 100.0, 100.0, 100.0, 100.0]
+LOWER = IndexDefinition("wind", "m/s", tail="lower")
+
+
+def _step(grid: Sequence[float] = (0.0, 5.0, 8.0)) -> Cover:
+    return Cover(
+        INDEX,
+        StepPayout([Free(0.0, 8.0, grid=grid), 8.5], [Free(), Free()]),
+        payout_unit="EUR",
+    )
+
+
+def _binary(index: IndexDefinition = INDEX) -> Cover:
+    tail: Tail = index.tail
+    return Cover(
+        index,
+        BinaryPayout(Free(0.0, 10.0, grid=[0.0, 5.0, 10.0]), Free(), tail=tail),
+        payout_unit="EUR",
+    )
+
+
+def _compass(
+    monkeypatch: pytest.MonkeyPatch, *arguments: Any, **terms: Any
+) -> DesignResult:
+    """The same design, its step or binary payout refined by a compass search."""
+    with monkeypatch.context() as patched:
+        patched.setattr(DESIGN_MODULE, "_on_index_values", lambda *_: False)
+        return design(*arguments, options=REFINE, **terms)
+
+
+@pytest.mark.parametrize(("objective", "terms"), OBJECTIVES, ids=OBJECTIVE_IDS)
+def test_a_step_threshold_between_grid_points_is_found_exactly(
+    objective: Objective, terms: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The loss is a step payout of 50 from 4.31 and 100 from 8.5: the
+    # objective is 0 with the first breakpoint at 4.31, exactly, and above 0
+    # at any breakpoint that pays another set of years.
+    sample = _sample(STEP_INDEX, STEP_LOSS)
+    plain = design(_step(), sample, objective, **terms)
+    refined = design(_step(), sample, objective, options=REFINE, **terms)
+    compass = _compass(monkeypatch, _step(), sample, objective, **terms)
+    assert refined.parameters["breakpoints[0]"] == 4.31
+    assert refined.parameters["levels[0]"] == pytest.approx(50.0, rel=1e-9)
+    assert refined.parameters["levels[1]"] == pytest.approx(100.0, rel=1e-9)
+    assert 0.0 <= _scaled(refined, refined.objective_value) <= 1e-12
+    assert plain.objective_value > 0.0
+    # The compass search from the same grid point misses that set of years.
+    assert compass.refinement is not None
+    assert compass.refinement["method"] == REFINE_METHOD
+    assert compass.parameters["breakpoints[0]"] != 4.31
+    assert _scaled(compass, compass.objective_value) > 0.01
+    record = refined.refinement
+    assert record is not None
+    assert record["method"] == INDEX_VALUES_METHOD
+    assert record["start"] == {"breakpoints[0]": plain.parameters["breakpoints[0]"]}
+    assert record["end"] == {"breakpoints[0]": 4.31}
+    assert record["moves"] >= 1 and record["stopped"] == "no_move"
+    assert record["gain"] == pytest.approx(
+        plain.objective_value - refined.objective_value
+    )
+
+
+@pytest.mark.parametrize("index", [INDEX, LOWER], ids=["upper", "lower"])
+@pytest.mark.parametrize(("objective", "terms"), OBJECTIVES, ids=OBJECTIVE_IDS)
+def test_a_binary_trigger_between_grid_points_is_found_exactly(
+    objective: Objective,
+    terms: dict[str, Any],
+    index: IndexDefinition,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The loss is 100 from 4.31 up; with a lower tail the index is mirrored,
+    # 10 - x, and the loss is 100 from 5.69 down. A trigger pays the years at
+    # or beyond it, so the exact trigger is that index value itself.
+    upper = index.tail == "upper"
+    values = STEP_INDEX if upper else [10.0 - x for x in STEP_INDEX]
+    trigger = 4.31 if upper else 10.0 - 4.31
+    sample = _sample(values, BINARY_LOSS)
+    plain = design(_binary(index), sample, objective, **terms)
+    refined = design(_binary(index), sample, objective, options=REFINE, **terms)
+    compass = _compass(monkeypatch, _binary(index), sample, objective, **terms)
+    assert trigger in values
+    assert refined.parameters["trigger"] == trigger
+    assert refined.parameters["amount"] == pytest.approx(100.0, rel=1e-9)
+    assert 0.0 <= _scaled(refined, refined.objective_value) <= 1e-12
+    assert plain.objective_value > 0.0
+    assert compass.parameters["trigger"] != trigger
+    assert _scaled(compass, compass.objective_value) > 0.01
+    assert refined.refinement is not None
+    assert refined.refinement["method"] == INDEX_VALUES_METHOD
+    low, high = refined.refinement["windows"]["trigger"]
+    assert low <= plain.parameters["trigger"] <= high and low <= trigger <= high
+
+
+def test_each_set_of_paying_years_is_tried_once() -> None:
+    # The window of 5 is the grid's 0 and 8: the index values 1 to 8 and the
+    # end 0, ten values. The first pass tries the 2 nearest 5, 4.31 and 4.3,
+    # and moves to 4.31; each pass after tries twice as many around 4.31: 4
+    # and 3 (and 6, which pays the same years as 5, the start), then 2, 7, 1
+    # and 8. The fourth covers the window, finds 0 paying the same years as
+    # 1, solves nothing and moves nothing.
+    sample = _sample(STEP_INDEX, STEP_LOSS)
+    refined = design(_step(), sample, MSE(), options=REFINE)
+    record = refined.refinement
+    assert record is not None
+    assert record["windows"] == {"breakpoints[0]": [0.0, 8.0]}
+    assert record["candidates"] == {"breakpoints[0]": 10}
+    tried = [row["breakpoints[0]"] for row in _rows(refined)]
+    assert tried == [4.31, 4.3, 4.0, 3.0, 2.0, 7.0, 1.0, 8.0]
+    assert record["points"] == len(tried) == record["counts"]["optimal"]
+    assert (record["moves"], record["passes"]) == (1, 4)
+
+
+def test_several_thresholds_are_refined_in_passes_until_none_moves() -> None:
+    rng = np.random.default_rng(4)
+    index = rng.gumbel(5.0, 1.5, 80)
+    loss = 20.0 * (index >= 4.2) + 30.0 * (index >= 6.1) + rng.normal(0.0, 3.0, 80)
+    sample = _sample(index.tolist(), np.maximum(loss, 0.0).tolist())
+    template = Cover(
+        INDEX,
+        StepPayout(
+            [
+                Free(2.0, 6.0, grid=[2.0, 3.5, 5.0]),
+                Free(5.5, 9.0, grid=[5.5, 7.0, 9.0]),
+            ],
+            [Free(), Free()],
+        ),
+        payout_unit="EUR",
+    )
+    plain = design(template, sample, MSE())
+    refined = design(template, sample, MSE(), options=REFINE)
+    record = refined.refinement
+    assert record is not None and record["stopped"] == "no_move"
+    assert record["passes"] >= 2 and record["moves"] >= 2
+    assert refined.objective_value < plain.objective_value
+    names = ["breakpoints[0]", "breakpoints[1]"]
+    end = [refined.parameters[name] for name in names]
+    # No single threshold improves on the end within its window by more than
+    # the tie tolerance: every index value there, and the window's ends, give
+    # an objective at least as high, to that tolerance (scaled units).
+    best = _scaled(refined, refined.objective_value)
+    for i, name in enumerate(names):
+        low, high = record["windows"][name]
+        assert low <= end[i] <= high
+        assert end[i] in index.tolist() or end[i] in (low, high)
+        values = {x for x in index.tolist() if low <= x <= high} | {low, high}
+        for value in sorted(values):
+            point = list(end)
+            point[i] = value
+            if point[0] >= point[1]:
+                continue
+            fixed = Cover(INDEX, StepPayout(point, [Free(), Free()]), payout_unit="EUR")
+            other = design(fixed, sample, MSE())
+            gap = _scaled(other, other.objective_value) - best
+            assert gap >= -1e-7 * max(1.0, best), (name, value)
+
+
+def test_the_point_cap_stops_the_index_value_search() -> None:
+    sample = _sample(STEP_INDEX, STEP_LOSS)
+    plain = design(_step(), sample, MSE())
+    capped = design(
+        _step(), sample, MSE(), options=DesignOptions(refine=True, refine_max_points=2)
+    )
+    record = capped.refinement
+    assert record is not None
+    assert record["points"] == 2 and record["stopped"] == "max_points"
+    assert record["passes"] == 2
+    # The first pass tried the two values nearest 5 and moved to the better;
+    # the second stopped at its first new value.
+    assert capped.parameters["breakpoints[0]"] == 4.31
+    assert capped.objective_value <= plain.objective_value
+    line = _design_line(capped, sample)
+    assert "after 2 points in 2 passes (" in line
+    assert "at most 2 points; it stopped at that cap)" in line
+
+
+def test_the_index_value_search_is_deterministic() -> None:
+    sample = _sample(STEP_INDEX, STEP_LOSS)
+    terms: dict[str, Any] = {"budget": Budget(ratio=1.0)}
+    first = design(_step(), sample, WeightedCVaR(0.5, 0.9), options=REFINE, **terms)
+    second = design(_step(), sample, WeightedCVaR(0.5, 0.9), options=REFINE, **terms)
+    assert first.refinement == second.refinement
+    assert first.parameters == second.parameters
+    assert first.refinement_profile is not None
+    assert first.refinement_profile.equals(second.refinement_profile)
+    assert first.design_id == second.design_id
+
+
+def test_the_record_of_an_index_value_search_is_plain_json() -> None:
+    sample = _sample(STEP_INDEX, STEP_LOSS)
+    record = design(_step(), sample, MSE(), options=REFINE).to_record()
+    assert json.loads(json.dumps(record, allow_nan=False)) == record
+    assert set(record["refinement"]) == {
+        "method",
+        "max_points",
+        "windows",
+        "candidates",
+        "start",
+        "start_objective",
+        "end",
+        "objective",
+        "gain",
+        "points",
+        "counts",
+        "moves",
+        "passes",
+        "stopped",
+    }
+
+
+def test_the_amounts_report_is_that_of_the_refined_thresholds() -> None:
+    sample = _sample(STEP_INDEX, STEP_LOSS)
+    terms: dict[str, Any] = {"budget": Budget(ratio=1.0)}
+    options = DesignOptions(refine=True, ranges=True)
+    refined = design(_step(), sample, ExpectedUncovered(), options=options, **terms)
+    assert refined.refinement is not None and refined.refinement["moves"] == 1
+    fixed = design(
+        Cover(INDEX, StepPayout([4.31, 8.5], [Free(), Free()]), payout_unit="EUR"),
+        sample,
+        ExpectedUncovered(),
+        options=DesignOptions(ranges=True),
+        **terms,
+    )
+    assert refined.ties == 0
+    assert refined.unique == fixed.unique is not None
+    assert refined.ranges == fixed.ranges
+
+
+def test_the_setup_text_states_the_index_value_search() -> None:
+    sample = _sample(STEP_INDEX, STEP_LOSS)
+    line = _design_line(design(_step(), sample, MSE(), options=REFINE), sample)
+    # At the optimum the MSE is 0 to rounding, which differs by platform.
+    assert (
+        "route: grid; refined over the sample's index values from the grid's best "
+        "point (breakpoints[0] 5, objective 250) to breakpoints[0] 4.31, "
+        "objective " in line
+    )
+    assert (
+        ", a gain of 250, after 8 points in 4 passes (each threshold over the "
+        "index values between its grid neighbours: breakpoints[0] from 0 to 8; "
+        "at most 1,000 points); unique optimum: yes; ties: 0." in line
+    )
+
+
+def test_without_the_option_step_and_binary_designs_are_unchanged() -> None:
+    # The ids, values and solves of these designs before the option existed.
+    sample = _sample(STEP_INDEX, STEP_LOSS)
+    step = design(_step(), sample, MSE())
+    assert step.refinement is None and step.refinement_profile is None
+    assert step.parameters["breakpoints[0]"] == 5.0 and step.solves == 4
+    assert step.design_id == (
+        "sha256:fc9745dbf4e558b0e936f99fdf6490b7d559c70f1ac20bc95643e6e6fc16efc1"
+    )
+    binary = design(_binary(), _sample(STEP_INDEX, BINARY_LOSS), MSE())
+    assert binary.refinement is None
+    assert binary.parameters["trigger"] == 5.0 and binary.solves == 4
+    assert binary.design_id == (
+        "sha256:4aa0ffc8feada3b3275da1f32c5a6dc691e0ed642f3972f104fa2e19e9d4513d"
+    )
+
+
+def test_other_families_keep_the_compass_search() -> None:
+    linear = design(_linear(), SAMPLE, MSE(), options=REFINE)
+    piecewise = design(
+        Cover(
+            INDEX,
+            PiecewiseLinearPayout(
+                [Free(0.0, 6.0, grid=[0.0, 2.5, 5.0]), 8.0], [Free(), Free()]
+            ),
+            payout_unit="EUR",
+        ),
+        SAMPLE,
+        MSE(),
+        options=REFINE,
+    )
+    user = design(
+        Cover(INDEX, OpenBinary(Free(0.0, 10.0, grid=GRID), Free()), payout_unit="EUR"),
+        SAMPLE,
+        MSE(),
+        options=REFINE,
+    )
+    for result in (linear, piecewise, user):
+        assert result.refinement is not None
+        assert result.refinement["method"] == REFINE_METHOD
+
+
 # -- the compass search itself -------------------------------------------------
 
 
@@ -938,3 +1267,136 @@ def test_a_parameter_without_room_is_not_polled() -> None:
 def test_the_compass_search_checks_its_inputs(bad: dict[str, Any]) -> None:
     with pytest.raises(ValueError):
         _search(lambda x: x[0] ** 2, [0.0], **bad)
+
+
+# -- the coordinate search itself ----------------------------------------------
+
+
+def _coordinate(
+    function: Callable[[tuple[float, ...]], float | None],
+    start: Sequence[float],
+    candidates: Sequence[Sequence[float]],
+    **settings: Any,
+) -> tuple[_solver.CoordinateSearch, list[Any]]:
+    calls: list[tuple[float, ...]] = []
+
+    def evaluate(point: tuple[float, ...]) -> tuple[float | None, str]:
+        calls.append(point)
+        value = function(point)
+        return value, "optimal" if value is not None else "invalid"
+
+    arguments: dict[str, Any] = {
+        "key": lambda point: point,
+        "max_points": 1_000,
+        "allowance": lambda value: 1e-12,
+    }
+    arguments.update(settings)
+    value = function(tuple(start))
+    assert value is not None
+    found = _solver.coordinate_search(
+        evaluate, start, value, candidates=candidates, **arguments
+    )
+    return found, calls
+
+
+def test_the_coordinate_search_finds_the_best_candidate() -> None:
+    found, calls = _coordinate(
+        lambda x: (x[0] - 3.3) ** 2, [8.0], [[float(i) for i in range(11)]]
+    )
+    assert found.best == (3.0,) and found.objective == pytest.approx(0.09)
+    assert found.moves == 3 and found.passes == 4 and found.stopped == "no_move"
+    # The 2 values nearest 8, then 4 nearest 7, 8 nearest 5 and all 10 others
+    # nearest 3, each nearest first and the lower first at equal distance,
+    # each value evaluated once.
+    assert calls == [(x,) for x in (7.0, 9.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 10.0)]
+    assert len(calls) == 10 == len(found.points)
+
+
+def test_a_capped_coordinate_search_reaches_every_parameter() -> None:
+    # The first pass tries 2 values of each parameter, so a cap of 4 points
+    # moves both.
+    grid = [float(i) for i in range(-10, 11)]
+    found, calls = _coordinate(
+        lambda x: x[0] ** 2 + x[1] ** 2, [5.0, 5.0], [grid, grid], max_points=4
+    )
+    assert calls == [(4.0, 5.0), (6.0, 5.0), (4.0, 4.0), (4.0, 6.0)]
+    assert found.best == (4.0, 4.0) and found.stopped == "max_points"
+
+
+def test_the_coordinate_search_takes_the_nearest_of_equal_candidates() -> None:
+    found, _ = _coordinate(
+        lambda x: min(abs(x[0] - 1.0), abs(x[0] - 6.0)), [4.0], [[1.0, 6.0, 9.0]]
+    )
+    assert found.best == (6.0,)
+    found, _ = _coordinate(
+        lambda x: min(abs(x[0] - 2.0), abs(x[0] - 6.0)), [4.0], [[2.0, 6.0]]
+    )
+    assert found.best == (2.0,)  # at equal distance, the lower one
+
+
+def test_the_coordinate_search_evaluates_each_class_once() -> None:
+    # The objective depends only on the integer part: the start's class (2)
+    # is skipped, and 0.5 shares the class of 0.25.
+    found, calls = _coordinate(
+        lambda x: (math.floor(x[0]) - 0.6) ** 2,
+        [2.5],
+        [[0.25, 0.5, 1.0, 2.0, 2.75, 3.0]],
+        key=lambda point: math.floor(point[0]),
+    )
+    assert found.best == (1.0,)
+    assert calls == [(3.0,), (1.0,), (0.5,)]
+
+
+def test_the_coordinate_search_moves_each_parameter_in_passes() -> None:
+    grid = [float(i) for i in range(-5, 6)]
+
+    def coupled(x: tuple[float, ...]) -> float:
+        return (x[0] - 2.0) ** 2 + 0.5 * (x[1] - x[0]) ** 2
+
+    # Each pass moves x0 with x1 held, then x1: pass 1 (2 values each) to
+    # (-3, 3), pass 2 (4 values) to (-1, 1), pass 3 (8 values) to (2, 2), and
+    # pass 4, which tries every value, moves neither.
+    found, _ = _coordinate(coupled, [-5.0, 5.0], [grid, grid])
+    assert found.best == (2.0, 2.0) and found.objective == 0.0
+    assert (found.moves, found.passes, found.stopped) == (6, 4, "no_move")
+
+
+def test_the_coordinate_search_does_not_move_to_a_point_without_an_objective() -> None:
+    found, _ = _coordinate(
+        lambda x: None if x[0] < 0.0 else x[0], [2.0], [[-3.0, -1.0, 1.0, 2.0]]
+    )
+    assert found.best == (1.0,)
+    assert [point.status for point in found.points] == ["optimal", "invalid", "invalid"]
+
+
+def test_the_coordinate_search_moves_only_on_a_gain_above_the_allowance() -> None:
+    found, _ = _coordinate(
+        lambda x: 0.0 if x == (0.0,) else -1e-3,
+        [0.0],
+        [[-1.0, 1.0]],
+        allowance=lambda value: 1e-2,
+    )
+    assert found.moves == 0 and found.best == (0.0,)
+
+
+def test_the_coordinate_search_stops_at_its_cap_with_its_best_point() -> None:
+    found, calls = _coordinate(
+        lambda x: (x[0] - 5.0) ** 2, [0.0], [[1.0, 2.0, 5.0]], max_points=2
+    )
+    assert found.stopped == "max_points" and len(calls) == 2
+    assert found.best == (2.0,) and found.passes == 2
+
+
+@pytest.mark.parametrize("bad", [{"candidates": [[1.0], [2.0]]}, {"max_points": 0}])
+def test_the_coordinate_search_checks_its_inputs(bad: dict[str, Any]) -> None:
+    arguments: dict[str, Any] = {
+        "candidates": [[1.0]],
+        "key": lambda point: point,
+        "max_points": 10,
+        "allowance": lambda value: 0.0,
+    }
+    arguments.update(bad)
+    with pytest.raises(ValueError):
+        _solver.coordinate_search(
+            lambda point: (0.0, "optimal"), [0.0], 0.0, **arguments
+        )
