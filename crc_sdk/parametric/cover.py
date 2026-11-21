@@ -228,9 +228,7 @@ class Cover:
         if isinstance(self._index, CompositeIndex):
             raise CoverDefinitionError(
                 f"this cover pays on the components {list(self._index.names)}, not "
-                "on one index: read cover.index_definition. ParametricPlan takes "
-                "covers on one index for now; design and evaluate this cover with "
-                "the functions"
+                "on one index: read cover.index_definition, its CompositeIndex"
             )
         return self._index
 

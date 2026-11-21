@@ -704,9 +704,9 @@ def test_the_scenarios_builder_refuses_what_it_can(curves: Path) -> None:
         plan.scenarios(
             ScenarioSet(reference="2030s", labels=WINDOWS), premiums={"linear": -1.0}
         )
+    # Allocated rows across scenarios are offered: they go to a file of their own.
     joint = stated.scopes(Joint()).dependence(Independent()).allocation("value")
-    with pytest.raises(ValueError, match="allocation"):
-        joint.explain()
+    assert joint.explain(format="json")["allocation"] == "value"
     with pytest.raises(ValueError, match="holds every scenario's samples"):
         _curve_plan(curves, horizons=[2030]).scenario_samples()
     # There is no per-year option on the split: the rule makes every scenario's blocks.

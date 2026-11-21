@@ -20,6 +20,10 @@ where a row is evaluated and `design_scenario` where it was designed.
 `to_drift(table, reference=)` adds each row's difference and ratio against the
 row of the same cover or design on a reference scenario. Neither ranks anything:
 a row is a measurement of a stated setup, and `setup_text` states it.
+`allocate_scenarios` gives a joint design's allocated rows on every scenario's
+block in a table of their own, as `allocate` does on one block, and
+`payout_breakdown_scenarios` each entry's payout in its parts on every block, as
+`payout_breakdown` does on one.
 
 A plan reads its scenarios rather than taking built samples: a set given to
 `ParametricPlan.scenarios` describes them, with `labels=` for the selection of a
@@ -49,8 +53,11 @@ from crc_sdk.parametric.evaluate import (
     Allocation,
     CoverPackage,
     EvaluationEntry,
+    _allocated_rows,
     _allocation,
     _block_fields,
+    _block_values,
+    _breakdown_rows,
     _check_allocated,
     _check_keys,
     _CoverSet,
@@ -59,6 +66,7 @@ from crc_sdk.parametric.evaluate import (
     _Entry,
     _fold,
     _Item,
+    _joint_entries,
     _JointEntry,
     _metadata,
     _options,
@@ -68,6 +76,7 @@ from crc_sdk.parametric.evaluate import (
     _Run,
     _sample,
     _schema,
+    _short_blocks,
     _split_step,
     _values,
     _values_hash,
@@ -90,6 +99,7 @@ from crc_sdk.parametric.intervals import (
     _no_premium_names,
     _short_block,
 )
+from crc_sdk.parametric.joint import JointDesignResult
 from crc_sdk.parametric.metadata import (
     EVALUATION_METADATA_KEY,
     KEY_COLUMNS,
@@ -100,6 +110,7 @@ from crc_sdk.parametric.metrics import (
     MetricColumn,
     MetricOptions,
     _with_repriced,
+    breakdown_columns,
     metric_columns,
 )
 from crc_sdk.parametric.pricing import Pricing, PurePremium
@@ -109,6 +120,7 @@ from crc_sdk.parametric.sample import (
     _check_known_pathway,
     _identifier,
     _pathway_statements,
+    _require_one_asset,
     _share_a_source,
     _source_columns,
     _text,
@@ -129,7 +141,9 @@ __all__ = [
     "AnnualScenario",
     "CurveScenario",
     "ScenarioSet",
+    "allocate_scenarios",
     "compare_scenarios",
+    "payout_breakdown_scenarios",
     "to_drift",
 ]
 
@@ -1967,15 +1981,32 @@ def _premium_bases(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def _block_rows(
-    terms: _Terms, sample: OutcomeSample
-) -> tuple[list[dict[str, Any]], list[EvaluationMetadata]]:
-    """One scenario's rows, and the metadata of each of its evaluations."""
+@dataclass(frozen=True, eq=False)
+class _Group:
+    """One block's entries designed on one scenario, prepared as one call.
+
+    `label` is the design scenario, `None` for covers given as is, and `chosen`
+    the entries' positions in the call.
+    """
+
+    label: str | None
+    chosen: tuple[int, ...]
+    run: _Run
+    evaluation: dict[str, Any]
+    designs: tuple[OutcomeSample, ...]
+
+
+def _groups(terms: _Terms, sample: OutcomeSample, *, priced: bool) -> list[_Group]:
+    """Check and prepare one block's entries, one design scenario at a time.
+
+    A design on another scenario brings a design block of its own, and a cover
+    given as is takes the reference's, where it is also priced when `priced`.
+    Every cover must read the place the block's index is read at.
+    """
     positions: dict[str | None, list[int]] = {}
     for i, label in enumerate(terms.design_labels):
         positions.setdefault(label, []).append(i)
-    runs: dict[int, _Run] = {}
-    prepared: dict[str | None, tuple[dict[str, Any], tuple[OutcomeSample, ...]]] = {}
+    groups: list[_Group] = []
     for label, chosen in positions.items():
         drawn_up = [terms.entries[i] for i in chosen]
         joint = any(isinstance(entry, _JointEntry) for entry in drawn_up)
@@ -1991,21 +2022,58 @@ def _block_rows(
             design_sample=(terms.given if label in (None, terms.reference) else None),
             allocation=terms.allocation if joint else None,
             values=terms.values if joint else None,
-            price_on=terms.given if label is None else None,
+            price_on=terms.given if priced and label is None else None,
         )
-        runs.update(dict.fromkeys(chosen, run))
-        prepared[label] = (evaluation, designs)
         for entry in drawn_up:
             for cover in _covers_of(entry):
                 _check_bound_cover(cover, sample)
-    groups = _apply_premiums(
+        groups.append(_Group(label, tuple(chosen), run, evaluation, designs))
+    return groups
+
+
+def _on_block(
+    terms: _Terms, group: _Group, sample: OutcomeSample, made: Mapping[str, Any]
+) -> None:
+    """Record in a group's evaluation the block it is on and the design scenario."""
+    evaluation = group.evaluation
+    evaluation["scenario"] = sample.scenario
+    evaluation["design_scenario"] = group.label
+    if (terms.reference if group.label is None else group.label) != sample.scenario:
+        _other_scenario(evaluation, sample, group.designs, made)
+
+
+def _group_metadata(
+    terms: _Terms, group: _Group, sample: OutcomeSample
+) -> EvaluationMetadata:
+    """The metadata of one group's evaluation."""
+    run = group.run
+    return _metadata(
+        [terms.entries[i] for i in group.chosen],
+        sample,
+        evaluation=group.evaluation,
+        design_samples=group.designs,
+        options=terms.options,
+        columns=terms.columns,
+        values_sha256=None if run.values is None else _values_hash(run.values),
+    )
+
+
+_BlockRows = tuple[list[dict[str, Any]], list[EvaluationMetadata]]
+"""One scenario's rows, and the metadata of each of its evaluations."""
+
+
+def _block_rows(terms: _Terms, sample: OutcomeSample) -> _BlockRows:
+    """One scenario's rows of `compare_scenarios`, and its evaluations' metadata."""
+    groups = _groups(terms, sample, priced=True)
+    runs = {i: group.run for group in groups for i in group.chosen}
+    by_entry = _apply_premiums(
         terms.premiums,
         [_rows(entry, runs[i]) for i, entry in enumerate(terms.entries)],
     )
     every_row = np.ones(len(sample), dtype=np.bool_)
     without = _no_premium_names(terms.options)
-    for i, (entry, group) in enumerate(zip(terms.entries, groups, strict=True)):
-        for row, arrays in zip(group, _arrays(entry, runs[i]), strict=True):
+    for i, (entry, rows) in enumerate(zip(terms.entries, by_entry, strict=True)):
+        for row, arrays in zip(rows, _arrays(entry, runs[i]), strict=True):
             if row["premium_basis"] == "stated":
                 read = _block_read(row, arrays, terms.pricing)
                 row.update(
@@ -2018,31 +2086,69 @@ def _block_rows(
             )
     made = _made(sample)
     items: list[EvaluationMetadata] = []
-    for label, chosen in positions.items():
-        evaluation, designs = prepared[label]
-        run = runs[chosen[0]]
-        entries = [terms.entries[i] for i in chosen]
-        by_entry = [groups[i] for i in chosen]
-        _describe_rows(evaluation, run, entries, by_entry)
-        evaluation["premium_bases"] = _premium_bases(
-            row for group in by_entry for row in group
+    for group in groups:
+        entries = [terms.entries[i] for i in group.chosen]
+        chosen = [by_entry[i] for i in group.chosen]
+        _describe_rows(group.evaluation, group.run, entries, chosen)
+        group.evaluation["premium_bases"] = _premium_bases(
+            row for rows in chosen for row in rows
         )
-        evaluation["scenario"] = sample.scenario
-        evaluation["design_scenario"] = label
-        if (terms.reference if label is None else label) != sample.scenario:
-            _other_scenario(evaluation, sample, designs, made)
-        items.append(
-            _metadata(
-                entries,
-                sample,
-                evaluation=evaluation,
-                design_samples=designs,
-                options=terms.options,
-                columns=terms.columns,
-                values_sha256=None if run.values is None else _values_hash(run.values),
-            )
+        _on_block(terms, group, sample, made)
+        items.append(_group_metadata(terms, group, sample))
+    return [row for rows in by_entry for row in rows], items
+
+
+def _allocated_block(terms: _Terms, sample: OutcomeSample) -> _BlockRows:
+    """One scenario's allocated rows, as `compare_scenarios` gives them, alone."""
+    groups = _groups(terms, sample, priced=False)
+    flags = _short_blocks(terms.options, len(sample))
+    by_entry: dict[int, list[dict[str, Any]]] = {}
+    made = _made(sample)
+    items: list[EvaluationMetadata] = []
+    for group in groups:
+        for i in group.chosen:
+            entry = terms.entries[i]
+            assert isinstance(entry, _JointEntry)
+            by_entry[i] = [
+                {
+                    **row,
+                    **_block_values(group.run, row["level"]),
+                    **flags,
+                    "premium_repriced": None,
+                }
+                for row in _allocated_rows(entry, group.run)
+            ]
+        entries = [terms.entries[i] for i in group.chosen]
+        _describe_rows(
+            group.evaluation, group.run, entries, [by_entry[i] for i in group.chosen]
         )
-    return [row for group in groups for row in group], items
+        # Allocated rows hold no premium: a pricing prices the total payout.
+        group.evaluation["pricing"] = None
+        _on_block(terms, group, sample, made)
+        items.append(_group_metadata(terms, group, sample))
+    return [row for i in sorted(by_entry) for row in by_entry[i]], items
+
+
+def _breakdown_block(terms: _Terms, sample: OutcomeSample) -> _BlockRows:
+    """One scenario's rows of `payout_breakdown`, and its evaluations' metadata."""
+    _require_one_asset(sample, "payout_breakdown_scenarios")
+    groups = _groups(terms, sample, priced=False)
+    by_entry: dict[int, list[dict[str, Any]]] = {}
+    made = _made(sample)
+    items: list[EvaluationMetadata] = []
+    for group in groups:
+        for i in group.chosen:
+            by_entry[i] = _breakdown_rows(terms.entries[i], group.run)
+        rows = [row for i in group.chosen for row in by_entry[i]]
+        evaluation = group.evaluation
+        evaluation["pricing"] = None
+        evaluation["level"] = list(dict.fromkeys(row["level"] for row in rows))
+        evaluation["scope"] = list(dict.fromkeys(row["scope"] for row in rows))
+        evaluation["allocation"] = None
+        evaluation["part_kinds"] = list(dict.fromkeys(row["part_kind"] for row in rows))
+        _on_block(terms, group, sample, made)
+        items.append(_group_metadata(terms, group, sample))
+    return [row for i in sorted(by_entry) for row in by_entry[i]], items
 
 
 def _hazard_record(scenario: _Scenario) -> Any:
@@ -2239,10 +2345,7 @@ def compare_scenarios(
     an entry that isn't a joint design; `LeakageError` for a shared
     period or a reused generator state; and otherwise as `compare` does.
     """
-    if not isinstance(scenarios, ScenarioSet):
-        raise TypeError(
-            f"scenarios must be a ScenarioSet, got {type(scenarios).__name__}"
-        )
+    scenarios = _scenario_set(scenarios)
     labels = scenarios.labels
     entries = tuple(_entries(covers))
     design_labels = tuple(_checked_design_label(entry, labels) for entry in entries)
@@ -2273,23 +2376,194 @@ def compare_scenarios(
         values=checked_values,
         columns=columns,
     )
+    return _table_across(
+        scenarios, terms, _block_rows, extra=_block_fields(checked_options.betas)
+    )
+
+
+def _scenario_set(scenarios: Any) -> ScenarioSet:
+    """`scenarios`, checked to be a `ScenarioSet`."""
+    if not isinstance(scenarios, ScenarioSet):
+        raise TypeError(
+            f"scenarios must be a ScenarioSet, got {type(scenarios).__name__}"
+        )
+    return scenarios
+
+
+def _table_across(
+    scenarios: ScenarioSet,
+    terms: _Terms,
+    block: Callable[[_Terms, OutcomeSample], _BlockRows],
+    *,
+    extra: Sequence[Any],
+    key: Sequence[str] = KEY_COLUMNS,
+) -> Any:
+    """Every scenario's rows of `block`, the reference first, as one table.
+
+    Its metadata merges every evaluation's and records the set under
+    `setup.scenarios`.
+    """
+    labels = scenarios.labels
     rows: list[dict[str, Any]] = []
     items: list[EvaluationMetadata] = []
     for label in labels:
-        block_rows, block_items = _block_rows(terms, scenarios.sample(label))
+        block_rows, block_items = block(terms, scenarios.sample(label))
         rows += block_rows
         items += block_items
-    _check_keys(rows, KEY_COLUMNS)
+    _check_keys(rows, key)
     merged = EvaluationMetadata.merge(*items)
     metadata = _replaced(
         merged,
         setup=_replaced(
             merged.setup,
-            scenarios=_scenarios_document(scenarios, labels, columns, checked_fold),
+            scenarios=_scenarios_document(scenarios, labels, terms.columns, terms.fold),
         ),
     )
-    schema = _schema(columns, metadata, extra=_block_fields(checked_options.betas))
+    schema = _schema(terms.columns, metadata, extra=extra)
     return pa.Table.from_pylist(rows, schema=schema)
+
+
+def allocate_scenarios(
+    designs: Sequence[JointDesignResult],
+    scenarios: ScenarioSet,
+    *,
+    allocation: Allocation,
+    values: Mapping[str, float],
+    fold: int = 0,
+    options: MetricOptions = MetricOptions(),
+) -> Any:
+    """Share each joint design's total payout out over its assets, on every scenario.
+
+    The form of `allocate` across scenarios, as `compare_scenarios` is the form
+    of `compare`: each joint design's allocated rows on every scenario's block,
+    the reference first and then as the set gives them, and nothing else. They
+    are the rows at `level` `"asset_by_value"` or `"asset_by_loss"` that
+    `compare_scenarios(designs, scenarios, allocation=..., values=...)` gives
+    beside each design's `"total"` rows, in a table of their own, so they never
+    sit beside an `"asset"` or a `"total"` row. `compare_scenarios` holds the
+    owner's total, which is what a joint design optimises.
+
+    `designs` are `JointDesignResult`s on the set's samples, each designed on one
+    of its scenarios, whose label is the row's `design_scenario`. `allocation`
+    is the rule, with no default: `"value"` shares each draw's total payout in
+    proportion to the assets' `values`, and `"loss"` in proportion to their
+    losses in that draw, and to their values in a draw without loss. `values`
+    maps every asset id to its value in the loss unit; only the hash of the
+    (asset id, value) pairs is written. `fold` and `options` are those of
+    `compare_scenarios`, and every row is out of sample.
+
+    The rows have `compare_scenarios`' columns, with `premium_basis`, `premium`,
+    `premium_repriced` and the net-loss columns null: a pricing prices the total
+    payout, not a part of it. A rule is an accounting statement about the total
+    payout, not the payout of an asset's cover, and the rule is in `level`. A row
+    whose design was made on another scenario than its block is a cross row, and
+    its evaluation's `method` is `"other_scenario"`. The metadata records the
+    set under `setup.scenarios`, the rule and `pricing` null in each evaluation,
+    and `setup_text` states them; `write_comparison` writes the table.
+
+    Raises `TypeError` for a `scenarios` that isn't a `ScenarioSet` of built
+    samples, for an entry that isn't a `JointDesignResult` and for arguments of
+    the wrong type; `ScenarioError` for a design sample labelled outside the set;
+    and as `allocate` and `compare_scenarios` do.
+    """
+    checked = _scenario_set(scenarios)
+    labels = checked.labels
+    entries = tuple(_joint_entries(designs))
+    if allocation is None:
+        raise EvaluationError(
+            "allocate_scenarios needs a rule: allocation= one of "
+            f"{get_args(Allocation)}"
+        )
+    rule = _allocation(allocation)
+    checked_options = _options(options)
+    terms = _Terms(
+        entries=entries,
+        design_labels=tuple(_checked_design_label(entry, labels) for entry in entries),
+        reference=checked.reference,
+        given=None,
+        fold=_fold(fold),
+        pricing=PurePremium(),
+        premiums=None,
+        options=checked_options,
+        allocation=rule,
+        values=_values(values, rule, checked.sample(checked.reference)),
+        columns=_with_repriced(metric_columns(checked_options)),
+    )
+    return _table_across(
+        checked, terms, _allocated_block, extra=_block_fields(checked_options.betas)
+    )
+
+
+_BREAKDOWN_FIELDS = (
+    pa.field("part", pa.string(), nullable=False),
+    pa.field("part_kind", pa.string(), nullable=False),
+)
+"""The columns a payout breakdown adds after the identity columns."""
+
+
+def payout_breakdown_scenarios(
+    covers: Sequence[EvaluationEntry],
+    scenarios: ScenarioSet,
+    *,
+    fold: int = 0,
+    options: MetricOptions = MetricOptions(),
+    design_sample: OutcomeSample | None = None,
+) -> Any:
+    """Break each entry's payout down into its parts, on every scenario's block.
+
+    The form of `payout_breakdown` across scenarios, as `compare_scenarios` is
+    the form of `compare`: `covers` is what `payout_breakdown` takes, on the
+    set's samples of one asset, and every entry is broken down on every
+    scenario's block, the reference first and then as the set gives them. On
+    each block the rows are `payout_breakdown`'s, one per entry and part, with
+    `scenario` saying where they are evaluated and `design_scenario` where the
+    entry was designed, null for a cover given as is. Every row is out of
+    sample.
+
+    `design_sample` is the reference's design block, as for `compare_scenarios`,
+    and is required when an entry is a cover given as is. A design brings its
+    own, whose label must be one of the set's, and the designs of one package
+    must share it. `fold` and `options` are those of `compare_scenarios`.
+
+    The rows of one entry on one block add up to its expected payout there. A
+    row whose design was made on another scenario than its block is a cross row,
+    and its evaluation's `method` is `"other_scenario"`. The table holds no
+    premium. Its metadata records the set under `setup.scenarios`, and
+    `write_comparison` writes it.
+
+    Raises `TypeError` for a `scenarios` that isn't a `ScenarioSet` of built
+    samples and for arguments of the wrong type; `SampleError` for a set whose
+    samples hold several assets, and without the `design_sample` a cover given
+    as is needs; `ScenarioError` for a design sample labelled outside the set, for
+    a `design_sample=` not labelled as the reference, and for a cover bound to a
+    location a scenario's index doesn't read; and otherwise as `payout_breakdown`
+    and `compare_scenarios` do.
+    """
+    checked = _scenario_set(scenarios)
+    labels = checked.labels
+    entries = tuple(_entries(covers))
+    design_labels = tuple(_checked_design_label(entry, labels) for entry in entries)
+    checked_options = _options(options)
+    terms = _Terms(
+        entries=entries,
+        design_labels=design_labels,
+        reference=checked.reference,
+        given=_checked_design_block(design_sample, design_labels, checked.reference),
+        fold=_fold(fold),
+        pricing=PurePremium(),
+        premiums=None,
+        options=checked_options,
+        allocation=None,
+        values=None,
+        columns=breakdown_columns(checked_options),
+    )
+    return _table_across(
+        checked,
+        terms,
+        _breakdown_block,
+        extra=_BREAKDOWN_FIELDS,
+        key=(*KEY_COLUMNS, "part"),
+    )
 
 
 # -- differences from a reference --------------------------------------------------
