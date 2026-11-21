@@ -365,6 +365,14 @@ def test_each_component_keeps_its_damage_before_the_rule(combine: Any) -> None:
         damage[name] = component.damage[:, 0]
     # The noise moved the damage off the impact of the hazard alone.
     assert not np.array_equal(damage["rain"], np.array(RAIN) / 100.0)
+    # Written and read back with its damages, under its hash.
+    read = OutcomeSample.from_written_table(sample.to_table())
+    assert read.content_hash == sample.content_hash
+    assert read.index_components is not None
+    for name, kept in damage.items():
+        again = read.index_components[name].damage
+        assert again is not None
+        np.testing.assert_array_equal(again[:, 0], kept)
     np.testing.assert_array_equal(sample.loss[:, 0], combine.combine(damage) * 1000.0)
 
 

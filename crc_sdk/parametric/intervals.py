@@ -49,8 +49,8 @@ those rows each replicate builds the rows again as the block built them:
 - **Re-ranked.** A row that reads a column built with the held form: each
   replicate resamples by the unit above, and ranks the hazard at the asset
   again over the resampled rows, as the held form ranks it over the rows of a
-  call. Each row takes the loss of its new hazard at the asset, which the
-  block's own rows give.
+  call. Each row takes the loss of its new hazard at the asset, and on a
+  sample of several hazards its damage, which the block's own rows give.
 
 A row of both is re-dealt and re-ranked. A replicate holds the rows rebuilt,
 not reweighted: a row drawn twice can take two places in the reference, or two
@@ -67,10 +67,10 @@ numbers, and `setup.intervals.kept_today` lists each kind of them with the
 reason, which the setup text states: a sample of several hazards whose
 combined loss can't be made again (a rule of the caller's, a table's loss, or
 a stated value or a value column on a sample without damages), a one-hazard
-view whose combined loss reads
-hazards it doesn't hold, a selection of a held sample, whose hazards at the
-asset came from rows it doesn't hold, a record of an `EmpiricalCopula` without
-its draws per reference year, and pooled rows of such blocks.
+view whose combined loss reads hazards it doesn't hold, a selection of a held
+sample, whose hazards at the asset came from rows it doesn't hold, a record of
+an `EmpiricalCopula` without its draws per reference year, and pooled rows of
+such blocks.
 `docs/parametric.md` gives a synthetic coverage study. Resampling whole
 reference years is not offered: it made most intervals of a copula block too
 wide.

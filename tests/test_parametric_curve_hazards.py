@@ -422,6 +422,13 @@ def test_a_rows_damage_moves_with_its_own_loss(model: Any) -> None:
             np.testing.assert_array_equal(component.own_loss, component.damage * 1e6)
             damage[name] = component.damage[:, 0]
         np.testing.assert_array_equal(sample.loss[:, 0], combine.combine(damage) * 1e6)
+        read = OutcomeSample.from_written_table(sample.to_table())
+        assert read.content_hash == sample.content_hash
+        assert read.index_components is not None
+        for name, kept in damage.items():
+            again = read.index_components[name].damage
+            assert again is not None
+            np.testing.assert_array_equal(again[:, 0], kept)
     single = _single("rain")
     rain = _draws(Independent()).index_components
     assert rain is not None and rain["rain"].damage is not None
