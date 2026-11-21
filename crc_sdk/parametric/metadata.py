@@ -471,8 +471,12 @@ def _merged_frontier(
     return _unique(entry for record in records for entry in record or ()) or None
 
 
-_BLOCK_FIELDS = ("n_rows", "blocks")
-"""The fields of a scenario in `setup.scenarios` that differ between folds."""
+_BLOCK_FIELDS = ("n_rows", "blocks", "index_read")
+"""The fields of a scenario in `setup.scenarios` that differ between tables.
+
+Between the folds of one set its blocks differ, and between its assets, each
+evaluated on its own block, the blocks and where each asset reads the index.
+"""
 
 
 def _check_scenarios_record(record: Mapping[str, Any]) -> None:
@@ -492,7 +496,12 @@ def _check_scenarios_record(record: Mapping[str, Any]) -> None:
 
 
 def _without_blocks(record: Mapping[str, Any]) -> dict[str, Any]:
-    """`record` without what differs between the folds of one set."""
+    """`record` without what differs between the folds or assets of one set.
+
+    That is each scenario's blocks and index places, and, among the shared draws,
+    the generator records, which are each asset's own.
+    """
+    shared = record.get("shared_draws")
     return {
         **record,
         "scenarios": {
@@ -501,7 +510,29 @@ def _without_blocks(record: Mapping[str, Any]) -> dict[str, Any]:
             }
             for label, entry in record["scenarios"].items()
         },
+        "shared_draws": (
+            {key: value for key, value in shared.items() if key != "rng"}
+            if isinstance(shared, Mapping)
+            else shared
+        ),
     }
+
+
+def _merged_draws(stated: Sequence[Mapping[str, Any]]) -> Any:
+    """One `shared_draws` for several tables: each owner's generator records once."""
+    first = stated[0].get("shared_draws")
+    if not isinstance(first, Mapping):
+        return first
+    rng: dict[str, Any] = {}
+    for record in stated:
+        for owner, records in (record["shared_draws"].get("rng") or {}).items():
+            if owner in rng and rng[owner] != records:
+                raise EvaluationError(
+                    "the metadata differ in their scenarios: the shared draws of "
+                    f"{owner} have two generator records"
+                )
+            rng[owner] = records
+    return {**first, "rng": rng}
 
 
 def _merged_scenarios(
@@ -509,9 +540,11 @@ def _merged_scenarios(
 ) -> dict[str, Any] | None:
     """One `setup.scenarios` for several tables; `None` if none has any.
 
-    Every table must state one set of scenarios. The folds of a set differ in
-    their blocks only: the blocks are combined without repeats, and a scenario's
-    `n_rows` is the sum over them.
+    Every table must state one set of scenarios. The folds and the assets of a
+    set differ in their blocks, where each asset reads the index and each asset's
+    generator records only: the blocks and places are combined without repeats, a
+    scenario's `n_rows` is the sum over its blocks, and the generator records of
+    the shared draws are combined by owner.
     """
     if all(record is None for record in records):
         return None
@@ -541,7 +574,18 @@ def _merged_scenarios(
             "blocks": blocks,
             "n_rows": sum(int(block["n_rows"]) for block in blocks),
         }
-    return {**first, "scenarios": merged}
+        if "index_read" in entry:
+            merged[label]["index_read"] = list(
+                _unique(
+                    place
+                    for record in stated
+                    for place in record["scenarios"][label].get("index_read") or ()
+                )
+            )
+    merged_record = {**first, "scenarios": merged}
+    if "shared_draws" in first:
+        merged_record["shared_draws"] = _merged_draws(stated)
+    return merged_record
 
 
 def _merged_drift(records: Sequence[dict[str, Any] | None]) -> dict[str, Any] | None:
@@ -723,9 +767,11 @@ class EvaluationMetadata(_EvaluationModel):
         the first one given is the one kept. Intervals of several
         tables must have one method, unit, number of resamples and level, and
         their flagged columns are combined. Tables of `compare_scenarios` must
-        state one set of scenarios, of which only the blocks may differ, and
-        those are combined. The entries of `setup.frontier` are combined without
-        repeats. `created_at` is the latest one.
+        state one set of scenarios, of which only the blocks may differ, with
+        where each asset reads the index and each asset's generator records, and
+        those are combined, so the folds and the assets of one set merge. The
+        entries of `setup.frontier` are combined without repeats. `created_at`
+        is the latest one.
 
         Raises `EvaluationError` if the items disagree, and `TypeError` for an
         item that is not `EvaluationMetadata`.
@@ -3449,16 +3495,31 @@ def _scenario_line(
     """Statement 1: one scenario's label, role, sources, rows and block."""
     role = " (the reference)" if label == reference else ""
     members = _list(entry, "members", where)
-    blocks = [
-        _scenario_block(block, members, samples, f"{where}.blocks[{i}]")
-        for i, block in enumerate(_objects(entry, "blocks", where))
+    held = _objects(entry, "blocks", where)
+    owners = [
+        (samples.get(str(block.get("sample_hash"))) or {}).get("asset_ids")
+        for block in held
     ]
+    # The blocks of several assets, as a plan's rows of one asset at a time give.
+    named = len({json.dumps(owner) for owner in owners if owner}) > 1
+    blocks = [
+        (
+            f"{'asset' if len(owner) == 1 else 'assets'} "
+            f"{_join([str(each) for each in owner])}: "
+            if named and owner
+            else ""
+        )
+        + _scenario_block(block, members, samples, f"{where}.blocks[{i}]")
+        for i, (block, owner) in enumerate(zip(held, owners, strict=True))
+    ]
+    planned = not held and entry.get("n_rows", 0) is None
+    rows = "not known yet" if planned else "not among these rows"
     text = (
         f"Scenario {label}{role}: hazard {_hazard_read(entry)}; product "
         f"{_named_or_silent(entry.get('product'))}; pathway "
         f"{_named_or_silent(entry.get('pathway'))}; horizon "
         f"{_named_or_silent(entry.get('horizon'))}; rows: "
-        f"{'; '.join(blocks) or 'not among these rows'}."
+        f"{'; '.join(blocks) or rows}."
     )
     if len(members) > 1:
         names = _join([f"{pathway} {horizon}" for pathway, horizon in members])
@@ -3557,10 +3618,12 @@ def _read_at(places: Sequence[Mapping[str, Any]], where: str) -> str:
 def _index_line(scenarios: Mapping[str, Any]) -> str:
     """Statement 5: where each scenario reads the index."""
     entries = _get(scenarios, "scenarios", Mapping, "setup.scenarios") or {}
-    parts = [
-        f"scenario {label} at {_read_at(_objects(entry, 'index_read', label), label)}"
-        for label, entry in entries.items()
-    ]
+    parts = []
+    for label, entry in entries.items():
+        place = _read_at(_objects(entry, "index_read", label), label)
+        parts.append(
+            f"scenario {label} at {place}" if place else f"{label}: not known yet"
+        )
     return f"Index: {'; '.join(parts)}. Each scenario reads its own index there."
 
 

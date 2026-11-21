@@ -19,9 +19,11 @@ ParametricPlan.for_annual_extremes(source, assets, impact=, unit=, provenance=)
   .scopes(Individual() | Joint())       # optional: asset by asset, or on the total
   .dependence(Comonotonic() | ...)      # with Joint() on curves: required
   .allocation("value" | "loss")         # optional: a joint design's allocated rows
+  .scenarios(ScenarioSet(...))          # optional: several scenarios, out of sample
   .explain()                            # the setup, no I/O
   .samples()                            # execution: one sample per asset
   .joint_sample()                       # execution: Joint() only
+  .scenario_samples()                   # execution: every scenario's samples
   .designs()                            # execution: the designed covers
   .write_parquet("comparison.parquet")  # execution: written atomically
 ```
@@ -142,6 +144,20 @@ joint design's allocated rows, with the values the plan's loss model read, in a
 table and a file of their own (`allocate`), so they never sit beside the rows
 of covers that stand on their own. `docs/parametric.md` describes the rows.
 
+**Scenarios.** `.scenarios(ScenarioSet(...))` reads several scenarios: on fitted
+curves each selected (pathway, horizon), or a window of horizons under
+`labels=`, and a `CurveScenario` for another canonical dataset; on per-year
+values the plan's own source and each `AnnualScenario`. Each scenario's samples
+are built as the plan builds its own, from the same generators, and the refusals
+of `ScenarioSet` run on them. Every template is designed on each scenario's
+design block (`design_on="each"`) or the reference's (`"reference"`), and every
+cover and design is evaluated on every scenario's evaluation block with
+`compare_scenarios`, one fold and asset at a time, or once for all the assets
+under `Joint()`, so the rows are out of sample only and `.split(...)` is
+required. A request that selects several horizons or pathways needs
+`.scenarios(...)`: without it `explain()` and every execution point raise
+`ValueError`.
+
 **Output.** `write_parquet(path)` writes one comparison table, as `compare`
 builds it, through a temporary sibling and `os.replace`. Its metadata under
 `crc.parametric.evaluation` (`EvaluationMetadata`) holds the setup of every
@@ -206,10 +222,12 @@ from crc_sdk.parametric.errors import (
     EvaluationError,
     ProbabilitySemanticsError,
     SampleError,
+    ScenarioError,
 )
 from crc_sdk.parametric.evaluate import (
     Allocation,
     Split,
+    _premium,
     allocate,
     compare,
     write_comparison,
@@ -230,12 +248,23 @@ from crc_sdk.parametric.pricing import Pricing, PurePremium, _check_pricing
 from crc_sdk.parametric.sample import (
     OutcomeSample,
     _arrow_table,
+    _check_known_pathway,
     _identifier,
+    _named_in_source,
     _sample_years,
     _string_values,
     _thaw,
     holdout,
     year_block_kfold,
+)
+from crc_sdk.parametric.scenarios import (
+    AnnualScenario,
+    CurveScenario,
+    ScenarioSet,
+    _check_pairs_held,
+    _check_scenarios,
+    _same_pair,
+    compare_scenarios,
 )
 from crc_sdk.parametric.sources import (
     AnnualSemantics,
@@ -252,11 +281,13 @@ from crc_sdk.parametric.sources import (
     sample_curves,
 )
 from crc_sdk.parametric.trend import AsRecorded, LinearTrend, Trend, _require_trend
-from crc_sdk.types import SourceProvenance
+from crc_sdk.pathways import pathways_equivalent
+from crc_sdk.types import HazardDatasetMetadata, SourceProvenance
 from crc_sdk.workflows.distributions import CURVE_COLUMNS
 from crc_sdk.workflows.portfolio import (
     AssetPortfolio,
     CellColumn,
+    HazardSelection,
     ImpactContextColumns,
     ImpactSpec,
     PointColumns,
@@ -478,7 +509,10 @@ class StationColumn:
     `annual_extremes()` (`station`, `year`, ..., `value`). `name` is the
     asset column holding each asset's station id, and `table_column` the
     table column it is matched against (`"station"`; NOAA water levels use
-    `"station_id"`).
+    `"station_id"`). Each series records `table_column` as its station column
+    (`AnnualSeries.from_table(station=)`), whatever it is called, so a
+    scenario set's place checks and a cover bound with `AtStation` read the
+    station from it.
     """
 
     name: str
@@ -671,7 +705,14 @@ class ParametricResult:
       as written, in a table of their own with its metadata, as `allocate`
       builds them; otherwise `None`;
     - `allocated_output`: the file of `allocated`, `<stem>.allocated<suffix>`
-      beside `output`; otherwise `None`.
+      beside `output`; otherwise `None`;
+    - `scenario_samples`: with `.scenarios(...)`, every scenario's samples, by
+      label and then by asset, the reference first; `samples`, `fresh_samples`
+      and `joint_sample` are then the reference's. Otherwise `None`;
+    - `scenario_fresh_samples`: with `.scenarios(...)` and `FreshDraws`, every
+      curve scenario's fresh draws, by label and then by asset, on one set of
+      uniforms; their `content_hash` is the `sample_hash` of each scenario's
+      rows. Otherwise `None`.
     """
 
     output: Path
@@ -686,6 +727,8 @@ class ParametricResult:
     fresh_joint_sample: OutcomeSample | None = None
     allocated: Any = None
     allocated_output: Path | None = None
+    scenario_samples: Mapping[str, Mapping[str, OutcomeSample]] | None = None
+    scenario_fresh_samples: Mapping[str, Mapping[str, OutcomeSample]] | None = None
 
     @property
     def row_count(self) -> int:
@@ -708,6 +751,7 @@ class _Run:
     joint: OutcomeSample | None = None
     fresh_joint: OutcomeSample | None = None
     run_records: Mapping[tuple[str, str], dict[str, Any]] | None = None
+    scenarios: Mapping[str, _Samples] | None = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -725,6 +769,40 @@ class _AnnualAsset:
 
 _Block = tuple[int, OutcomeSample, OutcomeSample | None]
 """A fold, its design block, and its evaluation block if it has one."""
+
+DesignOn = Literal["each", "reference"]
+"""Where a plan with scenarios designs: on every scenario, or the reference's."""
+
+_Pairs = tuple[tuple[str, int], ...]
+"""A curve scenario's (pathway, horizon) pairs, in horizon order."""
+
+
+@dataclass(frozen=True, eq=False)
+class _Planned:
+    """One scenario of a plan, as far as it is known before execution.
+
+    `kind` is `"selection"` for pairs of the request's selection, `"dataset"`
+    for a `CurveScenario`, `"own"` for a per-year plan's own source and
+    `"annual"` for an `AnnualScenario`. `members` are a curve scenario's pairs,
+    `None` where they are known only at execution or the scenario reads years.
+    """
+
+    label: str
+    kind: Literal["selection", "dataset", "own", "annual"]
+    members: _Pairs | None = None
+    described: AnnualScenario | CurveScenario | None = None
+
+
+@dataclass(frozen=True, eq=False)
+class _CurveRead:
+    """One canonical dataset at execution: its metadata, its record and its rows.
+
+    `rows` holds each asset's matched canonical rows, one per (pathway, horizon).
+    """
+
+    metadata: HazardDatasetMetadata
+    record: dict[str, Any]
+    rows: dict[str, list[dict[str, Any]]]
 
 
 @dataclass(frozen=True, eq=False)
@@ -1095,6 +1173,33 @@ def _bound(
     )
 
 
+def _cover_label(cover: Cover) -> str:
+    """A cover's `cover_label` in a comparison: its label, or its hash's start."""
+    if cover.label is not None:
+        return cover.label
+    return cover.definition_hash.removeprefix("sha256:")[:12]
+
+
+def _checked_premiums(premiums: Any) -> tuple[tuple[str, float], ...] | None:
+    """`premiums=` of `.scenarios(...)`, as (cover_label, premium) pairs."""
+    if premiums is None:
+        return None
+    if not isinstance(premiums, Mapping):
+        raise TypeError(
+            "premiums must map a cover_label to a stated premium, got "
+            f"{type(premiums).__name__}"
+        )
+    pairs: list[tuple[str, float]] = []
+    for key, value in premiums.items():
+        if not isinstance(key, str):
+            raise TypeError(f"premiums must be keyed by cover_label, got {key!r}")
+        amount = _premium(value)
+        if amount is None:
+            raise EvaluationError(f"premiums= states no number for {key!r}")
+        pairs.append((key, amount))
+    return tuple(pairs)
+
+
 def _design_label(template: Cover, objective: Objective) -> str:
     base = template.label or template.definition_hash.removeprefix("sha256:")[:12]
     return f"{base} ({_objective_tag(objective)})"
@@ -1252,6 +1357,47 @@ def _within_grid_cell(
     return True
 
 
+def _several_selected(name: str, count: int) -> ValueError:
+    """The refusal of a selection of several hazards, horizons or pathways."""
+    return ValueError(
+        f"the plan samples one curve per asset, but the request selects {count} "
+        f"{name}; select one with .select({name}=[...])"
+        + (
+            ""
+            if name == "hazard_names"
+            else ", or state the scenarios to read with .scenarios(ScenarioSet(...))"
+        )
+    )
+
+
+def _source_pathway(source: Any) -> str | None:
+    """The pathway a source plan's `explain()` states; `None` for other sources."""
+    if _source_kind(source) != "plan" or not callable(getattr(source, "explain", None)):
+        return None
+    return _stated_pathway(_source_plan_document(source))
+
+
+def _source_hazard(source: Any) -> str | None:
+    """The hazard a source plan's `explain()` names; `None` for other sources."""
+    if _source_kind(source) != "plan" or not callable(getattr(source, "explain", None)):
+        return None
+    explained = _source_plan_document(source)
+    return _named_in_source(explained) if isinstance(explained, Mapping) else None
+
+
+def _window_count(label: str, what: str, n: int, m: int, step: int = 1) -> None:
+    """Raise `ScenarioError` unless `n` rows give every member of `m` as many."""
+    unit = m * step
+    if n % unit:
+        lower = max(n // unit, 1) * unit
+        whose = "" if step == 1 else f", its members times the reference's {step} rows"
+        raise ScenarioError(
+            f"scenario {label!r} is a window of {m} horizons, so {what} must be a "
+            f"whole multiple of {unit}{whose}, got {n}; the nearest valid counts "
+            f"are {lower} and {lower + unit}"
+        )
+
+
 # -- the plan ----------------------------------------------------------------
 
 
@@ -1276,7 +1422,11 @@ class ParametricPlan:
     `allocation_rule` what `.scopes(...)`, `.dependence(...)` and
     `.allocation(...)` state. `pool` holds what `for_annual_extremes(...)`
     states of a pool of model-years, and `source` is then a tuple of its sources
-    when several were given.
+    when several were given. `hazard_name` is the name `for_annual_extremes`
+    states, and `scenario_set`, `design_on` and `scenario_premiums` what
+    `.scenarios(...)` states. `stated_pathway` and `names_hazard` are set on the
+    plan a per-year scenario is read with: the pathway an `AnnualScenario`
+    states, and that each series records the hazard its source plan names.
     """
 
     source: Any
@@ -1306,6 +1456,12 @@ class ParametricPlan:
     dependence_model: Dependence | None = None
     allocation_rule: Allocation | None = None
     pool: ModelPool | None = None
+    hazard_name: str | None = None
+    scenario_set: ScenarioSet | None = None
+    design_on: DesignOn = "each"
+    scenario_premiums: tuple[tuple[str, float], ...] | None = None
+    stated_pathway: str | None = None
+    names_hazard: bool = False
 
     # -- the entry points -----------------------------------------------------
 
@@ -1326,7 +1482,10 @@ class ParametricPlan:
         selection must leave one hazard, horizon and pathway. At execution,
         `request.asset_curves()` gives the asset's canonical curve row and
         `sample_curve` draws the simulated years that `.monte_carlo(n_draws,
-        seed=...)` states, so `.monte_carlo(...)` is required.
+        seed=...)` states, so `.monte_carlo(...)` is required. A selection of
+        several horizons or pathways is for `.scenarios(...)`, which reads each
+        selected (pathway, horizon), or a window of them, as one scenario;
+        without it, `explain()` and every execution point raise `ValueError`.
 
         - The loss is `impact(hazard) × value`: the impact is the request's
           (an `ImpactExpression` keeps its `definition_hash`), the value the
@@ -1343,9 +1502,8 @@ class ParametricPlan:
         Raises `TypeError` for a request of another type (for a remote
         source, materialize it first and build the request on the
         `HazardDataset` it returns) or for SQL assets; `ValueError` for a
-        request without an impact or a selection of several hazards,
-        horizons or pathways; and `SampleError` for a missing asset column
-        or an invalid loss model.
+        request without an impact or a selection of several hazards; and
+        `SampleError` for a missing asset column or an invalid loss model.
         """
         if not isinstance(request, PortfolioEvaluation):
             raise TypeError(
@@ -1361,17 +1519,8 @@ class ParametricPlan:
                 "value_unit=..., value_semantics=...) to state the loss"
             )
         selection = request.selection
-        for name, values in (
-            ("hazard_names", selection.hazard_names),
-            ("horizons", selection.horizons),
-            ("pathways", selection.pathways),
-        ):
-            if values is not None and len(values) > 1:
-                raise ValueError(
-                    f"the plan samples one curve per asset, but the request "
-                    f"selects {len(values)} {name}; select one with "
-                    f".select({name}=[...])"
-                )
+        if selection.hazard_names is not None and len(selection.hazard_names) > 1:
+            raise _several_selected("hazard_names", len(selection.hazard_names))
         portfolio = request.portfolio
         if isinstance(portfolio.data, str):
             raise TypeError(
@@ -1425,6 +1574,7 @@ class ParametricPlan:
         scenario: str = "baseline",
         cell: str | H3Cell | None = None,
         pool: ModelPool | None = None,
+        hazard_name: str | None = None,
     ) -> ParametricPlan:
         """Plan covers on per-year hazard values at each asset.
 
@@ -1483,11 +1633,21 @@ class ParametricPlan:
           run. `years`, `missing` and `trend` apply to every run, and every
           run must then hold the same years. `.samples()` returns one pooled
           sample per asset. `.index(...)` and `StationColumn` are refused.
+        - `hazard_name` states the hazard the loss reads. It is optional where
+          the source names one (a source plan's `recipe` or `hazard_name`, or
+          a one-valued `recipe` column of the table), and must then agree, which
+          `explain()` checks for a source plan and execution for a table. A
+          scenario set needs every scenario's name
+          (`.scenarios(...)`), so it is required there for a source that is
+          silent, such as a plain table, a file or NOAA water levels. Each
+          sample records the name in its provenance's `hazard`, and whether the
+          caller stated it.
 
         Raises `TypeError` for arguments of the wrong type, `SampleError`
         for a unit the impact is not calibrated for, a missing asset column,
         an invalid `scenario` or a `cell` for an impact that takes no
-        context, and `ValueError` for other invalid arguments, among them a
+        context, `ScenarioError` for a `hazard_name` a source plan
+        contradicts, and `ValueError` for other invalid arguments, among them a
         `LinearTrend` with `fit_years`, which the plan sets per fold, a
         `cell` where the impact's context already holds one, and `pool` with
         `StationColumn`, since models have no stations. A registry
@@ -1580,6 +1740,8 @@ class ParametricPlan:
                 "plan sets them per fold, so leave them out"
             )
         scenario = _identifier("scenario", scenario)
+        if hazard_name is not None:
+            hazard_name = _identifier("hazard_name", hazard_name)
         return cls(
             source=source,
             assets=portfolio,
@@ -1596,6 +1758,7 @@ class ParametricPlan:
             trend=trend,
             scenario=scenario,
             pool=pool,
+            hazard_name=hazard_name,
         )
 
     # -- builders ---------------------------------------------------------------
@@ -2124,6 +2287,340 @@ class ParametricPlan:
             )
         return dataclasses.replace(self, allocation_rule=rule)
 
+    def scenarios(
+        self,
+        scenarios: ScenarioSet,
+        *,
+        design_on: DesignOn = "each",
+        premiums: Mapping[str, float] | None = None,
+    ) -> ParametricPlan:
+        """Read several scenarios, and put every cover or design on each one's block.
+
+        `scenarios` is a `ScenarioSet` that describes what the plan reads, with a
+        `reference` you name: the module chooses none. Each scenario's samples
+        are built as the plan builds its own, every template is designed on the
+        design blocks, and every cover and design is evaluated on every
+        scenario's evaluation block with `compare_scenarios`, out of sample only,
+        so the rows are the function route's. `scenario` says where a row is
+        evaluated and `design_scenario` where it was designed.
+
+        **On fitted curves** the request's `select(...)` must state exactly one
+        hazard in `hazard_names`, and `horizons` and `pathways`, so that
+        `explain()` lists the scenarios without reading anything. Without
+        `labels=`, every selected (pathway, horizon) is one scenario, labelled
+        `<pathway>_<horizon>`. `labels=` maps a label to its pairs instead and
+        lists exactly the pairs read, each of them selected: several pairs of one
+        pathway are a window of horizons, an equal-weight mixture of their curves
+        on one stream of uniforms, and one pair is a single horizon. So
+        `ScenarioSet(reference="2030s", labels={"2030s": [("ssp585", 2025),
+        ("ssp585", 2030), ("ssp585", 2035)], ...})` is the whole statement. A
+        `CurveScenario` among the set's entries reads another local canonical
+        dataset. One `.monte_carlo(n_draws, seed=...)` serves every curve
+        scenario: each asset's generators are rebuilt per scenario, from the
+        plan's seed and from `FreshDraws.seed`, so the curve scenarios share one
+        set of design draws and one of evaluation draws. `n_draws` and
+        `FreshDraws(n)` must be whole multiples of every window's members.
+
+        **On per-year values** the plan's own source is one scenario, under its
+        `scenario=` label, and each `AnnualScenario` among the set's entries is
+        another, such as another pathway's years. `.index(...)` applies to every
+        scenario, on that scenario's hazard years.
+
+        - `design_on="each"`, the default, designs every template under every
+          objective on every scenario's design block, so that how a fixed cover
+          drifts and a design per scenario are slices of one table;
+          `"reference"` designs on the reference's only.
+        - `premiums` maps a resolved cover's `cover_label` to a stated premium,
+          its `premium_basis` `"stated"`. Another resolved cover is priced once,
+          with the plan's pricing, on the reference's design block
+          (`"reference"`). A design keeps its design premium. `premium_repriced`
+          prices the same payouts on each block.
+        - `.split(...)` is required, because the rows are out of sample only:
+          `FreshDraws` on curves, `Holdout` or `KFold` on either route.
+
+        The refusals of a `ScenarioSet` run on the samples at execution, through
+        the function `ScenarioSet` itself runs. `explain()` lists the scenarios,
+        their sources and members, the reference and `design_on`, without I/O.
+        Replaces any scenarios stated before.
+
+        Raises `TypeError` for arguments of the wrong type and for a set of built
+        samples, which `compare_scenarios` takes; `ValueError` for an
+        `AnnualScenario` on fitted curves, a `CurveScenario` or `labels=` on
+        per-year values, a `design_on` other than `"each"` or `"reference"`, and
+        a selection that doesn't state one hazard, its horizons and its
+        pathways; `ScenarioError` for a label used twice, a reference that is
+        none of the scenarios, a pair of `labels=` the request doesn't select
+        and a selected pathway `crc_sdk.pathways` doesn't know;
+        `EvaluationError` for a premium that is not a finite non-negative
+        number; and `SampleError` for an `AnnualScenario` in a unit the impact
+        is not calibrated for.
+        """
+        if not isinstance(scenarios, ScenarioSet):
+            raise TypeError(
+                f"scenarios must be a ScenarioSet, got {type(scenarios).__name__}"
+            )
+        if not scenarios._describes:
+            raise TypeError(
+                "this set holds built samples, which compare_scenarios takes; a plan "
+                "reads its scenarios, so describe them: ScenarioSet(reference=..., "
+                "labels=...) on fitted curves, or AnnualScenario and CurveScenario "
+                "entries"
+            )
+        if design_on not in get_args(DesignOn):
+            raise ValueError(
+                f"design_on must be one of {get_args(DesignOn)}, got {design_on!r}"
+            )
+        described = scenarios._described
+        if self._on_curves:
+            annual = [entry for entry in described if isinstance(entry, AnnualScenario)]
+            if annual:
+                raise ValueError(
+                    f"AnnualScenario {annual[0].label!r} reads per-year values, and "
+                    "this plan reads fitted curves (for_evaluation); state a "
+                    "CurveScenario for another canonical dataset"
+                )
+            self._check_scenario_selection()
+        else:
+            curves = [entry for entry in described if isinstance(entry, CurveScenario)]
+            if curves:
+                raise ValueError(
+                    f"CurveScenario {curves[0].label!r} reads fitted curves, and this "
+                    "plan reads per-year values (for_annual_extremes); state an "
+                    "AnnualScenario for another per-year source"
+                )
+            if scenarios._pairs is not None:
+                raise ValueError(
+                    "labels= names (pathway, horizon) pairs of the selection of a "
+                    "plan on fitted curves; a per-year plan's scenarios are its own "
+                    "source, under its scenario= label, and AnnualScenario entries"
+                )
+        plan = dataclasses.replace(
+            self,
+            scenario_set=scenarios,
+            design_on=design_on,
+            scenario_premiums=_checked_premiums(premiums),
+        )
+        for planned in plan._planned_scenarios():
+            if isinstance(planned.described, AnnualScenario):
+                unit = planned.described.unit
+                if unit is not None:
+                    self.loss_model.check_hazard_unit(unit)
+        return plan
+
+    def _check_scenario_selection(self) -> None:
+        """Raise unless the request states what `explain()` lists the scenarios by."""
+        selection = self.source.selection
+        names = selection.hazard_names
+        if names is None or len(names) != 1:
+            raise ValueError(
+                "with .scenarios(...), the request's select(...) must state exactly "
+                "one hazard in hazard_names, so that explain() names the hazard every "
+                "scenario reads without reading anything"
+            )
+        for name in ("horizons", "pathways"):
+            if getattr(selection, name) is None:
+                raise ValueError(
+                    f"with .scenarios(...), the request's select(...) must state "
+                    f"{name}, so that explain() lists the scenarios without reading "
+                    "anything"
+                )
+
+    def _selected_pairs(self) -> list[tuple[str, int]]:
+        """Every (pathway, horizon) the request selects, pathway by pathway."""
+        selection = self.source.selection
+        return [
+            (str(pathway), int(horizon))
+            for pathway in selection.pathways or ()
+            for horizon in selection.horizons or ()
+        ]
+
+    def _planned_scenarios(self) -> list[_Planned]:
+        """The plan's scenarios, the reference first, then as given.
+
+        On curves the selection's come first, then each `CurveScenario`; on
+        per-year values the plan's own source, then each `AnnualScenario`.
+        """
+        stated = self.scenario_set
+        assert stated is not None
+        planned: list[_Planned] = []
+        if self._on_curves:
+            selected = self._selected_pairs()
+            pairs = stated._pairs
+            if pairs is None:
+                for pathway, horizon in selected:
+                    label = _identifier("scenario", f"{pathway}_{horizon}")
+                    _check_known_pathway(pathway, label)
+                    planned.append(_Planned(label, "selection", ((pathway, horizon),)))
+            else:
+                for label, members in pairs.items():
+                    for pair in members:
+                        if not any(_same_pair(pair, each) for each in selected):
+                            raise ScenarioError(
+                                f"scenario {label!r} lists the (pathway, horizon) pair "
+                                f"{pair}, which the request doesn't select; it selects "
+                                f"{selected}, and labels= lists the pairs read"
+                            )
+                    planned.append(_Planned(label, "selection", tuple(members)))
+            for entry in stated._described:
+                assert isinstance(entry, CurveScenario)
+                horizons = entry.horizons
+                stated_pairs = (
+                    None
+                    if entry.pathway is None or horizons is None
+                    else tuple((entry.pathway, horizon) for horizon in horizons)
+                )
+                planned.append(_Planned(entry.label, "dataset", stated_pairs, entry))
+        else:
+            planned.append(_Planned(self.scenario, "own"))
+            for entry in stated._described:
+                assert isinstance(entry, AnnualScenario)
+                planned.append(_Planned(entry.label, "annual", None, entry))
+        labels = [each.label for each in planned]
+        repeated = sorted({label for label in labels if labels.count(label) > 1})
+        if repeated:
+            raise ScenarioError(
+                f"two scenarios are labelled {repeated[0]!r}: each scenario has its "
+                "own label"
+                + (
+                    ""
+                    if self._on_curves
+                    else ", and the plan's own source is labelled by its scenario="
+                )
+            )
+        if stated.reference not in labels:
+            raise ScenarioError(
+                f"the reference {stated.reference!r} must be one of the plan's "
+                f"scenarios, {labels}"
+            )
+        return sorted(planned, key=lambda each: each.label != stated.reference)
+
+    def _scenario_plan(self, planned: _Planned) -> ParametricPlan:
+        """The plan one per-year scenario is read with: the plan's, or its own source.
+
+        The loss model, the cell, the seed, the covers and the rest are the plan's.
+        Every scenario's series record the hazard their source plan names.
+        """
+        base = dataclasses.replace(
+            self, scenario_set=None, scenario_premiums=None, names_hazard=True
+        )
+        entry = planned.described
+        if not isinstance(entry, AnnualScenario):
+            return base
+        pool = self.pool if entry.pool is None else (entry.pool or None)
+        if pool is None and isinstance(entry.source, tuple):
+            raise ValueError(
+                f"scenario {entry.label!r} gives a sequence of sources, which are a "
+                "pool's runs; state pool=ModelPool() on it or on the plan"
+            )
+        return dataclasses.replace(
+            base,
+            source=entry.source,
+            provenance=entry.provenance,
+            unit=self.unit if entry.unit is None else entry.unit,
+            location=self.location if entry.location is None else entry.location,
+            year_column=(
+                self.year_column if entry.year_column is None else entry.year_column
+            ),
+            hazard_column=(
+                self.hazard_column
+                if entry.hazard_column is None
+                else entry.hazard_column
+            ),
+            years=self.years if entry.years is None else tuple(entry.years),
+            missing=self.missing if entry.missing is None else entry.missing,
+            trend=self.trend if entry.trend is None else entry.trend,
+            pool=pool,
+            scenario=entry.label,
+            hazard_name=entry.hazard_name,
+            stated_pathway=entry.pathway,
+        )
+
+    def _check_scenario_plan(self) -> None:
+        """Check what no single builder can, for a plan with or without scenarios.
+
+        Without scenarios, a plan on curves reads one horizon and one pathway.
+        With them, the rows are out of sample, so a split is required; every
+        window's members divide the draws; and the premiums name resolved covers.
+        """
+        stated = self.scenario_set
+        if stated is None:
+            if self._on_curves:
+                selection = self.source.selection
+                for name in ("horizons", "pathways"):
+                    values = getattr(selection, name)
+                    if values is not None and len(values) > 1:
+                        raise _several_selected(name, len(values))
+            self._check_hazard_name()
+            return
+        if self.split_rule is None:
+            raise ValueError(
+                "a plan with scenarios needs .split(...): its rows are out of sample "
+                "only, each scenario's design block apart from its evaluation block "
+                "(FreshDraws on fitted curves, Holdout or KFold on either route)"
+            )
+        if self.allocation_rule is not None:
+            raise ValueError(
+                ".allocation(...) is not offered with .scenarios(...) yet: a plan "
+                "writes allocated rows in a file of their own, and compare_scenarios "
+                "puts them beside the totals; compare_scenarios(..., allocation=...) "
+                "gives them on the function route"
+            )
+        planned = self._planned_scenarios()
+        draws = self.draws
+        rule = self.split_rule
+        model = self.dependence_model if self._holds_joint else None
+        step = len(model.reference) if isinstance(model, EmpiricalCopula) else 1
+        for each in planned:
+            if each.members is not None and len(each.members) > 1:
+                m = len(each.members)
+                if draws is not None:
+                    _window_count(each.label, "n_draws", draws.n_draws, m, step)
+                if isinstance(rule, FreshDraws):
+                    _window_count(each.label, "FreshDraws(n)", rule.n_draws, m, step)
+            if each.kind in ("own", "annual"):
+                variant = self._scenario_plan(each)
+                if variant.pool is not None and self.index_read is not None:
+                    refusal = variant._index_refusal()
+                    assert refusal is not None
+                    raise ValueError(f"scenario {each.label!r}: {refusal}")
+                if variant.pool is not None and isinstance(
+                    variant.location, StationColumn
+                ):
+                    raise ValueError(
+                        f"scenario {each.label!r} pools climate-model runs, and "
+                        "models have no stations; locate each asset with "
+                        "NearestCell()"
+                    )
+                variant._check_hazard_name()
+        given = {
+            _cover_label(cover)
+            for cover in self.cover_list
+            if not cover.free_parameters()
+        }
+        unknown = sorted(
+            key for key, _ in self.scenario_premiums or () if key not in given
+        )
+        if unknown:
+            raise EvaluationError(
+                f"premiums= names {unknown}, which match no cover given as is; it "
+                f"maps the cover_label of a resolved cover, here {sorted(given)}"
+            )
+
+    def _check_hazard_name(self) -> None:
+        """Raise `ScenarioError` for a stated hazard name a source plan contradicts."""
+        stated = self.hazard_name
+        if stated is None or self._on_curves:
+            return
+        sources = self._pool_sources() if self.pool is not None else (self.source,)
+        for source in sources:
+            named = _source_hazard(source)
+            if named is not None and named != stated:
+                raise ScenarioError(
+                    f"scenario {self.scenario!r}: hazard_name={stated!r} contradicts "
+                    f"the source plan, which names {named!r}; a stated name never "
+                    "overrides the record"
+                )
+
     # -- scopes -----------------------------------------------------------------
 
     @property
@@ -2410,15 +2907,18 @@ class ParametricPlan:
             "steps": ["hazard", "basis_risk"],
         }
 
+    def _by_asset(self, sample: dict[str, Any]) -> list[dict[str, Any]]:
+        """One sample description per asset, or one of all of them under `Joint()`."""
+        ids = self._known_asset_ids()
+        if ids is None:
+            return [{**sample, "asset_ids": []}]
+        if self._holds_joint:
+            return [{**sample, "asset_ids": ids}]
+        return [{**sample, "asset_ids": [asset_id]} for asset_id in ids]
+
     def _explain_document(self) -> dict[str, Any]:
         ids = self._known_asset_ids()
-        sample = self._sample_description()
-        if ids is None:
-            samples = [{**sample, "asset_ids": []}]
-        elif self._holds_joint:
-            samples = [{**sample, "asset_ids": ids}]
-        else:
-            samples = [{**sample, "asset_ids": [asset_id]} for asset_id in ids]
+        samples = self._by_asset(self._sample_description())
         spec = self.design_spec
         designs = None
         if spec is not None:
@@ -2524,6 +3024,211 @@ class ParametricPlan:
             }
         return document
 
+    def _scenario_entry(
+        self, planned: _Planned, variant: ParametricPlan | None
+    ) -> dict[str, Any]:
+        """One scenario's entry of `setup.scenarios`, as far as it is known."""
+        members = (
+            None
+            if planned.members is None
+            else [[pathway, year] for pathway, year in planned.members]
+        )
+        pathway: str | None = None
+        horizon: int | None = None
+        product: str | None = None
+        hazard: dict[str, str] | None = None
+        if variant is None:
+            names = self.source.selection.hazard_names
+            hazard = {"name": str(names[0]), "from": "curve_row"}
+            if planned.members is not None:
+                pathway = planned.members[0][0]
+                horizons = [year for _, year in planned.members]
+                horizon = (horizons[0] + horizons[-1]) // 2
+        else:
+            assert variant.provenance is not None
+            product = variant.provenance.provider
+            sources = variant._pool_sources() if variant.pool else (variant.source,)
+            named = [_source_hazard(source) for source in sources]
+            pathway = variant.stated_pathway or next(
+                (each for each in map(_source_pathway, sources) if each), None
+            )
+            if any(named):
+                hazard = {
+                    "name": str(next(n for n in named if n)),
+                    "from": "source_plan",
+                }
+            elif variant.hazard_name is not None:
+                hazard = {"name": variant.hazard_name, "from": "stated"}
+        return {
+            "blocks": [],
+            "hazard": hazard,
+            "horizon": horizon,
+            "index_read": [],
+            "members": members,
+            "n_rows": None,
+            "pathway": pathway,
+            "product": product,
+            "source_kind": "monte_carlo" if self._on_curves else "annual",
+        }
+
+    def _scenario_evaluations(self, labels: Sequence[str]) -> list[dict[str, Any]]:
+        """The planned evaluations: every design scenario on every scenario's block."""
+        stated = self.scenario_set
+        assert stated is not None
+        reference = stated.reference
+        templates = any(cover.free_parameters() for cover in self.cover_list)
+        given = any(not cover.free_parameters() for cover in self.cover_list)
+        design_scenarios: list[str | None] = [
+            *(self._design_labels(labels) if templates else []),
+            *([None] if given else []),
+        ]
+        rows = self._planned_rows() if self._holds_joint else {}
+        pricing = self._pricing().to_document()
+        rule = self.split_rule
+        evaluations: list[dict[str, Any]] = []
+        for entry in self._evaluations():
+            if entry["split"] != "out_of_sample":
+                continue
+            made: dict[str, Any] = {"kind": "as_built"}
+            if isinstance(rule, Holdout):
+                made = {"kind": "holdout", "train_fraction": rule.train_fraction}
+            elif isinstance(rule, KFold):
+                made = {"kind": "kfold", "k": rule.k, "fold": entry["fold"]}
+            for label in labels:
+                for design_scenario in design_scenarios:
+                    designed_on = (
+                        reference if design_scenario is None else design_scenario
+                    )
+                    own = designed_on == label
+                    details = (
+                        dict(entry["details"])
+                        if own
+                        else {"block": made, **self._seed_details()}
+                    )
+                    evaluations.append(
+                        {
+                            **rows,
+                            "design_scenario": design_scenario,
+                            "details": details,
+                            "fold": entry["fold"],
+                            "method": entry["method"] if own else "other_scenario",
+                            "pricing": pricing,
+                            "scenario": label,
+                            "split": "out_of_sample",
+                        }
+                    )
+        return evaluations
+
+    def _design_labels(self, labels: Sequence[str]) -> list[str]:
+        """The scenarios the templates are designed on, under `design_on`."""
+        stated = self.scenario_set
+        assert stated is not None
+        return list(labels) if self.design_on == "each" else [stated.reference]
+
+    def _explain_scenarios(self, document: dict[str, Any]) -> None:
+        """Add the scenarios to `explain()`'s document: what each reads, and where."""
+        stated = self.scenario_set
+        assert stated is not None
+        planned = self._planned_scenarios()
+        labels = [each.label for each in planned]
+        entries: dict[str, Any] = {}
+        described: dict[str, Any] = {}
+        samples: list[dict[str, Any]] = []
+        own_sources = document["sources"]
+        index = [entry for entry in own_sources if entry.get("role") == "index"]
+        sources: list[dict[str, Any]] = []
+        licences: list[dict[str, Any]] = []
+        selection = [each.label for each in planned if each.kind == "selection"]
+        for each in planned:
+            variant = None if self._on_curves else self._scenario_plan(each)
+            entry = self._scenario_entry(each, variant)
+            entries[each.label] = entry
+            own = variant if variant is not None else self
+            sample = {
+                **own._sample_description(),
+                "scenario": each.label,
+                **{key: entry[key] for key in ("horizon", "pathway", "product")},
+                "members": entry["members"],
+            }
+            samples += self._by_asset(sample)
+            description: dict[str, Any] = {
+                "kind": each.kind,
+                "members": entry["members"],
+            }
+            if each.kind == "dataset":
+                assert isinstance(each.described, CurveScenario)
+                source = self._curve_scenario_description(each.described)
+                sources.append(source)
+                description |= {"path": source["path"]}
+            elif variant is not None:
+                read = variant._source_descriptions()
+                sources += [{**part, "scenarios": [each.label]} for part in read]
+                assert variant.provenance is not None
+                licence = {
+                    "attribution": variant.provenance.attribution,
+                    "licence": variant.provenance.licence,
+                    "role": "hazard",
+                    "source": variant.provenance.dataset,
+                }
+                if licence not in licences:
+                    licences.append(licence)
+                description |= {
+                    "hazard_name": variant.hazard_name,
+                    "pathway": variant.stated_pathway,
+                    "pool": None
+                    if variant.pool is None
+                    else variant.pool.to_document(),
+                    "trend": variant.trend.to_document(),
+                }
+            described[each.label] = description
+        if self._on_curves:
+            dataset = [entry for entry in own_sources if entry.get("role") != "index"]
+            sources = [{**entry, "scenarios": selection} for entry in dataset] + sources
+        if document["licences"] is not None:
+            licences += [
+                entry for entry in document["licences"] if entry["role"] != "hazard"
+            ]
+            document["licences"] = licences
+        document["sources"] = [*sources, *index]
+        curves = list(labels) if self._on_curves else None
+        document["setup"]["scenarios"] = {
+            "design_on": self.design_on,
+            "labels": labels,
+            "mixed_products": stated.mixed_products,
+            "reference": stated.reference,
+            "scenarios": entries,
+            "shared_draws": None if curves is None else {"labels": curves, "rng": {}},
+        }
+        document["setup"]["samples"] = samples
+        document["setup"]["evaluations"] = self._scenario_evaluations(labels)
+        document["scenarios"] = {
+            "design_on": self.design_on,
+            "labels": labels,
+            "mixed_products": stated.mixed_products,
+            "premiums": (
+                None if self.scenario_premiums is None else dict(self.scenario_premiums)
+            ),
+            "reference": stated.reference,
+            "scenarios": described,
+        }
+
+    def _curve_scenario_description(self, entry: CurveScenario) -> dict[str, Any]:
+        """A `CurveScenario`'s dataset, in the form of the plan's own source entry."""
+        request: PortfolioEvaluation = self.source
+        own = self._source_description(request)
+        names = request.selection.hazard_names
+        return {
+            **own,
+            "path": os.fspath(entry.dataset.provider.source),
+            "scenarios": [entry.label],
+            "selection": {
+                "hazard_names": _listed(names),
+                "horizons": _listed(entry.horizons),
+                "pathways": None if entry.pathway is None else [entry.pathway],
+            },
+            "type": type(entry.dataset).__name__,
+        }
+
     def explain(
         self, *, format: Literal["text", "json"] = "text"
     ) -> str | dict[str, Any]:
@@ -2559,14 +3264,30 @@ class ParametricPlan:
         evaluation its `level`, `scope` and `allocation`. `format="json"` returns a
         dict, `"text"` its JSON text.
 
+        With `.scenarios(...)`, the document adds `scenarios` (the reference,
+        the labels, `design_on`, `mixed_products`, `premiums` and each
+        scenario's kind and members), `setup.scenarios` in the form the
+        written metadata has, one sample per scenario and asset, the planned
+        evaluations of every design scenario on every scenario's block, and
+        one entry of `sources` per scenario source, with the labels that read
+        it.
+
         Raises `ValueError` for `Joint()` on fitted curves without
         `.dependence(...)`, for a dependence or an allocation without
         `Joint()`, and for a cover written for one asset under `Joint()`;
-        `SampleError` for a draw count or assets that `EmpiricalCopula`'s
-        reference does not fit.
+        for a request that selects several horizons or pathways without
+        `.scenarios(...)`; with `.scenarios(...)`, without `.split(...)` or
+        with `.allocation(...)`; `SampleError` for a draw count or assets that
+        `EmpiricalCopula`'s reference does not fit; `ScenarioError` for a
+        window whose members don't divide `n_draws` or `FreshDraws(n)`, and
+        for a stated `hazard_name` a source plan contradicts; and
+        `EvaluationError` for `premiums=` that name no cover given as is.
         """
         self._check_scopes()
+        self._check_scenario_plan()
         document = self._explain_document()
+        if self.scenario_set is not None:
+            self._explain_scenarios(document)
         if format == "json":
             return document
         if format != "text":
@@ -2696,15 +3417,25 @@ class ParametricPlan:
         return document
 
     def _open(self, read: _SeriesRead) -> _OpenedRead:
-        """Read a source once, for all the assets' series."""
+        """Read a source once, for all the assets' series.
+
+        On a plan with scenarios, or with a stated `hazard_name`, the series'
+        source records the hazard its source plan's `explain()` names, so that
+        the sample's `hazard` record says the source names it.
+        """
         table, record = self._read_source(read)
-        return _OpenedRead(
-            read,
-            table,
-            record,
-            self._series_source(read),
-            _stated_pathway(record.get("explain")),
-        )
+        source = self._series_source(read)
+        explained = record.get("explain")
+        if (
+            read.role == "hazard"
+            and (self.names_hazard or self.hazard_name is not None)
+            and isinstance(explained, Mapping)
+        ):
+            for key in ("recipe", "hazard_name"):
+                value = explained.get(key)
+                if isinstance(value, str) and value:
+                    source[key] = value
+        return _OpenedRead(read, table, record, source, _stated_pathway(explained))
 
     def _pool_sources(self) -> tuple[Any, ...]:
         """The sources of a pool: several, or the one that holds every run."""
@@ -2732,6 +3463,9 @@ class ParametricPlan:
             if key in columns:
                 continue
             value = explained.get(key) if isinstance(explained, dict) else None
+            if key == "pathway" and not value and self.stated_pathway is not None:
+                # An AnnualScenario's pathway fills the record where none states it.
+                value = self.stated_pathway
             if not isinstance(value, str) or not value:
                 raise SampleError(
                     f"a source of the pool states no {key}: it has no column "
@@ -2810,16 +3544,31 @@ class ParametricPlan:
         asset_id: str,
         portfolio: AssetPortfolio,
     ) -> AnnualSeries:
-        """One asset's series of an opened source, as read at its location."""
+        """One asset's series of an opened source, as read at its location.
+
+        The pathway a source plan states is recorded beside the caller's source,
+        and so is an `AnnualScenario`'s stated pathway where the source states
+        none; one that the source plan contradicts raises `ScenarioError`.
+        """
         series = self._located_series(opened, row, asset_id, portfolio)
-        if opened.pathway is None:
+        pathway = opened.pathway
+        stated = self.stated_pathway if opened.read.role == "hazard" else None
+        if stated is not None:
+            if pathway is not None and not pathways_equivalent(pathway, stated):
+                raise ScenarioError(
+                    f"scenario {self.scenario!r}: pathway={stated!r} contradicts the "
+                    f"source plan, which states {pathway!r}; a stated pathway must "
+                    "agree with its source"
+                )
+            pathway = stated if pathway is None else pathway
+        if pathway is None:
             return series
         # Beside the caller's source: the plan does not rewrite it.
         return AnnualSeries(
             series.years,
             series.values,
             series.unit,
-            {**_thaw(series.provenance), "pathway": opened.pathway},
+            {**_thaw(series.provenance), "pathway": pathway},
         )
 
     def _located_series(
@@ -2989,6 +3738,7 @@ class ParametricPlan:
                 missing=self.missing,
                 trend=trend,
                 scenario=self.scenario,
+                hazard_name=self.hazard_name,
             )
         else:
             sample = _pool_rows(
@@ -3000,6 +3750,7 @@ class ParametricPlan:
                 missing=self.missing,
                 trend=trend,
                 scenario=self.scenario,
+                hazard_name=self.hazard_name,
             )
         if asset.cell is not None:
             assert self.cell is not None
@@ -3080,6 +3831,8 @@ class ParametricPlan:
         and `samples` holds each asset's view of it.
         """
         self._check_scopes()
+        self._check_scenario_plan()
+        assert self.scenario_set is None, "a plan with scenarios builds each one's"
         if self._on_curves:
             return self._curve_samples(fresh=fresh)
         basis_risk = self._require_basis_risk()
@@ -3219,14 +3972,34 @@ class ParametricPlan:
         return model.for_asset(portfolio, asset_id)
 
     def _curve_samples(self, *, fresh: bool) -> _Samples:
-        basis_risk = self._require_basis_risk()
-        draws = self._require_draws()
+        self._require_basis_risk()
+        self._require_draws()
         request: PortfolioEvaluation = self.source
         portfolio = self._portfolio()
         rows = self._asset_rows(portfolio)
         if self._holds_joint:
             _require_several_assets([asset_id for asset_id, _ in rows])
         metadata = request.dataset.metadata()
+        self._check_cover_units(metadata)
+        path = Path(request.dataset.provider.source)
+        file_sha256 = _file_sha256(path)
+        curves = dataclasses.replace(request, portfolio=portfolio).asset_curves()
+        matched = self._curve_rows(
+            curves, portfolio.id_column, [asset_id for asset_id, _ in rows]
+        )
+        record = {
+            "curves": int(curves.num_rows),
+            "file_sha256": file_sha256,
+            "kind": "canonical_dataset",
+            "path": os.fspath(path),
+        }
+        read = _CurveRead(
+            metadata, record, {asset_id: [row] for asset_id, row in matched.items()}
+        )
+        return self._drawn_curves(portfolio, rows, read, fresh=fresh, label=None)
+
+    def _check_cover_units(self, metadata: HazardDatasetMetadata) -> None:
+        """Raise `SampleError` for a cover on an index in another unit than curves'."""
         for cover in self.cover_list:
             if cover.index.unit != metadata.value_unit:
                 raise SampleError(
@@ -3234,12 +4007,25 @@ class ParametricPlan:
                     f"index in {cover.index.unit!r}, but the dataset's values are "
                     f"in {metadata.value_unit!r}"
                 )
-        path = Path(request.dataset.provider.source)
-        file_sha256 = _file_sha256(path)
-        curves = dataclasses.replace(request, portfolio=portfolio).asset_curves()
-        matched = self._curve_rows(
-            curves, portfolio.id_column, [asset_id for asset_id, _ in rows]
-        )
+
+    def _drawn_curves(
+        self,
+        portfolio: AssetPortfolio,
+        rows: Sequence[tuple[str, dict[str, Any]]],
+        read: _CurveRead,
+        *,
+        fresh: bool,
+        label: str | None,
+    ) -> _Samples:
+        """Each asset's draws from its curves in `read`, under `label`.
+
+        An asset's curves are one canonical row, or several, a window of
+        horizons, which `sample_curve` and `sample_curves` mix on one stream of
+        uniforms. `label=None` leaves the sample's `scenario` at its default.
+        """
+        basis_risk = self._require_basis_risk()
+        draws = self._require_draws()
+        metadata, file_sha256 = read.metadata, read.record["file_sha256"]
         rule = self.split_rule if fresh else None
         fresh_seed = rule.seed if isinstance(rule, FreshDraws) else None
         generators = self._generators(len(rows))
@@ -3252,18 +4038,21 @@ class ParametricPlan:
             ]
         )
         asset_ids = [asset_id for asset_id, _ in rows]
+        first = {asset_id: read.rows[asset_id][0] for asset_id in asset_ids}
         loss_models = {
             asset_id: self._cell_loss_model(
-                portfolio, asset_id, row, matched[asset_id].get("cell_index")
+                portfolio, asset_id, row, first[asset_id].get("cell_index")
             )
             for asset_id, row in rows
         }
-        canonical = {
-            asset_id: {
-                name: curve[name] for name in _CURVE_ROW_COLUMNS if name in curve
-            }
-            for asset_id, curve in matched.items()
-        }
+        canonical: dict[str, Any] = {}
+        for asset_id in asset_ids:
+            members = [
+                {name: curve[name] for name in _CURVE_ROW_COLUMNS if name in curve}
+                for curve in read.rows[asset_id]
+            ]
+            canonical[asset_id] = members[0] if len(members) == 1 else members
+        named: dict[str, Any] = {} if label is None else {"scenario": label}
 
         def draw_joint(
             count: int, drawn: Sequence[np.random.Generator | None]
@@ -3287,10 +4076,11 @@ class ParametricPlan:
                 details={
                     "file_sha256": file_sha256,
                     "spatial_match_by_asset": {
-                        asset_id: matched[asset_id]["spatial_match"]
+                        asset_id: first[asset_id]["spatial_match"]
                         for asset_id in asset_ids
                     },
                 },
+                **named,
             )
 
         def draw(
@@ -3309,8 +4099,9 @@ class ParametricPlan:
                 outside_support=draws.outside_support,
                 details={
                     "file_sha256": file_sha256,
-                    "spatial_match": matched[asset_id]["spatial_match"],
+                    "spatial_match": first[asset_id]["spatial_match"],
                 },
+                **named,
             )
 
         samples: dict[str, OutcomeSample]
@@ -3333,18 +4124,12 @@ class ParametricPlan:
                     asset_id: draw(asset_id, rule.n_draws, rng)
                     for asset_id, rng in zip(asset_ids, fresh_generators, strict=True)
                 }
-        record = {
-            "curves": int(curves.num_rows),
-            "file_sha256": file_sha256,
-            "kind": "canonical_dataset",
-            "path": os.fspath(path),
-        }
         return _Samples(
             portfolio,
             samples,
             fresh_samples if isinstance(rule, FreshDraws) else None,
             "canonical_file",
-            record,
+            read.record,
             joint=joint,
             fresh_joint=fresh_joint,
         )
@@ -3487,11 +4272,20 @@ class ParametricPlan:
         each objective on the owner's total and, if the plan holds
         `Individual()` too, on each asset's own view of the block.
         """
+        positions, designs = self._joint_positions(train, covers)
+        return [entry for entries in positions for entry in entries], designs
+
+    def _joint_positions(
+        self, train: OutcomeSample, covers: Mapping[str, Sequence[Cover]]
+    ) -> tuple[list[list[Any]], list[Any]]:
+        """`_joint_entries`, each cover's entries apart, in the order of the covers."""
         assets = train.asset_ids
-        entries: list[Any] = []
+        positions: list[list[Any]] = []
         designs: list[Any] = []
         for position, stated in enumerate(self.cover_list):
             own = {asset_id: covers[asset_id][position] for asset_id in assets}
+            entries: list[Any] = []
+            positions.append(entries)
             if not stated.free_parameters():
                 entries.append(own)
                 continue
@@ -3514,7 +4308,7 @@ class ParametricPlan:
                     }
                     designs += each.values()
                     entries.append(each)
-        return entries, designs
+        return positions, designs
 
     def _run(self, *, evaluate: bool) -> _Run:
         if not self.cover_list:
@@ -3529,6 +4323,8 @@ class ParametricPlan:
                 f"covers {names} have free parameters; design them with "
                 ".objective(...), or resolve them with Cover.with_values"
             )
+        if self.scenario_set is not None:
+            return self._scenario_run(evaluate=evaluate)
         built = self._build_samples(fresh=evaluate, folds=True)
         portfolio, samples = built.portfolio, built.samples
         asset_ids = list(samples)
@@ -3594,6 +4390,350 @@ class ParametricPlan:
             run_records=built.run_records,
         )
 
+    # -- scenarios ----------------------------------------------------------------
+
+    def _read_curves(
+        self, request: PortfolioEvaluation, asset_ids: Sequence[str]
+    ) -> _CurveRead:
+        """One canonical dataset's matched curves, each asset's in its own list."""
+        metadata = request.dataset.metadata()
+        self._check_cover_units(metadata)
+        path = Path(request.dataset.provider.source)
+        file_sha256 = _file_sha256(path)
+        curves = request.asset_curves()
+        id_column = request.portfolio.id_column
+        held: dict[str, list[dict[str, Any]]] = {asset_id: [] for asset_id in asset_ids}
+        ids = _string_values(curves.column(id_column), id_column)
+        for asset_id, row in zip(ids, curves.to_pylist(), strict=True):
+            if asset_id in held:
+                held[asset_id].append(row)
+        record = {
+            "curves": int(curves.num_rows),
+            "file_sha256": file_sha256,
+            "kind": "canonical_dataset",
+            "path": os.fspath(path),
+        }
+        return _CurveRead(metadata, record, held)
+
+    def _dataset_request(
+        self, entry: CurveScenario, portfolio: AssetPortfolio
+    ) -> PortfolioEvaluation:
+        """The request a `CurveScenario` reads: the plan's, on its own dataset."""
+        request: PortfolioEvaluation = self.source
+        return dataclasses.replace(
+            request,
+            dataset=entry.dataset,
+            portfolio=portfolio,
+            selection=HazardSelection(
+                hazard_names=request.selection.hazard_names,
+                horizons=entry.horizons,
+                pathways=None if entry.pathway is None else (entry.pathway,),
+            ),
+        )
+
+    def _dataset_members(
+        self, entry: CurveScenario, read: _CurveRead, request: PortfolioEvaluation
+    ) -> _Pairs:
+        """The pairs a `CurveScenario` reads: stated, or the one its dataset holds.
+
+        Raises `ScenarioError` for a dataset with no curve of the plan's hazard,
+        naming the hazards it holds, and where it holds several pathways or
+        horizons that `pathway=` and `horizon=` don't choose between.
+        """
+        names = request.selection.hazard_names
+        assert names is not None
+        found = list(
+            dict.fromkeys(
+                (str(row["pathway"]), int(row["horizon"]))
+                for rows in read.rows.values()
+                for row in rows
+            )
+        )
+        horizons = entry.horizons
+        stated = (
+            None
+            if entry.pathway is None or horizons is None
+            else tuple((entry.pathway, horizon) for horizon in horizons)
+        )
+        if not found:
+            every = dataclasses.replace(request, selection=HazardSelection())
+            hazards = sorted(
+                {str(row["hazard_name"]) for row in every.asset_curves().to_pylist()}
+            )
+            if names[0] not in hazards:
+                raise ScenarioError(
+                    f"scenario {entry.label!r} reads the plan's hazard {names[0]!r}, "
+                    f"but its dataset {entry.dataset.provider.source} holds no curve "
+                    f"of it for the plan's assets; it holds the hazards {hazards}"
+                )
+            if stated is None:
+                raise ScenarioError(
+                    f"scenario {entry.label!r}: its dataset holds no curve of "
+                    f"{names[0]!r} for the plan's assets at the stated pathway or "
+                    "horizon"
+                )
+        if stated is not None:
+            # A pair the dataset doesn't hold is the pairs check's to name.
+            return stated
+        pathways = list(dict.fromkeys(pathway for pathway, _ in found))
+        if len(pathways) > 1:
+            raise ScenarioError(
+                f"scenario {entry.label!r} reads a dataset that holds the pathways "
+                f"{pathways} for the plan's hazard; state pathway="
+            )
+        if horizons is not None:
+            return tuple((pathways[0], horizon) for horizon in horizons)
+        years = sorted({horizon for _, horizon in found})
+        if len(years) > 1:
+            raise ScenarioError(
+                f"scenario {entry.label!r} reads a dataset that holds the horizons "
+                f"{years} for the plan's hazard; state horizon=, one year or "
+                "several for a window"
+            )
+        return ((pathways[0], years[0]),)
+
+    def _curve_scenarios(self, *, fresh: bool) -> dict[str, _Samples]:
+        """Every curve scenario's samples, the reference first, on one set of draws.
+
+        Each scenario's draws come from the asset's same child generators, so the
+        curve scenarios share their uniforms row by row.
+        """
+        self._require_basis_risk()
+        self._require_draws()
+        request: PortfolioEvaluation = self.source
+        portfolio = self._portfolio()
+        rows = self._asset_rows(portfolio)
+        asset_ids = [asset_id for asset_id, _ in rows]
+        if self._holds_joint:
+            _require_several_assets(asset_ids)
+        own = self._read_curves(
+            dataclasses.replace(request, portfolio=portfolio), asset_ids
+        )
+        built: dict[str, _Samples] = {}
+        for each in self._planned_scenarios():
+            read, members = own, each.members
+            if isinstance(each.described, CurveScenario):
+                asked = self._dataset_request(each.described, portfolio)
+                read = self._read_curves(asked, asset_ids)
+                members = self._dataset_members(each.described, read, asked)
+            assert members is not None
+            pairs = {
+                asset_id: [
+                    (row["pathway"], row["horizon"]) for row in read.rows[asset_id]
+                ]
+                for asset_id in asset_ids
+            }
+            _check_pairs_held(
+                each.label,
+                members,
+                {f"asset {asset_id!r}": pairs[asset_id] for asset_id in asset_ids},
+            )
+            chosen = {
+                asset_id: [
+                    next(
+                        row
+                        for row, held in zip(
+                            read.rows[asset_id], pairs[asset_id], strict=True
+                        )
+                        if _same_pair(member, held)
+                    )
+                    for member in members
+                ]
+                for asset_id in asset_ids
+            }
+            built[each.label] = self._drawn_curves(
+                portfolio,
+                rows,
+                _CurveRead(read.metadata, read.record, chosen),
+                fresh=fresh,
+                label=each.label,
+            )
+        return built
+
+    def _built_scenarios(self, *, fresh: bool, folds: bool) -> dict[str, _Samples]:
+        """Every scenario's samples, the reference first, after the set's refusals.
+
+        The refusals of a `ScenarioSet` run on each asset's samples, or on the
+        samples of all the assets under `Joint()`, through the function the set
+        runs at construction.
+        """
+        self._check_scopes()
+        self._check_scenario_plan()
+        stated = self.scenario_set
+        assert stated is not None
+        if self._on_curves:
+            built = self._curve_scenarios(fresh=fresh)
+        else:
+            built = {
+                each.label: self._scenario_plan(each)._build_samples(
+                    fresh=fresh, folds=folds
+                )
+                for each in self._planned_scenarios()
+            }
+        groups: list[list[OutcomeSample]]
+        if self._holds_joint:
+            groups = [[]]
+            for each in built.values():
+                assert each.joint is not None
+                groups[0].append(each.joint)
+        else:
+            reference = built[stated.reference]
+            groups = [
+                [each.samples[asset_id] for each in built.values()]
+                for asset_id in reference.samples
+            ]
+        for group in groups:
+            _check_scenarios(
+                group, reference=stated.reference, mixed_products=stated.mixed_products
+            )
+        return built
+
+    def _scenario_table(
+        self,
+        entries: Sequence[Any],
+        blocks: Mapping[str, _Block],
+        given: Sequence[Cover],
+        used: set[str],
+    ) -> Any:
+        """One fold's rows, for one asset or for all of them: `compare_scenarios`."""
+        stated = self.scenario_set
+        assert stated is not None
+        reference = blocks[stated.reference]
+        evaluated: list[OutcomeSample] = []
+        for block in blocks.values():
+            assert block[2] is not None
+            evaluated.append(block[2])
+        labels = {_cover_label(cover) for cover in given}
+        premiums = {
+            key: value for key, value in self.scenario_premiums or () if key in labels
+        }
+        used.update(premiums)
+        return compare_scenarios(
+            entries,
+            ScenarioSet(
+                evaluated,
+                reference=stated.reference,
+                mixed_products=stated.mixed_products,
+            ),
+            fold=reference[0],
+            pricing=self._pricing(),
+            premiums=premiums or None,
+            options=self.metric_options,
+            design_sample=reference[1] if given else None,
+        )
+
+    def _scenario_run(self, *, evaluate: bool) -> _Run:
+        """`_run` for a plan with scenarios: designs per scenario, one set per fold."""
+        built = self._built_scenarios(fresh=evaluate, folds=True)
+        stated = self.scenario_set
+        assert stated is not None
+        labels = list(built)
+        designed_on = self._design_labels(labels)
+        reference = built[stated.reference]
+        portfolio = reference.portfolio
+        asset_ids = list(reference.samples)
+        covers = {
+            label: self._covers_for(asset_ids, built[label].locations)
+            for label in labels
+        }
+        spec = self.design_spec
+        designs: list[Any] = []
+        tables: list[Any] = []
+        used: set[str] = set()
+        if self._holds_joint:
+            blocks = {label: self._joint_blocks(built[label]) for label in labels}
+            made: dict[tuple[str, int], list[list[Any]]] = {}
+            for label in designed_on:
+                for fold, block in enumerate(blocks[label]):
+                    positions, drawn_up = self._joint_positions(block[1], covers[label])
+                    made[(label, fold)] = positions
+                    designs += drawn_up
+            for fold in range(len(blocks[stated.reference]) if evaluate else 0):
+                entries: list[Any] = []
+                given: list[Cover] = []
+                for position, cover in enumerate(self.cover_list):
+                    if not cover.free_parameters():
+                        own = {
+                            asset_id: covers[stated.reference][asset_id][position]
+                            for asset_id in asset_ids
+                        }
+                        entries.append(own)
+                        given += own.values()
+                        continue
+                    for label in designed_on:
+                        entries += made[(label, fold)][position]
+                fold_blocks = {label: blocks[label][fold] for label in labels}
+                tables.append(self._scenario_table(entries, fold_blocks, given, used))
+        else:
+            per_asset = {
+                (label, asset_id): self._asset_blocks(built[label], asset_id)
+                for label in labels
+                for asset_id in asset_ids
+            }
+            results: dict[tuple[str, str, int, int], list[DesignResult]] = {}
+            for label in designed_on:
+                for asset_id in asset_ids:
+                    for fold, block in enumerate(per_asset[(label, asset_id)]):
+                        for i, cover in enumerate(covers[label][asset_id]):
+                            if not cover.free_parameters():
+                                continue
+                            assert spec is not None
+                            for objective in spec.objectives:
+                                result = self._individual_design(
+                                    cover,
+                                    asset_id,
+                                    block[1],
+                                    objective,
+                                    _design_label(cover, objective),
+                                )
+                                results.setdefault(
+                                    (label, asset_id, fold, i), []
+                                ).append(result)
+                                designs.append(result)
+            for asset_id in asset_ids if evaluate else ():
+                count = len(per_asset[(stated.reference, asset_id)])
+                for fold in range(count):
+                    entries = []
+                    given = []
+                    for i, cover in enumerate(covers[stated.reference][asset_id]):
+                        if not cover.free_parameters():
+                            entries.append(cover)
+                            given.append(cover)
+                            continue
+                        for label in designed_on:
+                            entries += results[(label, asset_id, fold, i)]
+                    fold_blocks = {
+                        label: per_asset[(label, asset_id)][fold] for label in labels
+                    }
+                    tables.append(
+                        self._scenario_table(entries, fold_blocks, given, used)
+                    )
+        unused = sorted(
+            key for key, _ in self.scenario_premiums or () if key not in used
+        )
+        if evaluate and unused:
+            raise EvaluationError(
+                f"premiums= names {unused}, which match no cover given as is"
+            )
+        return _Run(
+            samples=MappingProxyType(reference.samples),
+            fresh=None
+            if reference.fresh is None
+            else MappingProxyType(reference.fresh),
+            designs=tuple(designs),
+            tables=tuple(tables),
+            allocated=(),
+            source_key=reference.record_key,
+            source=reference.record,
+            id_column=portfolio.id_column,
+            values_sha256=self._values_sha256(portfolio, asset_ids),
+            index_source=reference.index_record,
+            joint=reference.joint,
+            fresh_joint=reference.fresh_joint,
+            run_records=reference.run_records,
+            scenarios=MappingProxyType(built),
+        )
+
     def samples(self) -> Mapping[str, OutcomeSample]:
         """Execution: build one outcome sample per asset, in asset order.
 
@@ -3614,9 +4754,37 @@ class ParametricPlan:
         of one year; and `ImportError` without the `geometry` extra for
         assets located by their H3 cells on per-year values, or for
         `cell=H3Cell(...)`, whose cells are computed before the source is
-        read.
+        read. With `.scenarios(...)`, these are the reference's samples, after
+        the set's refusals (`ScenarioError`), and `.scenario_samples()` holds
+        every scenario's.
         """
+        if self.scenario_set is not None:
+            reference = self.scenario_set.reference
+            built = self._built_scenarios(fresh=False, folds=False)
+            return MappingProxyType(built[reference].samples)
         return MappingProxyType(self._build_samples().samples)
+
+    def scenario_samples(self) -> Mapping[str, Mapping[str, OutcomeSample]]:
+        """Execution: every scenario's samples, by label and then by asset.
+
+        The reference first, then as the plan states them: on fitted curves the
+        selection's scenarios, then each `CurveScenario`; on per-year values the
+        plan's own source, then each `AnnualScenario`. Each holds all its draws
+        or years, before any split, as `.samples()` does, and the curve
+        scenarios share one set of draws. The set's refusals run on them, so
+        this raises `ScenarioError` as `ScenarioSet` does on built samples.
+        Raises `ValueError` for a plan without `.scenarios(...)`, and as
+        `samples` does.
+        """
+        if self.scenario_set is None:
+            raise ValueError(
+                "scenario_samples() holds every scenario's samples; state "
+                ".scenarios(ScenarioSet(...))"
+            )
+        built = self._built_scenarios(fresh=False, folds=False)
+        return MappingProxyType(
+            {label: MappingProxyType(each.samples) for label, each in built.items()}
+        )
 
     def joint_sample(self) -> OutcomeSample:
         """Execution: the sample of all the assets, side by side, under `Joint()`.
@@ -3630,14 +4798,19 @@ class ParametricPlan:
 
         Raises `ValueError` for a plan that does not hold `Joint()`, and as
         `samples` does; `SampleError` when the assets' years differ, as
-        `OutcomeSample.join` raises, which a stated `years=` resolves.
+        `OutcomeSample.join` raises, which a stated `years=` resolves. With
+        `.scenarios(...)`, it is the reference's.
         """
         if not self._holds_joint:
             raise ValueError(
                 "joint_sample() puts the assets side by side under Joint(); state "
                 ".scopes(Joint())"
             )
-        joint = self._build_samples().joint
+        if self.scenario_set is not None:
+            reference = self.scenario_set.reference
+            joint = self._built_scenarios(fresh=False, folds=False)[reference].joint
+        else:
+            joint = self._build_samples().joint
         assert joint is not None
         return joint
 
@@ -3649,10 +4822,14 @@ class ParametricPlan:
         each fold's design block) under each objective. Under `Joint()` the
         designs are `JointDesignResult`s, in fold, cover and objective order,
         each followed by that template's `DesignResult`s, in asset order, when
-        the plan also holds `Individual()`. Raises `ValueError`
-        without covers, an objective or a basis-risk model, the design errors
-        of `design` and `design_joint`, and `SolverUnavailableError` without
-        `crc-sdk[parametric]` on the LP and QP routes.
+        the plan also holds `Individual()`. With `.scenarios(...)`, they are in
+        scenario, asset, fold, cover and objective order (scenario, fold, cover
+        and objective under `Joint()`), on every scenario's design blocks under
+        `design_on="each"` and on the reference's under `"reference"`. Raises
+        `ValueError` without covers, an objective or a basis-risk model, the
+        design errors of `design` and `design_joint`, and
+        `SolverUnavailableError` without `crc-sdk[parametric]` on the LP and QP
+        routes.
         """
         if self.design_spec is None:
             raise ValueError(
@@ -3700,6 +4877,16 @@ class ParametricPlan:
         with its own metadata, which records the rule and the hash of the asset
         values. The comparison's own evaluations then record no allocation.
 
+        With `.scenarios(...)`, the rows are `compare_scenarios`' on each fold's
+        blocks of every scenario, one asset at a time, or once for all the
+        assets under `Joint()`, all out of sample, in one file. The metadata
+        records the set under `setup.scenarios`, with `design_on`; each
+        dataset or per-year source is in `source_records` once, with the
+        labels of the scenarios that read it under `scenarios`, and each hazard
+        source names its `scenario`. The result's `samples` are the
+        reference's, and `scenario_samples` and `scenario_fresh_samples` hold
+        every scenario's.
+
         Returns a `ParametricResult`, with the fresh draws in
         `fresh_samples` when the split is `FreshDraws`, and the allocated rows
         in `allocated` and their file in `allocated_output` under
@@ -3734,7 +4921,81 @@ class ParametricPlan:
             fresh_joint_sample=run.fresh_joint,
             allocated=None if allocated is None else allocated[0],
             allocated_output=None if allocated is None else beside,
+            scenario_samples=(
+                None
+                if run.scenarios is None
+                else MappingProxyType(
+                    {
+                        label: MappingProxyType(each.samples)
+                        for label, each in run.scenarios.items()
+                    }
+                )
+            ),
+            scenario_fresh_samples=(
+                None
+                if run.scenarios is None or run.fresh is None
+                else MappingProxyType(
+                    {
+                        label: MappingProxyType(each.fresh or {})
+                        for label, each in run.scenarios.items()
+                    }
+                )
+            ),
         )
+
+    @staticmethod
+    def _scenario_sources(run: _Run, document: dict[str, Any]) -> None:
+        """Each scenario's source records, once each, and each source's checksum.
+
+        A record read by several scenarios, as the selection's dataset is, is
+        kept once with all their labels under `scenarios`. Each hazard source
+        names its record by its checksum and its scenario by `scenario`.
+        """
+        assert run.scenarios is not None
+        records: list[dict[str, Any]] = []
+        seen: dict[str, int] = {}
+        for label, built in run.scenarios.items():
+            parts = (
+                [built.record]
+                if built.run_records is None
+                else list(built.run_records.values())
+            )
+            for part in parts:
+                text = json.dumps({built.record_key: part}, sort_keys=True, default=str)
+                if text in seen:
+                    records[seen[text]][built.record_key]["scenarios"].append(label)
+                    continue
+                seen[text] = len(records)
+                records.append({built.record_key: {**part, "scenarios": [label]}})
+        if run.index_source is not None:
+            records.append({"index_table": run.index_source})
+        label_of = {
+            str(sample["sample_hash"]): str(sample["scenario"])
+            for sample in document["setup"]["samples"]
+        }
+        sources: list[dict[str, Any]] = []
+        for entry in document["sources"]:
+            role = entry.get("role")
+            extra: dict[str, Any] = {}
+            if role == "index" and run.index_source is not None:
+                extra = {"index_table_sha256": run.index_source["table_sha256"]}
+            scenario = label_of.get(str(entry.get("sample_hash")))
+            if role == "hazard" and scenario is not None and scenario in run.scenarios:
+                built = run.scenarios[scenario]
+                key = built.record_key
+                if built.run_records is not None:
+                    part = built.run_records[(entry["model"], entry["member"])]
+                    extra = {f"{key}_sha256": part["table_sha256"]}
+                else:
+                    checksum = (
+                        "file_sha256" if key == "canonical_file" else "table_sha256"
+                    )
+                    extra = {f"{key}_sha256": built.record[checksum]}
+            if scenario is not None:
+                extra["scenario"] = scenario
+            sources.append({**entry, **extra})
+        document["sources"] = sources
+        document["source_records"] = [*document.get("source_records", ()), *records]
 
     def _written(
         self, run: _Run, tables: Sequence[Any]
@@ -3744,36 +5005,42 @@ class ParametricPlan:
             *(EvaluationMetadata.from_table(table) for table in tables)
         )
         document = merged.model_dump(mode="json")
-        checksum = run.source[
-            "file_sha256" if run.source_key == "canonical_file" else "table_sha256"
-        ]
-        checksums = {"hazard": {f"{run.source_key}_sha256": checksum}}
-        records: list[dict[str, Any]] = [{run.source_key: run.source}]
-        by_run = run.run_records
-        if by_run is not None:
-            records = [{run.source_key: record} for record in by_run.values()]
-        if run.index_source is not None:
-            checksums["index"] = {
-                "index_table_sha256": run.index_source["table_sha256"]
-            }
-            records.append({"index_table": run.index_source})
-        document["sources"] = [
-            {
-                **entry,
-                **checksums.get(str(entry.get("role")), {}),
-                **(
-                    {}
-                    if by_run is None
-                    else {
-                        f"{run.source_key}_sha256": by_run[
-                            (entry["model"], entry["member"])
-                        ]["table_sha256"]
-                    }
-                ),
-            }
-            for entry in document["sources"]
-        ]
-        document["source_records"] = [*document.get("source_records", ()), *records]
+        if run.scenarios is not None:
+            self._scenario_sources(run, document)
+        else:
+            checksum = run.source[
+                "file_sha256" if run.source_key == "canonical_file" else "table_sha256"
+            ]
+            checksums = {"hazard": {f"{run.source_key}_sha256": checksum}}
+            records: list[dict[str, Any]] = [{run.source_key: run.source}]
+            by_run = run.run_records
+            if by_run is not None:
+                records = [{run.source_key: record} for record in by_run.values()]
+            if run.index_source is not None:
+                checksums["index"] = {
+                    "index_table_sha256": run.index_source["table_sha256"]
+                }
+                records.append({"index_table": run.index_source})
+            document["sources"] = [
+                {
+                    **entry,
+                    **checksums.get(str(entry.get("role")), {}),
+                    **(
+                        {}
+                        if by_run is None
+                        else {
+                            f"{run.source_key}_sha256": by_run[
+                                (entry["model"], entry["member"])
+                            ]["table_sha256"]
+                        }
+                    ),
+                }
+                for entry in document["sources"]
+            ]
+            document["source_records"] = [
+                *document.get("source_records", ()),
+                *records,
+            ]
         seeded = self._seed_details()
         rule = self.split_rule
         fresh = {"fresh_draws_seed": rule.seed} if isinstance(rule, FreshDraws) else {}
@@ -3795,6 +5062,8 @@ class ParametricPlan:
             "values_sha256": run.values_sha256
             or document["assets"].get("values_sha256"),
         }
+        if run.scenarios is not None and document["setup"].get("scenarios"):
+            document["setup"]["scenarios"]["design_on"] = self.design_on
         metadata = EvaluationMetadata.model_validate(document)
         table = pa.concat_tables(tables)
         existing = dict(table.schema.metadata or {})

@@ -21,16 +21,24 @@ where a row is evaluated and `design_scenario` where it was designed.
 row of the same cover or design on a reference scenario. Neither ranks anything:
 a row is a measurement of a stated setup, and `setup_text` states it.
 
+A plan reads its scenarios rather than taking built samples: a set given to
+`ParametricPlan.scenarios` describes them, with `labels=` for the selection of a
+plan on fitted curves, `CurveScenario` for another canonical dataset and
+`AnnualScenario` for another per-year source.
+
 This module does no I/O.
 """
 
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from dataclasses import field as _field
+from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import numpy as np
 import pyarrow as pa  # type: ignore[import-untyped]
@@ -106,11 +114,23 @@ from crc_sdk.parametric.sample import (
     _trend_of,
     _year,
 )
+from crc_sdk.parametric.sources import MissingYears
+from crc_sdk.parametric.trend import LinearTrend, Trend, _require_trend
 from crc_sdk.pathways import pathways_equivalent
-from crc_sdk.types import TemporalWindow
+from crc_sdk.types import SourceProvenance, TemporalWindow
 from crc_sdk.workflows.distributions import warn_if_outside_window
+from crc_sdk.workflows.portfolio import HazardDataset
 
-__all__ = ["ScenarioSet", "compare_scenarios", "to_drift"]
+if TYPE_CHECKING:
+    from crc_sdk.parametric.plan import ModelPool, NearestCell, StationColumn
+
+__all__ = [
+    "AnnualScenario",
+    "CurveScenario",
+    "ScenarioSet",
+    "compare_scenarios",
+    "to_drift",
+]
 
 _Pair = tuple[str | None, int | None]
 """A (pathway, horizon) as a record states it; either may be null."""
@@ -1055,6 +1075,257 @@ def _check_bound_cover(cover: Cover, sample: OutcomeSample) -> None:
         _check_location(cover, label, f"asset {asset!r}", index.location, leaf)
 
 
+# -- what a plan reads, beside its own source ------------------------------------
+
+
+def _checked_years(years: Any) -> tuple[int, ...] | None:
+    """`years=` as sorted distinct years; `None` takes the plan's."""
+    if years is None:
+        return None
+    if isinstance(years, (str, bytes)) or not isinstance(years, Sequence):
+        raise TypeError("years must be a sequence of integer years")
+    if not years or not all(
+        isinstance(year, (int, np.integer)) and not isinstance(year, bool)
+        for year in years
+    ):
+        raise ValueError("years must be a non-empty sequence of integer years")
+    window = tuple(sorted(int(year) for year in years))
+    if len(set(window)) != len(window):
+        raise ValueError("years must not repeat")
+    return window
+
+
+@dataclass(frozen=True, eq=False)
+class AnnualScenario:
+    """A scenario a per-year plan reads from another source, such as another pathway.
+
+    For `ParametricPlan.for_annual_extremes(...).scenarios(ScenarioSet([...]))`.
+    The plan's own source is one scenario, under its `scenario=` label, and each
+    `AnnualScenario` is another, under `label`. `source` takes what
+    `for_annual_extremes` takes: a plan with an `annual_extremes()` execution
+    point, an Arrow table or a local Parquet file, or, for a pool, a sequence of
+    them, one per run. It is read only at an execution point. `provenance` states
+    its licence, attribution and version, as for the plan's own source.
+
+    A field left `None` takes the plan's value: `unit`, `location`, `year_column`,
+    `hazard_column`, `years`, `missing` and `trend`. `impact`, `value_column`,
+    `context`, `cell` and `seed` are always the plan's, so the loss model and the
+    basis-risk draws are the same in every scenario. `pool=None` takes the plan's
+    `pool=`, `pool=False` states a series that is not pooled, and a `ModelPool`
+    states one.
+
+    - `pathway` states the scenario's pathway: it fills the record where the
+      source states none, and must agree with the source where it does, compared
+      by `crc_sdk.pathways.pathways_equivalent`; a contradiction raises
+      `ScenarioError` at execution.
+    - `hazard_name` states the hazard the loss reads. It is optional where the
+      source names one (a source plan's `recipe`, or a one-valued `recipe` column)
+      and must then agree; where the source is silent it is required, because
+      every scenario of a set names its hazard. The plan's own hazard name is not
+      a default.
+
+    Raises `TypeError` for arguments of the wrong type, `ValueError` for invalid
+    ones (among them a `LinearTrend` with `fit_years`, which the plan sets per
+    fold), `ScenarioError` for an invalid label, and `ScenarioError` for a pathway
+    `crc_sdk.pathways` doesn't know. On a plan on fitted curves,
+    `.scenarios(...)` raises `ValueError`: state a `CurveScenario` there.
+    """
+
+    label: str
+    source: Any
+    provenance: SourceProvenance = _field(kw_only=True)
+    unit: str | None = _field(default=None, kw_only=True)
+    location: NearestCell | StationColumn | None = _field(default=None, kw_only=True)
+    year_column: str | None = _field(default=None, kw_only=True)
+    hazard_column: str | None = _field(default=None, kw_only=True)
+    years: Sequence[int] | None = _field(default=None, kw_only=True)
+    """Stated as a sequence of years; held sorted, as a tuple."""
+    missing: MissingYears | None = _field(default=None, kw_only=True)
+    trend: Trend | None = _field(default=None, kw_only=True)
+    pool: ModelPool | Literal[False] | None = _field(default=None, kw_only=True)
+    pathway: str | None = _field(default=None, kw_only=True)
+    hazard_name: str | None = _field(default=None, kw_only=True)
+
+    def __post_init__(self) -> None:
+        # A plan holds a set, so plan.py can't be imported as this module loads.
+        from crc_sdk.parametric.plan import (
+            ModelPool,
+            NearestCell,
+            StationColumn,
+            _column_name,
+            _pool_source,
+            _source_kind,
+        )
+
+        label = _checked_text("a scenario's label", self.label)
+        object.__setattr__(self, "label", label)
+        if not isinstance(self.provenance, SourceProvenance):
+            raise TypeError(
+                "provenance must be a SourceProvenance stating the source's licence "
+                f"and attribution, got {type(self.provenance).__name__}"
+            )
+        pool = self.pool
+        if pool is not None and pool is not False and not isinstance(pool, ModelPool):
+            raise TypeError(
+                "pool must be None (the plan's), False (a series that is not "
+                f"pooled) or a ModelPool, got {pool!r}"
+            )
+        if isinstance(pool, ModelPool):
+            object.__setattr__(self, "source", _pool_source(self.source))
+        elif pool is False:
+            _source_kind(self.source)
+        elif isinstance(self.source, Sequence) and not isinstance(
+            self.source, (str, bytes)
+        ):
+            # A sequence is a pool's runs: the plan's pool= decides.
+            object.__setattr__(self, "source", _pool_source(self.source))
+        else:
+            _source_kind(self.source)
+        if self.unit is not None:
+            object.__setattr__(self, "unit", _identifier("unit", self.unit))
+        if self.location is not None and not isinstance(
+            self.location, (NearestCell, StationColumn)
+        ):
+            raise TypeError(
+                "location must be NearestCell() or StationColumn(name), got "
+                f"{type(self.location).__name__}"
+            )
+        if isinstance(pool, ModelPool) and isinstance(self.location, StationColumn):
+            raise ValueError(
+                "pool= pools climate-model runs, and models have no stations; "
+                "locate each asset with NearestCell()"
+            )
+        for name in ("year_column", "hazard_column"):
+            value = getattr(self, name)
+            if value is not None:
+                _column_name(name, value)
+        object.__setattr__(self, "years", _checked_years(self.years))
+        if self.missing is not None and self.missing not in get_args(MissingYears):
+            raise ValueError(
+                f"missing must be one of {get_args(MissingYears)}, got {self.missing!r}"
+            )
+        if self.trend is not None:
+            trend = _require_trend(self.trend)
+            if isinstance(trend, LinearTrend) and trend.fit_years is not None:
+                raise ValueError(
+                    "LinearTrend(fit_years=...) states the fit years of one sample; "
+                    "a plan sets them per fold, so leave them out"
+                )
+        if self.pathway is not None:
+            if not isinstance(self.pathway, str) or not self.pathway:
+                raise TypeError(f"pathway must be a string, got {self.pathway!r}")
+            _check_known_pathway(self.pathway, label)
+        if self.hazard_name is not None:
+            object.__setattr__(
+                self, "hazard_name", _identifier("hazard_name", self.hazard_name)
+            )
+
+    def __repr__(self) -> str:
+        return (
+            f"AnnualScenario({self.label!r}, {type(self.source).__name__}, "
+            f"provider={self.provenance.provider!r}, pathway={self.pathway!r})"
+        )
+
+
+def _checked_horizon(label: str, horizon: Any) -> int | tuple[int, ...] | None:
+    """`horizon=`: one year, or several for a window, in horizon order."""
+    if horizon is None:
+        return None
+    if isinstance(horizon, (str, bytes)):
+        raise TypeError(f"horizon must be a year or years, got {horizon!r}")
+    if isinstance(horizon, Iterable):
+        years = [_year(value) for value in horizon]
+        if not years or any(year is None for year in years):
+            raise TypeError(f"horizon must be a year or years, got {horizon!r}")
+        held = [int(year) for year in years if year is not None]
+        if len(set(held)) != len(held):
+            raise ScenarioError(
+                f"scenario {label!r} is a window, whose members differ in horizon, "
+                f"but the horizons in {held} repeat"
+            )
+        ordered = tuple(sorted(held))
+        return ordered[0] if len(ordered) == 1 else ordered
+    year = _year(horizon)
+    if year is None:
+        raise TypeError(f"horizon must be a year or years, got {horizon!r}")
+    return year
+
+
+@dataclass(frozen=True, eq=False, init=False, repr=False)
+class CurveScenario:
+    """A scenario a plan on fitted curves reads from another local canonical dataset.
+
+    For `ParametricPlan.for_evaluation(...).scenarios(ScenarioSet([...]))`.
+    `dataset` is a `HazardDataset` on a local canonical Parquet file, or the file's
+    path, holding curves for the plan's assets; the plan's request reads its own
+    dataset. The scenario reads the plan's selected hazard there, with the plan's
+    assets, impact and values, and is read only at an execution point.
+
+    `pathway` and `horizon` pick its curves, and are required where the dataset
+    holds several for an asset. Several years in `horizon` make a window of that
+    pathway: an equal-weight mixture of its horizons' curves, read on one stream
+    of uniforms, as `sample_curve` reads a sequence of canonical rows. A dataset
+    with no curve of the plan's hazard raises `ScenarioError` at execution, naming
+    the hazards it holds.
+
+    Raises `TypeError` for arguments of the wrong type, and `ScenarioError` for an
+    invalid label, a pathway `crc_sdk.pathways` doesn't know and a horizon given
+    twice. On a per-year plan, `.scenarios(...)` raises `ValueError`: state an
+    `AnnualScenario` there.
+    """
+
+    label: str
+    dataset: HazardDataset
+    pathway: str | None
+    horizon: int | tuple[int, ...] | None
+    """One year, or several in order for a window."""
+
+    def __init__(
+        self,
+        label: str,
+        dataset: HazardDataset | str | os.PathLike[str],
+        *,
+        pathway: str | None = None,
+        horizon: int | Iterable[int] | None = None,
+    ) -> None:
+        label = _checked_text("a scenario's label", label)
+        if isinstance(dataset, (str, os.PathLike)):
+            dataset = HazardDataset.local(Path(dataset))
+        if not isinstance(dataset, HazardDataset):
+            raise TypeError(
+                "dataset must be a HazardDataset on a local canonical file, or the "
+                "file's path; for a remote source, materialize it first "
+                f"(plan.materialize(path)), got {type(dataset).__name__}"
+            )
+        if pathway is not None:
+            if not isinstance(pathway, str) or not pathway:
+                raise TypeError(f"pathway must be a string, got {pathway!r}")
+            _check_known_pathway(pathway, label)
+        object.__setattr__(self, "label", label)
+        object.__setattr__(self, "dataset", dataset)
+        object.__setattr__(self, "pathway", pathway)
+        object.__setattr__(self, "horizon", _checked_horizon(label, horizon))
+
+    @property
+    def horizons(self) -> tuple[int, ...] | None:
+        """The stated horizons, in order; `None` when none is stated."""
+        horizon = self.horizon
+        if horizon is None:
+            return None
+        return horizon if isinstance(horizon, tuple) else (horizon,)
+
+    def __repr__(self) -> str:
+        return (
+            f"CurveScenario({self.label!r}, "
+            f"{Path(self.dataset.provider.source).name}, pathway={self.pathway!r}, "
+            f"horizon={self.horizon!r})"
+        )
+
+
+_Description = AnnualScenario | CurveScenario
+"""What a plan reads beside its own source."""
+
+
 # -- a plan's labels -------------------------------------------------------------
 
 
@@ -1094,8 +1365,14 @@ def _checked_pairs(label: str, given: Any) -> _Members:
     return tuple(sorted(pairs, key=lambda pair: pair[1]))
 
 
-def _checked_labels(labels: Any, reference: str) -> Mapping[str, _Members]:
-    """A plan's labels, after the refusals that need only the labels."""
+def _checked_labels(
+    labels: Any, reference: str, described: Sequence[str] = ()
+) -> Mapping[str, _Members]:
+    """A plan's labels, after the refusals that need only the labels.
+
+    `described` are the labels of the set's descriptions, which the reference may
+    name too.
+    """
     if not isinstance(labels, Mapping):
         raise TypeError(
             "labels must map each label to its (pathway, horizon) pairs, got "
@@ -1105,10 +1382,10 @@ def _checked_labels(labels: Any, reference: str) -> Mapping[str, _Members]:
         _checked_text("a scenario's label", label): _checked_pairs(label, given)
         for label, given in labels.items()
     }
-    if reference not in held:
+    if reference not in held and reference not in described:
         raise ScenarioError(
             f"the reference {reference!r} must be one of the set's scenarios, "
-            f"{list(held)}"
+            f"{[*held, *described]}"
         )
     names = list(held)
     for i, first in enumerate(names):
@@ -1131,19 +1408,40 @@ def _checked_text(name: str, value: Any) -> str:
         raise ScenarioError(str(error)) from error
 
 
-def _checked_entries(entries: Any) -> tuple[OutcomeSample, ...]:
+def _checked_entries(
+    entries: Any,
+) -> tuple[tuple[OutcomeSample, ...], tuple[_Description, ...]]:
+    """`entries` as built samples or a plan's descriptions, never both."""
     if isinstance(entries, (str, bytes, Mapping)) or not isinstance(entries, Iterable):
         raise TypeError(
-            "entries must be an iterable of OutcomeSample, got "
-            f"{type(entries).__name__}"
+            "entries must be an iterable of OutcomeSample, or of AnnualScenario or "
+            f"CurveScenario for a plan, got {type(entries).__name__}"
         )
     held = tuple(entries)
     for entry in held:
-        if not isinstance(entry, OutcomeSample):
+        if not isinstance(entry, (OutcomeSample, AnnualScenario, CurveScenario)):
             raise TypeError(
-                f"entries must hold OutcomeSample, got {type(entry).__name__}"
+                "entries must hold OutcomeSample, or AnnualScenario or CurveScenario "
+                f"for a plan, got {type(entry).__name__}"
             )
-    return held
+    samples = tuple(entry for entry in held if isinstance(entry, OutcomeSample))
+    described = tuple(
+        entry for entry in held if isinstance(entry, (AnnualScenario, CurveScenario))
+    )
+    if samples and described:
+        raise TypeError(
+            "a set holds built samples or the scenarios a plan reads, never both; "
+            "give built samples to compare_scenarios, and AnnualScenario or "
+            "CurveScenario to a plan's .scenarios(...)"
+        )
+    labels = [entry.label for entry in described]
+    repeated = sorted({label for label in labels if labels.count(label) > 1})
+    if repeated:
+        raise ScenarioError(
+            f"two scenarios are labelled {repeated[0]!r}: each scenario has its own "
+            "label"
+        )
+    return samples, described
 
 
 # -- the set ---------------------------------------------------------------------
@@ -1160,11 +1458,18 @@ class ScenarioSet:
     the reference included, or a series that isn't a pool beside pools, and that a
     difference between such scenarios includes the products.
 
-    `labels` is for a plan and takes no built samples: it maps a label to its
-    (pathway, horizon) pairs, in any order, several pairs being a window of
-    horizons of one pathway and one pair a single horizon. A set with `labels=`,
-    or with no entries, describes what a plan reads and holds no samples, so
-    `labels` (the property) and `sample` raise on it.
+    **For a plan** (`ParametricPlan.scenarios`), a set describes what the plan
+    reads, and holds no samples. Its `entries` are then `AnnualScenario`s, on a
+    per-year plan, or `CurveScenario`s, on a plan on fitted curves: the sources
+    beside the plan's own. `labels` takes no built samples: it maps a label to its
+    (pathway, horizon) pairs of the plan's selection, in any order, several pairs
+    being a window of horizons of one pathway and one pair a single horizon.
+    Without `labels=`, every selected (pathway, horizon) of a plan on curves is
+    one scenario, labelled `<pathway>_<horizon>`, and a per-year plan's own source
+    is one scenario under its `scenario=` label. So `ScenarioSet(reference=...,
+    labels=...)`, or `ScenarioSet(reference="ssp585_2030")`, is a whole
+    statement. A set holds built samples or descriptions, never both, and
+    `labels` (the property) and `sample` raise on a set of descriptions.
 
     Every scenario of a set is read from curves, or every scenario from per-year
     rows. `ScenarioError` names the two scenarios and the field for scenarios that
@@ -1232,14 +1537,14 @@ class ScenarioSet:
     `package.terms_text()` for a `CoverPackage`.
     """
 
-    entries: tuple[OutcomeSample, ...]
+    entries: tuple[OutcomeSample, ...] | tuple[AnnualScenario | CurveScenario, ...]
     reference: str
     mixed_products: bool
     _pairs: Mapping[str, _Members] | None
 
     def __init__(
         self,
-        entries: Iterable[OutcomeSample] = (),
+        entries: Iterable[OutcomeSample | AnnualScenario | CurveScenario] = (),
         *,
         reference: str,
         labels: Mapping[str, Iterable[tuple[str, int]]] | None = None,
@@ -1250,34 +1555,59 @@ class ScenarioSet:
             raise TypeError(
                 f"mixed_products must be a bool, got {type(mixed_products).__name__}"
             )
-        held = _checked_entries(entries)
+        held, described = _checked_entries(entries)
         if held and labels is not None:
             raise TypeError(
                 "labels= describes the scenarios a plan reads, and a set holds built "
                 "samples or such descriptions, never both; a built sample's label "
                 "is its own scenario="
             )
-        pairs = None if labels is None else _checked_labels(labels, reference)
+        names = [entry.label for entry in described]
+        pairs = None if labels is None else _checked_labels(labels, reference, names)
+        if pairs is not None:
+            both = sorted(set(pairs) & set(names))
+            if both:
+                raise ScenarioError(
+                    f"two scenarios are labelled {both[0]!r}: a label of labels= and "
+                    "the label of a scenario the set describes"
+                )
         if held:
             _check_scenarios(held, reference=reference, mixed_products=mixed_products)
-        object.__setattr__(self, "entries", held)
+        object.__setattr__(self, "entries", held or described)
         object.__setattr__(self, "reference", reference)
         object.__setattr__(self, "mixed_products", mixed_products)
         object.__setattr__(self, "_pairs", pairs)
 
+    @property
+    def _described(self) -> tuple[AnnualScenario | CurveScenario, ...]:
+        """The scenarios a plan reads beside its own source, as given."""
+        return tuple(
+            entry
+            for entry in self.entries
+            if isinstance(entry, (AnnualScenario, CurveScenario))
+        )
+
+    @property
+    def _describes(self) -> bool:
+        """Whether the set describes what a plan reads, rather than built samples."""
+        return self._pairs is not None or bool(self._described) or not self.entries
+
     def _built(self) -> tuple[OutcomeSample, ...]:
         """The built samples; raises on a set that describes what a plan reads."""
-        if self._pairs is not None:
+        if self._pairs is not None or self._described:
             raise TypeError(
                 "this set describes the scenarios a plan reads and holds no built "
                 "samples"
             )
-        if not self.entries:
+        samples = tuple(
+            entry for entry in self.entries if isinstance(entry, OutcomeSample)
+        )
+        if not samples:
             raise ScenarioError(
                 "this set holds no built samples: a set of samples holds one scenario "
                 "or more"
             )
-        return self.entries
+        return samples
 
     @property
     def labels(self) -> tuple[str, ...]:
@@ -1307,11 +1637,12 @@ class ScenarioSet:
         )
 
     def __repr__(self) -> str:
-        described = (
-            f"{len(self.entries)} samples"
-            if self._pairs is None
-            else f"labels={list(self._pairs)}"
-        )
+        parts: list[str] = []
+        if self._described:
+            parts.append(f"scenarios={[entry.label for entry in self._described]}")
+        if self._pairs is not None:
+            parts.append(f"labels={list(self._pairs)}")
+        described = ", ".join(parts) if parts else f"{len(self.entries)} samples"
         return (
             f"ScenarioSet({described}, reference={self.reference!r}, "
             f"mixed_products={self.mixed_products})"

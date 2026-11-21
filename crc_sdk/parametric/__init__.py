@@ -46,6 +46,8 @@ budget, and reads the designs on one block, one row per budget.
 and refuses a set in which anything but the hazard differs. `compare_scenarios`
 puts every cover or design on every scenario's block in one table, and `to_drift`
 adds each row's difference and ratio against a reference scenario.
+`AnnualScenario` and `CurveScenario` describe the sources a plan's scenarios read
+beside its own.
 `PurePremium`, `CostOfCapitalLoad` and `ExpectedPayoutMultiple` price the
 premiums, a design's budget bounds and a comparison reads.
 
@@ -54,7 +56,8 @@ comparison: `ParametricPlan.for_evaluation(request)` from the fitted hazard
 curves of a `PortfolioEvaluation` (with `.monte_carlo(...)` and, for the
 out-of-sample test, `FreshDraws`), or `ParametricPlan.for_annual_extremes(...)`
 from an annual-extremes source and assets. By default each asset is designed on
-its own; `.scopes(Joint())` designs them together. Its builders and `explain()`
+its own; `.scopes(Joint())` designs them together, and `.scenarios(...)` puts
+every cover or design on every scenario's block. Its builders and `explain()`
 do no I/O.
 
 The functions work on numpy arrays and Arrow tables in memory and do no I/O,
@@ -171,7 +174,13 @@ from crc_sdk.parametric.sample import (
     holdout,
     year_block_kfold,
 )
-from crc_sdk.parametric.scenarios import ScenarioSet, compare_scenarios, to_drift
+from crc_sdk.parametric.scenarios import (
+    AnnualScenario,
+    CurveScenario,
+    ScenarioSet,
+    compare_scenarios,
+    to_drift,
+)
 from crc_sdk.parametric.sources import (
     AnnualSeries,
     ModelRun,
@@ -185,6 +194,7 @@ from crc_sdk.parametric.sources import (
 from crc_sdk.parametric.trend import AsRecorded, LinearTrend, RecentYears
 
 __all__ = [
+    "AnnualScenario",
     "AnnualSeries",
     "AsRecorded",
     "AtAsset",
@@ -204,6 +214,7 @@ __all__ = [
     "Cover",
     "CoverDefinitionError",
     "CoverPackage",
+    "CurveScenario",
     "DependenceModel",
     "DesignError",
     "DesignOptions",

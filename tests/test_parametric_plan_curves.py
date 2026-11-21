@@ -777,7 +777,23 @@ def test_for_evaluation_checks_its_request(dataset: Path, tmp_path: Path) -> Non
     with pytest.raises(ValueError, match="no impact"):
         UNTYPED_PLAN.for_evaluation(bare)
     with pytest.raises(ValueError, match="one curve per asset"):
-        UNTYPED_PLAN.for_evaluation(_request(dataset, horizons=[2050, 2080]))
+        UNTYPED_PLAN.for_evaluation(_request(dataset, hazard_names=["rx1day", "tx"]))
+    # Several horizons are for .scenarios(...), which comes after: the check moves
+    # to explain() and every execution point.
+    several = UNTYPED_PLAN.for_evaluation(
+        _request(dataset, horizons=[2050, 2080]),
+        value_column="value_eur",
+        value_unit="EUR",
+    )
+    several = several.monte_carlo(10, seed=1).basis_risk(NoBasisRisk())
+    for run in (
+        several.explain,
+        several.samples,
+        lambda: several.covers(_linear()).write_parquet(tmp_path / "never.parquet"),
+    ):
+        with pytest.raises(ValueError, match="selects 2 horizons; select one"):
+            run()
+    assert not (tmp_path / "never.parquet").exists()
     sql = HazardDataset.local(dataset).for_assets(
         AssetPortfolio("SELECT 1", location=PointColumns())
     )
