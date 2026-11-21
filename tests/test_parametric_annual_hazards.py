@@ -350,6 +350,33 @@ def test_a_component_with_no_impact_needs_no_rule() -> None:
     }
 
 
+@pytest.mark.parametrize("combine", [CappedSum(1.0), CompoundDamage()], ids=repr)
+def test_each_component_keeps_its_damage_before_the_rule(combine: Any) -> None:
+    # The damage is the impact the rule takes; the own loss is it times the
+    # value, and the rule's result on the damages times the value is the loss.
+    sample = _sample(combine=combine, basis_risk=NOISE, rng=np.random.default_rng(4))
+    components = sample.index_components
+    assert components is not None
+    damage = {}
+    for name in ("rain", "heat"):
+        component = components[name]
+        assert component.damage is not None and component.own_loss is not None
+        np.testing.assert_array_equal(component.own_loss, component.damage * 1000.0)
+        damage[name] = component.damage[:, 0]
+    # The noise moved the damage off the impact of the hazard alone.
+    assert not np.array_equal(damage["rain"], np.array(RAIN) / 100.0)
+    np.testing.assert_array_equal(sample.loss[:, 0], combine.combine(damage) * 1000.0)
+
+
+def test_a_component_with_no_impact_keeps_no_damage() -> None:
+    sample = _sample(loss_models={"heat": _ramp("heat-ramp")}, combine=None)
+    assert sample.index_components is not None
+    assert sample.index_components["rain"].damage is None
+    damage = sample.index_components["heat"].damage
+    assert damage is not None
+    np.testing.assert_array_equal(damage[:, 0], np.array(HEAT) / 100.0)
+
+
 # -- one value ---------------------------------------------------------------------
 
 
