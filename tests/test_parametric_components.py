@@ -1212,6 +1212,90 @@ def test_a_component_with_no_impact_has_no_own_loss() -> None:
     assert sample.component("heat", loss="combined").loss.shape == (8, 1)
 
 
+def _on_the_low_side(amount: Any = None) -> Cover:
+    """A cover on heat's index with the lower tail, which the sample's heat lacks."""
+    return Cover(
+        IndexDefinition("heat", "degC", tail="lower", aggregation="annual_maximum"),
+        BinaryPayout(30.0, Free() if amount is None else amount, tail="lower"),
+        payout_unit="EUR",
+    )
+
+
+def _on_the_high_side() -> Cover:
+    return Cover(
+        IndexDefinition("heat", "degC", aggregation="annual_maximum"),
+        BinaryPayout(38.0, Free()),
+        payout_unit="EUR",
+    )
+
+
+VIEW_TAIL = (
+    "the cover's index has the tail 'lower', but the sample is the view of "
+    "component 'heat', which has 'upper'"
+)
+
+
+def test_a_component_keeps_its_tail_and_design_refuses_another() -> None:
+    sample = _from_table()
+    view = sample.component("heat")
+    budget = Budget(amount=2.0)
+    with pytest.raises(SampleError, match=VIEW_TAIL):
+        design(_on_the_low_side(), view, ExpectedUncovered(), budget=budget)
+    # As on the sample of several hazards itself.
+    with pytest.raises(SampleError, match="the sample's component has 'upper'"):
+        design(_on_the_low_side(), sample, ExpectedUncovered(), budget=budget)
+    # Every block of the view is still the view, whichever step comes first, and
+    # so is the view with the combined loss.
+    blocks = (
+        holdout(view, 0.75)[0],
+        holdout(sample, 0.75)[0].component("heat"),
+        year_block_kfold(view, 2)[1][0],
+        view.select(PERIOD[:5]),
+        view.asset("site"),
+        sample.component("heat", loss="combined"),
+    )
+    for block in blocks:
+        with pytest.raises(SampleError, match=VIEW_TAIL):
+            design(_on_the_low_side(), block, ExpectedUncovered(), budget=budget)
+    # A cover given as is meets the same check wherever it meets the view.
+    resolved = _on_the_low_side(4.0)
+    with pytest.raises(SampleError, match=VIEW_TAIL):
+        evaluate(resolved, view, split="in_sample", design_sample=view)
+    # The component's own tail designs, as before.
+    made = design(_on_the_high_side(), view, ExpectedUncovered(), budget=budget)
+    assert made.design_sample is view
+
+
+def test_a_views_tail_changes_no_hash_table_or_record() -> None:
+    view = _from_table().component("heat")
+    # The same rows and record, built as a one-hazard sample: it is no view, so
+    # a cover's tail on it is the caller's to know, as on any one-hazard sample.
+    plain = UNTYPED_SAMPLE(
+        asset_ids=view.asset_ids,
+        period=view.period,
+        probability=view.probability,
+        index=view.index,
+        loss=view.loss,
+        hazard=view.hazard,
+        index_unit=view.index_unit,
+        loss_unit=view.loss_unit,
+        semantics=view.semantics,
+        provenance=view.provenance,
+        scenario=view.scenario,
+    )
+    assert plain.content_hash == view.content_hash
+    assert plain.to_table().equals(view.to_table())
+    assert plain.to_table().schema.metadata == view.to_table().schema.metadata
+    assert plain.provenance.to_document() == view.provenance.to_document()
+    assert repr(plain) == repr(view)
+    budget = Budget(amount=2.0)
+    on_view = design(_on_the_high_side(), view, ExpectedUncovered(), budget=budget)
+    on_plain = design(_on_the_high_side(), plain, ExpectedUncovered(), budget=budget)
+    assert on_view.design_id == on_plain.design_id
+    low = design(_on_the_low_side(), plain, ExpectedUncovered(), budget=budget)
+    assert low.design_sample is plain
+
+
 @pytest.mark.parametrize(
     ("sample", "name", "loss", "message"),
     [

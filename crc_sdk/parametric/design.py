@@ -155,7 +155,9 @@ its names, in its order, so its payout sees an `(n, k)` index and everything
 above applies. A cover on one index reads, on a sample with index components,
 the component named its `hazard_name`. A design uses the loss of the sample
 it is given: `design(template, sample)` the combined loss, and
-`design(template, sample.component(name))` that hazard's own loss.
+`design(template, sample.component(name))` that hazard's own loss. Each read
+has the component's tail: the view keeps it, so a template whose index has the
+other tail raises `SampleError` there as on the sample of several hazards.
 
 **Payouts over several components.** A `SumOf` of components with amounts is
 one LP or QP on the block basis `[B_1 | ... | B_K]`. A `MaxOf` with a free scale
@@ -2342,7 +2344,8 @@ def _check_units(
     """Raise `SampleError` unless `template` reads `sample`, for `asset`'s column.
 
     The payout unit must be the loss unit, and the index must read what the
-    sample holds: its unit and, where the sample records one, its hazard.
+    sample holds: its unit, on a component's view (`sample.component(name)`)
+    the component's tail, and, where the sample records one, its hazard.
     """
     if template.payout_unit != sample.loss_unit:
         raise SampleError(
@@ -2420,9 +2423,11 @@ def design(
     `DesignOptions(refine=True)` on a grid evaluated in numpy or on a
     threshold without a finite upper bound; `SampleError` when the
     sample holds several assets (take one with `sample.asset(asset_id)`), the
-    template's units or asset differ from the sample's, its index's
-    `hazard_name` differs from the hazard the sample records, or the sample
-    lacks a component the template reads; `ValueError` for a template without free
+    template's units or asset differ from the sample's, its index's tail
+    differs from the component's on a component's view or on a sample of
+    several hazards, its index's `hazard_name` differs from the hazard the
+    sample records, or the sample lacks a component the template reads;
+    `ValueError` for a template without free
     parameters; and `TypeError` for arguments of the wrong type.
     """
     _check_inputs(template, sample, objective, pricing, budget, limit, options)

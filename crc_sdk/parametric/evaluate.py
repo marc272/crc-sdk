@@ -470,6 +470,26 @@ def _cover_set(entry: Mapping[Any, Any]) -> _CoverSet:
     return _CoverSet(items)
 
 
+def _designed_on(sample: OutcomeSample) -> str | None:
+    """The component whose view `sample` is, by its last component step; else `None`."""
+    for step in reversed(sample.provenance.selection):
+        if step.get("kind") == "component":
+            return str(step["name"])
+    return None
+
+
+def _check_designed_on(key: str, design: DesignedCover) -> None:
+    """Raise `EvaluationError` if `design` was made on another component than `key`."""
+    name = _designed_on(design.design_sample)
+    if name is not None and name != key:
+        raise EvaluationError(
+            f"the design under {key!r} was made on component {name!r}, its design "
+            f"sample being sample.component({name!r}): a CoverPackage keys each "
+            f"contract by the component it reads, so put it under {name!r}, or "
+            f"design it on sample.component({key!r})"
+        )
+
+
 @dataclass(frozen=True, eq=False, init=False)
 class CoverPackage:
     """Separate contracts on one asset's hazards, as one row of a comparison.
@@ -497,8 +517,15 @@ class CoverPackage:
     contracts', each on its own terms, so a loading applies per contract. Each
     cover keeps its own limit, and the package has none of its own.
 
+    A design sits under the key of the component it was designed on: a design
+    on `sample.component(name)` records the step in its design sample's
+    `selection`, so it goes under `name`, and under another key it would be read
+    on another component's index. A design on a sample that is no component's
+    view records none, and its key is the caller's to know, as a cover's is.
+
     Raises `EvaluationError` for fewer than two covers, a mix of covers and
-    designs, a cover on several components, or different units or assets;
+    designs, a cover on several components, a design under another key than
+    the component it was designed on, or different units or assets;
     `UnresolvedParameterError` for a template; `TypeError` for arguments of
     the wrong type.
     """
@@ -542,6 +569,8 @@ class CoverPackage:
                     f"the cover of {name!r} is a template; resolve its free "
                     f"parameters first: {', '.join(free)}"
                 )
+            if item.design is not None:
+                _check_designed_on(name, item.design)
         resolved = {name: item.cover for name, item in items.items()}
         for what, seen in (
             ("payout_unit", {cover.payout_unit for cover in resolved.values()}),
