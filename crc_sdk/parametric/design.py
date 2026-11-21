@@ -33,26 +33,44 @@ smooth in the thresholds, so a stated grid is used rather than gradients; the
 objective at every candidate is kept (`DesignResult.profile`).
 
 **A local refinement.** `DesignOptions(refine=True)`, off by default, refines
-the grid's best point by a compass search (`_solver.compass_search`): from a
-step per free threshold of half the larger gap to its grid neighbours (or to
-its bound, at an end of the grid), each round evaluates the point one step up
-and one step down along each threshold, clipped to its `Free` bounds, with the
-amounts solved exactly by the LP or QP at each point, as at a grid point. It
-moves to the best of them when that lowers the objective by more than the
-grid's tie tolerance, and halves every step otherwise. It stops when every
-step is at most `refine_tolerance` times its bounds' width, or after
-`refine_max_points` points. It is deterministic, never ends worse than the
-grid's best point, and ends at a local optimum at the resolution of its last
-step, not a global one. `DesignResult.refinement` records the method, its
-settings, the start, the end, the gain, the points and why it stopped, and
-`refinement_profile` lists the points. Where it ends, the amounts are solved
-again with the uniqueness report; `ties` counts the grid's candidates within
-the tie tolerance of the refined objective, and the search's own points are
-not counted, so whether the thresholds themselves are unique is not checked.
-A design without free thresholds is not refined. A grid evaluated in numpy (a
-`UserObjective`, or a payout not linear in its amounts) has no exact amounts
-to refine around, so the option raises `DesignError` there, as it does in
-`design_joint`, which has no grid.
+the grid's best point, with the amounts solved exactly by the LP or QP at
+every point it evaluates, as at a grid point. Each free threshold's window
+is the best point's neighbours on its grid (or its bound, at an end of the
+grid).
+
+- A `StepPayout` or `BinaryPayout` pays from a threshold the years whose
+  severity is at least the threshold's, so its objective changes only where
+  a threshold crosses one of the sample's index values. Its thresholds are
+  refined over those values (`_solver.coordinate_search`): threshold by
+  threshold, the others held, it tries the sample's distinct index values in
+  the window and the window's two ends, one point per set of years paid,
+  nearest the current value first, and moves to the best of them when that
+  lowers the objective by more than the grid's tie tolerance. Passes repeat
+  until one moves no threshold, or until `refine_max_points` points. With
+  one free threshold that is the best of every set of years a threshold in
+  its window can pay; with several, a point that no single threshold can
+  improve within its window.
+- Every other family is refined by a compass search
+  (`_solver.compass_search`): from a step per free threshold of half the
+  larger side of its window, each round evaluates the point one step up and
+  one step down along each threshold, clipped to its `Free` bounds. It moves
+  to the best of them when that lowers the objective by more than the grid's
+  tie tolerance, and halves every step otherwise. It stops when every step
+  is at most `refine_tolerance` times its bounds' width, or after
+  `refine_max_points` points, at a local optimum at the resolution of its
+  last step, not a global one.
+
+Either is deterministic and never ends worse than the grid's best point.
+`DesignResult.refinement` records the method, its settings, the start, the
+end, the gain, the points and why it stopped, and `refinement_profile` lists
+the points. Where it ends, the amounts are solved again with the uniqueness
+report; `ties` counts the grid's candidates within the tie tolerance of the
+refined objective, and the search's own points are not counted, so whether
+the thresholds themselves are unique is not checked. A design without free
+thresholds is not refined. A grid evaluated in numpy (a `UserObjective`, or
+a payout not linear in its amounts) has no exact amounts to refine around,
+so the option raises `DesignError` there, as it does in `design_joint`,
+which has no grid.
 
 **Solver.** The LP and QP routes use HiGHS from the optional extra
 `crc-sdk[parametric]` (`pip install crc-sdk[parametric]`), imported only
@@ -197,8 +215,10 @@ from crc_sdk.parametric.objectives import (
 )
 from crc_sdk.parametric.parameters import Free, _DefinitionModel
 from crc_sdk.parametric.payouts import (
+    BinaryPayout,
     LinearConstraints,
     LinearInAmounts,
+    StepPayout,
     SumOf,
     _has_amounts,
 )
@@ -274,6 +294,9 @@ BASIS_ROW_TOLERANCE = 1e-9
 REFINE_METHOD = "compass_search"
 """The method of `DesignOptions(refine=True)`, as the record names it."""
 
+INDEX_VALUES_METHOD = "index_values"
+"""The method of `DesignOptions(refine=True)` on a step or binary payout."""
+
 REFINE_TOLERANCE = 1e-4
 """The default smallest step of a refinement, as a share of a parameter's bounds."""
 
@@ -299,12 +322,13 @@ class DesignOptions(_DefinitionModel):
     - `ranges`: on the LP route, range every identified amount over the
       near-optimal designs and report `unique` (four range ends per amount,
       each an LP, solved on reduced LPs; see the module docstring).
-    - `refine`: after a grid over free thresholds, refine its best point by
-      a compass search, with the amounts solved exactly at every point it
-      evaluates (see the module docstring). `refine_tolerance` is its
-      smallest step, as a share of each parameter's bounds (`upper -
-      lower`), and `refine_max_points` the most points it evaluates. Both
-      apply only with `refine=True`.
+    - `refine`: after a grid over free thresholds, refine its best point,
+      with the amounts solved exactly at every point it evaluates: over the
+      sample's index values for a `StepPayout` or `BinaryPayout`, by a
+      compass search otherwise (see the module docstring).
+      `refine_tolerance` is the compass search's smallest step, as a share of
+      each parameter's bounds (`upper - lower`), and `refine_max_points` the
+      most points either evaluates. Both apply only with `refine=True`.
 
     Raises `CoverDefinitionError` (a `ValueError`) for invalid values, and
     for `refine_tolerance` or `refine_max_points` changed without
@@ -416,16 +440,21 @@ class DesignResult:
       `degenerate_tail`.
     - `design_sample`, the sample the cover was designed on.
     - `refinement`: with `DesignOptions(refine=True)` on a grid, the record
-      of the compass search after it, as plain JSON types: `method`,
-      `tolerance`, `max_points` and `initial_steps` (its settings), `start`
-      and `start_objective` (the grid's best point), `end` and `objective`
-      (where it ended), `gain` (`start_objective - objective`, never below
-      0), `points` (how many points it evaluated, the start left out),
-      `counts` (their statuses), `moves`, `final_steps` and `stopped`
-      (`"step_tolerance"` or `"max_points"`). Objectives are in payout units
-      (squared for MSE). `None` without a refinement.
-      `refinement_profile` is a `pyarrow.Table` of the points it evaluated,
-      in order: their values, `objective` and `status`, as in `profile`.
+      of the refinement after it, as plain JSON types: `method` and its
+      settings, `start` and `start_objective` (the grid's best point), `end`
+      and `objective` (where it ended), `gain` (`start_objective -
+      objective`, never below 0), `points` (how many points it evaluated,
+      the start left out), `counts` (their statuses), `moves` and `stopped`.
+      A compass search (`method="compass_search"`) adds `tolerance`,
+      `max_points`, `initial_steps` and `final_steps`, and stops at
+      `"step_tolerance"` or `"max_points"`; a search over the index values
+      (`method="index_values"`, a step or binary payout) adds `max_points`,
+      `windows` (each threshold's `[lower, upper]`), `candidates` (how many
+      values each window holds) and `passes`, and stops at `"no_move"` or
+      `"max_points"`. Objectives are in payout units (squared for MSE).
+      `None` without a refinement. `refinement_profile` is a
+      `pyarrow.Table` of the points it evaluated, in order: their values,
+      `objective` and `status`, as in `profile`.
 
     `evaluate` and `compare` take a `DesignResult` in place of a cover: its
     rows use the design premium and carry `unique`, `ties` and
@@ -1987,21 +2016,64 @@ def _refinement_bounds(
     return lower, upper
 
 
-def _initial_step(
+def _window(
     value: float, grid: Sequence[float], lower: float, upper: float
-) -> float:
-    """Half the larger gap from a grid value to its neighbours on the grid.
-
-    At either end of the grid, the bound on that side is the neighbour.
-    """
+) -> tuple[float, float]:
+    """A grid value's neighbours on the grid; at either end, that side's bound."""
     position = list(grid).index(value)
     below = grid[position - 1] if position > 0 else lower
     above = grid[position + 1] if position + 1 < len(grid) else upper
-    return max(value - below, above - value) / 2.0
+    return below, above
 
 
 def _named(names: Sequence[str], values: Sequence[float]) -> dict[str, float]:
     return {name: float(value) + 0.0 for name, value in zip(names, values, strict=True)}
+
+
+def _on_index_values(payout: Any, context: _Context) -> bool:
+    """Whether a refinement searches `payout`'s thresholds over the index values.
+
+    A step or binary payout pays from a threshold the years whose severity is
+    at least the threshold's, so its objective changes only where a threshold
+    crosses one of the sample's index values.
+    """
+    return type(payout) in (StepPayout, BinaryPayout) and context.index.ndim == 1
+
+
+def _index_candidates(
+    index: FloatArray, below: float, above: float
+) -> tuple[float, ...]:
+    """The sample's distinct index values in `[below, above]`, and both ends."""
+    inside = np.unique(index[(index >= below) & (index <= above)])
+    values = {float(value) + 0.0 for value in inside.tolist()}
+    return tuple(sorted(values | {below + 0.0, above + 0.0}))
+
+
+def _paying_years(
+    template: Cover, names: Sequence[str], context: _Context
+) -> Callable[[tuple[float, ...]], tuple[int, ...] | None]:
+    """The class of a point of a step or binary payout's free thresholds.
+
+    A threshold pays the years whose severity is at least its own (`>=`), so
+    two values of it that leave the same number of years below them pay the
+    same years: the class is that number for every free threshold. Two
+    points of one class have the same basis, so the same amounts, objective
+    and constraints. `None` when the values make no valid cover.
+    """
+    payout = cast(StepPayout | BinaryPayout, template.payout)
+    sign = 1.0 if payout.tail == "upper" else -1.0
+    severity = np.sort(sign * context.index)
+
+    def key(point: tuple[float, ...]) -> tuple[int, ...] | None:
+        try:
+            template.with_values(_named(names, point))
+        except CoverDefinitionError:
+            return None
+        thresholds = sign * np.asarray(point, dtype=np.float64)
+        below = np.searchsorted(severity, thresholds, side="left")
+        return tuple(int(count) for count in below.tolist())
+
+    return key
 
 
 def _refine(
@@ -2012,17 +2084,24 @@ def _refine(
     context: _Context,
     solves: _Solves,
 ) -> _Refined:
-    """Refine a grid's chosen candidate by a compass search over `names`.
+    """Refine a grid's chosen candidate over `names`.
 
-    The search (`_solver.compass_search`) starts at the chosen candidate,
-    with a step per parameter of half the larger gap to its grid neighbours
-    (or to its bound, at an end of the grid), and stops when every step is at
-    most `refine_tolerance` times its bounds' width, or after
-    `refine_max_points` points. At every point it evaluates, the amounts are
-    solved exactly, as at a grid point; a point whose values make no valid
-    cover, or where no payout meets the constraints, has no objective. It
-    moves only to a point whose objective lies below the current one by more
-    than the tie tolerance of the grid, so it never ends worse than the grid.
+    Each threshold's window is the chosen value's neighbours on its grid (or
+    its bound, at an end of the grid). On a step or binary payout the search
+    (`_solver.coordinate_search`) tries, threshold by threshold, the sample's
+    distinct index values in the window and its two ends, one per set of
+    paying years, in passes until no threshold moves, or until
+    `refine_max_points` points. Otherwise a compass search
+    (`_solver.compass_search`) starts at the chosen candidate with a step per
+    parameter of half the window's larger side, and stops when every step is
+    at most `refine_tolerance` times its bounds' width, or after
+    `refine_max_points` points.
+
+    At every point either evaluates, the amounts are solved exactly, as at a
+    grid point; a point whose values make no valid cover, or where no payout
+    meets the constraints, has no objective. Either moves only to a point
+    whose objective lies below the current one by more than the tie
+    tolerance of the grid, so it never ends worse than the grid.
 
     Where it ends, the amounts are solved again with the uniqueness report.
     `ties` counts the grid's candidates within the tie tolerance of that
@@ -2031,15 +2110,11 @@ def _refine(
     options = context.options
     parameters = template.payout.parameters()
     lower, upper = bounds
-    steps: list[float] = []
+    windows: list[tuple[float, float]] = []
     for name, value, low, high in zip(names, outcome.point, lower, upper, strict=True):
         grid = cast(Free, parameters[name]).grid
         assert grid is not None  # the grid has checked it
-        steps.append(_initial_step(value, grid, low, high))
-    smallest = [
-        options.refine_tolerance * (high - low)
-        for low, high in zip(lower, upper, strict=True)
-    ]
+        windows.append(_window(value, grid, low, high))
     objectives: dict[tuple[float, ...], float | None] = {}
 
     def evaluate(point: tuple[float, ...]) -> tuple[float | None, str]:
@@ -2051,17 +2126,64 @@ def _refine(
         return options.feasibility_tolerance * max(1.0, abs(value))
 
     start = context.scaled(outcome.objective)
-    search = _solver.compass_search(
-        evaluate,
-        outcome.point,
-        start,
-        steps=steps,
-        smallest=smallest,
-        lower=lower,
-        upper=upper,
-        max_points=options.refine_max_points,
-        allowance=allowance,
-    )
+    search: _solver.Search | _solver.CoordinateSearch
+    if _on_index_values(template.payout, context):
+        candidates = [
+            _index_candidates(context.index, below, above) for below, above in windows
+        ]
+        search = _solver.coordinate_search(
+            evaluate,
+            outcome.point,
+            start,
+            candidates=candidates,
+            key=_paying_years(template, names, context),
+            max_points=options.refine_max_points,
+            allowance=allowance,
+        )
+        settings: dict[str, Any] = {
+            "method": INDEX_VALUES_METHOD,
+            "max_points": options.refine_max_points,
+            "windows": {
+                name: [below + 0.0, above + 0.0]
+                for name, (below, above) in zip(names, windows, strict=True)
+            },
+            "candidates": {
+                name: len(values)
+                for name, values in zip(names, candidates, strict=True)
+            },
+        }
+        closing: dict[str, Any] = {"passes": search.passes, "stopped": search.stopped}
+    else:
+        steps = [
+            max(value - below, above - value) / 2.0
+            for value, (below, above) in zip(outcome.point, windows, strict=True)
+        ]
+        smallest = [
+            options.refine_tolerance * (high - low)
+            for low, high in zip(lower, upper, strict=True)
+        ]
+        compass = _solver.compass_search(
+            evaluate,
+            outcome.point,
+            start,
+            steps=steps,
+            smallest=smallest,
+            lower=lower,
+            upper=upper,
+            max_points=options.refine_max_points,
+            allowance=allowance,
+        )
+        search = compass
+        settings = {
+            "method": REFINE_METHOD,
+            "tolerance": options.refine_tolerance,
+            "max_points": options.refine_max_points,
+            "initial_steps": _named(names, steps),
+        }
+        closing = {
+            "final_steps": _named(names, compass.steps),
+            "stopped": compass.stopped,
+        }
     moved = search.moves > 0
     cover = template.with_values(_named(names, search.best))
     amounts = _design_amounts(cover, context, solves, report=True)
@@ -2082,10 +2204,7 @@ def _refine(
     for point in search.points:
         counts[point.status] = counts.get(point.status, 0) + 1
     record = {
-        "method": REFINE_METHOD,
-        "tolerance": options.refine_tolerance,
-        "max_points": options.refine_max_points,
-        "initial_steps": _named(names, steps),
+        **settings,
         "start": _named(names, outcome.point),
         "start_objective": outcome.objective + 0.0,
         "end": _named(names, search.best),
@@ -2094,8 +2213,7 @@ def _refine(
         "points": len(search.points),
         "counts": dict(sorted(counts.items())),
         "moves": search.moves,
-        "final_steps": _named(names, search.steps),
-        "stopped": search.stopped,
+        **closing,
     }
     rows = [
         (point.values, objectives[point.values], point.status)
