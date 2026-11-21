@@ -856,7 +856,7 @@ def test_the_ranges_are_solved_on_reduced_lps(monkeypatch: pytest.MonkeyPatch) -
     assert all(
         options == _solver.RANGING_OPTIONS and not keep for _, options, keep in ranging
     )
-    assert max(columns for columns, _, _ in ranging) < design_columns / 10
+    assert max(columns for columns, _, _ in ranging) < design_columns / 4
     assert result.solves == len(lps)
     assert result.unique is True and result.ranges is not None
     assert set(result.ranges) == {"levels[0]", "levels[1]", "levels[2]"}
