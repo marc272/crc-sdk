@@ -1424,9 +1424,14 @@ def _components(sample: Mapping[str, Any], where: str) -> str | None:
             if _get(entry, "own_loss", bool, place)
             else "with no loss of its own"
         )
+        # Before execution a curve's unit and tail are its dataset's, not read yet.
+        unit = _get(entry, "unit", str, place)
+        tail = _get(entry, "tail", str, place)
         described.append(
-            f"{_get(entry, 'name', str, place)} (in {_get(entry, 'unit', str, place)}, "
-            f"{_get(entry, 'tail', str, place)} tail, {own})"
+            f"{_get(entry, 'name', str, place)} ("
+            + ("in a unit not known yet" if unit is None else f"in {unit}")
+            + (", its tail not known yet" if tail is None else f", {tail} tail")
+            + f", {own})"
         )
     text = f"Index components: {_join(described)}; the first is the sample's index."
     rule = _get(sample, "combine", Mapping, where) or {}
@@ -1870,7 +1875,10 @@ def _planned_source(entry: Mapping[str, Any], where: str) -> str:
     provenance = _get(entry, "provenance", Mapping, where)
     if kind not in ("file", "table", "plan") or provenance is None:
         return _source_record(entry, where)
-    text = _source_record({"role": "hazard", "series": {"source": provenance}}, where)
+    stated: dict[str, Any] = {"role": "hazard", "series": {"source": provenance}}
+    if entry.get("component") is not None:
+        stated["component"] = entry["component"]
+    text = _source_record(stated, where)
     if kind == "file":
         path = _recorded(entry, "path", where)
         return f"{text}, read from a file{'' if path is None else f' {path}'}"

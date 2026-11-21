@@ -20,11 +20,15 @@ ParametricPlan.for_annual_extremes(source, assets, impact=, unit=, provenance=)
   .dependence(Comonotonic() | ...)      # with Joint() on curves: required
   .allocation("value" | "loss")         # optional: a joint design's allocated rows
   .scenarios(ScenarioSet(...))          # optional: several scenarios, out of sample
+  .hazard(name, source, ...)            # optional: another hazard at each asset
+  .combine(rule)                        # with two impacts or more: required
+  .package(covers, label=...)           # optional: separate contracts as one row
   .explain()                            # the setup, no I/O
   .samples()                            # execution: one sample per asset
   .joint_sample()                       # execution: Joint() only
   .scenario_samples()                   # execution: every scenario's samples
   .designs()                            # execution: the designed covers
+  .payout_breakdown()                   # execution: each entry's payout in parts
   .write_parquet("comparison.parquet")  # execution: written atomically
 ```
 
@@ -158,6 +162,22 @@ required. A request that selects several horizons or pathways needs
 `.scenarios(...)`: without it `explain()` and every execution point raise
 `ValueError`.
 
+**Several hazards.** `.hazard(name, source, ...)` adds a hazard read at each
+asset, an index component of one sample per asset, as `sample_annual_hazards`
+(per-year values) or `sample_curve_hazards` (fitted curves) builds it. On
+per-year values `source` takes what `for_annual_extremes` takes, and
+`.hazard(name, tail=...)` without one names the plan's own hazard, which comes
+first. On fitted curves `source` is a second request for the plan's assets, and
+the plan's own request is the first component, named by the hazard it selects;
+`.dependence(...)` must state how the hazards' draws are put side by side.
+`.combine(rule)` states the rule of the combined loss whenever two components or
+more have an impact. A cover on a `CompositeIndex` is designed on the combined
+loss, and a cover on one index on its own hazard's loss (`sample.component`).
+`.package(covers, label=...)` makes separate contracts, named by their labels,
+one row of the comparison (`CoverPackage`); with a budget, `shares=` splits it
+between them (`split_budget`). Every row's metrics are on the combined loss.
+`Joint()`, `pool=` and `.index(...)` raise on such a plan.
+
 **Output.** `write_parquet(path)` writes one comparison table, as `compare`
 builds it, through a temporary sibling and `os.replace`. Its metadata under
 `crc.parametric.evaluation` (`EvaluationMetadata`) holds the setup of every
@@ -209,13 +229,14 @@ from crc_sdk.impacts.calibration import units_equivalent
 from crc_sdk.impacts.expression import ImpactExpression
 from crc_sdk.parametric._canonical import content_hash
 from crc_sdk.parametric.basis_risk import BasisRisk, HazardNoise, ImpactNoise
+from crc_sdk.parametric.combine import CombineRule, _rule_record
 from crc_sdk.parametric.constraints import Budget, Limit
 from crc_sdk.parametric.cover import Cover
 from crc_sdk.parametric.dependence import (
-    Comonotonic,
     Dependence,
+    DependenceModel,
     EmpiricalCopula,
-    Independent,
+    _model_record,
 )
 from crc_sdk.parametric.design import DesignOptions, DesignResult, design
 from crc_sdk.parametric.errors import (
@@ -226,13 +247,25 @@ from crc_sdk.parametric.errors import (
 )
 from crc_sdk.parametric.evaluate import (
     Allocation,
+    CoverPackage,
     Split,
     _premium,
+    _stated_shares,
     allocate,
     compare,
+    payout_breakdown,
+    split_budget,
     write_comparison,
 )
-from crc_sdk.parametric.index import AtAsset, AtPoint, AtStation, IndexDefinition
+from crc_sdk.parametric.index import (
+    AtAsset,
+    AtPoint,
+    AtStation,
+    CompositeIndex,
+    IndexDefinition,
+    Tail,
+    _component_name,
+)
 from crc_sdk.parametric.joint import Individual, Joint, JointDesignResult, design_joint
 from crc_sdk.parametric.loss import LossModel
 from crc_sdk.parametric.metadata import EVALUATION_METADATA_KEY, EvaluationMetadata
@@ -272,12 +305,15 @@ from crc_sdk.parametric.sources import (
     MissingYears,
     ModelRun,
     OutsideSupport,
+    _annual_hazard_rows,
     _annual_rows,
+    _combine_record,
     _coordinate,
     _pool_rows,
     _source_plan_document,
     _warn_comonotone,
     sample_curve,
+    sample_curve_hazards,
     sample_curves,
 )
 from crc_sdk.parametric.trend import AsRecorded, LinearTrend, Trend, _require_trend
@@ -287,6 +323,7 @@ from crc_sdk.workflows.distributions import CURVE_COLUMNS
 from crc_sdk.workflows.portfolio import (
     AssetPortfolio,
     CellColumn,
+    HazardDataset,
     HazardSelection,
     ImpactContextColumns,
     ImpactSpec,
@@ -314,6 +351,22 @@ _CURVES_READ_AT_THE_ASSET = (
 _EXECUTION = (
     "the source is read, the samples are built and the covers are designed and "
     "evaluated only at samples(), designs() and write_parquet()"
+)
+_HAZARDS_REFUSE_JOINT = (
+    "Joint() is refused on a plan with .hazard(...): a sample of several hazards "
+    "holds one asset, and several assets with several hazards would need a "
+    "dependence over both axes, which no model states; design each asset on its "
+    "own, with Individual()"
+)
+_HAZARDS_REFUSE_POOL = (
+    "pool= is refused on a plan with .hazard(...): a pool across hazards would "
+    "need the same (year, model, member) rows for every hazard, which no rule "
+    "states; read one series per hazard"
+)
+_HAZARDS_REFUSE_INDEX = (
+    ".index(...) is refused on a plan with .hazard(...): an index read elsewhere "
+    "has no form per component yet; each component's index is its hazard at the "
+    "asset"
 )
 
 
@@ -662,6 +715,83 @@ class _DesignSpec:
         }
 
 
+@dataclass(frozen=True, eq=False)
+class _Hazard:
+    """One index component of a plan with several hazards.
+
+    On per-year values `source` is `None` for the plan's own hazard, whose read
+    is the plan's, and otherwise what `for_annual_extremes` takes, read at
+    `location` (the plan's when `None`) with the plan's years, `missing=` and
+    trend. On fitted curves `source` is the component's `PortfolioEvaluation`,
+    `unit` and `tail` are `None` (its dataset states them at execution) and the
+    other read fields keep their defaults. `loss_model` is the component's
+    impact on the plan's value, `None` for a component with no impact.
+    """
+
+    name: str
+    source: Any = None
+    loss_model: LossModel | None = None
+    unit: str | None = None
+    tail: Tail | None = None
+    provenance: SourceProvenance | None = None
+    location: NearestCell | StationColumn | None = None
+    year_column: str = "year"
+    hazard_column: str = "value"
+    hazard_name: str | None = None
+
+    def to_document(self, *, own: bool, on_curves: bool) -> dict[str, Any]:
+        """What `explain()` lists of the component: where it is read, and what."""
+        document: dict[str, Any] = {
+            "impact": None
+            if self.loss_model is None
+            else self.loss_model.to_document(),
+            "name": self.name,
+            "own": own,
+        }
+        if on_curves:
+            request: PortfolioEvaluation = self.source
+            document["hazard_names"] = _listed(request.selection.hazard_names)
+            document["path"] = os.fspath(request.dataset.provider.source)
+            return document
+        document |= {
+            "hazard_name": self.hazard_name,
+            "tail": self.tail,
+            "unit": self.unit,
+        }
+        return document
+
+
+@dataclass(frozen=True, eq=False)
+class _Package:
+    """What `.package(...)` states: the separate contracts by component, and how.
+
+    `covers` holds (component, `cover_label`) pairs in order, and `shares` the
+    shares of `split_budget`: `"own_loss"`, (component, share) pairs or `None`.
+    """
+
+    covers: tuple[tuple[str, str], ...]
+    label: str
+    shares: Literal["own_loss"] | tuple[tuple[str, float], ...] | None
+
+    @property
+    def components(self) -> tuple[str, ...]:
+        return tuple(name for name, _ in self.covers)
+
+    def split_shares(self) -> Literal["own_loss"] | dict[str, float] | None:
+        """The shares as `split_budget` takes them."""
+        if self.shares is None or isinstance(self.shares, str):
+            return self.shares
+        return dict(self.shares)
+
+    def to_document(self) -> dict[str, Any]:
+        shares = self.split_shares()
+        return {
+            "covers": dict(self.covers),
+            "label": self.label,
+            "shares": shares,
+        }
+
+
 def _same_pricing(first: Pricing, second: Pricing) -> bool:
     return json.dumps(first.to_document(), sort_keys=True) == json.dumps(
         second.to_document(), sort_keys=True
@@ -752,6 +882,7 @@ class _Run:
     fresh_joint: OutcomeSample | None = None
     run_records: Mapping[tuple[str, str], dict[str, Any]] | None = None
     scenarios: Mapping[str, _Samples] | None = None
+    component_records: Mapping[str, dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -765,6 +896,16 @@ class _AnnualAsset:
     cell: int | None
     location: AtPoint | AtStation | None
     unused: list[int]
+
+
+@dataclass(frozen=True, eq=False)
+class _HazardAsset:
+    """What one asset's per-year sample of several hazards is built from."""
+
+    asset_id: str
+    series: dict[str, AnnualSeries]
+    loss_models: dict[str, LossModel]
+    cell: int | None
 
 
 _Block = tuple[int, OutcomeSample, OutcomeSample | None]
@@ -813,7 +954,8 @@ class _Samples:
     of its own. Under `Joint()`, `joint` and `fresh_joint` are the samples of
     all the assets, and `samples` and `fresh` each asset's view of them. A pool
     read from a sequence of sources has each run's record in `run_records`,
-    by model and member.
+    by model and member. A plan with several hazards has each component's
+    record in `component_records`, by name, and `record` is the first's.
     """
 
     portfolio: AssetPortfolio
@@ -827,6 +969,7 @@ class _Samples:
     joint: OutcomeSample | None = None
     fresh_joint: OutcomeSample | None = None
     run_records: Mapping[tuple[str, str], dict[str, Any]] | None = None
+    component_records: Mapping[str, dict[str, Any]] | None = None
 
 
 # -- helpers -----------------------------------------------------------------
@@ -925,6 +1068,20 @@ def _assets(assets: Any) -> AssetPortfolio | Path:
     if isinstance(assets, (str, os.PathLike)):
         return Path(assets)
     return AssetPortfolio(assets)
+
+
+def _same_assets(first: AssetPortfolio, second: AssetPortfolio) -> bool:
+    """Whether two portfolios hold the same assets, in the same order and places."""
+    if first is second:
+        return True
+    if (first.id_column, first.location) != (second.id_column, second.location):
+        return False
+    ours, theirs = first.data, second.data
+    if isinstance(ours, (pa.Table, pa.RecordBatch)) and type(ours) is type(theirs):
+        return bool(ours.equals(theirs))
+    if isinstance(ours, (str, os.PathLike)) and isinstance(theirs, (str, os.PathLike)):
+        return os.fspath(ours) == os.fspath(theirs)
+    return ours is theirs
 
 
 def _table_columns(assets: AssetPortfolio | Path) -> tuple[str, ...] | None:
@@ -1161,8 +1318,16 @@ def _bound(
 ) -> Cover:
     """`cover` written for `asset_id`, with `label` and `location` if given."""
     name = cover.label if label is None else label
-    index = cover.index if location is None else _index_at(cover, asset_id, location)
-    if cover.asset_id == asset_id and name == cover.label and index is cover.index:
+    index: IndexDefinition | CompositeIndex = (
+        cover.index_definition
+        if location is None
+        else _index_at(cover, asset_id, location)
+    )
+    if (
+        cover.asset_id == asset_id
+        and name == cover.label
+        and index is cover.index_definition
+    ):
         return cover
     return Cover(
         index,
@@ -1198,6 +1363,64 @@ def _checked_premiums(premiums: Any) -> tuple[tuple[str, float], ...] | None:
             raise EvaluationError(f"premiums= states no number for {key!r}")
         pairs.append((key, amount))
     return tuple(pairs)
+
+
+def _designed(entry: Any) -> bool:
+    """Whether a plan's entry was designed: a design, or a package of designs."""
+    if isinstance(entry, Cover):
+        return False
+    if isinstance(entry, CoverPackage):
+        return entry._designed
+    return True
+
+
+def _given(entry: Any) -> list[Cover]:
+    """The covers given as is that an entry holds: itself, or a package's contracts."""
+    if isinstance(entry, Cover):
+        return [entry]
+    if isinstance(entry, CoverPackage):
+        return [] if entry._designed else list(entry.covers.values())
+    return []
+
+
+def _source_components(document: Mapping[str, Any]) -> list[str | None]:
+    """The component each of a document's `sources` reads, where it reads one.
+
+    A source of a sample of several hazards names its component; a source of
+    one hazard's view, `sample.component(name)`, is named by the view's step.
+    """
+    viewed: dict[str, str] = {}
+    for sample in document["setup"]["samples"]:
+        steps = [
+            step
+            for step in sample.get("selection") or ()
+            if step.get("kind") == "component"
+        ]
+        if steps:
+            viewed[str(sample["sample_hash"])] = str(steps[-1]["name"])
+    return [
+        entry.get("component") or viewed.get(str(entry.get("sample_hash")))
+        for entry in document["sources"]
+    ]
+
+
+def _checksum_key(record_key: str) -> str:
+    """The key of a source record's checksum: a canonical file's, or a table's."""
+    return "file_sha256" if record_key == "canonical_file" else "table_sha256"
+
+
+def _component_parts(records: Mapping[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """The components' source records, each once, with the components that read it."""
+    parts: list[dict[str, Any]] = []
+    texts: list[str] = []
+    for name, record in records.items():
+        text = json.dumps(record, sort_keys=True, default=str)
+        if text in texts:
+            parts[texts.index(text)]["components"].append(name)
+            continue
+        texts.append(text)
+        parts.append({**record, "components": [name]})
+    return parts
 
 
 def _design_label(template: Cover, objective: Objective) -> str:
@@ -1408,10 +1631,12 @@ class ParametricPlan:
     Start one with `ParametricPlan.for_evaluation(request)` (fitted curves)
     or `ParametricPlan.for_annual_extremes(...)` (per-year values); the
     builders (`monte_carlo`, `index`, `basis_risk`, `covers`, `objective`,
-    `pricing`, `split`, `metrics`, `scopes`, `dependence`, `allocation`) return
-    new plans, and neither they nor `explain()` do any I/O. The execution
-    points `samples()`, `joint_sample()`, `designs()` and `write_parquet(path)`
-    read the source and the assets. The module docstring describes both routes.
+    `pricing`, `split`, `metrics`, `scopes`, `dependence`, `allocation`,
+    `scenarios`, `hazard`, `combine`, `package`) return new plans, and neither
+    they nor `explain()` do any I/O. The execution points `samples()`,
+    `joint_sample()`, `scenario_samples()`, `designs()`, `payout_breakdown()`
+    and `write_parquet(path)` read the source and the assets. The module
+    docstring describes both routes.
 
     `entry` names the entry point. On the curve route `source` is the
     request, `unit` and `provenance` are `None` (the dataset's metadata
@@ -1427,6 +1652,8 @@ class ParametricPlan:
     `.scenarios(...)` states. `stated_pathway` and `names_hazard` are set on the
     plan a per-year scenario is read with: the pathway an `AnnualScenario`
     states, and that each series records the hazard its source plan names.
+    `hazard_list`, `combine_rule` and `package_list` hold what `.hazard(...)`,
+    `.combine(...)` and `.package(...)` state.
     """
 
     source: Any
@@ -1453,7 +1680,7 @@ class ParametricPlan:
     trend: Trend = field(default_factory=AsRecorded)
     scenario: str = "baseline"
     scope_list: tuple[Individual | Joint, ...] = (Individual(),)
-    dependence_model: Dependence | None = None
+    dependence_model: Dependence | DependenceModel | None = None
     allocation_rule: Allocation | None = None
     pool: ModelPool | None = None
     hazard_name: str | None = None
@@ -1462,6 +1689,9 @@ class ParametricPlan:
     scenario_premiums: tuple[tuple[str, float], ...] | None = None
     stated_pathway: str | None = None
     names_hazard: bool = False
+    hazard_list: tuple[_Hazard, ...] = ()
+    combine_rule: CombineRule | None = None
+    package_list: tuple[_Package, ...] = ()
 
     # -- the entry points -----------------------------------------------------
 
@@ -1870,7 +2100,10 @@ class ParametricPlan:
         that the index is read at (`AtStation` or `AtPoint`, the kind that
         `.index`'s `location` resolves to), which is checked at execution.
         Under `Joint()` a cover must be written for no asset, as it applies to
-        every asset. Replaces any covers set before.
+        every asset. With `.hazard(...)`, a cover may pay on a `CompositeIndex`,
+        and each cover's index is checked against the components it reads, by
+        name, unit and tail, at `explain()` and at every execution point, so
+        only its payout unit is checked here. Replaces any covers set before.
 
         Raises `TypeError` for a non-cover, `SampleError` for a cover in
         other units or on an index read elsewhere, and `ValueError` for no
@@ -1900,6 +2133,10 @@ class ParametricPlan:
                 f"cover {name!r} pays in {cover.payout_unit!r}, but the loss is in "
                 f"{self.loss_model.value_unit!r}"
             )
+        if self.hazard_list or isinstance(cover.index_definition, CompositeIndex):
+            # Checked against the components by explain() and at execution, as
+            # .hazard(...) may come after .covers(...).
+            return
         read = self.index_read
         unit = self.unit if read is None else read.unit
         if unit is not None and cover.index.unit != unit:
@@ -2008,6 +2245,8 @@ class ParametricPlan:
         refusal = self._index_refusal()
         if refusal is not None:
             raise ValueError(refusal)
+        if self.hazard_list:
+            raise ValueError(_HAZARDS_REFUSE_INDEX)
         _source_kind(source)
         if not isinstance(location, (NearestCell, StationColumn)):
             raise TypeError(
@@ -2224,26 +2463,35 @@ class ParametricPlan:
         if repeated:
             raise ValueError(f"scope {repeated[0]!r} is given twice")
         plan = dataclasses.replace(self, scope_list=tuple(scopes))
+        if plan._holds_joint and self.hazard_list:
+            raise ValueError(_HAZARDS_REFUSE_JOINT)
         ids = self._known_asset_ids()
         if ids is not None and plan._holds_joint:
             _require_several_assets(ids)
         return plan
 
-    def dependence(self, model: Dependence) -> ParametricPlan:
-        """State the dependence between the assets' curve draws, under `Joint()`.
+    def dependence(self, model: Dependence | DependenceModel) -> ParametricPlan:
+        """State the dependence between curve draws: of the assets, or the hazards.
 
-        For plans on fitted curves, where it is required with `Joint()`: a
-        fitted curve says nothing about how two places move together, so
-        `Independent()`, `Comonotonic()` or `EmpiricalCopula(reference)` is an
-        assumption the plan states, in its metadata and its setup text. The
-        draws are those of `sample_curves`, with the plan's generators. Without
-        `Joint()` nothing puts the assets side by side, so `explain()` and every
-        execution point raise. Replaces any dependence stated before.
+        For plans on fitted curves, where it is required with `Joint()` and with
+        `.hazard(...)`: a fitted curve says nothing about how two places, or two
+        hazards, move together, so `Independent()`, `Comonotonic()`,
+        `EmpiricalCopula(reference)`, `GaussianCopula(correlation)` or a
+        `DependenceModel` of your own is an assumption the plan states, in its
+        metadata and its setup text. Under `Joint()` the draws are those of
+        `sample_curves`, with the plan's generators, the columns being the
+        assets; with `.hazard(...)` those of `sample_curve_hazards`, the columns
+        being the hazards, and an `EmpiricalCopula`'s reference holds exactly the
+        plan's components. Without either nothing puts draws side by side, so
+        `explain()` and every execution point raise. Replaces any dependence
+        stated before.
 
         Raises `ValueError` on a plan on per-year values, whose dependence is
         the data's own: the rows are the same years of the data. Raises
         `TypeError` for another type, and `SampleError` for
-        `EmpiricalCopula(...)` under `Holdout` or `KFold`.
+        `EmpiricalCopula(...)` under `Holdout` or `KFold`; a model that doesn't
+        pass the gate of `DependenceModel` raises `SampleError` at `explain()`
+        and at every execution point.
         """
         if not self._on_curves:
             raise ValueError(
@@ -2251,10 +2499,11 @@ class ParametricPlan:
                 "dependence is the data's own, the rows being the same years of "
                 "the data"
             )
-        if not isinstance(model, (Independent, Comonotonic, EmpiricalCopula)):
+        if isinstance(model, type) or not isinstance(model, DependenceModel):
             raise TypeError(
-                "model must be Independent(), Comonotonic() or "
-                f"EmpiricalCopula(reference), got {type(model).__name__}"
+                "model must be Independent(), Comonotonic(), "
+                "EmpiricalCopula(reference), GaussianCopula(correlation) or another "
+                f"DependenceModel, got {type(model).__name__}"
             )
         rule = self.split_rule
         if isinstance(model, EmpiricalCopula) and isinstance(rule, (Holdout, KFold)):
@@ -2402,10 +2651,450 @@ class ParametricPlan:
         )
         for planned in plan._planned_scenarios():
             if isinstance(planned.described, AnnualScenario):
-                unit = planned.described.unit
-                if unit is not None:
-                    self.loss_model.check_hazard_unit(unit)
+                plan._check_annual_units(planned.described)
         return plan
+
+    # -- several hazards --------------------------------------------------------
+
+    def hazard(
+        self,
+        name: str,
+        source: Any = None,
+        *,
+        impact: Any = None,
+        unit: str | None = None,
+        tail: Tail | None = None,
+        provenance: SourceProvenance | None = None,
+        location: NearestCell | StationColumn | None = None,
+        year_column: str | None = None,
+        hazard_column: str | None = None,
+        hazard_name: str | None = None,
+    ) -> ParametricPlan:
+        """Add a hazard read at each asset: an index component of its sample.
+
+        A plan with `.hazard(...)` builds one sample of several hazards per
+        asset, as `sample_annual_hazards` or `sample_curve_hazards` builds it,
+        each component with its index, unit, tail and the loss of that hazard
+        alone, and one combined loss per year under `.combine(rule)`. `name` is
+        the component's name: non-empty, without surrounding whitespace and
+        without `.`, `+`, `[` or `]`, and not taken for a hazard name. A cover on
+        one index reads the component named its `hazard_name`, and a cover on a
+        `CompositeIndex` the components of its names.
+
+        **On per-year values** (`for_annual_extremes`), `.hazard(name,
+        tail=...)` without a `source` names the plan's own hazard, whose tail
+        (`"upper"` or `"lower"`) it states; it is the first component, whatever
+        the order of the calls, and a plan with another component needs it.
+        With a `source`, which takes what `for_annual_extremes` takes (a plan
+        with an `annual_extremes()` execution point, an Arrow table or a local
+        Parquet file; not a pool's runs), the component's series is read at
+        each asset as the plan's own is:
+
+        - `unit` (required) is the unit of its values, checked against its
+          impact's calibration here, and against a `unit` column of the table
+          and the source plan's `explain()` at execution;
+        - `tail` (required) states its severe side;
+        - `provenance` (required) its licence, attribution and version;
+        - `impact` its impact, on the plan's value, `value_unit` and context, so
+          the loss models have one value; without one the component is an index
+          only, with no loss of its own, and needs no rule;
+        - `location` finds its series, the plan's `location=` by default;
+          `year_column` and `hazard_column` name its columns (`"year"` and
+          `"value"` by default); `hazard_name` states the hazard it reads, as
+          `for_annual_extremes(hazard_name=)` does for the plan's own.
+
+        The plan's `years=`, `missing=` and `trend=` apply to every series, so
+        the series must hold the same years: a row is one year of every hazard,
+        and the setup text says that two annual maxima of one year may come from
+        different events. One basis-risk model draws for every component, from
+        the asset's generator, in component order.
+
+        **On fitted curves** (`for_evaluation`), `source` is a second
+        `PortfolioEvaluation` for the plan's assets, built as the plan's own
+        request is, that selects at most one hazard, horizon and pathway, or
+        the plan's horizons and pathways under `.scenarios(...)`; its
+        `.impact(...)`, if it has one, is the component's impact, on the plan's
+        value. The plan's own request is the first component, named by the one
+        hazard it must select in `hazard_names`. A component's unit is its
+        dataset's `value_unit` and its tail the dataset's `return_period_tail`,
+        so only `name` and `source` are taken. `.dependence(...)` is required:
+        it states how the hazards' draws are put side by side. The first
+        component draws from the asset's child generator, so it draws what the
+        plan with one hazard draws, and each other component from a generator
+        spawned from that child, in component order.
+
+        A cover on a `CompositeIndex` is designed on the combined loss; a cover
+        on one index on its own hazard's loss, `sample.component(name)`, so a
+        template on a component with no impact raises: design it on the
+        function route. State `.hazard(...)` before `.covers(...)`: the covers'
+        units and tails are then checked against the components by `explain()`
+        and at every execution point. `Joint()`, `pool=` and `.index(...)` raise
+        on a plan with `.hazard(...)`. `explain()` lists the components without
+        I/O, and `.samples()` returns one sample of several hazards per asset.
+
+        Raises `TypeError` for arguments of the wrong type; `ValueError` for an
+        invalid or repeated name, a keyword the route doesn't take, a missing
+        `unit`, `tail` or `provenance`, a request for other assets or that
+        selects several hazards, and for a plan that pools model-years, holds
+        `Joint()` or reads its index elsewhere; and `SampleError` for a unit the
+        impact is not calibrated for, a missing asset column or an impact that
+        needs an H3 cell the plan doesn't give.
+        """
+        name = _component_name(name, ValueError)
+        if self.pool is not None:
+            raise ValueError(_HAZARDS_REFUSE_POOL)
+        if self._holds_joint:
+            raise ValueError(_HAZARDS_REFUSE_JOINT)
+        if self.index_read is not None:
+            raise ValueError(_HAZARDS_REFUSE_INDEX)
+        taken = [each.name for each in self.hazard_list]
+        if self._on_curves:
+            taken.append(self._primary_name())
+        if name in taken:
+            raise ValueError(f"the component {name!r} is given twice")
+        if self._on_curves:
+            stated = {
+                "impact": impact,
+                "unit": unit,
+                "tail": tail,
+                "provenance": provenance,
+                "location": location,
+                "year_column": year_column,
+                "hazard_column": hazard_column,
+                "hazard_name": hazard_name,
+            }
+            given = sorted(key for key, value in stated.items() if value is not None)
+            if given:
+                raise ValueError(
+                    f"on fitted curves a component takes its impact from its "
+                    "request's .impact(...), and its unit and tail from its "
+                    f"dataset's metadata, so {given} are not taken; pass the request"
+                )
+            added = _Hazard(name, source, self._curve_component_model(source))
+            return dataclasses.replace(self, hazard_list=(*self.hazard_list, added))
+        if tail != "upper" and tail != "lower":
+            raise ValueError(
+                f"tail must state the component's severe side, 'upper' or 'lower', "
+                f"got {tail!r}"
+            )
+        if source is None:
+            stated_own = {
+                "impact": impact,
+                "unit": unit,
+                "provenance": provenance,
+                "location": location,
+                "year_column": year_column,
+                "hazard_column": hazard_column,
+                "hazard_name": hazard_name,
+            }
+            extra = sorted(
+                key for key, value in stated_own.items() if value is not None
+            )
+            if extra:
+                raise ValueError(
+                    f".hazard(name, tail=...) without a source names the plan's own "
+                    f"hazard, whose {extra} are for_annual_extremes(...)'s; state "
+                    "them there"
+                )
+            if any(each.source is None for each in self.hazard_list):
+                raise ValueError("the plan's own hazard is named twice")
+            own = _Hazard(name, None, None, tail=tail)
+            return dataclasses.replace(self, hazard_list=(*self.hazard_list, own))
+        added = self._annual_component(
+            name,
+            source,
+            impact=impact,
+            unit=unit,
+            tail=tail,
+            provenance=provenance,
+            location=location,
+            year_column="year" if year_column is None else year_column,
+            hazard_column="value" if hazard_column is None else hazard_column,
+            hazard_name=hazard_name,
+        )
+        return dataclasses.replace(self, hazard_list=(*self.hazard_list, added))
+
+    def _annual_component(
+        self,
+        name: str,
+        source: Any,
+        *,
+        impact: Any,
+        unit: str | None,
+        tail: Tail,
+        provenance: SourceProvenance | None,
+        location: NearestCell | StationColumn | None,
+        year_column: str,
+        hazard_column: str,
+        hazard_name: str | None,
+    ) -> _Hazard:
+        """A per-year component read from another source, after its checks."""
+        if isinstance(source, Sequence) and not isinstance(source, (str, bytes)):
+            raise TypeError(
+                "a component reads one series per asset, so source must be one "
+                "plan, table or file; pools are refused with .hazard(...)"
+            )
+        _source_kind(source)
+        if unit is None:
+            raise ValueError(f"component {name!r} needs unit=, the unit of its values")
+        unit = _identifier("unit", unit)
+        if not isinstance(provenance, SourceProvenance):
+            raise TypeError(
+                "provenance must be a SourceProvenance stating the source's licence "
+                f"and attribution, got {type(provenance).__name__}"
+            )
+        if location is not None and not isinstance(
+            location, (NearestCell, StationColumn)
+        ):
+            raise TypeError(
+                "location must be NearestCell() or StationColumn(name), got "
+                f"{type(location).__name__}"
+            )
+        _column_name("year_column", year_column)
+        _column_name("hazard_column", hazard_column)
+        if hazard_name is not None:
+            hazard_name = _identifier("hazard_name", hazard_name)
+        model: LossModel | None = None
+        if impact is not None:
+            plan_model = self.loss_model
+            model = LossModel(
+                impact,
+                value_column=plan_model.value_column,
+                value_unit=plan_model.value_unit,
+                context=plan_model.context,
+            )
+            model.check_hazard_unit(unit)
+            factor = _registry_needs_cell(
+                impact, plan_model.context, self.assets, self.cell
+            )
+            if factor is not None:
+                raise SampleError(
+                    f"component {name!r}: impact {factor!r} needs an H3 cell in its "
+                    "context, and this route reads none for an asset; state each "
+                    "asset's cell with for_annual_extremes(..., cell=...), or give "
+                    "the impact a context with the cell"
+                )
+        read_at = self.location if location is None else location
+        columns = _table_columns(self.assets)
+        if columns is not None and isinstance(read_at, StationColumn):
+            if read_at.name not in columns:
+                raise SampleError(f"the asset table has no columns {[read_at.name]}")
+        return _Hazard(
+            name,
+            source,
+            model,
+            unit=unit,
+            tail=tail,
+            provenance=provenance,
+            location=location,
+            year_column=year_column,
+            hazard_column=hazard_column,
+            hazard_name=hazard_name,
+        )
+
+    def _curve_component_model(self, source: Any) -> LossModel | None:
+        """A curve component's loss model: its request's impact on the plan's value.
+
+        Raises unless `source` is a request for the plan's assets that selects at
+        most one hazard.
+        """
+        if not isinstance(source, PortfolioEvaluation):
+            raise TypeError(
+                "on fitted curves a component's source is a PortfolioEvaluation for "
+                "the plan's assets, as HazardDataset.local(path).for_assets(assets) "
+                f"builds; got {type(source).__name__}"
+            )
+        names = source.selection.hazard_names
+        if names is not None and len(names) > 1:
+            raise _several_selected("hazard_names", len(names))
+        own: PortfolioEvaluation = self.source
+        if not _same_assets(source.portfolio, own.portfolio):
+            raise ValueError(
+                "a component's request must be for the plan's assets: build it on "
+                "the same assets, with .for_assets(...) of the plan's request"
+            )
+        spec = source.impact_spec
+        if spec is None:
+            return None
+        impact, context = _request_impact(spec)
+        plan_model = self.loss_model
+        columns = _table_columns(source.portfolio)
+        if columns is not None and context is not None:
+            absent = [name for _, name in context.items() if name not in columns]
+            if absent:
+                raise SampleError(f"the asset table has no columns {absent}")
+        return LossModel(
+            impact,
+            value_column=plan_model.value_column,
+            value_unit=plan_model.value_unit,
+            context=context,
+            name=spec.name,
+        )
+
+    def combine(self, rule: CombineRule) -> ParametricPlan:
+        """State the rule of the combined loss of a plan with several hazards.
+
+        Required whenever two components or more have an impact, with no
+        default, because how the hazards' impacts make one year's loss is a
+        statement about the asset: `CappedSum(cap)`, `CompoundDamage()` or a
+        `CombineRule` of your own, which passes the gate of `sample_annual_hazards`.
+        Each component's impact comes from its loss model, after the basis-risk
+        model; the rule takes the impacts, and the combined loss is its result
+        times the value. With fewer than two impacts it raises at `explain()` and
+        at every execution point, rather than being ignored. Replaces any rule
+        stated before.
+
+        Raises `TypeError` for anything but a `CombineRule`, a bare callable
+        included, and `SampleError` for a document or sentence that doesn't pass
+        the gate.
+        """
+        _rule_record(rule)
+        return dataclasses.replace(self, combine_rule=rule)
+
+    def package(
+        self,
+        covers: Mapping[str, str],
+        *,
+        label: str,
+        shares: Literal["own_loss"] | Mapping[str, float] | None = None,
+    ) -> ParametricPlan:
+        """Make separate contracts one row of the comparison: a `CoverPackage`.
+
+        `covers` maps each component to the `cover_label` of a cover on one
+        index in `.covers(...)` (its label, or the first 12 hex digits of its
+        hash): two or more, all templates or all resolved, each in one package
+        at most. The key is the component the contract reads, so it need not be
+        the cover's `hazard_name`. On each design block the package holds the
+        contracts as designed there, each on its own hazard's loss
+        (`sample.component(name)`), one package per objective, labelled `label`
+        followed by the objective, or the resolved covers as they are, labelled
+        `label`. Its rows are `CoverPackage`'s: one `"asset"` row per contract and
+        one `"package"` row, whose metrics are on the summed payout against the
+        combined loss and whose premium is the sum of the contracts', each on
+        its own terms. Its contracts are not compared again on their own. The
+        package sits where its first contract sits in `.covers(...)`.
+
+        **The budget.** With a budget on `.objective(...)` and a package of
+        templates, `shares` is required: the budget is that of one contract on
+        every hazard, and each contract takes `split_budget(budget, block,
+        shares=shares)[component]` on each design block, so the bounds sum to the
+        one bound. `"own_loss"` splits it by each component's share of the summed
+        expected own losses, and a mapping by component states the shares, which
+        must name every contract and sum to 1. How to split a budget between
+        hazards is an assumption, so there is no default. A template named in no
+        package takes the budget as stated. Without a budget, or for a package of
+        resolved covers, `shares` raises.
+
+        Checked against the covers and the components by `explain()` and at
+        every execution point, as builders come in any order. Replaces any
+        package stated before under the same `label`.
+
+        Raises `TypeError` for arguments of the wrong type, and `ValueError` for
+        fewer than two contracts, an invalid component name or label; at
+        `explain()` and at execution, `ValueError` for a label that names no
+        cover, or several, a cover on several components, a mix of templates and
+        resolved covers, a cover in two packages, a component the plan doesn't
+        hold, `shares` where it is refused, a missing `shares`, or a package
+        without `.hazard(...)`.
+        """
+        if not isinstance(covers, Mapping):
+            raise TypeError(
+                "covers must map each component to the cover_label of its contract, "
+                f"got {type(covers).__name__}"
+            )
+        if len(covers) < 2:
+            raise ValueError(
+                f"a package holds two contracts or more, got {len(covers)}"
+            )
+        pairs: list[tuple[str, str]] = []
+        for component, cover_label in covers.items():
+            component = _component_name(component, ValueError)
+            if not isinstance(cover_label, str) or not cover_label:
+                raise TypeError(
+                    f"covers[{component!r}] must be the cover_label of a cover in "
+                    f".covers(...), got {cover_label!r}"
+                )
+            pairs.append((component, cover_label))
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError(f"label must be a non-empty string, got {label!r}")
+        held: Literal["own_loss"] | tuple[tuple[str, float], ...] | None
+        if shares is None or shares == "own_loss":
+            held = shares
+        elif isinstance(shares, Mapping):
+            held = tuple((str(key), value) for key, value in shares.items())
+        else:
+            raise TypeError(
+                "shares must be 'own_loss' or a mapping from component to share, "
+                f"got {shares!r}"
+            )
+        stated = _Package(tuple(pairs), label, held)
+        others = tuple(each for each in self.package_list if each.label != label)
+        return dataclasses.replace(self, package_list=(*others, stated))
+
+    # -- what a plan with several hazards reads ------------------------------------
+
+    def _primary_name(self) -> str:
+        """The first component's name: on curves, the hazard the request selects."""
+        if not self._on_curves:
+            own = [each for each in self.hazard_list if each.source is None]
+            if not own:
+                raise ValueError(
+                    "a per-year plan with .hazard(name, source, ...) names its own "
+                    "hazard too, the first component: state .hazard(name, "
+                    "tail=...) without a source"
+                )
+            return own[0].name
+        names = self.source.selection.hazard_names
+        if names is None or len(names) != 1:
+            raise ValueError(
+                "with .hazard(...), the plan's request must select exactly one "
+                "hazard in hazard_names, which names its component, the first"
+            )
+        return _component_name(str(names[0]), ValueError)
+
+    def _components(self) -> list[_Hazard]:
+        """Every component, the plan's own first, each with its read filled in."""
+        if not self.hazard_list:
+            return []
+        if self._on_curves:
+            own = _Hazard(self._primary_name(), self.source, self.loss_model)
+            return [own, *self.hazard_list]
+        first = self._primary_name()
+        named = next(each for each in self.hazard_list if each.name == first)
+        own = dataclasses.replace(
+            named,
+            loss_model=self.loss_model,
+            unit=self.unit,
+            provenance=self.provenance,
+            location=self.location,
+            year_column=self.year_column,
+            hazard_column=self.hazard_column,
+            hazard_name=self.hazard_name,
+        )
+        others = [each for each in self.hazard_list if each.source is not None]
+        return [own, *others]
+
+    def _check_annual_units(self, entry: AnnualScenario) -> None:
+        """Check an `AnnualScenario`'s units against the impacts that read them.
+
+        A scenario of several hazards is checked once the components are known,
+        at `explain()` and at execution.
+        """
+        if isinstance(entry.unit, str):
+            self.loss_model.check_hazard_unit(entry.unit)
+            return
+        if not isinstance(entry.unit, Mapping) or not self._complete_hazards():
+            return
+        for component in self._components():
+            unit = entry.unit.get(component.name)
+            if unit is not None and component.loss_model is not None:
+                component.loss_model.check_hazard_unit(unit)
+
+    def _complete_hazards(self) -> bool:
+        """Whether every component is known: on per-year values, the own one named."""
+        if not self.hazard_list:
+            return False
+        return self._on_curves or any(each.source is None for each in self.hazard_list)
 
     def _check_scenario_selection(self) -> None:
         """Raise unless the request states what `explain()` lists the scenarios by."""
@@ -2506,33 +3195,99 @@ class ParametricPlan:
         entry = planned.described
         if not isinstance(entry, AnnualScenario):
             return base
+        if isinstance(entry.source, Mapping):
+            return self._hazard_scenario_plan(base, entry)
         pool = self.pool if entry.pool is None else (entry.pool or None)
         if pool is None and isinstance(entry.source, tuple):
             raise ValueError(
                 f"scenario {entry.label!r} gives a sequence of sources, which are a "
                 "pool's runs; state pool=ModelPool() on it or on the plan"
             )
+        # One source, so AnnualScenario holds no mapping in these fields.
+        provenance, unit, location = entry.provenance, entry.unit, entry.location
+        year_column, hazard_column = entry.year_column, entry.hazard_column
+        hazard_name = entry.hazard_name
+        assert isinstance(provenance, SourceProvenance)
+        assert not isinstance(unit, Mapping) and not isinstance(location, Mapping)
+        assert not isinstance(year_column, Mapping)
+        assert not isinstance(hazard_column, Mapping)
+        assert not isinstance(hazard_name, Mapping)
         return dataclasses.replace(
             base,
             source=entry.source,
-            provenance=entry.provenance,
-            unit=self.unit if entry.unit is None else entry.unit,
-            location=self.location if entry.location is None else entry.location,
-            year_column=(
-                self.year_column if entry.year_column is None else entry.year_column
-            ),
+            provenance=provenance,
+            unit=self.unit if unit is None else unit,
+            location=self.location if location is None else location,
+            year_column=self.year_column if year_column is None else year_column,
             hazard_column=(
-                self.hazard_column
-                if entry.hazard_column is None
-                else entry.hazard_column
+                self.hazard_column if hazard_column is None else hazard_column
             ),
             years=self.years if entry.years is None else tuple(entry.years),
             missing=self.missing if entry.missing is None else entry.missing,
             trend=self.trend if entry.trend is None else entry.trend,
             pool=pool,
             scenario=entry.label,
-            hazard_name=entry.hazard_name,
+            hazard_name=hazard_name,
             stated_pathway=entry.pathway,
+        )
+
+    def _hazard_scenario_plan(
+        self, base: ParametricPlan, entry: AnnualScenario
+    ) -> ParametricPlan:
+        """The plan a per-year scenario of several hazards is read with.
+
+        Each component reads its own source of `entry`. A per-source field left
+        out takes that component's value on the plan, and `hazard_name` is
+        never the plan's: a scenario states each name, where its source is
+        silent.
+        """
+        sources: Mapping[str, Any] = entry.source
+
+        def stated(field_name: str, component: str) -> Any:
+            value = getattr(entry, field_name)
+            return value.get(component) if isinstance(value, Mapping) else None
+
+        provenance: Mapping[str, SourceProvenance] = entry.provenance  # type: ignore[assignment]
+        replaced: list[_Hazard] = []
+        for component in self.hazard_list:
+            if component.source is None:
+                replaced.append(component)
+                continue
+            name = component.name
+            own_location = (
+                self.location if component.location is None else component.location
+            )
+            replaced.append(
+                dataclasses.replace(
+                    component,
+                    source=sources[name],
+                    provenance=provenance[name],
+                    unit=stated("unit", name) or component.unit,
+                    location=stated("location", name) or own_location,
+                    year_column=stated("year_column", name) or component.year_column,
+                    hazard_column=(
+                        stated("hazard_column", name) or component.hazard_column
+                    ),
+                    hazard_name=stated("hazard_name", name),
+                )
+            )
+        primary = self._primary_name()
+        return dataclasses.replace(
+            base,
+            source=sources[primary],
+            provenance=provenance[primary],
+            unit=stated("unit", primary) or self.unit,
+            location=stated("location", primary) or self.location,
+            year_column=stated("year_column", primary) or self.year_column,
+            hazard_column=stated("hazard_column", primary) or self.hazard_column,
+            years=self.years if entry.years is None else tuple(entry.years),
+            missing=self.missing if entry.missing is None else entry.missing,
+            trend=self.trend if entry.trend is None else entry.trend,
+            pool=None,
+            scenario=entry.label,
+            hazard_name=stated("hazard_name", primary),
+            stated_pathway=entry.pathway,
+            hazard_list=tuple(replaced),
         )
 
     def _check_scenario_plan(self) -> None:
@@ -2568,9 +3323,11 @@ class ParametricPlan:
         planned = self._planned_scenarios()
         draws = self.draws
         rule = self.split_rule
-        model = self.dependence_model if self._holds_joint else None
+        moved = self._holds_joint or bool(self.hazard_list)
+        model = self.dependence_model if moved else None
         step = len(model.reference) if isinstance(model, EmpiricalCopula) else 1
         for each in planned:
+            self._check_described(each)
             if each.members is not None and len(each.members) > 1:
                 m = len(each.members)
                 if draws is not None:
@@ -2606,13 +3363,52 @@ class ParametricPlan:
                 f"maps the cover_label of a resolved cover, here {sorted(given)}"
             )
 
-    def _check_hazard_name(self) -> None:
-        """Raise `ScenarioError` for a stated hazard name a source plan contradicts."""
-        stated = self.hazard_name
-        if stated is None or self._on_curves:
+    def _check_described(self, planned: _Planned) -> None:
+        """A described scenario's sources: one, or one per component.
+
+        On a plan with several hazards an `AnnualScenario`'s `source` and a
+        `CurveScenario`'s `dataset` map each component to its own; on any other
+        plan they are one source.
+        """
+        entry = planned.described
+        if entry is None:
             return
+        given: Any = (
+            entry.source if isinstance(entry, AnnualScenario) else entry.dataset
+        )
+        several = isinstance(given, Mapping)
+        if not self.hazard_list:
+            if several:
+                raise ValueError(
+                    f"scenario {entry.label!r} maps its sources by component, and "
+                    "this plan reads one hazard per asset; give one source, or state "
+                    "the hazards with .hazard(...)"
+                )
+            return
+        names = [each.name for each in self._components()]
+        if not several:
+            raise ValueError(
+                f"scenario {entry.label!r} gives one source, and this plan reads the "
+                f"hazards {names}: map each component to its own"
+            )
+        if sorted(given) != sorted(names):
+            raise ValueError(
+                f"scenario {entry.label!r} maps the components {list(given)}, and the "
+                f"plan's are {names}"
+            )
+        if isinstance(entry, AnnualScenario):
+            self._check_annual_units(entry)
+
+    def _check_hazard_name(self) -> None:
+        """Raise `ScenarioError` for a stated hazard name a source plan contradicts.
+
+        The plan's own, and each per-year component's.
+        """
+        if self._on_curves:
+            return
+        stated = self.hazard_name
         sources = self._pool_sources() if self.pool is not None else (self.source,)
-        for source in sources:
+        for source in sources if stated is not None else ():
             named = _source_hazard(source)
             if named is not None and named != stated:
                 raise ScenarioError(
@@ -2620,6 +3416,270 @@ class ParametricPlan:
                     f"the source plan, which names {named!r}; a stated name never "
                     "overrides the record"
                 )
+        for component in self.hazard_list:
+            if component.source is None or component.hazard_name is None:
+                continue
+            named = _source_hazard(component.source)
+            if named is not None and named != component.hazard_name:
+                raise ScenarioError(
+                    f"scenario {self.scenario!r}, component {component.name!r}: "
+                    f"hazard_name={component.hazard_name!r} contradicts the source "
+                    f"plan, which names {named!r}; a stated name never overrides the "
+                    "record"
+                )
+
+    def _check_hazard_plan(self) -> None:
+        """Check a plan with several hazards, or that a plan without them needs none.
+
+        Run by `explain()` and every execution point, as `.hazard(...)` may come
+        after the builders it constrains.
+        """
+        if not self.hazard_list:
+            if self.combine_rule is not None:
+                raise ValueError(
+                    ".combine(...) states the rule of the combined loss of several "
+                    "hazards; state the hazards with .hazard(...)"
+                )
+            if self.package_list:
+                raise ValueError(
+                    ".package(...) makes separate contracts on several hazards one "
+                    "row; state the hazards with .hazard(...)"
+                )
+            for cover in self.cover_list:
+                index = cover.index_definition
+                if isinstance(index, CompositeIndex):
+                    raise SampleError(
+                        f"cover {cover.label or cover.definition_hash!r} pays on the "
+                        f"components {list(index.names)}, and this plan reads one "
+                        "hazard per asset; state the others with .hazard(...)"
+                    )
+            return
+        if self._holds_joint:
+            raise ValueError(_HAZARDS_REFUSE_JOINT)
+        if self.pool is not None:
+            raise ValueError(_HAZARDS_REFUSE_POOL)
+        if self.index_read is not None:
+            raise ValueError(_HAZARDS_REFUSE_INDEX)
+        components = self._components()
+        if len(components) < 2:
+            raise ValueError(
+                "a plan with .hazard(...) reads two hazards or more at each asset; "
+                "add another with .hazard(name, source, ...)"
+            )
+        _combine_record(
+            self.combine_rule,
+            [each.name for each in components if each.loss_model is not None],
+        )
+        if self._on_curves:
+            self._check_curve_hazards(components)
+        by_name = {each.name: each for each in components}
+        self._check_hazard_covers(by_name)
+        self._check_packages(by_name, self._package_members())
+
+    def _check_curve_hazards(self, components: Sequence[_Hazard]) -> None:
+        """The dependence across the hazards, and each component's selection."""
+        model = self.dependence_model
+        if model is None:
+            raise ValueError(
+                "several hazards on fitted curves need a stated dependence between "
+                "them, because fitted curves say nothing about how two hazards move "
+                "together: state .dependence(Independent()), "
+                ".dependence(Comonotonic()), .dependence(GaussianCopula(correlation)) "
+                "or .dependence(EmpiricalCopula(reference))"
+            )
+        names = [each.name for each in components]
+        rule = self.split_rule
+        for count in (
+            None if self.draws is None else self.draws.n_draws,
+            rule.n_draws if isinstance(rule, FreshDraws) else None,
+        ):
+            if count is not None:
+                _model_record(model, count, names, "hazards")
+        own: PortfolioEvaluation = self.source
+        for component in components[1:]:
+            request: PortfolioEvaluation = component.source
+            selection = request.selection
+            if self.scenario_set is None:
+                for axis in ("horizons", "pathways"):
+                    values = getattr(selection, axis)
+                    if values is not None and len(values) > 1:
+                        raise ValueError(
+                            f"component {component.name!r}: "
+                            + str(_several_selected(axis, len(values)))
+                        )
+                continue
+            names_selected = selection.hazard_names
+            if names_selected is None or len(names_selected) != 1:
+                raise ValueError(
+                    f"with .scenarios(...), component {component.name!r}'s request "
+                    "must select exactly one hazard in hazard_names, so that "
+                    "explain() names the hazard it reads without reading anything"
+                )
+            for axis in ("horizons", "pathways"):
+                stated = getattr(selection, axis)
+                planned = getattr(own.selection, axis)
+                if stated is not None and sorted(map(str, stated)) != sorted(
+                    map(str, planned or ())
+                ):
+                    raise ValueError(
+                        f"with .scenarios(...), component {component.name!r}'s "
+                        f"request selects the {axis} {list(stated)}, but the plan's "
+                        f"selects {_listed(planned)}: a scenario reads one (pathway, "
+                        "horizon) of every hazard, so select the plan's, or none"
+                    )
+
+    def _package_members(self) -> list[dict[str, int]]:
+        """Each package's contracts, by component: their positions in `.covers`.
+
+        Raises `ValueError` for a label that names no cover or several, a cover
+        on several components, a mix of templates and resolved covers, covers
+        written for different assets, and a cover in two packages.
+        """
+        positions: dict[str, list[int]] = {}
+        for position, cover in enumerate(self.cover_list):
+            positions.setdefault(_cover_label(cover), []).append(position)
+        packaged: dict[int, str] = {}
+        members: list[dict[str, int]] = []
+        for package in self.package_list:
+            found: dict[str, int] = {}
+            for component, cover_label in package.covers:
+                held = positions.get(cover_label, [])
+                if len(held) != 1:
+                    raise ValueError(
+                        f"package {package.label!r} names the cover_label "
+                        f"{cover_label!r}, which "
+                        + ("no cover" if not held else f"{len(held)} covers")
+                        + " in .covers(...) has; it names one cover each, by its "
+                        f"label or the first 12 hex digits of its hash, of "
+                        f"{sorted(positions)}"
+                    )
+                position = held[0]
+                cover = self.cover_list[position]
+                if isinstance(cover.index_definition, CompositeIndex):
+                    raise ValueError(
+                        f"package {package.label!r}: cover {cover_label!r} pays on "
+                        "several components, and a package holds contracts on one "
+                        "index each"
+                    )
+                if position in packaged:
+                    raise ValueError(
+                        f"cover {cover_label!r} is a contract of the packages "
+                        f"{packaged[position]!r} and {package.label!r}; a cover is "
+                        "in one package at most, as its rows would repeat"
+                    )
+                packaged[position] = package.label
+                found[component] = position
+            covers = [self.cover_list[position] for position in found.values()]
+            if len({not cover.free_parameters() for cover in covers}) > 1:
+                raise ValueError(
+                    f"package {package.label!r} holds templates and resolved covers; "
+                    "a package holds contracts designed alike: all templates, or "
+                    "all resolved"
+                )
+            if len({cover.asset_id for cover in covers}) > 1:
+                raise ValueError(
+                    f"package {package.label!r} holds covers written for different "
+                    "assets; a package is one asset's contracts"
+                )
+            members.append(found)
+        return members
+
+    def _check_hazard_covers(self, by_name: Mapping[str, _Hazard]) -> None:
+        """Each cover against the components it reads: their names, units, tails.
+
+        A contract of a package reads the component its package names; any
+        other cover on one index the component named its `hazard_name`.
+        """
+        names = list(by_name)
+        templates = {
+            cover.label or cover.definition_hash
+            for cover in self.cover_list
+            if cover.free_parameters()
+            and not isinstance(cover.index_definition, CompositeIndex)
+        }
+        for label, component_name, index, packaged in self._cover_reads():
+            if not isinstance(index.location, AtAsset):
+                raise SampleError(
+                    f"cover {label!r} reads its index at {index.location!r}, and a "
+                    "plan with .hazard(...) reads each component's index at the "
+                    "asset (AtAsset())"
+                )
+            component = by_name.get(component_name)
+            if component is None:
+                raise SampleError(
+                    f"cover {label!r} reads the component {component_name!r}, and "
+                    f"the plan's components are {names}: a cover on one index reads "
+                    "the component named its hazard_name, or the one its "
+                    ".package(...) names"
+                )
+            if component.unit is not None and index.unit != component.unit:
+                raise SampleError(
+                    f"cover {label!r} pays on an index in {index.unit!r}, but "
+                    f"component {component_name!r} is in {component.unit!r}"
+                )
+            if not packaged and component.tail is not None:
+                if index.tail != component.tail:
+                    raise SampleError(
+                        f"cover {label!r} has the tail {index.tail!r} on component "
+                        f"{component_name!r}, whose tail is {component.tail!r}"
+                    )
+            if label in templates and component.loss_model is None:
+                raise SampleError(
+                    f"template {label!r} on one index is designed on the own loss of "
+                    f"component {component_name!r}, which has no impact and so no "
+                    "loss of its own; design it on the combined loss on the function "
+                    f"route: design(template, sample.component({component_name!r}, "
+                    "loss='combined'), ...)"
+                )
+
+    def _check_packages(
+        self, by_name: Mapping[str, _Hazard], members: Sequence[Mapping[str, int]]
+    ) -> None:
+        """Each package's components, and its shares against the budget."""
+        spec = self.design_spec
+        budget = None if spec is None else spec.budget
+        for package, found in zip(self.package_list, members, strict=True):
+            unknown = [name for name in package.components if name not in by_name]
+            if unknown:
+                raise ValueError(
+                    f"package {package.label!r} names the components {unknown}, and "
+                    f"the plan's are {list(by_name)}"
+                )
+            templates = any(
+                self.cover_list[position].free_parameters()
+                for position in found.values()
+            )
+            shares = package.split_shares()
+            if not templates:
+                if shares is not None:
+                    raise ValueError(
+                        f"package {package.label!r} holds resolved covers, which have "
+                        "no budget to split: leave shares= out"
+                    )
+                continue
+            if budget is None:
+                if shares is not None:
+                    raise ValueError(
+                        f"package {package.label!r} states shares=, but "
+                        ".objective(...) states no budget to split; leave shares= out, "
+                        "or state the budget"
+                    )
+                continue
+            if shares is None:
+                raise ValueError(
+                    f"package {package.label!r} holds templates, and .objective(...) "
+                    "states a budget, the budget of one contract on every hazard: "
+                    "state how to split it between the contracts with shares="
+                    "'own_loss' or a mapping by component; there is no default"
+                )
+            if isinstance(shares, dict):
+                if sorted(shares) != sorted(package.components):
+                    raise ValueError(
+                        f"package {package.label!r}: shares= names {sorted(shares)}, "
+                        f"and must name its contracts' components, "
+                        f"{sorted(package.components)}"
+                    )
+                _stated_shares(shares, dict.fromkeys(package.components))
 
     # -- scopes -----------------------------------------------------------------
 
@@ -2635,10 +3695,11 @@ class ParametricPlan:
         """Check what no single builder can, as the builders come in any order."""
         model = self.dependence_model
         if not self._holds_joint:
-            if model is not None:
+            if model is not None and not self.hazard_list:
                 raise ValueError(
                     ".dependence(...) says how the assets are put side by side, "
-                    "and only Joint() does that; state .scopes(Joint())"
+                    "and only Joint() does that; state .scopes(Joint()), or the "
+                    "hazards it puts side by side with .hazard(...)"
                 )
             if self.allocation_rule is not None:
                 raise ValueError(
@@ -2766,7 +3827,22 @@ class ParametricPlan:
         return evaluations
 
     def _source_descriptions(self) -> list[dict[str, Any]]:
-        """The hazard's sources, as far as they are known: one entry per source."""
+        """The hazard's sources, as far as they are known: one entry per source.
+
+        With several hazards, one entry per component, which names it.
+        """
+        if self.hazard_list:
+            return [
+                {
+                    **(
+                        self._source_description(component.source)
+                        if self._on_curves
+                        else self._annual_description(component)
+                    ),
+                    "component": component.name,
+                }
+                for component in self._components()
+            ]
         if self.pool is None:
             return [self._source_description(self.source)]
         pooled = self.pool.to_document()
@@ -2780,13 +3856,16 @@ class ParametricPlan:
             request: PortfolioEvaluation = source
             selection = request.selection
             spec = request.impact_spec
-            assert spec is not None
             return {
-                "impact": {
-                    "name": spec.name,
-                    "value_semantics": spec.value_semantics,
-                    "value_unit": spec.value_unit,
-                },
+                "impact": (
+                    None
+                    if spec is None
+                    else {
+                        "name": spec.name,
+                        "value_semantics": spec.value_semantics,
+                        "value_unit": spec.value_unit,
+                    }
+                ),
                 "join": "PortfolioEvaluation.asset_curves()",
                 "kind": "canonical_dataset",
                 "metadata": None,
@@ -2798,17 +3877,37 @@ class ParametricPlan:
                 },
                 "type": type(request.dataset).__name__,
             }
+        assert self.provenance is not None and self.unit is not None
+        return self._annual_description(
+            _Hazard(
+                "",
+                source,
+                unit=self.unit,
+                provenance=self.provenance,
+                location=self.location,
+                year_column=self.year_column,
+                hazard_column=self.hazard_column,
+            )
+        )
+
+    def _annual_description(self, component: _Hazard) -> dict[str, Any]:
+        """A per-year source, as `component` reads it: the plan's own for its first."""
+        source = self.source if component.source is None else component.source
+        location = self.location if component.location is None else component.location
         kind = _source_kind(source)
-        assert self.provenance is not None
+        assert component.provenance is not None
         description: dict[str, Any] = {
-            "columns": {"value": self.hazard_column, "year": self.year_column},
+            "columns": {
+                "value": component.hazard_column,
+                "year": component.year_column,
+            },
             "kind": kind,
-            "location": self.location.to_document(),
+            "location": location.to_document(),
             "missing": self.missing,
-            "provenance": self.provenance.model_dump(mode="json"),
+            "provenance": component.provenance.model_dump(mode="json"),
             "role": "hazard",
             "type": type(source).__name__,
-            "unit": self.unit,
+            "unit": component.unit,
             "years": None if self.years is None else list(self.years),
         }
         if kind == "file":
@@ -2816,6 +3915,28 @@ class ParametricPlan:
         elif kind == "table":
             description["rows"] = int(source.num_rows)
         return description
+
+    def _hazard_licences(self) -> list[dict[str, Any]] | None:
+        """The hazard sources' terms, each once; `None` on curves (read later)."""
+        if self.provenance is None:
+            return None
+        stated = (
+            [component.provenance for component in self._components()]
+            if self.hazard_list
+            else [self.provenance]
+        )
+        licences: list[dict[str, Any]] = []
+        for provenance in stated:
+            assert provenance is not None
+            entry = {
+                "attribution": provenance.attribution,
+                "licence": provenance.licence,
+                "role": "hazard",
+                "source": provenance.dataset,
+            }
+            if entry not in licences:
+                licences.append(entry)
+        return licences
 
     def _index_description(self, read: _SeriesRead) -> dict[str, Any]:
         """`.index(...)`'s source, in the form of a written `sources` entry."""
@@ -2886,19 +4007,76 @@ class ParametricPlan:
                 notes.append(
                     self.dependence_model.statement(self.draws.n_draws, "assets")
                 )
+        if self.hazard_list:
+            self._describe_components(sample, notes)
         return sample
+
+    def _describe_components(self, sample: dict[str, Any], notes: list[str]) -> None:
+        """A sample of several hazards, as far as it is known before execution.
+
+        Its components (a curve's unit and tail are its dataset's, known only at
+        execution), each one's loss model, the rule and the dependence between
+        the hazards, in the keys the written `setup.samples` entries have.
+        """
+        components = self._components()
+        sample["components"] = [
+            {
+                "name": each.name,
+                "own_loss": each.loss_model is not None,
+                "tail": each.tail,
+                "unit": each.unit,
+            }
+            for each in components
+        ]
+        sample["loss_model"] = {
+            "kind": "components",
+            "components": [
+                {"name": each.name, "loss_model": each.loss_model.to_document()}
+                for each in components
+                if each.loss_model is not None
+            ],
+        }
+        sample["combine"] = _combine_record(
+            self.combine_rule,
+            [each.name for each in components if each.loss_model is not None],
+        )
+        model = self.dependence_model
+        if not self._on_curves:
+            sample["hazard_dependence"] = {"kind": "data"}
+            return
+        if model is None:
+            sample["hazard_dependence"] = None
+            return
+        if self.draws is None:
+            sample["hazard_dependence"] = model.to_document()
+            return
+        record, sentence = _model_record(
+            model, self.draws.n_draws, [each.name for each in components], "hazards"
+        )
+        sample["hazard_dependence"] = record
+        notes.append(sentence)
 
     def _rng_description(self) -> dict[str, Any]:
         generators = (
             "one child of numpy.random.SeedSequence(seed) per asset, in asset order"
         )
         if not self._on_curves:
+            if self.hazard_list:
+                generators += (
+                    "; the basis-risk model draws for every component from it, in "
+                    "component order"
+                )
             return {
                 "generators": generators,
                 "seed": self.seed,
                 "steps": ["basis_risk"],
             }
         rule = self.split_rule
+        if self.hazard_list:
+            generators += (
+                "; it draws the first component, and each other component draws "
+                "from a child it spawns, in component order"
+            )
         return {
             "fresh_draws_seed": rule.seed if isinstance(rule, FreshDraws) else None,
             "generators": generators
@@ -2942,19 +4120,7 @@ class ParametricPlan:
             path = os.fspath(assets.data)
         else:
             path = None
-        provenance = self.provenance
-        licences: list[dict[str, Any]] | None = (
-            None
-            if provenance is None
-            else [
-                {
-                    "attribution": provenance.attribution,
-                    "licence": provenance.licence,
-                    "role": "hazard",
-                    "source": provenance.dataset,
-                }
-            ]
-        )
+        licences = self._hazard_licences()
         read = self.index_read
         if licences is not None and read is not None:
             licences.append(
@@ -3005,6 +4171,17 @@ class ParametricPlan:
             document["scopes"] = [scope.to_document() for scope in self.scope_list]
             document["dependence"] = None if model is None else model.to_document()
             document["allocation"] = self.allocation_rule
+        if self.hazard_list:
+            components = self._components()
+            document["hazards"] = [
+                component.to_document(own=i == 0, on_curves=self._on_curves)
+                for i, component in enumerate(components)
+            ]
+            document["combine"] = samples[0]["combine"]
+            document["hazard_dependence"] = samples[0]["hazard_dependence"]
+            document["packages"] = [
+                package.to_document() for package in self.package_list
+            ]
         if isinstance(self.cell, H3Cell):
             document["assets"]["cell"] = self.cell.to_document()
         elif self.cell is not None:
@@ -3036,14 +4213,25 @@ class ParametricPlan:
         pathway: str | None = None
         horizon: int | None = None
         product: str | None = None
-        hazard: dict[str, str] | None = None
+        hazard: dict[str, Any] | None = None
         if variant is None:
             names = self.source.selection.hazard_names
             hazard = {"name": str(names[0]), "from": "curve_row"}
+            if self.hazard_list:
+                hazard = {
+                    component.name: {
+                        "name": str(component.source.selection.hazard_names[0]),
+                        "from": "curve_row",
+                    }
+                    for component in self._components()
+                    if component.loss_model is not None
+                }
             if planned.members is not None:
                 pathway = planned.members[0][0]
                 horizons = [year for _, year in planned.members]
                 horizon = (horizons[0] + horizons[-1]) // 2
+        elif variant.hazard_list:
+            pathway, product, hazard = variant._component_reads()
         else:
             assert variant.provenance is not None
             product = variant.provenance.provider
@@ -3070,6 +4258,46 @@ class ParametricPlan:
             "product": product,
             "source_kind": "monte_carlo" if self._on_curves else "annual",
         }
+
+    def _component_reads(
+        self,
+    ) -> tuple[str | None, str | None, dict[str, Any]]:
+        """A per-year plan's pathway, product and hazards, read by component.
+
+        The product joins the components' distinct providers, sorted, with `+`,
+        and the hazards are those of the components with an impact, as a sample
+        of several hazards records them.
+        """
+        components = self._components()
+        sources = [
+            self.source if component.source is None else component.source
+            for component in components
+        ]
+        providers = sorted(
+            {
+                str(component.provenance.provider)
+                for component in components
+                if component.provenance is not None and component.provenance.provider
+            }
+        )
+        pathway = self.stated_pathway or next(
+            (each for each in map(_source_pathway, sources) if each), None
+        )
+        hazard: dict[str, Any] = {}
+        for component, source in zip(components, sources, strict=True):
+            if component.loss_model is None:
+                continue
+            named = _source_hazard(source)
+            if named is not None:
+                hazard[component.name] = {"name": named, "from": "source_plan"}
+            elif component.hazard_name is not None:
+                hazard[component.name] = {
+                    "name": component.hazard_name,
+                    "from": "stated",
+                }
+            else:
+                hazard[component.name] = None
+        return pathway, "+".join(providers) or None, hazard
 
     def _scenario_evaluations(self, labels: Sequence[str]) -> list[dict[str, Any]]:
         """The planned evaluations: every design scenario on every scenario's block."""
@@ -3157,23 +4385,29 @@ class ParametricPlan:
             }
             if each.kind == "dataset":
                 assert isinstance(each.described, CurveScenario)
-                source = self._curve_scenario_description(each.described)
-                sources.append(source)
-                description |= {"path": source["path"]}
+                read = self._curve_scenario_descriptions(each.described)
+                sources += read
+                paths = {str(part.get("component")): part["path"] for part in read}
+                description |= {
+                    "path": paths
+                    if isinstance(each.described.dataset, Mapping)
+                    else read[0]["path"]
+                }
             elif variant is not None:
                 read = variant._source_descriptions()
                 sources += [{**part, "scenarios": [each.label]} for part in read]
-                assert variant.provenance is not None
-                licence = {
-                    "attribution": variant.provenance.attribution,
-                    "licence": variant.provenance.licence,
-                    "role": "hazard",
-                    "source": variant.provenance.dataset,
-                }
-                if licence not in licences:
-                    licences.append(licence)
+                for licence in variant._hazard_licences() or ():
+                    if licence not in licences:
+                        licences.append(licence)
                 description |= {
-                    "hazard_name": variant.hazard_name,
+                    "hazard_name": (
+                        {
+                            component.name: component.hazard_name
+                            for component in variant._components()
+                        }
+                        if variant.hazard_list
+                        else variant.hazard_name
+                    ),
                     "pathway": variant.stated_pathway,
                     "pool": None
                     if variant.pool is None
@@ -3212,22 +4446,41 @@ class ParametricPlan:
             "scenarios": described,
         }
 
-    def _curve_scenario_description(self, entry: CurveScenario) -> dict[str, Any]:
-        """A `CurveScenario`'s dataset, in the form of the plan's own source entry."""
-        request: PortfolioEvaluation = self.source
-        own = self._source_description(request)
-        names = request.selection.hazard_names
-        return {
-            **own,
-            "path": os.fspath(entry.dataset.provider.source),
-            "scenarios": [entry.label],
-            "selection": {
-                "hazard_names": _listed(names),
-                "horizons": _listed(entry.horizons),
-                "pathways": None if entry.pathway is None else [entry.pathway],
-            },
-            "type": type(entry.dataset).__name__,
-        }
+    def _curve_scenario_descriptions(
+        self, entry: CurveScenario
+    ) -> list[dict[str, Any]]:
+        """A `CurveScenario`'s datasets, in the form of the plan's own source entries.
+
+        One, or one per component, each reading that component's hazard.
+        """
+        datasets: dict[str | None, HazardDataset] = (
+            dict(entry.dataset.items())
+            if isinstance(entry.dataset, Mapping)
+            else {None: entry.dataset}
+        )
+        requests: dict[str | None, Any] = {
+            component.name: component.source for component in self._components()
+        } or {None: self.source}
+        described: list[dict[str, Any]] = []
+        for component, dataset in datasets.items():
+            request: PortfolioEvaluation = requests[component]
+            own = self._source_description(request)
+            names = request.selection.hazard_names
+            described.append(
+                {
+                    **own,
+                    **({} if component is None else {"component": component}),
+                    "path": os.fspath(dataset.provider.source),
+                    "scenarios": [entry.label],
+                    "selection": {
+                        "hazard_names": _listed(names),
+                        "horizons": _listed(entry.horizons),
+                        "pathways": None if entry.pathway is None else [entry.pathway],
+                    },
+                    "type": type(dataset).__name__,
+                }
+            )
+        return described
 
     def explain(
         self, *, format: Literal["text", "json"] = "text"
@@ -3282,7 +4535,21 @@ class ParametricPlan:
         window whose members don't divide `n_draws` or `FreshDraws(n)`, and
         for a stated `hazard_name` a source plan contradicts; and
         `EvaluationError` for `premiums=` that name no cover given as is.
+
+        With `.hazard(...)`, the document adds `hazards` (each component: its
+        name, whether it is the plan's own, its impact and where it is read),
+        `combine` (the rule's record), `hazard_dependence` (the data's own on
+        per-year values, the stated model's record on fitted curves) and
+        `packages`; `sources` has one entry per component, which names it, and
+        each sample its `components`, `combine` and `hazard_dependence`. It
+        raises as "Several hazards" in `.hazard(...)` says: `ValueError` for
+        `Joint()`, `pool=` or `.index(...)` beside it, a per-year plan that
+        doesn't name its own hazard, several hazards on curves without
+        `.dependence(...)`, and packages that don't fit the covers;
+        `SampleError` for a missing or needless rule, and a cover that doesn't
+        fit the components it reads.
         """
+        self._check_hazard_plan()
         self._check_scopes()
         self._check_scenario_plan()
         document = self._explain_document()
@@ -3416,19 +4683,21 @@ class ParametricPlan:
             document["file_sha256"] = _file_sha256(Path(read.source))
         return document
 
-    def _open(self, read: _SeriesRead) -> _OpenedRead:
+    def _open(self, read: _SeriesRead, *, named: bool | None = None) -> _OpenedRead:
         """Read a source once, for all the assets' series.
 
-        On a plan with scenarios, or with a stated `hazard_name`, the series'
-        source records the hazard its source plan's `explain()` names, so that
-        the sample's `hazard` record says the source names it.
+        On a plan with scenarios, or with a stated `hazard_name` (`named`, for
+        a component of a plan with several hazards), the series' source records
+        the hazard its source plan's `explain()` names, so that the sample's
+        `hazard` record says the source names it.
         """
         table, record = self._read_source(read)
         source = self._series_source(read)
         explained = record.get("explain")
+        stated = self.hazard_name is not None if named is None else named
         if (
             read.role == "hazard"
-            and (self.names_hazard or self.hazard_name is not None)
+            and (self.names_hazard or stated)
             and isinstance(explained, Mapping)
         ):
             for key in ("recipe", "hazard_name"):
@@ -3722,11 +4991,13 @@ class ParametricPlan:
 
     def _annual_sample(
         self,
-        asset: _AnnualAsset,
+        asset: _AnnualAsset | _HazardAsset,
         trend: Trend,
         rng: np.random.Generator | None,
     ) -> OutcomeSample:
         """One asset's per-year sample under `trend`, with its notes."""
+        if isinstance(asset, _HazardAsset):
+            return self._annual_hazard_sample(asset, trend, rng)
         if isinstance(asset.series, AnnualSeries):
             sample = _annual_rows(
                 asset.series,
@@ -3766,6 +5037,131 @@ class ParametricPlan:
             )
         return sample
 
+    def _annual_hazard_sample(
+        self,
+        asset: _HazardAsset,
+        trend: Trend,
+        rng: np.random.Generator | None,
+    ) -> OutcomeSample:
+        """One asset's per-year sample of several hazards, as the function builds it.
+
+        `sample_annual_hazards`, with the components' tails and hazard names,
+        the plan's rule, basis-risk model, `missing=` and scenario label.
+        """
+        components = self._components()
+        names = {
+            component.name: component.hazard_name
+            for component in components
+            if component.hazard_name is not None
+        }
+        tails: dict[str, Tail] = {}
+        for component in components:
+            assert component.tail is not None
+            tails[component.name] = component.tail
+        sample = _annual_hazard_rows(
+            asset.series,
+            tails=tails,
+            loss_models=asset.loss_models,
+            combine=self.combine_rule,
+            basis_risk=self._require_basis_risk(),
+            asset_id=asset.asset_id,
+            rng=rng,
+            missing=self.missing,
+            trend=trend,
+            scenario=self.scenario,
+            hazard_names=names or None,
+        )
+        if asset.cell is not None:
+            assert self.cell is not None
+            sample = _noted(
+                sample,
+                f"The impact reads H3 cell {asset.cell:x} for asset "
+                f"{asset.asset_id}: {_cell_origin(self.cell)}.",
+            )
+        return sample
+
+    def _component_read(self, component: _Hazard) -> _SeriesRead:
+        """Where each asset's series of a per-year component is read."""
+        if component.source is None:
+            return self._hazard_read
+        assert component.unit is not None and component.provenance is not None
+        return _SeriesRead(
+            role="hazard",
+            source=component.source,
+            location=self.location
+            if component.location is None
+            else component.location,
+            unit=component.unit,
+            provenance=component.provenance,
+            year_column=component.year_column,
+            value_column=component.hazard_column,
+            years=self.years,
+        )
+
+    def _annual_hazard_samples(self, *, folds: bool) -> _Samples:
+        """Each asset's per-year sample of several hazards; per fold under a trend.
+
+        Every source is read once for all the assets. Each asset's generator
+        draws the basis-risk model for every component, in component order.
+        """
+        basis_risk = self._require_basis_risk()
+        portfolio = self._portfolio()
+        rows = self._asset_rows(portfolio)
+        # Before the sources are read, which may take long or download data.
+        cells = [self._asset_cell(portfolio, asset_id, row) for asset_id, row in rows]
+        components = self._components()
+        opened = {
+            component.name: self._open(
+                self._component_read(component),
+                named=None
+                if component.source is None
+                else component.hazard_name is not None,
+            )
+            for component in components
+        }
+        generators = self._generators(len(rows))
+        per_fold = (
+            folds
+            and isinstance(self.trend, LinearTrend)
+            and isinstance(self.split_rule, (Holdout, KFold))
+        )
+        samples: dict[str, OutcomeSample] = {}
+        refitted: dict[str, tuple[OutcomeSample, ...]] = {}
+        for (asset_id, row), rng, cell in zip(rows, generators, cells, strict=True):
+            series = {
+                name: self._series(each, row, asset_id, portfolio)
+                for name, each in opened.items()
+            }
+            models = {
+                component.name: (
+                    component.loss_model.for_asset(portfolio, asset_id)
+                    if cell is None
+                    else self._cell_loss_model(
+                        portfolio, asset_id, row, cell, model=component.loss_model
+                    )
+                )
+                for component in components
+                if component.loss_model is not None
+            }
+            asset = _HazardAsset(asset_id, series, models, cell)
+            first_state = copy.deepcopy(rng)
+            samples[asset_id] = self._annual_hazard_sample(asset, self.trend, rng)
+            _warn_comonotone(basis_risk, separate_index=False)
+            if per_fold:
+                refitted[asset_id] = self._refitted_samples(
+                    asset, samples[asset_id], first_state
+                )
+        first = components[0].name
+        return _Samples(
+            portfolio,
+            samples,
+            None,
+            "annual_table",
+            opened[first].record,
+            folds=refitted if per_fold else None,
+            component_records={name: each.record for name, each in opened.items()},
+        )
+
     def _fold_blocks(self, samples: Sequence[OutcomeSample]) -> list[_Block]:
         """Each fold's two blocks, each from that fold's own sample."""
         return [self._blocks(sample, None)[fold] for fold, sample in enumerate(samples)]
@@ -3795,7 +5191,7 @@ class ParametricPlan:
 
     def _refitted_samples(
         self,
-        asset: _AnnualAsset,
+        asset: _AnnualAsset | _HazardAsset,
         sample: OutcomeSample,
         generator: np.random.Generator | None,
     ) -> tuple[OutcomeSample, ...]:
@@ -3830,11 +5226,14 @@ class ParametricPlan:
         is fitted per fold. Under `Joint()`, also the sample of all the assets,
         and `samples` holds each asset's view of it.
         """
+        self._check_hazard_plan()
         self._check_scopes()
         self._check_scenario_plan()
         assert self.scenario_set is None, "a plan with scenarios builds each one's"
         if self._on_curves:
             return self._curve_samples(fresh=fresh)
+        if self.hazard_list:
+            return self._annual_hazard_samples(folds=folds)
         basis_risk = self._require_basis_risk()
         portfolio = self._portfolio()
         rows = self._asset_rows(portfolio)
@@ -3958,9 +5357,13 @@ class ParametricPlan:
         asset_id: str,
         asset: Mapping[str, Any],
         cell: Any,
+        model: LossModel | None = None,
     ) -> LossModel:
-        """The loss model for one asset, with its H3 cell in the impact's context."""
-        model = self.loss_model
+        """The loss model for one asset, with its H3 cell in the impact's context.
+
+        `model` is a component's, by default the plan's.
+        """
+        model = self.loss_model if model is None else model
         if _takes_context(model.impact):
             model = LossModel(
                 model.impact,
@@ -3972,6 +5375,8 @@ class ParametricPlan:
         return model.for_asset(portfolio, asset_id)
 
     def _curve_samples(self, *, fresh: bool) -> _Samples:
+        if self.hazard_list:
+            return self._curve_hazard_samples(fresh=fresh)
         self._require_basis_risk()
         self._require_draws()
         request: PortfolioEvaluation = self.source
@@ -4134,6 +5539,205 @@ class ParametricPlan:
             fresh_joint=fresh_joint,
         )
 
+    # -- several hazards on curves -------------------------------------------------
+
+    def _component_curves(
+        self,
+        component: _Hazard,
+        portfolio: AssetPortfolio,
+        asset_ids: Sequence[str],
+        *,
+        one: bool,
+    ) -> _CurveRead:
+        """A component's matched curves: one per asset, or every selected pair."""
+        request: PortfolioEvaluation = dataclasses.replace(
+            component.source, portfolio=portfolio
+        )
+        metadata = request.dataset.metadata()
+        self._check_component_units(component.name, metadata)
+        if not one:
+            return self._read_curves(request, asset_ids, check=False)
+        path = Path(request.dataset.provider.source)
+        file_sha256 = _file_sha256(path)
+        curves = request.asset_curves()
+        matched = self._curve_rows(curves, portfolio.id_column, asset_ids)
+        record = {
+            "curves": int(curves.num_rows),
+            "file_sha256": file_sha256,
+            "kind": "canonical_dataset",
+            "path": os.fspath(path),
+        }
+        return _CurveRead(
+            metadata, record, {asset_id: [row] for asset_id, row in matched.items()}
+        )
+
+    def _check_component_units(
+        self, name: str, metadata: HazardDatasetMetadata
+    ) -> None:
+        """Raise `SampleError` for a cover on component `name` in another unit."""
+        for label, component, index, _ in self._cover_reads():
+            if component != name:
+                continue
+            if index.unit != metadata.value_unit:
+                raise SampleError(
+                    f"cover {label!r} pays on an index in {index.unit!r}, but the "
+                    f"dataset of component {name!r} holds values in "
+                    f"{metadata.value_unit!r}"
+                )
+
+    def _cover_reads(self) -> list[tuple[str, str, IndexDefinition, bool]]:
+        """What each cover reads: its label, the component, its index, if packaged."""
+        packaged = {
+            position: component
+            for found in self._package_members()
+            for component, position in found.items()
+        }
+        reads: list[tuple[str, str, IndexDefinition, bool]] = []
+        for position, cover in enumerate(self.cover_list):
+            label = cover.label or cover.definition_hash
+            definition = cover.index_definition
+            if isinstance(definition, CompositeIndex):
+                reads += [
+                    (label, name, index, False)
+                    for name, index in definition.components.items()
+                ]
+                continue
+            component = packaged.get(position, definition.hazard_name)
+            reads.append((label, component, definition, position in packaged))
+        return reads
+
+    def _curve_hazard_samples(self, *, fresh: bool) -> _Samples:
+        """Each asset's draws of several hazards, under the stated dependence."""
+        self._require_basis_risk()
+        self._require_draws()
+        portfolio = self._portfolio()
+        rows = self._asset_rows(portfolio)
+        asset_ids = [asset_id for asset_id, _ in rows]
+        reads = {
+            component.name: self._component_curves(
+                component, portfolio, asset_ids, one=True
+            )
+            for component in self._components()
+        }
+        return self._drawn_hazards(portfolio, rows, reads, fresh=fresh, label=None)
+
+    def _component_generators(
+        self, seed: int, count: int, names: Sequence[str]
+    ) -> list[dict[str, np.random.Generator]]:
+        """Each asset's generators, by component.
+
+        The asset's child of `SeedSequence(seed)` draws the first component, as
+        it draws the hazard of a plan with one, and each other component draws
+        from a child it spawns, in component order.
+        """
+        made: list[dict[str, np.random.Generator]] = []
+        for child in np.random.SeedSequence(seed).spawn(count):
+            generators = {names[0]: np.random.default_rng(child)}
+            for name, spawned in zip(
+                names[1:], child.spawn(len(names) - 1), strict=True
+            ):
+                generators[name] = np.random.default_rng(spawned)
+            made.append(generators)
+        return made
+
+    def _drawn_hazards(
+        self,
+        portfolio: AssetPortfolio,
+        rows: Sequence[tuple[str, dict[str, Any]]],
+        reads: Mapping[str, _CurveRead],
+        *,
+        fresh: bool,
+        label: str | None,
+    ) -> _Samples:
+        """Each asset's draws of several hazards from their curves in `reads`.
+
+        `sample_curve_hazards`, with each asset's generators by component, the
+        plan's dependence model, rule and basis-risk model. A component's curves
+        are one canonical row, or a window of horizons. `label=None` leaves the
+        sample's `scenario` at its default.
+        """
+        basis_risk = self._require_basis_risk()
+        draws = self._require_draws()
+        model = self.dependence_model
+        assert model is not None and self.seed is not None
+        components = self._components()
+        names = [component.name for component in components]
+        rule = self.split_rule if fresh else None
+        generators = self._component_generators(self.seed, len(rows), names)
+        fresh_generators = (
+            None
+            if not isinstance(rule, FreshDraws)
+            else self._component_generators(rule.seed, len(rows), names)
+        )
+        named: dict[str, Any] = {} if label is None else {"scenario": label}
+
+        def draw(
+            asset_id: str,
+            row: Mapping[str, Any],
+            count: int,
+            drawn: Mapping[str, np.random.Generator],
+        ) -> OutcomeSample:
+            first = {name: reads[name].rows[asset_id][0] for name in names}
+            curves: dict[str, Any] = {}
+            for name in names:
+                members = [
+                    {key: curve[key] for key in _CURVE_ROW_COLUMNS if key in curve}
+                    for curve in reads[name].rows[asset_id]
+                ]
+                curves[name] = members[0] if len(members) == 1 else members
+            loss_models = {
+                component.name: self._cell_loss_model(
+                    portfolio,
+                    asset_id,
+                    row,
+                    first[component.name].get("cell_index"),
+                    model=component.loss_model,
+                )
+                for component in components
+                if component.loss_model is not None
+            }
+            return sample_curve_hazards(
+                curves,
+                dependence=model,
+                metadata={name: reads[name].metadata for name in names},
+                n_draws=count,
+                rngs=drawn,
+                loss_models=loss_models,
+                combine=self.combine_rule,
+                basis_risk=basis_risk,
+                asset_id=asset_id,
+                assume_semantics=draws.assume_semantics,
+                outside_support=draws.outside_support,
+                # One document for every component, so each is named by its own.
+                details={
+                    "file_sha256_by_component": {
+                        name: reads[name].record["file_sha256"] for name in names
+                    },
+                    "spatial_match_by_component": {
+                        name: first[name]["spatial_match"] for name in names
+                    },
+                },
+                **named,
+            )
+
+        samples: dict[str, OutcomeSample] = {}
+        fresh_samples: dict[str, OutcomeSample] = {}
+        for i, (asset_id, row) in enumerate(rows):
+            samples[asset_id] = draw(asset_id, row, draws.n_draws, generators[i])
+            if fresh_generators is not None:
+                assert isinstance(rule, FreshDraws)
+                fresh_samples[asset_id] = draw(
+                    asset_id, row, rule.n_draws, fresh_generators[i]
+                )
+        return _Samples(
+            portfolio,
+            samples,
+            fresh_samples if fresh_generators is not None else None,
+            "canonical_file",
+            reads[names[0]].record,
+            component_records={name: reads[name].record for name in names},
+        )
+
     def _values_sha256(
         self, portfolio: AssetPortfolio, asset_ids: Sequence[str]
     ) -> str | None:
@@ -4190,6 +5794,21 @@ class ParametricPlan:
             for split, sample in self._evaluated(block)
         ]
 
+    def _breakdown_tables(self, entries: Sequence[Any], block: _Block) -> list[Any]:
+        """The parts of one block's payouts: on the design block, and any held-out."""
+        fold, train, _ = block
+        return [
+            payout_breakdown(
+                entries,
+                sample,
+                split=split,
+                fold=fold,
+                options=self.metric_options,
+                design_sample=train,
+            )
+            for split, sample in self._evaluated(block)
+        ]
+
     def _allocated_tables(
         self,
         designs: Sequence[JointDesignResult],
@@ -4221,8 +5840,12 @@ class ParametricPlan:
         train: OutcomeSample,
         objective: Objective,
         label: str,
+        budget: Budget | None | Literal["stated"] = "stated",
     ) -> DesignResult:
-        """One template's design on one asset's design block, labelled `label`."""
+        """One template's design on one asset's design block, labelled `label`.
+
+        `budget` is a package contract's share; `"stated"` takes the plan's.
+        """
         spec = self.design_spec
         assert spec is not None
         result = design(
@@ -4230,11 +5853,133 @@ class ParametricPlan:
             train,
             objective,
             pricing=self._pricing(),
-            budget=spec.budget,
+            budget=spec.budget if budget == "stated" else budget,
             limit=spec.limit,
             options=spec.options,
         )
         return dataclasses.replace(result, cover=_bound(result.cover, asset_id, label))
+
+    def _design_block(self, cover: Cover, train: OutcomeSample) -> OutcomeSample:
+        """What a template is designed on: the block, or its hazard's own loss.
+
+        On a plan with several hazards a cover on one index is designed on the
+        component named its `hazard_name`, with that hazard's own loss; a cover
+        on a `CompositeIndex` on the combined loss.
+        """
+        definition = cover.index_definition
+        if not self.hazard_list or isinstance(definition, CompositeIndex):
+            return train
+        return train.component(definition.hazard_name)
+
+    def _asset_entries(
+        self, asset_id: str, bound: Sequence[Cover], train: OutcomeSample
+    ) -> tuple[list[list[Any]], list[DesignResult]]:
+        """One asset's entries on one design block, slot by slot, and the designs.
+
+        A slot is a cover of `.covers(...)` that applies to the asset, or a
+        package, at the place of its first contract; the contracts of a package
+        have no slot of their own. A template's slot holds one design per
+        objective, and a package of templates one package per objective.
+        `bound` holds the asset's covers, in the order of `.covers(...)`.
+        """
+        positions = [
+            position
+            for position, cover in enumerate(self.cover_list)
+            if cover.asset_id in (None, asset_id)
+        ]
+        own = dict(zip(positions, bound, strict=True))
+        members = self._package_members() if self.package_list else []
+        first_of: dict[int, int] = {}
+        packaged: set[int] = set()
+        for number, found in enumerate(members):
+            # A package's covers are written for one asset, or for none.
+            if all(position in own for position in found.values()):
+                first_of[min(found.values())] = number
+                packaged.update(found.values())
+        slots: list[list[Any]] = []
+        designs: list[DesignResult] = []
+        for position in positions:
+            if position in first_of:
+                number = first_of[position]
+                contracts = {
+                    component: own[held] for component, held in members[number].items()
+                }
+                slots.append(
+                    self._package_entries(
+                        self.package_list[number], contracts, asset_id, train, designs
+                    )
+                )
+            elif position not in packaged:
+                slots.append(
+                    self._cover_entries(own[position], asset_id, train, designs)
+                )
+        return slots, designs
+
+    def _cover_entries(
+        self,
+        cover: Cover,
+        asset_id: str,
+        train: OutcomeSample,
+        designs: list[DesignResult],
+    ) -> list[Any]:
+        """A cover's entries on one design block: itself, or a design per objective."""
+        if not cover.free_parameters():
+            return [cover]
+        spec = self.design_spec
+        assert spec is not None
+        block = self._design_block(cover, train)
+        made: list[Any] = []
+        for objective in spec.objectives:
+            result = self._individual_design(
+                cover, asset_id, block, objective, _design_label(cover, objective)
+            )
+            designs.append(result)
+            made.append(result)
+        return made
+
+    def _package_entries(
+        self,
+        package: _Package,
+        contracts: Mapping[str, Cover],
+        asset_id: str,
+        train: OutcomeSample,
+        designs: list[DesignResult],
+    ) -> list[Any]:
+        """A package's entries on one design block: its covers, or its designs.
+
+        Each template is designed on its component's own loss, under its share
+        of the plan's budget (`split_budget` on `train`), one package per
+        objective.
+        """
+        if not any(cover.free_parameters() for cover in contracts.values()):
+            return [CoverPackage(dict(contracts), label=package.label)]
+        spec = self.design_spec
+        assert spec is not None
+        budgets = (
+            None
+            if spec.budget is None
+            else split_budget(spec.budget, train, shares=package.split_shares())  # type: ignore[arg-type]
+        )
+        made: list[Any] = []
+        for objective in spec.objectives:
+            designed: dict[str, DesignResult] = {}
+            for component, cover in contracts.items():
+                result = self._individual_design(
+                    cover,
+                    asset_id,
+                    train.component(component),
+                    objective,
+                    _design_label(cover, objective),
+                    budget=None if budgets is None else budgets[component],
+                )
+                designs.append(result)
+                designed[component] = result
+            made.append(
+                CoverPackage(
+                    designed, label=f"{package.label} ({_objective_tag(objective)})"
+                )
+            )
+        return made
 
     def _joint_design(
         self,
@@ -4310,7 +6055,11 @@ class ParametricPlan:
                     entries.append(each)
         return positions, designs
 
-    def _run(self, *, evaluate: bool) -> _Run:
+    def _run(self, *, evaluate: bool, breakdown: bool = False) -> _Run:
+        """Build, design and evaluate; with `breakdown`, the payouts' parts instead.
+
+        `breakdown` is for a plan of one scope, `Individual()`, without scenarios.
+        """
         if not self.cover_list:
             raise ValueError("the plan has no covers; set them with .covers(...)")
         spec = self.design_spec
@@ -4355,25 +6104,17 @@ class ParametricPlan:
         else:
             for asset_id in asset_ids:
                 for block in self._asset_blocks(built, asset_id):
-                    train = block[1]
-                    items: list[Any] = []
-                    for cover in covers[asset_id]:
-                        if not cover.free_parameters():
-                            items.append(cover)
-                            continue
-                        assert spec is not None
-                        for objective in spec.objectives:
-                            result = self._individual_design(
-                                cover,
-                                asset_id,
-                                train,
-                                objective,
-                                _design_label(cover, objective),
-                            )
-                            designs.append(result)
-                            items.append(result)
+                    slots, made = self._asset_entries(
+                        asset_id, covers[asset_id], block[1]
+                    )
+                    designs += made
                     if evaluate:
-                        tables += self._block_tables(items, block)
+                        items = [entry for slot in slots for entry in slot]
+                        tables += (
+                            self._breakdown_tables(items, block)
+                            if breakdown
+                            else self._block_tables(items, block)
+                        )
         return _Run(
             samples=MappingProxyType(samples),
             fresh=None if built.fresh is None else MappingProxyType(built.fresh),
@@ -4388,16 +6129,25 @@ class ParametricPlan:
             joint=built.joint,
             fresh_joint=built.fresh_joint,
             run_records=built.run_records,
+            component_records=built.component_records,
         )
 
     # -- scenarios ----------------------------------------------------------------
 
     def _read_curves(
-        self, request: PortfolioEvaluation, asset_ids: Sequence[str]
+        self,
+        request: PortfolioEvaluation,
+        asset_ids: Sequence[str],
+        *,
+        check: bool = True,
     ) -> _CurveRead:
-        """One canonical dataset's matched curves, each asset's in its own list."""
+        """One canonical dataset's matched curves, each asset's in its own list.
+
+        `check=False` leaves the covers' units to the caller, a component's.
+        """
         metadata = request.dataset.metadata()
-        self._check_cover_units(metadata)
+        if check:
+            self._check_cover_units(metadata)
         path = Path(request.dataset.provider.source)
         file_sha256 = _file_sha256(path)
         curves = request.asset_curves()
@@ -4416,13 +6166,28 @@ class ParametricPlan:
         return _CurveRead(metadata, record, held)
 
     def _dataset_request(
-        self, entry: CurveScenario, portfolio: AssetPortfolio
+        self,
+        entry: CurveScenario,
+        portfolio: AssetPortfolio,
+        component: _Hazard | None = None,
     ) -> PortfolioEvaluation:
-        """The request a `CurveScenario` reads: the plan's, on its own dataset."""
-        request: PortfolioEvaluation = self.source
+        """The request a `CurveScenario` reads: the plan's, on its own dataset.
+
+        For a component of a plan with several hazards, that component's request
+        on the dataset `entry` maps it to.
+        """
+        request: PortfolioEvaluation = (
+            self.source if component is None else component.source
+        )
+        stated = entry.dataset
+        if isinstance(stated, Mapping):
+            assert component is not None
+            dataset = stated[component.name]
+        else:
+            dataset = stated
         return dataclasses.replace(
             request,
-            dataset=entry.dataset,
+            dataset=dataset,
             portfolio=portfolio,
             selection=HazardSelection(
                 hazard_names=request.selection.hazard_names,
@@ -4442,6 +6207,7 @@ class ParametricPlan:
         """
         names = request.selection.hazard_names
         assert names is not None
+        place = request.dataset.provider.source
         found = list(
             dict.fromkeys(
                 (str(row["pathway"]), int(row["horizon"]))
@@ -4463,7 +6229,7 @@ class ParametricPlan:
             if names[0] not in hazards:
                 raise ScenarioError(
                     f"scenario {entry.label!r} reads the plan's hazard {names[0]!r}, "
-                    f"but its dataset {entry.dataset.provider.source} holds no curve "
+                    f"but its dataset {place} holds no curve "
                     f"of it for the plan's assets; it holds the hazards {hazards}"
                 )
             if stated is None:
@@ -4498,6 +6264,8 @@ class ParametricPlan:
         Each scenario's draws come from the asset's same child generators, so the
         curve scenarios share their uniforms row by row.
         """
+        if self.hazard_list:
+            return self._curve_hazard_scenarios(fresh=fresh)
         self._require_basis_risk()
         self._require_draws()
         request: PortfolioEvaluation = self.source
@@ -4550,6 +6318,80 @@ class ParametricPlan:
             )
         return built
 
+    def _curve_hazard_scenarios(self, *, fresh: bool) -> dict[str, _Samples]:
+        """Every curve scenario's draws of several hazards, the reference first.
+
+        Each component reads every scenario's (pathway, horizon) pairs from its
+        own dataset, the selection's from its request's and a `CurveScenario`'s
+        from the dataset it maps the component to. The draws come from each
+        asset's same generators, so the scenarios share their uniforms.
+        """
+        self._require_basis_risk()
+        self._require_draws()
+        portfolio = self._portfolio()
+        rows = self._asset_rows(portfolio)
+        asset_ids = [asset_id for asset_id, _ in rows]
+        components = self._components()
+        own = {
+            component.name: self._component_curves(
+                component, portfolio, asset_ids, one=False
+            )
+            for component in components
+        }
+        built: dict[str, _Samples] = {}
+        for each in self._planned_scenarios():
+            reads, members = own, each.members
+            if isinstance(each.described, CurveScenario):
+                reads = {}
+                for component in components:
+                    asked = self._dataset_request(each.described, portfolio, component)
+                    read = self._read_curves(asked, asset_ids, check=False)
+                    self._check_component_units(component.name, read.metadata)
+                    reads[component.name] = read
+                    if members is None:
+                        members = self._dataset_members(each.described, read, asked)
+            assert members is not None
+            chosen: dict[str, _CurveRead] = {}
+            for component in components:
+                read = reads[component.name]
+                pairs = {
+                    asset_id: [
+                        (row["pathway"], row["horizon"]) for row in read.rows[asset_id]
+                    ]
+                    for asset_id in asset_ids
+                }
+                _check_pairs_held(
+                    each.label,
+                    members,
+                    {
+                        f"component {component.name!r} of asset {asset_id!r}": pairs[
+                            asset_id
+                        ]
+                        for asset_id in asset_ids
+                    },
+                )
+                chosen[component.name] = _CurveRead(
+                    read.metadata,
+                    read.record,
+                    {
+                        asset_id: [
+                            next(
+                                row
+                                for row, held in zip(
+                                    read.rows[asset_id], pairs[asset_id], strict=True
+                                )
+                                if _same_pair(member, held)
+                            )
+                            for member in members
+                        ]
+                        for asset_id in asset_ids
+                    },
+                )
+            built[each.label] = self._drawn_hazards(
+                portfolio, rows, chosen, fresh=fresh, label=each.label
+            )
+        return built
+
     def _built_scenarios(self, *, fresh: bool, folds: bool) -> dict[str, _Samples]:
         """Every scenario's samples, the reference first, after the set's refusals.
 
@@ -4557,6 +6399,7 @@ class ParametricPlan:
         samples of all the assets under `Joint()`, through the function the set
         runs at construction.
         """
+        self._check_hazard_plan()
         self._check_scopes()
         self._check_scenario_plan()
         stated = self.scenario_set
@@ -4636,7 +6479,6 @@ class ParametricPlan:
             label: self._covers_for(asset_ids, built[label].locations)
             for label in labels
         }
-        spec = self.design_spec
         designs: list[Any] = []
         tables: list[Any] = []
         used: set[str] = set()
@@ -4670,38 +6512,30 @@ class ParametricPlan:
                 for label in labels
                 for asset_id in asset_ids
             }
-            results: dict[tuple[str, str, int, int], list[DesignResult]] = {}
+            slots: dict[tuple[str, str, int], list[list[Any]]] = {}
             for label in designed_on:
                 for asset_id in asset_ids:
                     for fold, block in enumerate(per_asset[(label, asset_id)]):
-                        for i, cover in enumerate(covers[label][asset_id]):
-                            if not cover.free_parameters():
-                                continue
-                            assert spec is not None
-                            for objective in spec.objectives:
-                                result = self._individual_design(
-                                    cover,
-                                    asset_id,
-                                    block[1],
-                                    objective,
-                                    _design_label(cover, objective),
-                                )
-                                results.setdefault(
-                                    (label, asset_id, fold, i), []
-                                ).append(result)
-                                designs.append(result)
+                        made_here, drawn_up = self._asset_entries(
+                            asset_id, covers[label][asset_id], block[1]
+                        )
+                        slots[(label, asset_id, fold)] = made_here
+                        designs += drawn_up
             for asset_id in asset_ids if evaluate else ():
                 count = len(per_asset[(stated.reference, asset_id)])
                 for fold in range(count):
                     entries = []
                     given = []
-                    for i, cover in enumerate(covers[stated.reference][asset_id]):
-                        if not cover.free_parameters():
-                            entries.append(cover)
-                            given.append(cover)
+                    reference_slots = slots[(stated.reference, asset_id, fold)]
+                    for i, slot in enumerate(reference_slots):
+                        if not any(_designed(entry) for entry in slot):
+                            entries += slot
+                            given += [
+                                cover for entry in slot for cover in _given(entry)
+                            ]
                             continue
                         for label in designed_on:
-                            entries += results[(label, asset_id, fold, i)]
+                            entries += slots[(label, asset_id, fold)][i]
                     fold_blocks = {
                         label: per_asset[(label, asset_id)][fold] for label in labels
                     }
@@ -4732,6 +6566,7 @@ class ParametricPlan:
             fresh_joint=reference.fresh_joint,
             run_records=reference.run_records,
             scenarios=MappingProxyType(built),
+            component_records=reference.component_records,
         )
 
     def samples(self) -> Mapping[str, OutcomeSample]:
@@ -4756,7 +6591,9 @@ class ParametricPlan:
         `cell=H3Cell(...)`, whose cells are computed before the source is
         read. With `.scenarios(...)`, these are the reference's samples, after
         the set's refusals (`ScenarioError`), and `.scenario_samples()` holds
-        every scenario's.
+        every scenario's. With `.hazard(...)`, each is the asset's sample of
+        several hazards, as `sample_annual_hazards` or `sample_curve_hazards`
+        builds it, its loss the combined loss.
         """
         if self.scenario_set is not None:
             reference = self.scenario_set.reference
@@ -4825,7 +6662,10 @@ class ParametricPlan:
         the plan also holds `Individual()`. With `.scenarios(...)`, they are in
         scenario, asset, fold, cover and objective order (scenario, fold, cover
         and objective under `Joint()`), on every scenario's design blocks under
-        `design_on="each"` and on the reference's under `"reference"`. Raises
+        `design_on="each"` and on the reference's under `"reference"`. With
+        `.package(...)`, a package's contracts are designed where the package
+        sits, its first contract's place, under each objective in turn and in
+        component order. Raises
         `ValueError` without covers, an objective or a basis-risk model, the
         design errors of `design` and `design_joint`, and
         `SolverUnavailableError` without `crc-sdk[parametric]` on the LP and QP
@@ -4836,6 +6676,41 @@ class ParametricPlan:
                 "the plan has no objective; state one with .objective(...)"
             )
         return self._run(evaluate=False).designs
+
+    def payout_breakdown(self) -> Any:
+        """Execution: each entry's expected payout in its parts, on every block.
+
+        `payout_breakdown` of the entries `write_parquet` compares, on each
+        asset's design block and on any held-out block or fresh draws, in the
+        same asset, fold and split order, as one table: one row per entry and
+        part, with `compare`'s identity columns, `part`, `part_kind`,
+        `expected_payout`, `share` and `payout_frequency`. A cover on one index
+        has one part, its component; a `SumOf` or a package one per component;
+        a `MaxOf` an attribution to the component paying most; a `StepGrid` its
+        regions. The parts of one entry add up to its expected payout. The
+        table's metadata is that of the comparison's evaluations, with the
+        plan's source records; nothing is written.
+
+        Raises `ValueError` for a plan that holds `Joint()`, whose designs are on
+        the owner's total, and for one with `.scenarios(...)`, which this point
+        doesn't offer yet: take `payout_breakdown` on each block on the function
+        route. Otherwise raises as `write_parquet` does.
+        """
+        if self._holds_joint:
+            raise ValueError(
+                "payout_breakdown() breaks down one asset's covers, designs and "
+                "packages, and Joint() designs on the owner's total; take "
+                "payout_breakdown on each asset's own design on the function route"
+            )
+        if self.scenario_set is not None:
+            raise ValueError(
+                "payout_breakdown() is not offered with .scenarios(...) yet; take "
+                "payout_breakdown(entries, block, ...) on each scenario's block on "
+                "the function route"
+            )
+        run = self._run(evaluate=True, breakdown=True)
+        table, _ = self._written(run, run.tables)
+        return table
 
     def write_parquet(self, path: str | os.PathLike[str]) -> ParametricResult:
         """Execution: design, evaluate and compare; write the comparison.
@@ -4886,6 +6761,15 @@ class ParametricPlan:
         source names its `scenario`. The result's `samples` are the
         reference's, and `scenario_samples` and `scenario_fresh_samples` hold
         every scenario's.
+
+        With `.hazard(...)`, every row is on the combined loss of its block: a
+        cover on a `CompositeIndex` designed on the combined loss, a cover on one
+        index on its own hazard's loss, and a package as one `"package"` row
+        beside its contracts' `"asset"` rows, as `compare` gives them, with the
+        `components` and `design_budget` columns. `source_records` holds each
+        component's record once, with the components that read it under
+        `components`, and each hazard source, a component's view's included,
+        names its record by its checksum.
 
         Returns a `ParametricResult`, with the fresh draws in
         `fresh_samples` when the split is `FreshDraws`, and the allocated rows
@@ -4956,7 +6840,9 @@ class ParametricPlan:
         seen: dict[str, int] = {}
         for label, built in run.scenarios.items():
             parts = (
-                [built.record]
+                _component_parts(built.component_records)
+                if built.component_records is not None
+                else [built.record]
                 if built.run_records is None
                 else list(built.run_records.values())
             )
@@ -4974,7 +6860,8 @@ class ParametricPlan:
             for sample in document["setup"]["samples"]
         }
         sources: list[dict[str, Any]] = []
-        for entry in document["sources"]:
+        components = _source_components(document)
+        for entry, component in zip(document["sources"], components, strict=True):
             role = entry.get("role")
             extra: dict[str, Any] = {}
             if role == "index" and run.index_source is not None:
@@ -4983,7 +6870,10 @@ class ParametricPlan:
             if role == "hazard" and scenario is not None and scenario in run.scenarios:
                 built = run.scenarios[scenario]
                 key = built.record_key
-                if built.run_records is not None:
+                if built.component_records is not None:
+                    part = built.component_records[str(component)]
+                    extra = {f"{key}_sha256": part[_checksum_key(key)]}
+                elif built.run_records is not None:
                     part = built.run_records[(entry["model"], entry["member"])]
                     extra = {f"{key}_sha256": part["table_sha256"]}
                 else:
@@ -5016,11 +6906,17 @@ class ParametricPlan:
             by_run = run.run_records
             if by_run is not None:
                 records = [{run.source_key: record} for record in by_run.values()]
+            by_component = run.component_records
+            if by_component is not None:
+                records = [
+                    {run.source_key: part} for part in _component_parts(by_component)
+                ]
             if run.index_source is not None:
                 checksums["index"] = {
                     "index_table_sha256": run.index_source["table_sha256"]
                 }
                 records.append({"index_table": run.index_source})
+            components = _source_components(document)
             document["sources"] = [
                 {
                     **entry,
@@ -5034,8 +6930,21 @@ class ParametricPlan:
                             ]["table_sha256"]
                         }
                     ),
+                    **(
+                        {
+                            f"{run.source_key}_sha256": by_component[str(component)][
+                                _checksum_key(run.source_key)
+                            ]
+                        }
+                        if by_component is not None
+                        and entry.get("role") == "hazard"
+                        and component in by_component
+                        else {}
+                    ),
                 }
-                for entry in document["sources"]
+                for entry, component in zip(
+                    document["sources"], components, strict=True
+                )
             ]
             document["source_records"] = [
                 *document.get("source_records", ()),
