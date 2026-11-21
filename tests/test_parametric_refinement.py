@@ -918,8 +918,7 @@ def test_a_step_threshold_between_grid_points_is_found_exactly(
     assert record["method"] == INDEX_VALUES_METHOD
     assert record["start"] == {"breakpoints[0]": plain.parameters["breakpoints[0]"]}
     assert record["end"] == {"breakpoints[0]": 4.31}
-    assert record["moves"] == 1 and record["passes"] == 2
-    assert record["stopped"] == "no_move"
+    assert record["moves"] >= 1 and record["stopped"] == "no_move"
     assert record["gain"] == pytest.approx(
         plain.objective_value - refined.objective_value
     )
@@ -958,9 +957,11 @@ def test_a_binary_trigger_between_grid_points_is_found_exactly(
 
 def test_each_set_of_paying_years_is_tried_once() -> None:
     # The window of 5 is the grid's 0 and 8: the index values 1 to 8 and the
-    # end 0, ten values, tried nearest 5 first. 6 pays the same years as 5,
-    # the start, and 0 those of 1: neither is solved. The second pass finds
-    # every set of years tried.
+    # end 0, ten values. The first pass tries the 2 nearest 5, 4.31 and 4.3,
+    # and moves to 4.31; each pass after tries twice as many around 4.31: 4
+    # and 3 (and 6, which pays the same years as 5, the start), then 2, 7, 1
+    # and 8. The fourth covers the window, finds 0 paying the same years as
+    # 1, solves nothing and moves nothing.
     sample = _sample(STEP_INDEX, STEP_LOSS)
     refined = design(_step(), sample, MSE(), options=REFINE)
     record = refined.refinement
@@ -968,8 +969,9 @@ def test_each_set_of_paying_years_is_tried_once() -> None:
     assert record["windows"] == {"breakpoints[0]": [0.0, 8.0]}
     assert record["candidates"] == {"breakpoints[0]": 10}
     tried = [row["breakpoints[0]"] for row in _rows(refined)]
-    assert tried == [4.31, 4.3, 4.0, 3.0, 7.0, 2.0, 8.0, 1.0]
+    assert tried == [4.31, 4.3, 4.0, 3.0, 2.0, 7.0, 1.0, 8.0]
     assert record["points"] == len(tried) == record["counts"]["optimal"]
+    assert (record["moves"], record["passes"]) == (1, 4)
 
 
 def test_several_thresholds_are_refined_in_passes_until_none_moves() -> None:
@@ -1025,12 +1027,13 @@ def test_the_point_cap_stops_the_index_value_search() -> None:
     record = capped.refinement
     assert record is not None
     assert record["points"] == 2 and record["stopped"] == "max_points"
-    assert record["passes"] == 1
-    # The two nearest values were tried, and the better one moved to.
+    assert record["passes"] == 2
+    # The first pass tried the two values nearest 5 and moved to the better;
+    # the second stopped at its first new value.
     assert capped.parameters["breakpoints[0]"] == 4.31
     assert capped.objective_value <= plain.objective_value
     line = _design_line(capped, sample)
-    assert "after 2 points in 1 pass (" in line
+    assert "after 2 points in 2 passes (" in line
     assert "at most 2 points; it stopped at that cap)" in line
 
 
@@ -1096,7 +1099,7 @@ def test_the_setup_text_states_the_index_value_search() -> None:
         "objective " in line
     )
     assert (
-        ", a gain of 250, after 8 points in 2 passes (each threshold over the "
+        ", a gain of 250, after 8 points in 4 passes (each threshold over the "
         "index values between its grid neighbours: breakpoints[0] from 0 to 8; "
         "at most 1,000 points); unique optimum: yes; ties: 0." in line
     )
@@ -1301,11 +1304,23 @@ def test_the_coordinate_search_finds_the_best_candidate() -> None:
         lambda x: (x[0] - 3.3) ** 2, [8.0], [[float(i) for i in range(11)]]
     )
     assert found.best == (3.0,) and found.objective == pytest.approx(0.09)
-    assert found.moves == 1 and found.passes == 2 and found.stopped == "no_move"
-    # Nearest the start first, the lower one first at equal distance; the
-    # second pass finds every candidate evaluated.
-    assert calls[:4] == [(7.0,), (9.0,), (6.0,), (10.0,)]
+    assert found.moves == 3 and found.passes == 4 and found.stopped == "no_move"
+    # The 2 values nearest 8, then 4 nearest 7, 8 nearest 5 and all 10 others
+    # nearest 3, each nearest first and the lower first at equal distance,
+    # each value evaluated once.
+    assert calls == [(x,) for x in (7.0, 9.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 10.0)]
     assert len(calls) == 10 == len(found.points)
+
+
+def test_a_capped_coordinate_search_reaches_every_parameter() -> None:
+    # The first pass tries 2 values of each parameter, so a cap of 4 points
+    # moves both.
+    grid = [float(i) for i in range(-10, 11)]
+    found, calls = _coordinate(
+        lambda x: x[0] ** 2 + x[1] ** 2, [5.0, 5.0], [grid, grid], max_points=4
+    )
+    assert calls == [(4.0, 5.0), (6.0, 5.0), (4.0, 4.0), (4.0, 6.0)]
+    assert found.best == (4.0, 4.0) and found.stopped == "max_points"
 
 
 def test_the_coordinate_search_takes_the_nearest_of_equal_candidates() -> None:
@@ -1338,11 +1353,12 @@ def test_the_coordinate_search_moves_each_parameter_in_passes() -> None:
     def coupled(x: tuple[float, ...]) -> float:
         return (x[0] - 2.0) ** 2 + 0.5 * (x[1] - x[0]) ** 2
 
-    # Pass 1 moves x0 to 3 (x1 held at 5), then x1 to 3; pass 2 moves both
-    # to 2; pass 3 moves neither.
+    # Each pass moves x0 with x1 held, then x1: pass 1 (2 values each) to
+    # (-3, 3), pass 2 (4 values) to (-1, 1), pass 3 (8 values) to (2, 2), and
+    # pass 4, which tries every value, moves neither.
     found, _ = _coordinate(coupled, [-5.0, 5.0], [grid, grid])
     assert found.best == (2.0, 2.0) and found.objective == 0.0
-    assert (found.moves, found.passes, found.stopped) == (4, 3, "no_move")
+    assert (found.moves, found.passes, found.stopped) == (6, 4, "no_move")
 
 
 def test_the_coordinate_search_does_not_move_to_a_point_without_an_objective() -> None:
@@ -1368,7 +1384,7 @@ def test_the_coordinate_search_stops_at_its_cap_with_its_best_point() -> None:
         lambda x: (x[0] - 5.0) ** 2, [0.0], [[1.0, 2.0, 5.0]], max_points=2
     )
     assert found.stopped == "max_points" and len(calls) == 2
-    assert found.best == (2.0,) and found.passes == 1
+    assert found.best == (2.0,) and found.passes == 2
 
 
 @pytest.mark.parametrize("bad", [{"candidates": [[1.0], [2.0]]}, {"max_points": 0}])

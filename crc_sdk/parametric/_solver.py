@@ -77,10 +77,12 @@ Review 45(3), 2003, section 3, with complete polling and step halving.
 a function when each parameter has finitely many candidate values, and a
 `key` names the class of a point: points of one class have the same
 objective, so each class is evaluated once. A pass takes each parameter in
-order and evaluates its candidates with the others held, nearest the
-current value first, skipping those in the current point's class; it moves
-to the best of them if that improves on the current point by more than an
-allowance. It stops after a pass in which no parameter moved, or when it has
+order and evaluates, with the others held, its candidates nearest the
+current value, skipping those in the current point's class: 2 in the first
+pass and twice as many in each pass after, so that a cap on the points
+reaches every parameter. It moves to the best of them if that improves on
+the current point by more than an allowance. It stops after a pass that
+tried every candidate of every parameter and moved none, or when it has
 evaluated a stated number of points. It is deterministic, and it never
 returns a point worse than its start.
 """
@@ -1323,12 +1325,12 @@ def compass_search(
 
 
 def _nearest_first(values: Sequence[float], here: float) -> list[float]:
-    """`values` nearest `here` first, the lower one first at equal distance."""
-    return sorted(values, key=lambda x: (abs(x - here), x))
+    """`values` but `here`, nearest it first, the lower one first at equal distance."""
+    return sorted((x for x in values if x != here), key=lambda x: (abs(x - here), x))
 
 
 CoordinateStop = Literal["no_move", "max_points"]
-"""Why a coordinate search stopped: a pass moved no parameter, or the cap."""
+"""Why a coordinate search stopped: a full pass moved no parameter, or the cap."""
 
 
 @dataclass(frozen=True, eq=False)
@@ -1338,7 +1340,8 @@ class CoordinateSearch:
     `best` is the point it ends at and `objective` the objective there;
     `points` the points it evaluated, in order, each class once and the start
     left out; `moves` how often it moved; `passes` how many passes it began;
-    `stopped` why it stopped.
+    `stopped` why it stopped: `"no_move"` after a pass that tried every
+    candidate and moved no parameter, or `"max_points"` at the cap.
     """
 
     best: tuple[float, ...]
@@ -1358,6 +1361,7 @@ def coordinate_search(
     key: Callable[[tuple[float, ...]], Hashable | None],
     max_points: int,
     allowance: Callable[[float], float],
+    first_width: int = 2,
 ) -> CoordinateSearch:
     """Minimise `evaluate` over candidate values, one parameter at a time.
 
@@ -1370,16 +1374,18 @@ def coordinate_search(
     once. A point whose key is `None` is a class of its own.
 
     A pass takes each parameter in order, holds the others where they are,
-    and tries its candidates nearest the current value first (the lower one
-    first at equal distance). It skips a candidate in the current point's
-    class, which can't gain, and evaluates one of a class it has evaluated
-    before only once. Of the candidates whose objective lies below the
-    current one by more than `allowance(current objective)`, it moves to the
-    first, in that order, whose objective is within `allowance(least)` of the
-    least of them. It stops after a pass in which no parameter moved, or when
-    it would evaluate more than `max_points` points; it then still moves to
-    the best of the candidates of that parameter it tried, if that improves
-    enough.
+    and tries its `width` candidates nearest the current value (the current
+    value left out), nearest first, the lower one first at equal distance;
+    `width` is `first_width` in the first pass and doubles with each pass. It skips a candidate in
+    the current point's class, which can't gain, and evaluates one of a
+    class it has evaluated before only once. Of the candidates whose
+    objective lies below the current one by more than
+    `allowance(current objective)`, it moves to the first, in that order,
+    whose objective is within `allowance(least)` of the least of them. It
+    stops after a pass whose `width` covers every parameter's candidates and
+    in which no parameter moved, or when it would evaluate more than
+    `max_points` points; it then still moves to the best of the candidates
+    of that parameter it tried, if that improves enough.
 
     Every move improves on the point before by more than the allowance, so
     the search never moves to a point twice: it ends, after at most
@@ -1387,13 +1393,15 @@ def coordinate_search(
     is deterministic when `evaluate` and `key` are.
 
     Raises `ValueError` for a number of candidate lists that differs from
-    the number of parameters, or `max_points` below 1.
+    the number of parameters, or `max_points` or `first_width` below 1.
     """
     n = len(start)
     if len(candidates) != n:
         raise ValueError("candidates need one list of values per parameter")
     if max_points < 1:
         raise ValueError(f"max_points must be at least 1, got {max_points}")
+    if first_width < 1:
+        raise ValueError(f"first_width must be at least 1, got {first_width}")
     current = tuple(float(x) + 0.0 for x in start)
     best = float(value)
     current_key = key(current)
@@ -1402,6 +1410,8 @@ def coordinate_search(
     if current_key is not None:
         by_class[current_key] = best
     lists = [sorted({float(x) + 0.0 for x in column}) for column in candidates]
+    widest = max((len(values) for values in lists), default=0)
+    width = first_width
     points: list[SearchPoint] = []
     moves = passes = 0
     stopped: CoordinateStop = "no_move"
@@ -1410,9 +1420,7 @@ def coordinate_search(
         moved = full = False
         for i in range(n):
             tried: list[tuple[tuple[float, ...], float, Hashable | None]] = []
-            for x in _nearest_first(lists[i], current[i]):
-                if x == current[i]:
-                    continue
+            for x in _nearest_first(lists[i], current[i])[:width]:
                 trial = current[:i] + (x,) + current[i + 1 :]
                 name = key(trial)
                 if name is not None and name == current_key:
@@ -1446,6 +1454,7 @@ def coordinate_search(
         if full:
             stopped = "max_points"
             break
-        if not moved:
+        if not moved and width >= widest:
             break
+        width = min(2 * width, max(widest, first_width))
     return CoordinateSearch(current, best, tuple(points), moves, passes, stopped)

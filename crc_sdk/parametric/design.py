@@ -43,13 +43,15 @@ grid).
   a threshold crosses one of the sample's index values. Its thresholds are
   refined over those values (`_solver.coordinate_search`): threshold by
   threshold, the others held, it tries the sample's distinct index values in
-  the window and the window's two ends, one point per set of years paid,
-  nearest the current value first, and moves to the best of them when that
-  lowers the objective by more than the grid's tie tolerance. Passes repeat
-  until one moves no threshold, or until `refine_max_points` points. With
-  one free threshold that is the best of every set of years a threshold in
-  its window can pay; with several, a point that no single threshold can
-  improve within its window.
+  the window and the window's two ends, one point per set of years paid, and
+  moves to the best of them when that lowers the objective by more than the
+  grid's tie tolerance. A pass tries the values nearest each threshold's
+  current one, 2 in the first pass and twice as many in each pass after, so
+  that a cap on the points reaches every threshold. Passes repeat until one
+  that tried every value moves no threshold, or until `refine_max_points`
+  points. With one free threshold that is the best of every set of years a
+  threshold in its window can pay; with several, a point that no single
+  threshold can improve within its window.
 - Every other family is refined by a compass search
   (`_solver.compass_search`): from a step per free threshold of half the
   larger side of its window, each round evaluates the point one step up and
@@ -2090,8 +2092,10 @@ def _refine(
     its bound, at an end of the grid). On a step or binary payout the search
     (`_solver.coordinate_search`) tries, threshold by threshold, the sample's
     distinct index values in the window and its two ends, one per set of
-    paying years, in passes until no threshold moves, or until
-    `refine_max_points` points. Otherwise a compass search
+    paying years: in each pass the values nearest the current one, 2 in the
+    first and twice as many in each pass after, until a pass that tried
+    every value moves no threshold, or until `refine_max_points` points.
+    Otherwise a compass search
     (`_solver.compass_search`) starts at the chosen candidate with a step per
     parameter of half the window's larger side, and stops when every step is
     at most `refine_tolerance` times its bounds' width, or after

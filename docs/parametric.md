@@ -2843,20 +2843,23 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
     objective is constant between two consecutive index values of the design
     sample and changes only where a threshold crosses one, and a threshold's
     best value, the others held, is one of them. The refinement tries them:
+    - a threshold's candidates are the sample's distinct index values within
+      its window, and the window's two ends, which stand for the thresholds
+      beyond the last index value in it;
     - a pass takes the free thresholds in the template's order. Holding the
-      others, it tries the sample's distinct index values within the
-      threshold's window, and the window's two ends, which stand for the
-      thresholds beyond the last index value in it, nearest the current value
-      first (the lower one first at equal distance). A value that pays the
-      same years as the current one is skipped, and one that pays the same
-      years as a value tried before isn't solved again, since its LP or QP is
-      the same;
+      others, it tries the candidates nearest the threshold's current value,
+      nearest first (the lower one first at equal distance): 2 in the first
+      pass, and twice as many in each pass after, so that a cap on the points
+      reaches every threshold. A value that pays the same years as the
+      current one is skipped, and one that pays the same years as a value
+      tried before isn't solved again, since its LP or QP is the same;
     - the threshold moves to the best value tried, if that gains more than the
       tie tolerance; of the values within the tie tolerance of the best, to the
       first tried, the nearest;
-    - passes repeat until one moves no threshold (`stopped="no_move"`), or
-      until `refine_max_points` points (`"max_points"`), when it still moves
-      the threshold it was on to the best value it tried.
+    - passes repeat until one that tried every candidate moves no threshold
+      (`stopped="no_move"`), or until `refine_max_points` points
+      (`"max_points"`), when it still moves the threshold it was on to the
+      best value it tried.
 
     With one free threshold the result is the best set of years that a
     threshold in its window can pay, exactly; with several, a point that no
@@ -2876,7 +2879,7 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
     from 4.31 and 100 from 8.5; a `StepPayout` with a free first breakpoint
     on the grid 0, 5 and 8 within bounds of 0 and 8, a second breakpoint
     fixed at 8.5, and free levels; MSE, no budget. The grid's best breakpoint
-    is 5. The refinement tries 8 values in 2 passes and ends at 4.31, where
+    is 5. The refinement tries 8 values in 4 passes and ends at 4.31, where
     the objective is 0. A compass search from 5 doesn't move: every
     breakpoint in (4.31, 6] pays the same years as 5, and the points its
     halved steps reach from 5 stay there. A step cover on the table quick
@@ -2981,8 +2984,10 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
     so its points grow with the sample: in the example above, on 28 years,
     the window of 40 to 80 holds 24 values; on the 7,000 design draws of
     `design_years`, the same window holds 5,787, and the cap of 1,000 points
-    stops the search within its first pass. A finer grid narrows the
-    windows, and a larger `refine_max_points` lets the search finish.
+    stops the search before it has tried them all. It then ends where the
+    values it tried near each threshold lead, and says so. A finer grid
+    narrows the windows, and a larger `refine_max_points` lets the search
+    finish.
 - **Scaling.** Losses and payouts are divided by the largest loss of a draw (1
   if that is at most 1e-6) before solving; results are in payout units.
 - **Solver settings.** HiGHS's simplex for the LPs (a vertex solution). HiGHS's
