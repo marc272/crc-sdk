@@ -58,13 +58,28 @@ a relaxation of the QP, so its objective is at most the QP's optimum. A new
 cut is never one already added, and the vertices are finitely many, so the
 method ends; `CUTTING_PLANE_LIMIT` bounds its steps. `Solution.method` is then
 `"cutting_planes"`.
+
+**A compass search.** `compass_search` minimises a function of a few
+bounded parameters that it can only evaluate, such as a design's objective
+in its free thresholds with the amounts solved exactly at each point. It is
+deterministic and uses no derivatives: from a start point and a step per
+parameter it evaluates, in a fixed order, the points one step up and one
+step down along each parameter, clipped to the bounds. It moves to the best
+of them if that improves on the current point by more than an allowance,
+and keeps its steps; otherwise it halves every step. It stops when every
+step is at most its smallest, or when it has evaluated a stated number of
+points, and it never returns a point worse than its start. The method is the
+coordinate (compass) search of Kolda, Lewis and Torczon, "Optimization by
+direct search: new perspectives on some classical and modern methods", SIAM
+Review 45(3), 2003, section 3, with complete polling and step halving.
 """
 
 from __future__ import annotations
 
+import itertools
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Any, Literal
@@ -92,9 +107,12 @@ __all__ = [
     "CVaRRow",
     "Method",
     "Programme",
+    "Search",
+    "SearchPoint",
     "Solution",
     "SolveStatus",
     "SparseColumns",
+    "compass_search",
     "identity",
     "require",
     "solve_lp",
@@ -1155,3 +1173,133 @@ def _active_set(programme: Programme, limit: int) -> Solution:
         limit,
         name="active_set_iteration_limit",
     )
+
+
+# -- a compass search ---------------------------------------------------------
+
+
+@dataclass(frozen=True, eq=False)
+class SearchPoint:
+    """A point that a compass search evaluated.
+
+    `objective` is `None` when the point has no objective, and `status` then
+    says why.
+    """
+
+    values: tuple[float, ...]
+    objective: float | None
+    status: str
+
+
+SearchStop = Literal["step_tolerance", "max_points"]
+"""Why a compass search stopped: every step at most its smallest, or the cap."""
+
+
+@dataclass(frozen=True, eq=False)
+class Search:
+    """The outcome of a compass search.
+
+    `best` is the point it ends at and `objective` the objective there;
+    `points` the points it evaluated, in order, each once and the start left
+    out; `moves` how often it moved; `steps` its steps at the end; `stopped`
+    why it stopped.
+    """
+
+    best: tuple[float, ...]
+    objective: float
+    points: tuple[SearchPoint, ...]
+    moves: int
+    steps: tuple[float, ...]
+    stopped: SearchStop
+
+
+def compass_search(
+    evaluate: Callable[[tuple[float, ...]], tuple[float | None, str]],
+    start: Sequence[float],
+    value: float,
+    *,
+    steps: Sequence[float],
+    smallest: Sequence[float],
+    lower: Sequence[float],
+    upper: Sequence[float],
+    max_points: int,
+    allowance: Callable[[float], float],
+) -> Search:
+    """Minimise `evaluate` by a compass search from `start`, within bounds.
+
+    `evaluate(point)` returns the objective at `point` and a status, or
+    `None` and a status when the point has no objective; the search never
+    moves to such a point. `value` is the objective at `start`, which is not
+    evaluated again.
+
+    Each poll takes, in parameter order, each parameter whose step exceeds
+    its `smallest`, and evaluates the point one step up, then the point one
+    step down, each clipped to `[lower, upper]`. A point equal to the current
+    one is skipped, and a point evaluated before is not evaluated again. If
+    the best polled point lies below the current objective by more than
+    `allowance(current objective)`, the search moves there (the first such
+    point, on equal objectives) and keeps its steps; otherwise it halves every
+    step. It stops when no step exceeds its `smallest`, or when it would
+    evaluate more than `max_points` points; it then still moves to the best
+    point of its last poll, if that improves enough.
+
+    Every move improves on the point before, and every point evaluated before
+    lies no lower than the current one, so each move is to a new point: the
+    search ends, after at most `max_points` evaluations, and never at a point
+    worse than `start`. It is deterministic when `evaluate` is.
+
+    Raises `ValueError` for lengths that differ, a start outside its bounds,
+    a negative step or smallest step, or `max_points` below 1.
+    """
+    n = len(start)
+    if not len(steps) == len(smallest) == len(lower) == len(upper) == n:
+        raise ValueError(
+            "start, steps, smallest, lower and upper need one entry per parameter"
+        )
+    if max_points < 1:
+        raise ValueError(f"max_points must be at least 1, got {max_points}")
+    current = tuple(float(x) + 0.0 for x in start)
+    if any(
+        not low <= x <= high for x, low, high in zip(current, lower, upper, strict=True)
+    ):
+        raise ValueError("the start must lie within its bounds")
+    if any(s < 0.0 for s in steps) or any(s < 0.0 for s in smallest):
+        raise ValueError("steps and smallest steps must be at least 0")
+    step = [float(s) for s in steps]
+    best = float(value)
+    seen: dict[tuple[float, ...], float | None] = {current: best}
+    points: list[SearchPoint] = []
+    moves = 0
+    stopped: SearchStop = "step_tolerance"
+    while True:
+        active = [i for i in range(n) if step[i] > smallest[i]]
+        if not active:
+            break
+        chosen: tuple[float, ...] | None = None
+        target = best - allowance(best)
+        full = False
+        for i, sign in itertools.product(active, (1.0, -1.0)):
+            moved = list(current)
+            moved[i] = min(max(current[i] + sign * step[i], lower[i]), upper[i]) + 0.0
+            trial = tuple(moved)
+            if trial == current:
+                continue
+            if trial not in seen:
+                if len(points) >= max_points:
+                    full = True
+                    break
+                objective, status = evaluate(trial)
+                seen[trial] = objective
+                points.append(SearchPoint(trial, objective, status))
+            found = seen[trial]
+            if found is not None and found < target:
+                chosen, target = trial, found
+        if chosen is not None:
+            current, best = chosen, target
+            moves += 1
+        if full:
+            stopped = "max_points"
+            break
+        if chosen is None:
+            step = [s / 2.0 for s in step]
+    return Search(current, best, tuple(points), moves, tuple(step), stopped)
