@@ -2697,9 +2697,9 @@ class ParametricPlan:
         `missing="drop_year"` can leave them, raise `EvaluationError` at every
         execution point, once the samples are built and before anything is
         designed: state `years=` that every asset's series holds, or run those
-        assets apart. `explain()` lists the scenarios,
-        their sources and members, the reference and `design_on`, without I/O.
-        Replaces any scenarios stated before.
+        assets apart. `explain()` lists the scenarios, their sources and
+        members, the reference and `design_on`, without I/O. Replaces any
+        scenarios stated before.
 
         Raises `TypeError` for arguments of the wrong type and for a set of built
         samples, which `compare_scenarios` takes; `ValueError` for an

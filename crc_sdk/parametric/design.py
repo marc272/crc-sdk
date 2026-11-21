@@ -2427,8 +2427,8 @@ def design(
     differs from the component's on a component's view or on a sample of
     several hazards, its index's `hazard_name` differs from the hazard the
     sample records, or the sample lacks a component the template reads;
-    `ValueError` for a template without free
-    parameters; and `TypeError` for arguments of the wrong type.
+    `ValueError` for a template without free parameters; and `TypeError` for
+    arguments of the wrong type.
     """
     _check_inputs(template, sample, objective, pricing, budget, limit, options)
     _require_one_asset(sample, "design")
