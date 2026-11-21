@@ -41,6 +41,7 @@ from crc_sdk.parametric import (
     LinearConstraints,
     LinearInAmounts,
     LinearPayout,
+    NoBasisRisk,
     OutcomeSample,
     ParametricPlan,
     PayoutFunction,
@@ -584,8 +585,8 @@ def test_the_index_of_a_composite_cover_is_its_definition() -> None:
         _ = cover.index
 
 
-def test_a_plan_refuses_a_composite_cover_for_now() -> None:
-    """The plan reads one index; until it reads components it says so."""
+def test_a_plan_of_one_hazard_refuses_a_composite_cover() -> None:
+    """A plan of one hazard reads one index, and names .hazard(...) for the rest."""
     untyped: Any = ParametricPlan
     plan = untyped.for_annual_extremes(
         pa.table({"year": [2000], "value": [1.0], "cell": ["a"]}),
@@ -610,8 +611,9 @@ def test_a_plan_refuses_a_composite_cover_for_now() -> None:
         value_unit="EUR",
         seed=42,
     )
-    with pytest.raises(CoverDefinitionError, match="ParametricPlan takes"):
-        plan.covers(_resolved())
+    stated = plan.covers(_resolved()).basis_risk(NoBasisRisk())
+    with pytest.raises(SampleError, match=r"state the others with \.hazard"):
+        stated.explain()
 
 
 def test_a_one_index_cover_keeps_its_index() -> None:

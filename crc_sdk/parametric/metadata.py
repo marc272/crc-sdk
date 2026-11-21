@@ -1843,7 +1843,10 @@ def _planned_source(entry: Mapping[str, Any], where: str) -> str:
     provenance = _get(entry, "provenance", Mapping, where)
     if kind not in ("file", "table", "plan") or provenance is None:
         return _source_record(entry, where)
-    text = _source_record({"role": "hazard", "series": {"source": provenance}}, where)
+    stated: dict[str, Any] = {"role": "hazard", "series": {"source": provenance}}
+    if entry.get("component") is not None:
+        stated["component"] = entry["component"]
+    text = _source_record(stated, where)
     if kind == "file":
         path = _recorded(entry, "path", where)
         return f"{text}, read from a file{'' if path is None else f' {path}'}"

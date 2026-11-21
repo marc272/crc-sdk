@@ -1095,6 +1095,17 @@ def _checked_years(years: Any) -> tuple[int, ...] | None:
     return window
 
 
+_PER_SOURCE = (
+    "provenance",
+    "unit",
+    "location",
+    "year_column",
+    "hazard_column",
+    "hazard_name",
+)
+"""The fields of `AnnualScenario` that describe one source, mapped by component."""
+
+
 @dataclass(frozen=True, eq=False)
 class AnnualScenario:
     """A scenario a per-year plan reads from another source, such as another pathway.
@@ -1124,46 +1135,136 @@ class AnnualScenario:
       every scenario of a set names its hazard. The plan's own hazard name is not
       a default.
 
-    Raises `TypeError` for arguments of the wrong type, `ValueError` for invalid
-    ones (among them a `LinearTrend` with `fit_years`, which the plan sets per
-    fold), `ScenarioError` for an invalid label, and `ScenarioError` for a pathway
-    `crc_sdk.pathways` doesn't know. On a plan on fitted curves,
+    **On a plan with several hazards** (`.hazard(...)`), `source` maps each
+    component's name to its own source, and the fields that describe one source
+    take a mapping by component name too: `provenance`, which names every
+    component, and `unit`, `location`, `year_column`, `hazard_column` and
+    `hazard_name`, each of which may name some of them. A component a mapping
+    leaves out takes its value on the plan, and its `hazard_name` none, as
+    above. `years`, `missing`, `trend` and `pathway` are the scenario's, one for
+    every component, so a row is one year of every hazard. A pool is refused:
+    `pool` is `None` or `False`. The plan checks that the mapping names its
+    components.
+
+    Raises `TypeError` for arguments of the wrong type, a mapping beside a
+    `source` that isn't one, and a component's sequence of sources;
+    `ValueError` for invalid ones (among them a `LinearTrend` with
+    `fit_years`, which the plan sets per fold, an invalid component name, a
+    mapping naming components `source` doesn't, and a `ModelPool` beside a
+    mapping), `ScenarioError` for an invalid label, and `ScenarioError` for a
+    pathway `crc_sdk.pathways` doesn't know. On a plan on fitted curves,
     `.scenarios(...)` raises `ValueError`: state a `CurveScenario` there.
     """
 
     label: str
     source: Any
-    provenance: SourceProvenance = _field(kw_only=True)
-    unit: str | None = _field(default=None, kw_only=True)
-    location: NearestCell | StationColumn | None = _field(default=None, kw_only=True)
-    year_column: str | None = _field(default=None, kw_only=True)
-    hazard_column: str | None = _field(default=None, kw_only=True)
+    """One source, or on a plan with several hazards a mapping by component."""
+    provenance: SourceProvenance | Mapping[str, SourceProvenance] = _field(kw_only=True)
+    unit: str | Mapping[str, str] | None = _field(default=None, kw_only=True)
+    location: (
+        NearestCell | StationColumn | Mapping[str, NearestCell | StationColumn] | None
+    ) = _field(default=None, kw_only=True)
+    year_column: str | Mapping[str, str] | None = _field(default=None, kw_only=True)
+    hazard_column: str | Mapping[str, str] | None = _field(default=None, kw_only=True)
     years: Sequence[int] | None = _field(default=None, kw_only=True)
     """Stated as a sequence of years; held sorted, as a tuple."""
     missing: MissingYears | None = _field(default=None, kw_only=True)
     trend: Trend | None = _field(default=None, kw_only=True)
     pool: ModelPool | Literal[False] | None = _field(default=None, kw_only=True)
     pathway: str | None = _field(default=None, kw_only=True)
-    hazard_name: str | None = _field(default=None, kw_only=True)
+    hazard_name: str | Mapping[str, str] | None = _field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
+        if isinstance(self.source, Mapping):
+            self._check_components()
+            return
+        for name in _PER_SOURCE:
+            if isinstance(getattr(self, name), Mapping):
+                raise TypeError(
+                    f"{name} maps components to values, which a scenario of several "
+                    "hazards takes; map each component to its source in source= too"
+                )
+        self._check_one_source()
+
+    def _check_components(self) -> None:
+        """Check a scenario of several hazards: one source and its fields each."""
+        from crc_sdk.parametric.index import _component_name
+        from crc_sdk.parametric.plan import ModelPool
+
+        label = _checked_text("a scenario's label", self.label)
+        object.__setattr__(self, "label", label)
+        sources: dict[str, Any] = {}
+        for name, source in self.source.items():
+            name = _component_name(name, ValueError)
+            if isinstance(source, Sequence) and not isinstance(source, (str, bytes)):
+                raise TypeError(
+                    f"scenario {label!r}: component {name!r} reads one series per "
+                    "asset, so its source is one plan, table or file; pools are "
+                    "refused on a plan with several hazards"
+                )
+            _source_kind_of(source)
+            sources[name] = source
+        if len(sources) < 2:
+            raise ValueError(
+                f"scenario {label!r} maps {len(sources)} component to a source; a "
+                "scenario of several hazards maps each of two or more"
+            )
+        object.__setattr__(self, "source", MappingProxyType(sources))
+        if isinstance(self.pool, ModelPool):
+            raise ValueError(
+                f"scenario {label!r} maps components to sources, and pool= pools one "
+                "hazard's runs; a plan with several hazards reads no pool"
+            )
+        if self.pool is not None and self.pool is not False:
+            raise TypeError(
+                "pool must be None (the plan's), False (a series that is not "
+                f"pooled) or a ModelPool, got {self.pool!r}"
+            )
+        provenance = self.provenance
+        if not isinstance(provenance, Mapping) or sorted(provenance) != sorted(sources):
+            raise TypeError(
+                f"scenario {label!r} maps components to sources, so provenance must "
+                f"map each of them, {list(sources)}, to its SourceProvenance"
+            )
+        for name in _PER_SOURCE:
+            given = getattr(self, name)
+            if given is None:
+                continue
+            if not isinstance(given, Mapping):
+                raise TypeError(
+                    f"scenario {label!r} maps components to sources, so {name} maps "
+                    f"components to values too, got {given!r}"
+                )
+            unknown = sorted(str(key) for key in given if key not in sources)
+            if unknown:
+                raise ValueError(
+                    f"scenario {label!r}: {name} names the components {unknown}, "
+                    f"which source doesn't map; it maps {list(sources)}"
+                )
+            object.__setattr__(
+                self,
+                name,
+                MappingProxyType(
+                    {
+                        key: _checked_field(name, value, key)
+                        for key, value in given.items()
+                    }
+                ),
+            )
+        self._check_scenario_fields(label)
+
+    def _check_one_source(self) -> None:
         # A plan holds a set, so plan.py can't be imported as this module loads.
         from crc_sdk.parametric.plan import (
             ModelPool,
-            NearestCell,
             StationColumn,
-            _column_name,
             _pool_source,
             _source_kind,
         )
 
         label = _checked_text("a scenario's label", self.label)
         object.__setattr__(self, "label", label)
-        if not isinstance(self.provenance, SourceProvenance):
-            raise TypeError(
-                "provenance must be a SourceProvenance stating the source's licence "
-                f"and attribution, got {type(self.provenance).__name__}"
-            )
+        _checked_field("provenance", self.provenance)
         pool = self.pool
         if pool is not None and pool is not False and not isinstance(pool, ModelPool):
             raise TypeError(
@@ -1181,24 +1282,23 @@ class AnnualScenario:
             object.__setattr__(self, "source", _pool_source(self.source))
         else:
             _source_kind(self.source)
-        if self.unit is not None:
-            object.__setattr__(self, "unit", _identifier("unit", self.unit))
-        if self.location is not None and not isinstance(
-            self.location, (NearestCell, StationColumn)
-        ):
-            raise TypeError(
-                "location must be NearestCell() or StationColumn(name), got "
-                f"{type(self.location).__name__}"
-            )
+        for name in ("unit", "location", "year_column", "hazard_column"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _checked_field(name, value))
         if isinstance(pool, ModelPool) and isinstance(self.location, StationColumn):
             raise ValueError(
                 "pool= pools climate-model runs, and models have no stations; "
                 "locate each asset with NearestCell()"
             )
-        for name in ("year_column", "hazard_column"):
-            value = getattr(self, name)
-            if value is not None:
-                _column_name(name, value)
+        if self.hazard_name is not None:
+            object.__setattr__(
+                self, "hazard_name", _checked_field("hazard_name", self.hazard_name)
+            )
+        self._check_scenario_fields(label)
+
+    def _check_scenario_fields(self, label: str) -> None:
+        """The fields one scenario states for every source: years, trend, pathway."""
         object.__setattr__(self, "years", _checked_years(self.years))
         if self.missing is not None and self.missing not in get_args(MissingYears):
             raise ValueError(
@@ -1215,16 +1315,52 @@ class AnnualScenario:
             if not isinstance(self.pathway, str) or not self.pathway:
                 raise TypeError(f"pathway must be a string, got {self.pathway!r}")
             _check_known_pathway(self.pathway, label)
-        if self.hazard_name is not None:
-            object.__setattr__(
-                self, "hazard_name", _identifier("hazard_name", self.hazard_name)
-            )
 
     def __repr__(self) -> str:
+        provenance = self.provenance
+        if isinstance(provenance, Mapping):
+            providers = {name: each.provider for name, each in provenance.items()}
+            sources = {name: type(each).__name__ for name, each in self.source.items()}
+            return (
+                f"AnnualScenario({self.label!r}, {sources}, providers={providers}, "
+                f"pathway={self.pathway!r})"
+            )
         return (
             f"AnnualScenario({self.label!r}, {type(self.source).__name__}, "
-            f"provider={self.provenance.provider!r}, pathway={self.pathway!r})"
+            f"provider={provenance.provider!r}, pathway={self.pathway!r})"
         )
+
+
+def _source_kind_of(source: Any) -> None:
+    """Raise `TypeError` unless `source` is one a per-year plan reads."""
+    # A plan holds a set, so plan.py can't be imported as this module loads.
+    from crc_sdk.parametric.plan import _source_kind
+
+    _source_kind(source)
+
+
+def _checked_field(name: str, value: Any, component: str | None = None) -> Any:
+    """One source's field of an `AnnualScenario`, checked as the plan checks it."""
+    from crc_sdk.parametric.plan import NearestCell, StationColumn, _column_name
+
+    whose = "" if component is None else f" of component {component!r}"
+    if name == "provenance":
+        if not isinstance(value, SourceProvenance):
+            raise TypeError(
+                f"provenance{whose} must be a SourceProvenance stating the source's "
+                f"licence and attribution, got {type(value).__name__}"
+            )
+        return value
+    if name == "location":
+        if not isinstance(value, (NearestCell, StationColumn)):
+            raise TypeError(
+                f"location{whose} must be NearestCell() or StationColumn(name), got "
+                f"{type(value).__name__}"
+            )
+        return value
+    if name in ("year_column", "hazard_column"):
+        return _column_name(name, value)
+    return _identifier(name, value)
 
 
 def _checked_horizon(label: str, horizon: Any) -> int | tuple[int, ...] | None:
@@ -1268,14 +1404,23 @@ class CurveScenario:
     with no curve of the plan's hazard raises `ScenarioError` at execution, naming
     the hazards it holds.
 
-    Raises `TypeError` for arguments of the wrong type, and `ScenarioError` for an
-    invalid label, a pathway `crc_sdk.pathways` doesn't know and a horizon given
-    twice. On a per-year plan, `.scenarios(...)` raises `ValueError`: state an
-    `AnnualScenario` there.
+    **On a plan with several hazards** (`.hazard(...)`), `dataset` maps each
+    component's name to its own dataset, which the component reads its hazard
+    from, as its request selects it. `pathway` and `horizon` are the scenario's,
+    one for every component, so a row reads one (pathway, horizon) of every
+    hazard, and every component's dataset must hold it. The plan checks that the
+    mapping names its components.
+
+    Raises `TypeError` for arguments of the wrong type, `ValueError` for an
+    invalid component name or a mapping of fewer than two, and `ScenarioError`
+    for an invalid label, a pathway `crc_sdk.pathways` doesn't know and a
+    horizon given twice. On a per-year plan, `.scenarios(...)` raises
+    `ValueError`: state an `AnnualScenario` there.
     """
 
     label: str
-    dataset: HazardDataset
+    dataset: HazardDataset | Mapping[str, HazardDataset]
+    """One dataset, or on a plan with several hazards a mapping by component."""
     pathway: str | None
     horizon: int | tuple[int, ...] | None
     """One year, or several in order for a window."""
@@ -1283,26 +1428,39 @@ class CurveScenario:
     def __init__(
         self,
         label: str,
-        dataset: HazardDataset | str | os.PathLike[str],
+        dataset: (
+            HazardDataset
+            | str
+            | os.PathLike[str]
+            | Mapping[str, HazardDataset | str | os.PathLike[str]]
+        ),
         *,
         pathway: str | None = None,
         horizon: int | Iterable[int] | None = None,
     ) -> None:
         label = _checked_text("a scenario's label", label)
-        if isinstance(dataset, (str, os.PathLike)):
-            dataset = HazardDataset.local(Path(dataset))
-        if not isinstance(dataset, HazardDataset):
-            raise TypeError(
-                "dataset must be a HazardDataset on a local canonical file, or the "
-                "file's path; for a remote source, materialize it first "
-                f"(plan.materialize(path)), got {type(dataset).__name__}"
-            )
+        held: HazardDataset | Mapping[str, HazardDataset]
+        if isinstance(dataset, Mapping):
+            from crc_sdk.parametric.index import _component_name
+
+            datasets = {
+                _component_name(name, ValueError): _local_dataset(each)
+                for name, each in dataset.items()
+            }
+            if len(datasets) < 2:
+                raise ValueError(
+                    f"scenario {label!r} maps {len(datasets)} component to a "
+                    "dataset; a scenario of several hazards maps each of two or more"
+                )
+            held = MappingProxyType(datasets)
+        else:
+            held = _local_dataset(dataset)
         if pathway is not None:
             if not isinstance(pathway, str) or not pathway:
                 raise TypeError(f"pathway must be a string, got {pathway!r}")
             _check_known_pathway(pathway, label)
         object.__setattr__(self, "label", label)
-        object.__setattr__(self, "dataset", dataset)
+        object.__setattr__(self, "dataset", held)
         object.__setattr__(self, "pathway", pathway)
         object.__setattr__(self, "horizon", _checked_horizon(label, horizon))
 
@@ -1315,11 +1473,29 @@ class CurveScenario:
         return horizon if isinstance(horizon, tuple) else (horizon,)
 
     def __repr__(self) -> str:
+        dataset = self.dataset
+        files: Any = (
+            {name: Path(each.provider.source).name for name, each in dataset.items()}
+            if isinstance(dataset, Mapping)
+            else Path(dataset.provider.source).name
+        )
         return (
-            f"CurveScenario({self.label!r}, "
-            f"{Path(self.dataset.provider.source).name}, pathway={self.pathway!r}, "
+            f"CurveScenario({self.label!r}, {files}, pathway={self.pathway!r}, "
             f"horizon={self.horizon!r})"
         )
+
+
+def _local_dataset(dataset: Any) -> HazardDataset:
+    """A `CurveScenario`'s dataset: a `HazardDataset` on a local file, or its path."""
+    if isinstance(dataset, (str, os.PathLike)):
+        dataset = HazardDataset.local(Path(dataset))
+    if not isinstance(dataset, HazardDataset):
+        raise TypeError(
+            "dataset must be a HazardDataset on a local canonical file, or the "
+            "file's path; for a remote source, materialize it first "
+            f"(plan.materialize(path)), got {type(dataset).__name__}"
+        )
+    return dataset
 
 
 _Description = AnnualScenario | CurveScenario
@@ -1967,10 +2143,18 @@ def _scenarios_document(
     read = [_read(scenarios.sample(label)) for label in labels]
     shared: dict[str, Any] | None = None
     if read[0].sample.provenance.source_kind == "monte_carlo":
+        sample = read[0].sample
+        # A component is named with its asset, so that the records of several
+        # assets' tables, as a plan writes them, merge by owner.
+        whose = (
+            ""
+            if sample.index_components is None
+            else f" of asset {sample.asset_ids[0]!r}"
+        )
         shared = {
             "labels": list(labels),
             "rng": {
-                owner: [list(record) for record in records]
+                f"{owner}{whose}": [list(record) for record in records]
                 for owner, records in _hazard_generators(read[0]).items()
             },
         }
