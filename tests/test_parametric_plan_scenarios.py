@@ -13,6 +13,8 @@ from typing import Any
 
 import numpy as np
 import pyarrow as pa  # type: ignore[import-untyped]
+import pyarrow.compute as pc  # type: ignore[import-untyped]
+import pyarrow.parquet as pq  # type: ignore[import-untyped]
 import pytest
 from crc_framework import PiecewiseLinearImpact, TransformContext
 
@@ -53,10 +55,12 @@ from crc_sdk.parametric import (
     ScenarioSet,
     StationColumn,
     StepPayout,
+    allocate_scenarios,
     compare_scenarios,
     design,
     design_joint,
     holdout,
+    payout_breakdown_scenarios,
     sample_annual,
     sample_curve,
     sample_curves,
@@ -1386,3 +1390,331 @@ def test_a_window_under_an_empirical_copula_divides_by_the_reference(
     with pytest.raises(ScenarioError, match="its members times the reference's 6"):
         plan.explain()
     plan.monte_carlo(36, seed=42).explain()
+
+
+# -- allocated rows and breakdowns across scenarios ------------------------------------
+
+VALUES = {"warehouse-a": 2e6, "depot-b": 3e6}
+"""The assets' values, as the plan's loss model reads them from `value_eur`."""
+
+
+def _joint_by_hand(curves: Path, fraction: float = 0.5) -> dict[str, Any]:
+    """Each window's sample of both assets, from the plan's generators, then a holdout."""
+    rows = _rows(curves)
+    metadata = HazardDataset.local(curves).metadata()
+    blocks: dict[str, Any] = {}
+    for label, horizons in (("2030s", EARLY), ("2050s", MIDDLE)):
+        children = np.random.SeedSequence(42).spawn(2)
+        joint = sample_curves(
+            {asset_id: [rows[(asset_id, h)] for h in horizons] for asset_id in POINTS},
+            dependence=Independent(),
+            metadata=dict.fromkeys(POINTS, metadata),
+            n_draws=600,
+            rngs={
+                asset_id: np.random.default_rng(child)
+                for asset_id, child in zip(POINTS, children, strict=True)
+            },
+            loss_models={asset_id: _loss(asset_id) for asset_id in POINTS},
+            basis_risk=ImpactNoise(0.3),
+            scenario=label,
+        )
+        blocks[label] = holdout(joint, fraction)
+    return blocks
+
+
+def test_allocated_rows_across_scenarios_go_to_a_file_of_their_own(
+    curves: Path, tmp_path: Path
+) -> None:
+    base = (
+        _curve_plan(curves)
+        .scopes(Joint())
+        .dependence(Independent())
+        .split(Holdout(0.5))
+        .scenarios(ScenarioSet(reference="2030s", labels=WINDOWS))
+    )
+    out = tmp_path / "out"
+    result = base.allocation("value").write_parquet(out / "joint.parquet")
+    plain = base.write_parquet(tmp_path / "plain" / "joint.parquet")
+    # The comparison is the plan's without an allocation, row for row, and its
+    # evaluations record none.
+    assert result.table.to_pylist() == plain.table.to_pylist()
+    assert {e["allocation"] for e in result.metadata.setup.evaluations} == {None}
+    assert result.allocated_output == out / "joint.allocated.parquet"
+    assert sorted(p.name for p in out.iterdir()) == [
+        "joint.allocated.parquet",
+        "joint.parquet",
+    ]
+    # The allocated rows: allocate_scenarios on the blocks of the function route.
+    blocks = _joint_by_hand(curves)
+    for planned in result.designs:
+        assert (
+            planned.design_sample.content_hash
+            == blocks[planned.design_sample.scenario][0].content_hash
+        )
+    evaluated = ScenarioSet([blocks[label][1] for label in WINDOWS], reference="2030s")
+    by_hand = allocate_scenarios(
+        list(result.designs),
+        evaluated,
+        allocation="value",
+        values=VALUES,
+        options=OPTIONS,
+    )
+    assert result.allocated is not None
+    rows = result.allocated.to_pylist()
+    assert rows == by_hand.to_pylist()
+    # 2 designs (one per window) x 2 scenarios x 2 assets, all allocated.
+    assert len(rows) == 8
+    assert {row["level"] for row in rows} == {"asset_by_value"}
+    assert {(row["design_scenario"], row["scenario"]) for row in rows} == {
+        (designed, evaluated_on) for designed in WINDOWS for evaluated_on in WINDOWS
+    }
+    # They are compare_scenarios' allocated rows, without the totals beside them.
+    beside = compare_scenarios(
+        list(result.designs),
+        evaluated,
+        allocation="value",
+        values=VALUES,
+        options=OPTIONS,
+    )
+    assert [r for r in beside.to_pylist() if r["level"] == "asset_by_value"] == rows
+    # The second file: the rows, with the set and the plan's records.
+    written = pq.read_table(result.allocated_output)
+    assert written.equals(result.allocated)
+    stored = EvaluationMetadata.from_table(written)
+    assert stored.setup.scenarios is not None
+    assert stored.setup.scenarios["design_on"] == "each"
+    assert stored.setup.scenarios["labels"] == ["2030s", "2050s"]
+    assert {e["allocation"] for e in stored.setup.evaluations} == {"value"}
+    assert {e["pricing"] is None for e in stored.setup.evaluations} == {True}
+    assert "other_scenario" in {e["method"] for e in stored.setup.evaluations}
+    (record,) = stored.source_records
+    assert record["canonical_file"]["scenarios"] == ["2030s", "2050s"]
+    assert stored.assets["values_sha256"] is not None
+    text = setup_text(stored)
+    assert "Pricing: allocated rows hold no premium" in text
+    assert "Scenario 2030s (the reference)" in text
+
+
+def test_allocated_rows_across_scenarios_on_years_fold_by_fold(
+    tmp_path: Path,
+) -> None:
+    plan = (
+        _annual_plan()
+        .scopes(Joint())
+        .split(KFold(3))
+        .allocation("loss")
+        .scenarios(ScenarioSet([_future()], reference="historical"))
+    )
+    result = plan.write_parquet(tmp_path / "joint.parquet")
+    assert result.scenario_samples is not None and result.allocated is not None
+    labels = ("historical", "ssp585")
+    joined = {
+        label: OutcomeSample.join(result.scenario_samples[label].values())
+        for label in labels
+    }
+    folds = {label: year_block_kfold(joined[label], 3) for label in labels}
+    expected: list[dict[str, Any]] = []
+    for fold in range(3):
+        trains = {folds[label][fold][0].content_hash for label in labels}
+        designs = [d for d in result.designs if d.design_sample.content_hash in trains]
+        expected += allocate_scenarios(
+            designs,
+            ScenarioSet(
+                [folds[label][fold][1] for label in labels], reference="historical"
+            ),
+            allocation="loss",
+            values=VALUES,
+            fold=fold,
+            options=OPTIONS,
+        ).to_pylist()
+    assert result.allocated.to_pylist() == expected
+    assert {row["level"] for row in expected} == {"asset_by_loss"}
+    assert {row["fold"] for row in expected} == {0, 1, 2}
+
+
+def test_an_allocation_across_scenarios_needs_a_joint_design(tmp_path: Path) -> None:
+    plan = (
+        _annual_plan()
+        .covers(_linear())
+        .scopes(Joint())
+        .split(Holdout(0.7))
+        .allocation("value")
+        .scenarios(ScenarioSet([_future()], reference="historical"))
+    )
+    with pytest.raises(EvaluationError, match="no entry is a joint design"):
+        plan.write_parquet(tmp_path / "joint.parquet")
+
+
+def test_a_breakdown_across_scenarios_is_payout_breakdown_scenarios(
+    tmp_path: Path,
+) -> None:
+    plan = (
+        _annual_plan()
+        .split(Holdout(0.7))
+        .scenarios(ScenarioSet([_future()], reference="historical"))
+    )
+    table = plan.payout_breakdown()
+    result = plan.write_parquet(tmp_path / "years.parquet")
+    # The breakdown writes nothing.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["years.parquet"]
+    assert result.scenario_samples is not None
+    labels = ("historical", "ssp585")
+    for asset_id in POINTS:
+        blocks = {
+            label: holdout(result.scenario_samples[label][asset_id], 0.7)
+            for label in labels
+        }
+        designs = [d for d in result.designs if d.cover.asset_id == asset_id]
+        by_hand = payout_breakdown_scenarios(
+            [*designs, _linear(asset_id)],
+            ScenarioSet([blocks[label][1] for label in labels], reference="historical"),
+            design_sample=blocks["historical"][0],
+            options=OPTIONS,
+        )
+        assert _plan_rows(table, asset_id=asset_id) == by_hand.to_pylist()
+    # Each entry's parts add up to its expected payout on each scenario's block.
+    rows = table.to_pylist()
+    assert {row["scenario"] for row in rows} == set(labels)
+    assert {row["split"] for row in rows} == {"out_of_sample"}
+    for row in result.table.to_pylist():
+        parts = [
+            part["expected_payout"]
+            for part in rows
+            if all(
+                part[key] == row[key]
+                for key in ("cover_hash", "design_id", "asset_id", "scenario")
+            )
+        ]
+        assert sum(parts) == pytest.approx(row["expected_payout"])
+    metadata = EvaluationMetadata.from_table(table)
+    assert metadata.setup.scenarios is not None
+    assert metadata.setup.scenarios["design_on"] == "each"
+    assert [r["annual_table"]["scenarios"] for r in metadata.source_records] == [
+        ["historical"],
+        ["ssp585"],
+    ]
+    assert "Pricing: a payout breakdown holds no premiums" in setup_text(metadata)
+
+
+def test_a_breakdown_across_windows_of_curves(curves: Path, tmp_path: Path) -> None:
+    plan = (
+        _curve_plan(curves)
+        .split(FreshDraws(600, seed=7))
+        .scenarios(ScenarioSet(reference="2030s", labels=WINDOWS))
+    )
+    table = plan.payout_breakdown()
+    result = plan.write_parquet(tmp_path / "scenarios.parquet")
+    assert result.scenario_samples is not None
+    assert result.scenario_fresh_samples is not None
+    for asset_id in POINTS:
+        designs = [d for d in result.designs if d.cover.asset_id == asset_id]
+        by_hand = payout_breakdown_scenarios(
+            [*designs, _linear(asset_id)],
+            ScenarioSet(
+                [result.scenario_fresh_samples[label][asset_id] for label in WINDOWS],
+                reference="2030s",
+            ),
+            design_sample=result.scenario_samples["2030s"][asset_id],
+            options=OPTIONS,
+        )
+        assert _plan_rows(table, asset_id=asset_id) == by_hand.to_pylist()
+
+
+def test_an_asset_whose_kept_years_differ_is_named_at_the_merge(
+    tmp_path: Path,
+) -> None:
+    future = _years(2041, location=58.0, seed=2)
+    # depot-b's series has no value in 2041, so it spans 2042 to 2070.
+    future = future.filter(
+        pc.invert(
+            pc.and_(pc.equal(future["year"], 2041), pc.equal(future["latitude"], 51.0))
+        )
+    )
+    entry = _future()
+    shorter = AnnualScenario(
+        "ssp585",
+        future,
+        provenance=entry.provenance,
+        pathway="ssp585",
+        hazard_name="rx1day",
+    )
+    plan = (
+        _annual_plan(missing="drop_year")
+        .split(Holdout(0.7))
+        .scenarios(ScenarioSet([shorter], reference="historical"))
+    )
+    with pytest.raises(EvaluationError) as raised:
+        plan.write_parquet(tmp_path / "years.parquet")
+    message = str(raised.value)
+    assert "scenario 'ssp585' has the horizon 2055 in one table" in message
+    assert "asset 'warehouse-a', whose series spans 2041 to 2070" in message
+    assert "2056 in another (asset 'depot-b', whose series spans 2042 to 2070)" in (
+        message
+    )
+    assert "state years= that every asset's series holds" in message
+    # Years every asset's series holds read one horizon, and the plan runs.
+    plan.scenarios(
+        ScenarioSet(
+            [
+                AnnualScenario(
+                    "ssp585",
+                    future,
+                    provenance=entry.provenance,
+                    pathway="ssp585",
+                    hazard_name="rx1day",
+                    years=list(range(2042, 2071)),
+                )
+            ],
+            reference="historical",
+        )
+    ).write_parquet(tmp_path / "years.parquet")
+
+
+def test_explain_states_a_per_year_horizon_where_years_states_it(
+    tmp_path: Path,
+) -> None:
+    stated = (
+        _annual_plan(years=list(range(1985, 2015)))
+        .split(Holdout(0.7))
+        .scenarios(
+            ScenarioSet(
+                [_future(years=list(range(2041, 2071)))], reference="historical"
+            )
+        )
+    )
+    document: Any = stated.explain(format="json")
+    entries = document["setup"]["scenarios"]["scenarios"]
+    assert {label: entry["horizon"] for label, entry in entries.items()} == {
+        "historical": 1999,
+        "ssp585": 2055,
+    }
+    assert "horizon 1999" in setup_text(document)
+    # The horizons explain() states are those the plan writes.
+    written = stated.write_parquet(tmp_path / "years.parquet").metadata.setup.scenarios
+    assert written is not None
+    assert {
+        label: entry["horizon"] for label, entry in written["scenarios"].items()
+    } == {"historical": 1999, "ssp585": 2055}
+    # A scenario's own years= wins over the plan's, and without years= the window
+    # is known only at execution, as under missing="drop_year".
+    own = (
+        _annual_plan()
+        .split(Holdout(0.7))
+        .scenarios(
+            ScenarioSet(
+                [_future(years=list(range(2045, 2061)))], reference="historical"
+            )
+        )
+    )
+    entries = own.explain(format="json")["setup"]["scenarios"]["scenarios"]
+    assert {label: entry["horizon"] for label, entry in entries.items()} == {
+        "historical": None,
+        "ssp585": 2052,
+    }
+    dropped = (
+        _annual_plan(years=list(range(1985, 2015)), missing="drop_year")
+        .split(Holdout(0.7))
+        .scenarios(ScenarioSet([_future()], reference="historical"))
+    )
+    entries = dropped.explain(format="json")["setup"]["scenarios"]["scenarios"]
+    assert {entry["horizon"] for entry in entries.values()} == {None}

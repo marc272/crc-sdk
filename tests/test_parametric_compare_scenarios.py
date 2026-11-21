@@ -47,12 +47,16 @@ from crc_sdk.parametric import (
     ScenarioError,
     ScenarioSet,
     StepPayout,
+    allocate,
+    allocate_scenarios,
     compare,
     compare_scenarios,
     design,
     design_joint,
     evaluate,
     holdout,
+    payout_breakdown,
+    payout_breakdown_scenarios,
     sample_annual,
     sample_annual_pool,
     sample_curve,
@@ -991,6 +995,188 @@ def test_a_joint_designs_setup_text_stays_method_only() -> None:
         assert word not in text
 
 
+# -- allocated rows across scenarios -------------------------------------------
+
+VALUES = {"a": 1e6, "b": 3e6}
+
+
+@pytest.mark.parametrize("rule", ["value", "loss"])
+def test_allocate_scenarios_gives_compare_scenarios_allocated_rows_alone(
+    rule: Any,
+) -> None:
+    designed, scenarios = _joint_setup()
+    later = design_joint(
+        list(_book_covers(free=True).values()),
+        _book("late", (3, 4), horizon=2080, location=95.0),
+        MSE(),
+    )
+    table = allocate_scenarios(
+        [designed, later], scenarios, allocation=rule, values=VALUES
+    )
+    beside = compare_scenarios(
+        [designed, later], scenarios, allocation=rule, values=VALUES
+    )
+    level = f"asset_by_{rule}"
+    assert table.to_pylist() == _rows(beside, level=level)
+    assert table.schema.remove_metadata() == beside.schema.remove_metadata()
+    # 2 designs x 2 scenarios x 2 assets, and no "total" or "asset" row.
+    assert table.num_rows == 8
+    assert {row["level"] for row in table.to_pylist()} == {level}
+    assert {
+        (row["design_scenario"], row["scenario"]) for row in table.to_pylist()
+    } == {(d, s) for d in ("early", "late") for s in ("early", "late")}
+    for row in table.to_pylist():
+        assert row["premium"] is None and row["premium_repriced"] is None
+        assert row["premium_basis"] is None
+    # The metadata: the set, the rule, no pricing, and the cross rows' method.
+    record = _scenarios_record(table)
+    assert record["reference"] == "early"
+    assert {e["allocation"] for e in _evaluations(table)} == {rule}
+    assert {e["pricing"] is None for e in _evaluations(table)} == {True}
+    assert _evaluation(table, "late", "early")["method"] == "other_scenario"
+    assert _evaluation(table, "early", "late")["method"] == "other_scenario"
+    assert EvaluationMetadata.from_table(table).assets["values_sha256"] is not None
+    text = setup_text(table)
+    assert "Pricing: allocated rows hold no premium" in text
+    assert "Scenario early (the reference)" in text
+    assert to_long(table).num_rows > 0
+
+
+def test_allocate_scenarios_on_one_scenario_is_allocate(tmp_path: Path) -> None:
+    designed, scenarios = _joint_setup()
+    block = scenarios.sample("early")
+    table = allocate_scenarios(
+        [designed],
+        ScenarioSet([block], reference="early"),
+        allocation="value",
+        values=VALUES,
+        options=OPTIONS,
+    )
+    plain = allocate(
+        [designed],
+        block,
+        split="out_of_sample",
+        allocation="value",
+        values=VALUES,
+        options=OPTIONS,
+    )
+    _same_rows(table, plain)
+    assert table.column("premium_repriced").null_count == table.num_rows
+    path = tmp_path / "allocated.parquet"
+    write_comparison(table, path)
+    assert pq.read_table(path).equals(table)
+
+
+def test_allocate_scenarios_refuses_what_allocate_refuses() -> None:
+    designed, scenarios = _joint_setup()
+    untyped: Any = allocate_scenarios
+    with pytest.raises(TypeError, match="ScenarioSet"):
+        untyped([designed], scenarios.sample("early"), allocation="value", values=VALUES)
+    with pytest.raises(TypeError, match="JointDesignResult"):
+        untyped([_book_covers()], scenarios, allocation="value", values=VALUES)
+    with pytest.raises(EvaluationError, match="at least one joint design"):
+        untyped([], scenarios, allocation="value", values=VALUES)
+    with pytest.raises(EvaluationError, match="needs a rule"):
+        untyped([designed], scenarios, allocation=None, values=VALUES)
+    with pytest.raises(EvaluationError, match="allocation must be"):
+        untyped([designed], scenarios, allocation="share", values=VALUES)
+    with pytest.raises(EvaluationError, match="values"):
+        untyped([designed], scenarios, allocation="value", values={"a": 1.0})
+    elsewhere = design_joint(
+        list(_book_covers(free=True).values()), _book("other", (5, 6)), MSE()
+    )
+    with pytest.raises(ScenarioError, match="not one of the set's scenarios"):
+        untyped([elsewhere], scenarios, allocation="value", values=VALUES)
+
+
+# -- payout breakdowns across scenarios ----------------------------------------
+
+
+def test_payout_breakdown_scenarios_gives_each_blocks_breakdown(
+    tmp_path: Path,
+) -> None:
+    train, scenarios, designed = _pair_set()
+    table = payout_breakdown_scenarios(
+        [designed, GIVEN], scenarios, design_sample=train, options=OPTIONS
+    )
+    # On each block, the rows are payout_breakdown's, row for row.
+    for label in scenarios.labels:
+        plain = payout_breakdown(
+            [designed, GIVEN],
+            scenarios.sample(label),
+            split="out_of_sample",
+            design_sample=train,
+            options=OPTIONS,
+        )
+        assert _rows(table, scenario=label) == plain.to_pylist()
+    assert table.column_names == plain.column_names
+    # Each entry's parts add up to its expected payout on each block.
+    compared = compare_scenarios(
+        [designed, GIVEN], scenarios, design_sample=train, options=OPTIONS
+    )
+    for row in compared.to_pylist():
+        parts = _rows(
+            table,
+            cover_hash=row["cover_hash"],
+            design_id=row["design_id"],
+            scenario=row["scenario"],
+        )
+        assert sum(part["expected_payout"] for part in parts) == pytest.approx(
+            row["expected_payout"]
+        )
+    assert {row["design_scenario"] for row in table.to_pylist()} == {"early", None}
+    assert _evaluation(table, "late", "early")["method"] == "other_scenario"
+    assert _evaluation(table, "late", None)["method"] == "other_scenario"
+    assert {e["pricing"] is None for e in _evaluations(table)} == {True}
+    assert _scenarios_record(table)["labels"] == ["early", "late"]
+    text = setup_text(table)
+    assert "Pricing: a payout breakdown holds no premiums" in text
+    assert "Scenario late:" in text
+    path = tmp_path / "parts.parquet"
+    write_comparison(table, path)
+    assert pq.read_table(path).equals(table)
+
+
+def test_payout_breakdown_scenarios_breaks_down_a_package() -> None:
+    package = CoverPackage(
+        {"rain": _contract(RAIN, "rain", 2e5), "heat": _contract(HEAT, "heat", 1e5)},
+        label="two",
+    )
+    train = _hazards("early", seeds=(1, 2))
+    scenarios = ScenarioSet(
+        [_hazards("early"), _hazards("late", shift=20.0)], reference="early"
+    )
+    table = payout_breakdown_scenarios([package], scenarios, design_sample=train)
+    assert [(row["scenario"], row["part"]) for row in table.to_pylist()] == [
+        ("early", "rain"),
+        ("early", "heat"),
+        ("late", "rain"),
+        ("late", "heat"),
+    ]
+    for label in scenarios.labels:
+        plain = payout_breakdown(
+            [package],
+            scenarios.sample(label),
+            split="out_of_sample",
+            design_sample=train,
+        )
+        assert _rows(table, scenario=label) == plain.to_pylist()
+
+
+def test_payout_breakdown_scenarios_refuses() -> None:
+    train, scenarios, designed = _pair_set()
+    untyped: Any = payout_breakdown_scenarios
+    with pytest.raises(TypeError, match="ScenarioSet"):
+        untyped([designed], scenarios.sample("early"))
+    with pytest.raises(SampleError, match="needs design_sample="):
+        untyped([GIVEN], scenarios)
+    with pytest.raises(ScenarioError, match="its label must be 'early'"):
+        untyped([GIVEN], scenarios, design_sample=_window("late", seed=1))
+    joint, book = _joint_setup()
+    with pytest.raises(SampleError, match="one asset's sample"):
+        untyped([joint], book)
+
+
 # -- packages on several hazards -----------------------------------------------
 
 
@@ -1449,6 +1635,41 @@ def test_a_fold_that_contradicts_the_block_raises() -> None:
     scenarios = ScenarioSet([early[1][1]], reference="early")
     with pytest.raises(EvaluationError, match="fold=0 was given"):
         compare_scenarios([GIVEN], scenarios, design_sample=early[1][0])
+
+
+def test_merge_names_the_assets_whose_series_span_other_years() -> None:
+    def table(asset_id: str, first: int) -> Any:
+        def sample(label: str, pathway: str, start: int, seed: int) -> Any:
+            return sample_annual(
+                _series(pathway, start, seed=seed),
+                loss_model=LOSS,
+                basis_risk=NoBasisRisk(),
+                asset_id=asset_id,
+                scenario=label,
+            )
+
+        train, past = holdout(sample("past", "historical", 1981, 1), 0.5)
+        _, later = holdout(sample("later", "ssp245", first, 2), 0.5)
+        return EvaluationMetadata.from_table(
+            compare_scenarios(
+                [GIVEN],
+                ScenarioSet([past, later], reference="past"),
+                design_sample=train,
+            )
+        )
+
+    # The same years for both assets merge; one year less at an end doesn't.
+    EvaluationMetadata.merge(table("a", 2015), table("b", 2015))
+    with pytest.raises(EvaluationError) as raised:
+        EvaluationMetadata.merge(table("a", 2015), table("b", 2016))
+    message = str(raised.value)
+    assert (
+        "scenario 'later' has the horizon 2034 in one table (asset 'a', whose series "
+        "spans 2015 to 2054) and 2035 in another (asset 'b', whose series spans 2016 "
+        "to 2055)"
+    ) in message
+    assert "missing='drop_year'" in message
+    assert "state years= that every asset's series holds" in message
 
 
 # -- refusals ------------------------------------------------------------------

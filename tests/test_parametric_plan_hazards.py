@@ -65,6 +65,7 @@ from crc_sdk.parametric import (
     design,
     holdout,
     payout_breakdown,
+    payout_breakdown_scenarios,
     sample_annual_hazards,
     sample_curve_hazards,
     sample_curves,
@@ -72,6 +73,8 @@ from crc_sdk.parametric import (
     split_budget,
     year_block_kfold,
 )
+from crc_sdk.parametric import plan as plan_module
+from crc_sdk.parametric.dependence import Comonotonic
 from crc_sdk.parametric.sample import _thaw
 from crc_sdk.types import HazardDatasetMetadata, SourceProvenance
 from crc_sdk.workflows import (
@@ -968,6 +971,80 @@ def test_covers_are_checked_against_the_components() -> None:
         plan.covers(lower).explain()
 
 
+def _lower_rain(amount: Any = 1e5) -> Cover:
+    """A cover on rain's index with a lower tail: it pays below a threshold."""
+    return Cover(
+        IndexDefinition("rx1day", "mm/day", tail="lower", aggregation="annual_maximum"),
+        StepPayout([30.0], [amount], tail="lower"),
+        payout_unit="EUR",
+        label="dry",
+    )
+
+
+def test_a_package_contract_with_another_tail_is_refused_at_explain() -> None:
+    message = (
+        "package contract 'dry' has the tail 'lower' on component 'rx1day', whose "
+        "tail is 'upper'"
+    )
+    heat = Cover(HEAT_INDEX, StepPayout([36.0], [1e5]), payout_unit="EUR", label="heat")
+    resolved = (
+        _two_hazards(_annual_plan())
+        .basis_risk(NOISE)
+        .covers(_lower_rain(), heat)
+        .package({"rx1day": "dry", "txx": "heat"}, label="separate")
+    )
+    for run in (resolved.explain, resolved.samples):
+        with pytest.raises(SampleError, match=message):
+            run()
+    # A template is refused before it is designed on the component's own loss.
+    templates = (
+        _two_hazards(_annual_plan())
+        .basis_risk(NOISE)
+        .covers(_lower_rain(Free()), _heat())
+        .package({"rx1day": "dry", "txx": "heat"}, label="separate", shares="own_loss")
+        .objective(ExpectedUncovered(), budget=Budget(ratio=0.8))
+    )
+    for run in (templates.explain, templates.designs):
+        with pytest.raises(SampleError, match=message):
+            run()
+
+
+def test_a_package_contract_with_another_tail_is_refused_on_curves(
+    datasets: dict[str, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def drawn(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the refusal comes before anything is drawn")
+
+    monkeypatch.setattr(plan_module, "sample_curve_hazards", drawn)
+    heat = Cover(HEAT_INDEX, StepPayout([36.0], [1e5]), payout_unit="EUR", label="heat")
+    plan = (
+        _curve_plan(datasets)
+        .dependence(Independent())
+        .basis_risk(NOISE)
+        .covers(_lower_rain(), heat)
+        .package({"rx1day": "dry", "txx": "heat"}, label="separate")
+        .split(FreshDraws(400, seed=8))
+    )
+    # A curve component's tail is its dataset's, read at execution, before any draw.
+    plan.explain()
+    message = (
+        "package contract 'dry' has the tail 'lower' on component 'rx1day', whose "
+        "dataset's return_period_tail is 'upper'"
+    )
+    for run in (plan.samples, lambda: plan.write_parquet(tmp_path / "out.parquet")):
+        with pytest.raises(SampleError, match=message):
+            run()
+    # So is a cover on one index that no package holds.
+    alone = (
+        _curve_plan(datasets)
+        .dependence(Independent())
+        .basis_risk(NOISE)
+        .covers(_lower_rain())
+    )
+    with pytest.raises(SampleError, match="cover 'dry' has the tail 'lower'"):
+        alone.samples()
+
+
 def test_packages_are_checked_against_the_covers_and_the_budget() -> None:
     plan = (
         _two_hazards(_annual_plan()).basis_risk(NOISE).covers(_grid(), _rain(), _heat())
@@ -1080,6 +1157,52 @@ def test_per_year_scenarios_of_several_hazards_give_the_function_routes_rows(
     assert "Scenario later: hazard component rx1day: rx1day, as the caller states" in (
         text
     )
+
+
+def test_a_breakdown_of_several_hazards_across_scenarios() -> None:
+    later = _weather(shift=6.0, seed=5)
+    scenario = AnnualScenario(
+        "later",
+        {"rx1day": later, "txx": later},
+        provenance={"rx1day": _provenance(), "txx": _provenance()},
+        hazard_name={"rx1day": "rx1day", "txx": "txx"},
+        pathway="ssp585",
+    )
+    plan = _designed(
+        _two_hazards(
+            _annual_plan(hazard_name="rx1day", scenario="early"), hazard_name="txx"
+        )
+    ).split(Holdout(0.7))
+    parts = plan.scenarios(ScenarioSet([scenario], reference="early")).payout_breakdown()
+    names = {"rx1day": "rx1day", "txx": "txx"}
+    for asset_id in STATIONS:
+        early_train, early_test = holdout(
+            _annual_by_hand(asset_id, scenario="early", hazard_names=names), 0.7
+        )
+        late_train, late_test = holdout(
+            _annual_by_hand(
+                asset_id,
+                table=later,
+                scenario="later",
+                pathway="ssp585",
+                hazard_names=names,
+            ),
+            0.7,
+        )
+        early = _entries_by_hand(early_train, asset_id)
+        late = _entries_by_hand(late_train, asset_id)
+        # As the plan orders them: each slot's designs by design scenario.
+        by_hand = payout_breakdown_scenarios(
+            [early[0], late[0], early[1], late[1], early[2]],
+            ScenarioSet([early_test, late_test], reference="early"),
+            design_sample=early_train,
+            options=OPTIONS,
+        )
+        assert _rows_of(parts, asset_id=asset_id) == by_hand.to_pylist()
+    kinds = {(row["cover_label"], row["part_kind"]) for row in parts.to_pylist()}
+    assert ("grid (expected_uncovered)", "region") in kinds
+    assert ("separate (expected_uncovered)", "component") in kinds
+    assert {row["scenario"] for row in parts.to_pylist()} == {"early", "later"}
 
 
 def test_curve_scenarios_of_several_hazards_share_their_draws(
@@ -1371,10 +1494,87 @@ def test_a_holdout_of_curve_draws_under_a_stated_dependence(
         "out_of_sample",
     }
     # A copula reorders the draws, so two blocks of one sample share their rows'
-    # draws; compare refuses it out of sample, and fresh draws are the test.
+    # draws; the plan refuses it before any design, and fresh draws are the test.
     copula = _designed(_curve_plan(datasets).dependence(GaussianCopula(0.3)))
-    with pytest.raises(LeakageError):
+    with pytest.raises(LeakageError, match="FreshDraws"):
         copula.split(Holdout(0.5)).write_parquet(tmp_path / "b.parquet")
+
+
+class _Reversed:
+    """A dependence model of the caller's: the second column's draws reversed."""
+
+    def to_document(self) -> dict[str, Any]:
+        return {"kind": "reversed"}
+
+    def record(self, n_draws: int, columns: Sequence[str]) -> dict[str, Any]:
+        del n_draws, columns
+        return self.to_document()
+
+    def statement(self, n_draws: int, between: str) -> str:
+        del n_draws, between
+        return "the second column's draws are reversed."
+
+    def reorder(self, uniforms: Any, columns: Sequence[str]) -> Any:
+        del columns
+        n, d = uniforms.shape
+        order = np.tile(np.arange(n, dtype=np.int64)[:, np.newaxis], (1, d))
+        order[:, 1:] = order[::-1, 1:]
+        return order
+
+
+@pytest.mark.parametrize(
+    "model",
+    [Comonotonic(), GaussianCopula(0.3), _Reversed()],
+    ids=["comonotonic", "gaussian", "own"],
+)
+@pytest.mark.parametrize("rule", [Holdout(0.5), KFold(3)], ids=["holdout", "kfold"])
+def test_a_split_by_rows_under_a_moving_model_is_refused_before_any_design(
+    datasets: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model: Any,
+    rule: Any,
+) -> None:
+    def drawn(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the refusal comes before anything is drawn")
+
+    # Nothing is drawn, and so nothing designed, before the refusal.
+    monkeypatch.setattr(plan_module, "sample_curve_hazards", drawn)
+    plan = _designed(_curve_plan(datasets).dependence(model)).split(rule)
+    name = type(model).__name__
+    for run in (
+        plan.explain,
+        plan.samples,
+        plan.designs,
+        plan.payout_breakdown,
+        lambda: plan.write_parquet(tmp_path / "out.parquet"),
+    ):
+        with pytest.raises(LeakageError, match=rf"{name}.*FreshDraws\(n_draws"):
+            run()
+    # With scenarios too, and whichever builder comes first.
+    horizons = {"horizons": [2030], "pathways": ["ssp585"]}
+    stated = (
+        _designed(_curve_plan(datasets, **horizons))
+        .split(rule)
+        .scenarios(ScenarioSet(reference="ssp585_2030"))
+        .dependence(model)
+    )
+    with pytest.raises(LeakageError, match="FreshDraws"):
+        stated.explain()
+    with pytest.raises(LeakageError, match="FreshDraws"):
+        stated.scenario_samples()
+    assert not (tmp_path / "out.parquet").exists()
+
+
+def test_a_split_by_rows_under_independent_draws_is_not_refused(
+    datasets: dict[str, Path],
+) -> None:
+    # Independent() keeps every column in draw order, so blocks of rows pass.
+    for rule, folds in ((Holdout(0.5), 1), (KFold(2), 2)):
+        plan = _designed(_curve_plan(datasets).dependence(Independent())).split(rule)
+        plan.explain()
+        # The grid and the package's two contracts, per asset and fold.
+        assert len(plan.designs()) == 3 * len(POINTS) * folds
 
 
 class _SourcePlan:

@@ -262,6 +262,37 @@ def test_a_package_keeps_each_key_as_the_component_it_reads() -> None:
     assert row["expected_payout"] == pytest.approx(8.0 * (RAIN_VALUES >= 50.0).mean())
 
 
+def _dry_cover(**rest: Any) -> Cover:
+    """A cover on rain's index with a lower tail, which the sample's rain lacks."""
+    lower = IndexDefinition("rain", "mm/day", tail="lower", aggregation="annual_maximum")
+    return Cover(lower, BinaryPayout(15.0, 8.0, tail="lower"), payout_unit="EUR", **rest)
+
+
+def test_a_contract_whose_tail_differs_from_its_components_is_refused() -> None:
+    # A package holds no sample, so its contracts meet their components' tails
+    # where it meets one: at every evaluation, by the key that names the component.
+    package = CoverPackage({"rain": _dry_cover(), "heat": _heat_cover()})
+    sample = _sample()
+    message = "the cover's index 'rain' has the tail 'lower', but the sample's"
+    with pytest.raises(SampleError, match=message):
+        compare([package], sample, split="in_sample")
+    with pytest.raises(SampleError, match=message):
+        evaluate(package, sample, split="in_sample")
+    with pytest.raises(SampleError, match=message):
+        payout_breakdown([package], sample, split="in_sample")
+    # The key names the component, whatever the cover's own hazard name.
+    components = sample.index_components
+    assert components is not None
+    renamed = _sample(
+        index_components={"wet": components["rain"], "heat": components["heat"]}
+    )
+    keyed = CoverPackage({"wet": _dry_cover(), "heat": _heat_cover()})
+    with pytest.raises(SampleError, match="the cover's index 'wet' has the tail"):
+        compare([keyed], renamed, split="in_sample")
+    # The same contract with the component's tail is evaluated.
+    assert compare([_as_is_package()], sample, split="in_sample").num_rows == 3
+
+
 @pytest.mark.parametrize(
     ("build", "kind", "message"),
     [
