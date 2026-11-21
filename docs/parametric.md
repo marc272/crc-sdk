@@ -2756,7 +2756,7 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
 | --- | --- | --- |
 | amounts free, thresholds fixed (any built-in family, or a `LinearInAmounts` user family) | E[U], weighted CVaR | one LP (`route="lp"`) |
 | the same | MSE | one QP in the amounts (`route="qp"`); under a cost-of-capital budget, cutting planes over such QPs |
-| free thresholds on grids (attachment, exhaustion, breakpoints, knots, trigger) | any built-in | a grid over the thresholds, with the LP or QP at each point (`route="grid"`); with `DesignOptions(refine=True)`, then a compass search from the grid's best point, with the LP or QP at each point it evaluates |
+| free thresholds on grids (attachment, exhaustion, breakpoints, knots, trigger) | any built-in | a grid over the thresholds, with the LP or QP at each point (`route="grid"`); with `DesignOptions(refine=True)`, then a refinement from the grid's best point, with the LP or QP at each point it evaluates: over the sample's index values for a step or binary payout, by a compass search otherwise |
 | a `UserObjective`, or a payout not linear in its amounts | any | a grid over every free parameter, evaluated in numpy; candidates that break the budget or the limit are dropped |
 | `SumOf`, `MaxOf`, `StepGrid` over several indices | any | one of the routes above, as [design on several indices](#design-on-several-indices) says |
 
@@ -2771,80 +2771,151 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
   `"infeasible"`, `"invalid"`, `"over_budget"`, `"over_limit"`).
 - **A local refinement after the grid.** The grid's best point can miss an
   optimum between two grid points. `DesignOptions(refine=True)`, off by
-  default, refines it by a compass search, a deterministic search that uses
-  no derivatives (the coordinate search of Kolda, Lewis and Torczon, SIAM
-  Review 45(3), 2003):
-  - it starts at the grid's best point, with a step per free threshold of
-    half the larger gap from it to its neighbours on the grid (at an end of
-    the grid, to that side's bound);
-  - each round evaluates, threshold by threshold in the template's order, the
-    point one step up and the point one step down, each clipped to the
-    threshold's `Free` bounds, with the amounts solved exactly by the LP or QP
-    at each point, as at a grid point. A point whose thresholds are out of
-    order makes no cover (`"invalid"`), and one where no payout meets the
-    constraints has none (`"infeasible"`); the search never moves to either;
-  - it moves to the best of those points when that lowers the objective by
-    more than the grid's tie tolerance, `feasibility_tolerance` ·
-    max(1, |objective|) in scaled units, and keeps its steps; otherwise it
-    halves every step;
-  - it stops when every step is at most `refine_tolerance` (1e-4 by default)
-    times its threshold's bounds' width, `upper − lower`, or after
-    `refine_max_points` points (1,000 by default).
+  default, refines it, by one of two methods that share these rules:
+  - each free threshold's window is the grid's best value's two neighbours
+    on its grid (at an end of the grid, that side's bound);
+  - at every point it evaluates, the amounts are solved exactly by the LP or
+    QP, as at a grid point. A point whose thresholds are out of order makes
+    no cover (`"invalid"`), and one where no payout meets the constraints has
+    none (`"infeasible"`); the refinement never moves to either;
+  - it moves only to a point that lowers the objective by more than the
+    grid's tie tolerance, `feasibility_tolerance` · max(1, |objective|) in
+    scaled units;
+  - it evaluates at most `refine_max_points` points (1,000 by default).
 
-  So the search is deterministic, stays within the bounds, adds no
+  So a refinement is deterministic, stays within the bounds, adds no
   dependency and solves with HiGHS alone, and never ends worse than the
-  grid's best point. It ends where no step of its last size along one
-  threshold gains more than the tie tolerance: a local optimum at that
-  resolution, not a global one. The grid is what searches the whole range;
-  on a step or binary payout, whose objective is constant between the
-  years' index values, an interval that no step lands on is not seen.
-  Under MSE the gains shrink with the square of the distance to a smooth
-  optimum, so the search stops at the tie tolerance before its steps reach
-  their smallest. One synthetic illustration, on the design sample itself:
-  200 years whose loss is a linear payout of a uniform index on [0, 10],
-  attached at 3.7, exhausted at 8 and paying up to 100; a `LinearPayout`
-  with its exhaustion fixed at 8, a free amount and a free attachment on
-  the grid 0, 2.5, 5 and 7.5 within bounds of 0 and 10; a pure premium, with
-  a budget of 1 × E[L] under E[U] and the weighted CVaR (α 0.5, β 0.9) and
-  none under MSE. The grid's best attachment is 2.5 under all three, and the
-  default settings refined it to within 5e-5 of 3.7 under E[U] and the
-  weighted CVaR, and within 1.2e-3 under MSE, after 23 points each.
+  grid's best point. The grid is what searches the whole range.
 
-  ```python
-  refinable = Cover(index, LinearPayout(Free(40.0, 120.0, grid=5), 150.0, Free()),
+  - **A step or binary payout: over the sample's index values.** A
+    `StepPayout` or `BinaryPayout` pays from a threshold the years whose
+    severity is at or beyond it: with an upper tail, the years whose index
+    value is at or above it; with a lower tail, at or below it. So its
+    objective is constant between two consecutive index values of the design
+    sample and changes only where a threshold crosses one, and a threshold's
+    best value, the others held, is one of them. The refinement tries them:
+    - a pass takes the free thresholds in the template's order. Holding the
+      others, it tries the sample's distinct index values within the
+      threshold's window, and the window's two ends, which stand for the
+      thresholds beyond the last index value in it, nearest the current value
+      first (the lower one first at equal distance). A value that pays the
+      same years as the current one is skipped, and one that pays the same
+      years as a value tried before isn't solved again, since its LP or QP is
+      the same;
+    - the threshold moves to the best value tried, if that gains more than the
+      tie tolerance; of the values within the tie tolerance of the best, to the
+      first tried, the nearest;
+    - passes repeat until one moves no threshold (`stopped="no_move"`), or
+      until `refine_max_points` points (`"max_points"`), when it still moves
+      the threshold it was on to the best value it tried.
+
+    With one free threshold the result is the best set of years that a
+    threshold in its window can pay, exactly; with several, a point that no
+    single threshold can improve within its window, which need not be the
+    best combination. A refined threshold lies on an index value, where the
+    payout changes: on the design sample, every threshold between it and the
+    next index value on the less severe side pays the same years.
+    `refine_tolerance` doesn't apply. Not tried, unless a window's end lies
+    there: a breakpoint between the next breakpoint and the last index value
+    below it, which leaves its band without a year. With that band's level
+    free, and its bounds allowing the level of the band below it, a
+    breakpoint at that index value does at least as well, since it can pay
+    the same.
+
+    One synthetic illustration, on the design sample itself: ten years with
+    the index values 1, 2, 3, 4, 4.3, 4.31, 6, 7, 8 and 9, whose loss is 50
+    from 4.31 and 100 from 8.5; a `StepPayout` with a free first breakpoint
+    on the grid 0, 5 and 8 within bounds of 0 and 8, a second breakpoint
+    fixed at 8.5, and free levels; MSE, no budget. The grid's best breakpoint
+    is 5. The refinement tries 8 values in 2 passes and ends at 4.31, where
+    the objective is 0. A compass search from 5 doesn't move: every
+    breakpoint in (4.31, 6] pays the same years as 5, and the points its
+    halved steps reach from 5 stay there. A step cover on the table quick
+    start's 28 design years:
+
+    ```python
+    table_years = OutcomeSample.from_table(record, period="year", asset_id="asset_id",
+                                           index="rx1day", loss="loss_eur",
+                                           index_unit="mm/day", loss_unit="EUR")
+    first_years, _ = holdout(table_years, train_fraction=0.7)
+    stepped = Cover(rain_index, StepPayout([Free(40.0, 120.0, grid=5), 150.0], [Free(), Free()]),
                     payout_unit="EUR", asset_id="warehouse-a")
-  refined = design(refinable, design_years, ExpectedUncovered(), budget=Budget(ratio=0.8),
+    exact = design(stepped, first_years, ExpectedUncovered(), budget=Budget(ratio=0.8),
                    options=DesignOptions(refine=True))
-  refined.refinement["start"], refined.parameters["attachment"], refined.refinement["gain"]
-  ```
+    exact.refinement["method"], exact.refinement["end"], exact.refinement["points"]
+    ```
 
-  - **The record.** `DesignResult.refinement` holds the method
-    (`"compass_search"`) and its settings (`tolerance`, `max_points`,
-    `initial_steps`), the grid's best point and its objective (`start`,
-    `start_objective`), where the search ended and its objective (`end`,
-    `objective`), the `gain` over the grid (their difference, never below 0,
-    in payout units and squared for MSE), the number of `points` it evaluated
-    and their statuses (`counts`), its `moves`, its `final_steps` and why it
-    `stopped` (`"step_tolerance"` or `"max_points"`).
-    `DesignResult.refinement_profile` lists those points in order, as
-    `profile` lists the grid's, which it leaves as it is. `to_record()` has
-    the record under `"refinement"`, so it reaches the metadata's `designs`,
-    and the setup text's `Design` line states it. The option and its settings
-    enter the options document, and so the `design_id`; without the option
-    the document, the id and every result are those of a design made before
-    it existed, and `refinement` is `None`.
-  - **Ties and non-uniqueness.** Where the search ends, the amounts are
+  - **Every other family: a compass search,** a deterministic search that
+    uses no derivatives (the coordinate search of Kolda, Lewis and Torczon,
+    SIAM Review 45(3), 2003):
+    - it starts at the grid's best point, with a step per free threshold of
+      half the larger side of its window;
+    - each round evaluates, threshold by threshold in the template's order,
+      the point one step up and the point one step down, each clipped to the
+      threshold's `Free` bounds;
+    - it moves to the best of those points when that gains more than the tie
+      tolerance, and keeps its steps; otherwise it halves every step;
+    - it stops when every step is at most `refine_tolerance` (1e-4 by
+      default) times its threshold's bounds' width, `upper − lower`
+      (`stopped="step_tolerance"`), or after `refine_max_points` points
+      (`"max_points"`).
+
+    It ends where no step of its last size along one threshold gains more
+    than the tie tolerance: a local optimum at that resolution, not a global
+    one. Under MSE the gains shrink with the square of the distance to a
+    smooth optimum, so the search stops at the tie tolerance before its steps
+    reach their smallest. One synthetic illustration, on the design sample
+    itself: 200 years whose loss is a linear payout of a uniform index on
+    [0, 10], attached at 3.7, exhausted at 8 and paying up to 100; a
+    `LinearPayout` with its exhaustion fixed at 8, a free amount and a free
+    attachment on the grid 0, 2.5, 5 and 7.5 within bounds of 0 and 10; a
+    pure premium, with a budget of 1 × E[L] under E[U] and the weighted CVaR
+    (α 0.5, β 0.9) and none under MSE. The grid's best attachment is 2.5
+    under all three, and the default settings refined it to within 5e-5 of
+    3.7 under E[U] and the weighted CVaR, and within 1.2e-3 under MSE, after
+    23 points each.
+
+    ```python
+    refinable = Cover(index, LinearPayout(Free(40.0, 120.0, grid=5), 150.0, Free()),
+                      payout_unit="EUR", asset_id="warehouse-a")
+    refined = design(refinable, design_years, ExpectedUncovered(), budget=Budget(ratio=0.8),
+                     options=DesignOptions(refine=True))
+    refined.refinement["start"], refined.parameters["attachment"], refined.refinement["gain"]
+    ```
+
+  - **The record.** `DesignResult.refinement` holds the `method`
+    (`"index_values"` or `"compass_search"`) and its settings: for the index
+    values `max_points`, `windows` (each threshold's `[lower, upper]`) and
+    `candidates` (how many values each window holds, its ends included); for
+    the compass search `tolerance`, `max_points` and `initial_steps`. Then
+    the grid's best point and its objective (`start`, `start_objective`),
+    where the refinement ended and its objective (`end`, `objective`), the
+    `gain` over the grid (their difference, never below 0, in payout units
+    and squared for MSE), the number of `points` it evaluated and their
+    statuses (`counts`), and its `moves`; and last, for the index values the
+    `passes` it began, for the compass search its `final_steps`, and why it
+    `stopped`. `DesignResult.refinement_profile` lists those points in
+    order, as `profile` lists the grid's, which it leaves as it is.
+    `to_record()` has the record under `"refinement"`, so it reaches the
+    metadata's `designs`, and the setup text's `Design` line states it. The
+    option and its settings enter the options document, and so the
+    `design_id`; without the option the document, the id and every result
+    are those of a design made before it existed, and `refinement` is
+    `None`.
+  - **Ties and non-uniqueness.** Where the refinement ends, the amounts are
     solved again with the uniqueness report, so `unique`, `ranges` (with
     `ranges=True`) and the QP's eigenvalue rule are those of the amounts at
     the refined thresholds. `ties` counts the grid's candidates within the tie
     tolerance of the refined objective, which is 0 after any move, since each
-    move gains more than that tolerance; when the search doesn't move, `ties`
-    and `unique` are the grid's. Not checked: whether other thresholds near
-    the refined point give the same objective. The search's own points are
-    not counted as ties, because near its end they lie within one small step
-    of it and, on a continuous objective, tie with it to rounding. So `unique`
-    true says that the amounts are unique at the refined thresholds, not that
-    the thresholds are.
+    move gains more than that tolerance; when the refinement doesn't move,
+    `ties` and `unique` are the grid's. Not checked: whether other thresholds
+    give the same objective. The refinement's own points are not counted as
+    ties: near a compass search's end they lie within one small step of it
+    and, on a continuous objective, tie with it to rounding; and a search
+    over the index values reports one value per set of years, while every
+    threshold between that value and the next index value ties with it. So
+    `unique` true says that the amounts are unique at the refined
+    thresholds, not that the thresholds are.
   - **Where it does not apply.** Without free thresholds a design is one LP
     or QP, exact already: the option changes only its `design_id`, and
     `refinement` is `None`. A `UserObjective`, or a payout not linear in its
@@ -2856,7 +2927,13 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
     raises `DesignError`. The plan and `design_frontier` pass the option to
     every design they make.
   - **What it costs.** Each point it evaluates is one LP or QP, as a grid
-    point is, and `solves`, `iterations` and `seconds` count them.
+    point is, and `solves`, `iterations` and `seconds` count them. A search
+    over the index values tries every distinct index value in each window,
+    so its points grow with the sample: in the example above, on 28 years,
+    the window of 40 to 80 holds 24 values; on the 7,000 design draws of
+    `design_years`, the same window holds 5,787, and the cap of 1,000 points
+    stops the search within its first pass. A finer grid narrows the
+    windows, and a larger `refine_max_points` lets the search finish.
 - **Scaling.** Losses and payouts are divided by the largest loss of a draw (1
   if that is at most 1e-6) before solving; results are in payout units.
 - **Solver settings.** HiGHS's simplex for the LPs (a vertex solution). HiGHS's
