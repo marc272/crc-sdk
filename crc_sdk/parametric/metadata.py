@@ -2909,16 +2909,21 @@ def _design(
     return f"Design {name}: {'; '.join(parts)}."
 
 
-_REFINE_METHODS = {"compass_search": "a compass search"}
+_REFINE_METHODS = {
+    "compass_search": "by a compass search",
+    "index_values": "over the sample's index values",
+}
 """How the setup text names a refinement's method."""
 
 
 def _refinement(refinement: Mapping[str, Any], where: str) -> str:
     """A design's refinement after its grid, in words.
 
-    It names the method and its settings, the grid's best point it started
-    from, where it ended, the gain, the points it evaluated and, if it
-    stopped at its cap, that it did.
+    It names the method, the grid's best point it started from, where it
+    ended, the gain, the points it evaluated and its settings: for a compass
+    search its smallest step, for a search over the index values the window
+    of each threshold and the passes; and, if it stopped at its cap, that it
+    did.
     """
 
     def point(key: str) -> str:
@@ -2928,10 +2933,18 @@ def _refinement(refinement: Mapping[str, Any], where: str) -> str:
             for name, value in values.items()
         )
 
+    def window(name: str, ends: Any) -> str:
+        at = f"{where}.windows.{name}"
+        if isinstance(ends, (str, bytes)) or not isinstance(ends, Sequence):
+            raise EvaluationError(f"{at} must be [lower, upper], got {ends!r}")
+        if len(ends) != 2:
+            raise EvaluationError(f"{at} must be [lower, upper], got {ends!r}")
+        return f"{name} from {_number(ends[0], at)} to {_number(ends[1], at)}"
+
     method = _get(refinement, "method", str, where)
-    named = _REFINE_METHODS.get(str(method), f"the method {method}")
+    named = _REFINE_METHODS.get(str(method), f"by the method {method}")
     start = _number(refinement.get("start_objective"), f"{where}.start_objective")
-    text = f"refined by {named} from the grid's best point ({point('start')}, "
+    text = f"refined {named} from the grid's best point ({point('start')}, "
     text += f"objective {start})"
     moves = _get(refinement, "moves", int, where)
     if moves:
@@ -2941,12 +2954,23 @@ def _refinement(refinement: Mapping[str, Any], where: str) -> str:
     else:
         text += ", not moved"
     points = _get(refinement, "points", int, where)
-    tolerance = _number(refinement.get("tolerance"), f"{where}.tolerance")
     most = _number(refinement.get("max_points"), f"{where}.max_points")
-    text += (
-        f", after {points} points (smallest step {tolerance} of each "
-        f"parameter's bounds, at most {most} points"
-    )
+    if method == "index_values":
+        passes = _get(refinement, "passes", int, where)
+        windows = _get(refinement, "windows", Mapping, where) or {}
+        between = ", ".join(window(name, ends) for name, ends in windows.items())
+        text += (
+            f", after {points} points in {passes} "
+            f"{'pass' if passes == 1 else 'passes'} (each threshold over the "
+            f"index values between its grid neighbours: {between}; at most "
+            f"{most} points"
+        )
+    else:
+        tolerance = _number(refinement.get("tolerance"), f"{where}.tolerance")
+        text += (
+            f", after {points} points (smallest step {tolerance} of each "
+            f"parameter's bounds, at most {most} points"
+        )
     if _get(refinement, "stopped", str, where) == "max_points":
         text += "; it stopped at that cap"
     return text + ")"
@@ -4032,7 +4056,9 @@ def setup_text(
     - `Design`, one line per design: the objective, pricing, budget and
       limit, the design premium, the route, a refinement after the grid (its
       method and settings, the grid's best point it started from, where it
-      ended, the gain and the points it evaluated), the non-uniqueness report
+      ended, the gain and the points it evaluated, and for a search over the
+      index values each threshold's window and the passes), the
+      non-uniqueness report
       (`unique`, `ties`, amounts no design year reaches) and a degenerate
       tail; for a joint design also its scope and which assets it covers,
       and for a design on a sample of several hazards the loss it read.
