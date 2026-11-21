@@ -55,6 +55,7 @@ from crc_sdk.parametric import (
     OutcomeSample,
     ParametricPlan,
     SampleError,
+    ScenarioError,
     ScenarioSet,
     StationColumn,
     StepGrid,
@@ -1374,3 +1375,72 @@ def test_a_holdout_of_curve_draws_under_a_stated_dependence(
     copula = _designed(_curve_plan(datasets).dependence(GaussianCopula(0.3)))
     with pytest.raises(LeakageError):
         copula.split(Holdout(0.5)).write_parquet(tmp_path / "b.parquet")
+
+
+class _SourcePlan:
+    """A stand-in for a crc-sdk source plan: annual_extremes() and explain()."""
+
+    def __init__(self, table: Any, recipe: str, unit: str) -> None:
+        self.table, self.recipe, self.unit = table, recipe, unit
+
+    def annual_extremes(self) -> Any:
+        return self.table
+
+    def explain(self, *, format: str = "text") -> Any:
+        return {"recipe": self.recipe, "unit": self.unit}
+
+
+def test_a_component_read_from_a_source_plan_names_its_hazard() -> None:
+    source = _SourcePlan(WEATHER, "txx", "degC")
+    plan = (
+        _annual_plan(hazard_name="rx1day")
+        .hazard("rx1day", tail="upper")
+        .hazard(
+            "txx",
+            source,
+            impact=HEAT,
+            unit="degC",
+            tail="upper",
+            provenance=_provenance(),
+            hazard_column="txx",
+            hazard_name="txx",
+        )
+        .combine(CompoundDamage())
+        .basis_risk(NOISE)
+    )
+    sample = plan.samples()["warehouse-a"]
+    components = sample.provenance.to_document()["components"]
+    assert components["txx"]["hazard"] == {"name": "txx", "from": "source_plan"}
+    assert components["rx1day"]["hazard"] == {"name": "rx1day", "from": "stated"}
+    # A stated name the source plan contradicts raises before anything is read.
+    wrong = (
+        _annual_plan()
+        .hazard("rx1day", tail="upper")
+        .hazard(
+            "txx",
+            source,
+            impact=HEAT,
+            unit="degC",
+            tail="upper",
+            provenance=_provenance(),
+            hazard_name="tasmax",
+        )
+        .combine(CompoundDamage())
+        .basis_risk(NOISE)
+        .covers(_rain())
+        .split(Holdout(0.7))
+        .scenarios(ScenarioSet(reference="baseline"))
+    )
+    with pytest.raises(ScenarioError, match="component 'txx'"):
+        wrong.explain()
+    # A unit the source plan contradicts raises when it is read.
+    other = _SourcePlan(WEATHER, "txx", "K")
+    mismatched = dataclasses.replace(
+        plan,
+        hazard_list=tuple(
+            dataclasses.replace(each, source=other) if each.source is not None else each
+            for each in plan.hazard_list
+        ),
+    )
+    with pytest.raises(SampleError, match="'K'"):
+        mismatched.samples()

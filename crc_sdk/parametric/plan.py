@@ -3400,12 +3400,15 @@ class ParametricPlan:
             self._check_annual_units(entry)
 
     def _check_hazard_name(self) -> None:
-        """Raise `ScenarioError` for a stated hazard name a source plan contradicts."""
-        stated = self.hazard_name
-        if stated is None or self._on_curves:
+        """Raise `ScenarioError` for a stated hazard name a source plan contradicts.
+
+        The plan's own, and each per-year component's.
+        """
+        if self._on_curves:
             return
+        stated = self.hazard_name
         sources = self._pool_sources() if self.pool is not None else (self.source,)
-        for source in sources:
+        for source in sources if stated is not None else ():
             named = _source_hazard(source)
             if named is not None and named != stated:
                 raise ScenarioError(
