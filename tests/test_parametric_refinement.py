@@ -996,8 +996,10 @@ def test_several_thresholds_are_refined_in_passes_until_none_moves() -> None:
     assert refined.objective_value < plain.objective_value
     names = ["breakpoints[0]", "breakpoints[1]"]
     end = [refined.parameters[name] for name in names]
-    # No single threshold improves on the end within its window: every index
-    # value there, and the window's ends, give an objective at least as high.
+    # No single threshold improves on the end within its window by more than
+    # the tie tolerance: every index value there, and the window's ends, give
+    # an objective at least as high, to that tolerance (scaled units).
+    best = _scaled(refined, refined.objective_value)
     for i, name in enumerate(names):
         low, high = record["windows"][name]
         assert low <= end[i] <= high
@@ -1010,9 +1012,8 @@ def test_several_thresholds_are_refined_in_passes_until_none_moves() -> None:
                 continue
             fixed = Cover(INDEX, StepPayout(point, [Free(), Free()]), payout_unit="EUR")
             other = design(fixed, sample, MSE())
-            assert _scaled(other, other.objective_value) >= _scaled(
-                refined, refined.objective_value
-            ) * (1.0 - 1e-9), (name, value)
+            gap = _scaled(other, other.objective_value) - best
+            assert gap >= -1e-7 * max(1.0, best), (name, value)
 
 
 def test_the_point_cap_stops_the_index_value_search() -> None:
@@ -1088,12 +1089,16 @@ def test_the_amounts_report_is_that_of_the_refined_thresholds() -> None:
 def test_the_setup_text_states_the_index_value_search() -> None:
     sample = _sample(STEP_INDEX, STEP_LOSS)
     line = _design_line(design(_step(), sample, MSE(), options=REFINE), sample)
+    # At the optimum the MSE is 0 to rounding, which differs by platform.
     assert (
         "route: grid; refined over the sample's index values from the grid's best "
         "point (breakpoints[0] 5, objective 250) to breakpoints[0] 4.31, "
-        "objective 0, a gain of 250, after 8 points in 2 passes (each threshold "
-        "over the index values between its grid neighbours: breakpoints[0] from "
-        "0 to 8; at most 1,000 points); unique optimum: yes; ties: 0." in line
+        "objective " in line
+    )
+    assert (
+        ", a gain of 250, after 8 points in 2 passes (each threshold over the "
+        "index values between its grid neighbours: breakpoints[0] from 0 to 8; "
+        "at most 1,000 points); unique optimum: yes; ties: 0." in line
     )
 
 
