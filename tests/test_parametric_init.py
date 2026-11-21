@@ -8,6 +8,7 @@ import sys
 import crc_sdk.parametric as parametric
 
 PUBLIC = [
+    "AnnualScenario",
     "AnnualSeries",
     "AsRecorded",
     "AtAsset",
@@ -27,6 +28,7 @@ PUBLIC = [
     "Cover",
     "CoverDefinitionError",
     "CoverPackage",
+    "CurveScenario",
     "DependenceModel",
     "DesignError",
     "DesignOptions",
