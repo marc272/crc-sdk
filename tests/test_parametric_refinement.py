@@ -692,7 +692,9 @@ def test_the_setup_text_states_the_refinement() -> None:
 def test_the_setup_text_says_when_the_search_did_not_move_or_hit_its_cap() -> None:
     template = _linear(Free(0.0, 10.0, grid=[0.0, ATTACHMENT, 7.5]))
     line = _design_line(design(template, SAMPLE, MSE(), options=REFINE))
-    assert "(attachment 3.7, objective 0), not moved, after " in line
+    # At the optimum the objective is 0 to rounding, which differs by platform.
+    assert "from the grid's best point (attachment 3.7, objective " in line
+    assert "), not moved, after " in line and "a gain of" not in line
     capped = design(
         _linear(),
         SAMPLE,

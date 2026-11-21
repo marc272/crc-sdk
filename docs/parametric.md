@@ -2760,10 +2760,15 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
   years' index values, an interval that no step lands on is not seen.
   Under MSE the gains shrink with the square of the distance to a smooth
   optimum, so the search stops at the tie tolerance before its steps reach
-  their smallest. On a synthetic linear cover whose loss attaches at 3.7, on
-  a grid of 0, 2.5, 5 and 7.5 within bounds of 0 and 10, the default
-  settings found the attachment within 5e-5 under E[U] and the weighted
-  CVaR, and within 1.2e-3 under MSE, after 23 points each.
+  their smallest. One synthetic illustration, on the design sample itself:
+  200 years whose loss is a linear payout of a uniform index on [0, 10],
+  attached at 3.7, exhausted at 8 and paying up to 100; a `LinearPayout`
+  with its exhaustion fixed at 8, a free amount and a free attachment on
+  the grid 0, 2.5, 5 and 7.5 within bounds of 0 and 10; a pure premium, with
+  a budget of 1 × E[L] under E[U] and the weighted CVaR (α 0.5, β 0.9) and
+  none under MSE. The grid's best attachment is 2.5 under all three, and the
+  default settings refined it to within 5e-5 of 3.7 under E[U] and the
+  weighted CVaR, and within 1.2e-3 under MSE, after 23 points each.
 
   ```python
   refinable = Cover(index, LinearPayout(Free(40.0, 120.0, grid=5), 150.0, Free()),
