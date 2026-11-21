@@ -32,6 +32,7 @@ from crc_sdk.parametric import (
     Cover,
     CoverPackage,
     CurveScenario,
+    EmpiricalCopula,
     EvaluationError,
     ExpectedUncovered,
     Free,
@@ -78,6 +79,8 @@ from crc_sdk.workflows import (
 )
 
 UNTYPED_PLAN: Any = ParametricPlan
+UNTYPED_COMPARE: Any = compare
+UNTYPED_CURVE_SCENARIO: Any = CurveScenario
 RAIN = PiecewiseLinearImpact([40.0, 120.0], [0.0, 0.5])
 HEAT = PiecewiseLinearImpact([32.0, 42.0], [0.0, 0.3])
 RAIN_INDEX = IndexDefinition("rx1day", "mm/day", aggregation="annual_maximum")
@@ -406,7 +409,7 @@ def test_per_year_hazards_give_the_function_routes_rows(tmp_path: Path) -> None:
         train, test = holdout(by_hand, 0.7)
         entries = _entries_by_hand(train, asset_id)
         for split, block in (("in_sample", train), ("out_of_sample", test)):
-            table = compare(
+            table = UNTYPED_COMPARE(
                 entries,
                 block,
                 split=split,
@@ -706,7 +709,7 @@ def test_curve_hazards_give_the_function_routes_rows(
             ("in_sample", drawn[asset_id]),
             ("out_of_sample", fresh[asset_id]),
         ):
-            table = compare(
+            table = UNTYPED_COMPARE(
                 entries,
                 block,
                 split=split,
@@ -1177,6 +1180,155 @@ def test_scenario_descriptions_check_their_mappings(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="two or more"):
         CurveScenario("x", {"rx1day": path})
     with pytest.raises(TypeError, match="HazardDataset"):
-        CurveScenario("x", {"rx1day": path, "txx": 3})
+        UNTYPED_CURVE_SCENARIO("x", {"rx1day": path, "txx": 3})
     stated = CurveScenario("x", {"rx1day": path, "txx": path})
     assert "rx1day.parquet" in repr(stated)
+
+
+def test_an_empirical_copula_across_the_hazards(datasets: dict[str, Path]) -> None:
+    # The reference: per-year rows of the same two components, without impacts.
+    reference = sample_annual_hazards(
+        {
+            "rx1day": _series("warehouse-a", "rx1day", "mm/day"),
+            "txx": _series("warehouse-a", "txx", "degC"),
+        },
+        tails={"rx1day": "upper", "txx": "upper"},
+        loss_models={"rx1day": _loss(RAIN, "warehouse-a")},
+        basis_risk=NOISE,
+        asset_id="warehouse-a",
+        rng=np.random.default_rng(1),
+    )
+    model = EmpiricalCopula(reference)
+    years = len(YEARS)
+    plan = (
+        UNTYPED_PLAN.for_evaluation(
+            _request(datasets["rx1day"], "rx1day", RAIN),
+            value_column="value_eur",
+            value_unit="EUR",
+        )
+        .monte_carlo(4 * years, seed=42)
+        .hazard("txx", _request(datasets["txx"], "txx", HEAT))
+        .combine(CappedSum(1.0))
+        .dependence(model)
+        .basis_risk(NOISE)
+    )
+    drawn = _drawn_by_hand(datasets, 42, 4 * years, model)
+    for asset_id, sample in plan.samples().items():
+        assert sample.content_hash == drawn[asset_id].content_hash
+    assert plan.explain(format="json")["hazard_dependence"]["kind"] == (
+        "empirical_copula"
+    )
+    # A draw count the reference's years don't divide, and a split by rows.
+    with pytest.raises(SampleError, match="multiple"):
+        dataclass_replace(
+            plan, draws=dataclasses.replace(plan.draws, n_draws=101)
+        ).explain()
+    with pytest.raises(SampleError, match="EmpiricalCopula"):
+        plan.split(Holdout(0.5))
+
+
+def test_curve_explain_lists_the_components(datasets: dict[str, Path]) -> None:
+    plan = _designed(_curve_plan(datasets).dependence(GaussianCopula(0.3)))
+    document = plan.explain(format="json")
+    assert [entry["name"] for entry in document["hazards"]] == ["rx1day", "txx"]
+    assert document["hazards"][1]["path"] == str(datasets["txx"])
+    assert document["hazards"][1]["hazard_names"] == ["txx"]
+    assert document["hazard_dependence"] == {
+        "correlation": 0.3,
+        "kind": "gaussian_copula",
+    }
+    assert [source["component"] for source in document["sources"]] == [
+        "rx1day",
+        "txx",
+    ]
+    assert document["licences"] is None
+    (sample, _) = document["setup"]["samples"]
+    assert [entry["unit"] for entry in sample["components"]] == [None, None]
+    assert "a child it spawns" in document["rng"]["generators"]
+    text = setup_text(document)
+    assert "rx1day (in a unit not known yet" in text
+    assert "GaussianCopula, a stated assumption: correlation 0.3" in text
+
+
+def test_a_component_reads_the_plans_scenarios(tmp_path: Path) -> None:
+    horizons = (2030, 2050)
+    datasets = {
+        "rx1day": _curves(tmp_path / "rx1day.parquet", "rx1day", horizons),
+        "txx": _curves(tmp_path / "txx.parquet", "txx", horizons),
+    }
+    select = {"horizons": list(horizons), "pathways": ["ssp585"]}
+    plan = (
+        UNTYPED_PLAN.for_evaluation(
+            _request(datasets["rx1day"], "rx1day", RAIN, **select),
+            value_column="value_eur",
+            value_unit="EUR",
+        )
+        .monte_carlo(400, seed=42)
+        .combine(CappedSum(1.0))
+        .dependence(Independent())
+        .basis_risk(NOISE)
+        .covers(_rain().with_values({"levels[0]": 1e5}))
+        .split(FreshDraws(400, seed=8))
+        .scenarios(ScenarioSet(reference="ssp585_2030"))
+    )
+    other = plan.hazard("txx", _request(datasets["txx"], "txx", HEAT, horizons=[2030]))
+    with pytest.raises(ValueError, match="select the plan's, or none"):
+        other.explain()
+    unnamed = plan.hazard(
+        "txx", _request(datasets["txx"], "txx", HEAT, hazard_names=None)
+    )
+    with pytest.raises(ValueError, match="exactly one hazard"):
+        unnamed.explain()
+    # Without scenarios, a component reads one horizon.
+    several = (
+        _curve_plan(datasets, **select).dependence(Independent()).basis_risk(NOISE)
+    )
+    with pytest.raises(ValueError, match="component 'txx'"):
+        several.explain()
+
+
+def test_curve_scenario_rows_are_compare_scenarios(tmp_path: Path) -> None:
+    horizons = (2030, 2050)
+    datasets = {
+        "rx1day": _curves(tmp_path / "rx1day.parquet", "rx1day", horizons),
+        "txx": _curves(tmp_path / "txx.parquet", "txx", horizons),
+    }
+    select = {"horizons": list(horizons), "pathways": ["ssp585"]}
+    plan = _designed(
+        _curve_plan(datasets, **select).dependence(GaussianCopula(0.3))
+    ).split(FreshDraws(400, seed=8))
+    plan = plan.scenarios(ScenarioSet(reference="ssp585_2030"), design_on="reference")
+    result = plan.write_parquet(tmp_path / "out.parquet")
+    labels = ("ssp585_2030", "ssp585_2050")
+    designs = {
+        label: _drawn_by_hand(
+            datasets, 42, 400, GaussianCopula(0.3), (year,), scenario=label
+        )
+        for label, year in zip(labels, horizons, strict=True)
+    }
+    fresh = {
+        label: _drawn_by_hand(
+            datasets, 8, 400, GaussianCopula(0.3), (year,), scenario=label
+        )
+        for label, year in zip(labels, horizons, strict=True)
+    }
+    for asset_id in POINTS:
+        reference = designs["ssp585_2030"][asset_id]
+        table = compare_scenarios(
+            _entries_by_hand(reference, asset_id),
+            ScenarioSet(
+                [fresh[label][asset_id] for label in labels], reference="ssp585_2030"
+            ),
+            design_sample=reference,
+            options=OPTIONS,
+        )
+        assert _rows_of(result.table, asset_id=asset_id) == table.to_pylist()
+    shared = result.metadata.model_dump(mode="json")["setup"]["scenarios"][
+        "shared_draws"
+    ]
+    assert sorted(shared["rng"]) == [
+        "component 'rx1day' of asset 'depot-b'",
+        "component 'rx1day' of asset 'warehouse-a'",
+        "component 'txx' of asset 'depot-b'",
+        "component 'txx' of asset 'warehouse-a'",
+    ]

@@ -1631,10 +1631,12 @@ class ParametricPlan:
     Start one with `ParametricPlan.for_evaluation(request)` (fitted curves)
     or `ParametricPlan.for_annual_extremes(...)` (per-year values); the
     builders (`monte_carlo`, `index`, `basis_risk`, `covers`, `objective`,
-    `pricing`, `split`, `metrics`, `scopes`, `dependence`, `allocation`) return
-    new plans, and neither they nor `explain()` do any I/O. The execution
-    points `samples()`, `joint_sample()`, `designs()` and `write_parquet(path)`
-    read the source and the assets. The module docstring describes both routes.
+    `pricing`, `split`, `metrics`, `scopes`, `dependence`, `allocation`,
+    `scenarios`, `hazard`, `combine`, `package`) return new plans, and neither
+    they nor `explain()` do any I/O. The execution points `samples()`,
+    `joint_sample()`, `scenario_samples()`, `designs()`, `payout_breakdown()`
+    and `write_parquet(path)` read the source and the assets. The module
+    docstring describes both routes.
 
     `entry` names the entry point. On the curve route `source` is the
     request, `unit` and `provenance` are `None` (the dataset's metadata
@@ -2098,7 +2100,10 @@ class ParametricPlan:
         that the index is read at (`AtStation` or `AtPoint`, the kind that
         `.index`'s `location` resolves to), which is checked at execution.
         Under `Joint()` a cover must be written for no asset, as it applies to
-        every asset. Replaces any covers set before.
+        every asset. With `.hazard(...)`, a cover may pay on a `CompositeIndex`,
+        and each cover's index is checked against the components it reads, by
+        name, unit and tail, at `explain()` and at every execution point, so
+        only its payout unit is checked here. Replaces any covers set before.
 
         Raises `TypeError` for a non-cover, `SampleError` for a cover in
         other units or on an index read elsewhere, and `ValueError` for no
@@ -6583,7 +6588,9 @@ class ParametricPlan:
         `cell=H3Cell(...)`, whose cells are computed before the source is
         read. With `.scenarios(...)`, these are the reference's samples, after
         the set's refusals (`ScenarioError`), and `.scenario_samples()` holds
-        every scenario's.
+        every scenario's. With `.hazard(...)`, each is the asset's sample of
+        several hazards, as `sample_annual_hazards` or `sample_curve_hazards`
+        builds it, its loss the combined loss.
         """
         if self.scenario_set is not None:
             reference = self.scenario_set.reference
@@ -6652,7 +6659,10 @@ class ParametricPlan:
         the plan also holds `Individual()`. With `.scenarios(...)`, they are in
         scenario, asset, fold, cover and objective order (scenario, fold, cover
         and objective under `Joint()`), on every scenario's design blocks under
-        `design_on="each"` and on the reference's under `"reference"`. Raises
+        `design_on="each"` and on the reference's under `"reference"`. With
+        `.package(...)`, a package's contracts are designed where the package
+        sits, its first contract's place, under each objective in turn and in
+        component order. Raises
         `ValueError` without covers, an objective or a basis-risk model, the
         design errors of `design` and `design_joint`, and
         `SolverUnavailableError` without `crc-sdk[parametric]` on the LP and QP
@@ -6748,6 +6758,15 @@ class ParametricPlan:
         source names its `scenario`. The result's `samples` are the
         reference's, and `scenario_samples` and `scenario_fresh_samples` hold
         every scenario's.
+
+        With `.hazard(...)`, every row is on the combined loss of its block: a
+        cover on a `CompositeIndex` designed on the combined loss, a cover on one
+        index on its own hazard's loss, and a package as one `"package"` row
+        beside its contracts' `"asset"` rows, as `compare` gives them, with the
+        `components` and `design_budget` columns. `source_records` holds each
+        component's record once, with the components that read it under
+        `components`, and each hazard source, a component's view's included,
+        names its record by its checksum.
 
         Returns a `ParametricResult`, with the fresh draws in
         `fresh_samples` when the split is `FreshDraws`, and the allocated rows

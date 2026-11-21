@@ -79,6 +79,7 @@ from crc_sdk.parametric.index import (
     AtPoint,
     AtStation,
     CompositeIndex,
+    _component_name,
 )
 from crc_sdk.parametric.intervals import (
     _apply_premiums,
@@ -1188,7 +1189,6 @@ class AnnualScenario:
 
     def _check_components(self) -> None:
         """Check a scenario of several hazards: one source and its fields each."""
-        from crc_sdk.parametric.index import _component_name
         from crc_sdk.parametric.plan import ModelPool
 
         label = _checked_text("a scenario's label", self.label)
@@ -1441,8 +1441,6 @@ class CurveScenario:
         label = _checked_text("a scenario's label", label)
         held: HazardDataset | Mapping[str, HazardDataset]
         if isinstance(dataset, Mapping):
-            from crc_sdk.parametric.index import _component_name
-
             datasets = {
                 _component_name(name, ValueError): _local_dataset(each)
                 for name, each in dataset.items()
