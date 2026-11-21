@@ -237,14 +237,21 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
   .split(FreshDraws(n_draws, seed=...) | Holdout(train_fraction) | KFold(k))
   .metrics(MetricOptions(...))                # optional
   .scopes(Individual() | Joint())             # optional; default Individual()
-  .dependence(Independent() | Comonotonic() | EmpiricalCopula(reference))
+  .dependence(Independent() | Comonotonic() | EmpiricalCopula(reference)
+              | GaussianCopula(correlation) | a DependenceModel of yours)
                                               # fitted curves; required with Joint()
+                                              # and with .hazard(...)
   .allocation("value" | "loss")               # optional: allocated rows, own file
   .scenarios(ScenarioSet(...), *, design_on="each", premiums=None)
                                               # optional: several scenarios
+  .hazard(name, source=None, *, impact=None, unit=None, tail=None, ...)
+                                              # optional: another hazard per asset
+  .combine(rule)                              # with two impacts or more: required
+  .package(covers, *, label, shares=None)     # optional: separate contracts, one row
   .explain(format="text")                     # no I/O
   .samples() / .joint_sample() / .designs() / .write_parquet(path)   # execution
   .scenario_samples()                         # execution, with .scenarios(...)
+  .payout_breakdown()                         # execution: each payout in its parts
 ```
 
 ### Fitted curves
@@ -299,9 +306,10 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
 | `.split(rule)` | `FreshDraws(n_draws, seed=...)` (fitted curves), `Holdout(train_fraction)` or `KFold(k)`, below |
 | `.metrics(options)` | The `MetricOptions` of every row |
 | `.scopes(*scopes)` | `Individual()`, the default, designs each asset on its own; `Joint()` designs each template on the owner's total ([joint design](#joint-design-over-several-assets)) |
-| `.dependence(model)` | Fitted curves only, and required there with `Joint()`: how the assets' draws are put side by side (`Independent()`, `Comonotonic()` or `EmpiricalCopula(reference)`). A plan on per-year values raises: its dependence is the data's own |
+| `.dependence(model)` | Fitted curves only, and required there with `Joint()` and with `.hazard(...)`: how the assets', or the hazards', draws are put side by side (`Independent()`, `Comonotonic()`, `EmpiricalCopula(reference)`, `GaussianCopula(correlation)` or a `DependenceModel` of your own). A plan on per-year values raises: its dependence is the data's own |
 | `.allocation(rule)` | With `Joint()`: adds a joint design's allocated rows, under `"value"` or `"loss"`, in a table and a file of their own ([allocated rows](#allocated-rows-in-a-table-of-their-own)) |
 | `.scenarios(set, *, design_on, premiums)` | Several scenarios, such as windows of horizons, each cover and design evaluated on every scenario's block, out of sample ([scenarios on the plan](#scenarios-on-the-plan)) |
+| `.hazard(name, source, ...)`, `.combine(rule)`, `.package(covers, *, label, shares)` | Several hazards at each asset, the rule of their combined loss, and separate contracts as one row ([several hazards on the plan](#several-hazards-on-the-plan)) |
 
 A designed cover keeps the template's label (or the first 12 hex digits of its
 hash) followed by the objective, for example `"step (mse)"`; its hash and
@@ -384,6 +392,7 @@ semantics the caller states and the fresh draws; the dataset's own metadata
 | `.joint_sample()` | With `Joint()` only: the `OutcomeSample` of all the assets, all draws or years |
 | `.designs()` | Every `DesignResult`, in asset, fold, cover and objective order; with `Joint()`, every `JointDesignResult`, in fold, cover and objective order; with `.scenarios(...)`, by scenario first |
 | `.scenario_samples()` | With `.scenarios(...)` only: every scenario's samples, by label and then by asset |
+| `.payout_breakdown()` | Each entry's expected payout in its parts, on every block, as `payout_breakdown` gives it; nothing is written. Not with `Joint()` or `.scenarios(...)` |
 | `.write_parquet(path)` | A `ParametricResult`: `output`, `table`, `metadata`, `samples`, `designs`, `fresh_samples`, `joint_sample`, `fresh_joint_sample`, `allocated`, `allocated_output`, `scenario_samples`, `scenario_fresh_samples` and `row_count` |
 
 `write_parquet` writes the rows of every asset, split and fold to one local
@@ -1054,6 +1063,37 @@ several years in `horizon` make a window of that pathway. A dataset with no curv
 of the plan's hazard raises `ScenarioError`, naming the hazards it holds. A
 dataset of another product needs `mixed_products=True`, the reference included,
 and the setup text then says that the difference includes the products.
+
+### Several hazards in scenarios
+
+On a plan with `.hazard(...)` ([several hazards on the
+plan](#several-hazards-on-the-plan)) every scenario reads every component, so a
+row is one draw or year of every hazard in each scenario:
+
+- **On fitted curves**, each selected (pathway, horizon), or window, is read
+  from every component's own dataset: the plan's request and each component's
+  request, which selects exactly one hazard in `hazard_names` and either the
+  plan's horizons and pathways or none, so that `explain()` names each
+  component's hazard without reading anything. A `CurveScenario`'s `dataset`
+  maps each component to its own dataset; its `pathway` and `horizon` are one for
+  every component, and every component's dataset must hold them. Each
+  component's generators are rebuilt per scenario, so the curve scenarios share
+  one set of uniforms per component.
+- **On per-year values**, an `AnnualScenario`'s `source` maps each component to
+  its own source, and so do the fields that describe one source: `provenance`,
+  for every component, and `unit`, `location`, `year_column`, `hazard_column` and
+  `hazard_name`, each naming some of them. A component a mapping leaves out takes
+  its value on the plan, and its `hazard_name` none. `years`, `missing`, `trend`
+  and `pathway` are one for every component, and a pool is refused.
+- **What a set compares** on samples of several hazards, as `ScenarioSet` does on
+  built ones: the components in order, each one's unit, tail, hazard name and
+  loss model, and the rule; on curves also the dependence between the hazards
+  and each component's shared draws. A scenario's `product` joins its
+  components' providers with `+`, and its `hazard` is each component's.
+- **Packages** are built from the contracts designed on each design block, as
+  designs are under `design_on`. `premiums=` names a package's resolved
+  contracts by their `cover_label`, all of them or none, and the package row
+  takes their sum.
 
 ### What is designed, priced and evaluated
 
@@ -3167,8 +3207,9 @@ per year under a rule you state. A cover can pay on several components through a
 `StepGrid` or a family of your own), or on one of them; and separate contracts,
 one per hazard, can be read as one row, a `CoverPackage`. Every piece is a
 function or a type you can combine with the others, and none of them says which
-cover, payout family, rule or dependence suits an asset. These are functions: a
-plan reads one hazard per asset.
+cover, payout family, rule or dependence suits an asset. The plan composes the
+same functions ([on the plan](#several-hazards-on-the-plan)), and its rows are
+theirs.
 
 Here one asset's covers on rain and heat, on 40 years of a synthetic table:
 one contract on both hazards, a two-dimensional step table, beside two separate
@@ -3643,6 +3684,155 @@ year, and `write_comparison` writes the table with its metadata.
 | A family of your own with `breakdown(index)`, a mapping of `(n,)` arrays that add up to its payout | its keys | `"user"` |
 | A family of your own without one | `whole` | `"whole"` |
 
+### Several hazards on the plan
+
+`.hazard(...)` adds a hazard read at each asset, so a plan runs the analysis
+above as it runs one on a single hazard: one sample of several hazards per
+asset, built by `sample_annual_hazards` or `sample_curve_hazards`, the covers
+designed on it, and one comparison. Here the example above on the plan, with the
+asset's station and value in an asset table:
+
+```python
+from crc_sdk.parametric import StationColumn
+
+station_assets = pa.table({
+    "asset_id": ["warehouse-a"], "longitude": [6.96], "latitude": [50.94],
+    "station": ["ST-1"], "value_eur": [2e6],
+})
+hazard_plan = (
+    ParametricPlan.for_annual_extremes(
+        weather, station_assets,
+        impact=PiecewiseLinearImpact([40.0, 120.0], [0.0, 0.5]), unit="mm/day",
+        provenance=synthetic, value_column="value_eur", value_unit="EUR",
+        location=StationColumn("station"), hazard_column="rx1day", seed=42,
+        hazard_name="rx1day",                   # a plain table names no hazard
+    )
+    .hazard("rx1day", tail="upper")             # names the plan's own hazard: first
+    .hazard("txx", weather, unit="degC", tail="upper", provenance=synthetic,
+            impact=PiecewiseLinearImpact([32.0, 42.0], [0.0, 0.3]),  # illustrative
+            hazard_column="txx", hazard_name="txx")
+    .combine(CompoundDamage())                  # required: no rule is assumed
+    .basis_risk(ImpactNoise(0.3, upper=1.0))
+    .covers(grid, rain_step, heat_step)
+    .package({"rx1day": "rain", "txx": "heat"}, label="separate",
+             shares="own_loss")                 # required with a budget: no default
+    .objective(ExpectedUncovered(), budget=Budget(ratio=0.8))
+    .split(Holdout(0.7))
+    .metrics(MetricOptions(betas=(0.9,), return_periods=(10,)))
+)
+print(setup_text(hazard_plan.explain(format="json")))   # no I/O
+hazard_result = hazard_plan.write_parquet("hazards.parquet")
+hazard_parts = hazard_plan.payout_breakdown()           # each payout in its parts
+```
+
+`hazard_result.table` holds, for each split, the rows of the comparison above:
+`grid (expected_uncovered)`, designed on the combined loss; `rain
+(expected_uncovered)` and `heat (expected_uncovered)`, each designed on its own
+hazard's loss under its share of the budget; `separate (expected_uncovered)`, the
+`"package"` row of the two; all on one block and against the combined loss.
+The plan's generator is a child of `SeedSequence(42)`, so its numbers are not
+those of the function example, which drew from `default_rng(42)`. Each row is a
+measurement of this synthetic setup, and nothing in the table says which cover
+form does better.
+
+```text
+.hazard(name, source=None, *, impact=None, unit=None, tail=None, provenance=None,
+        location=None, year_column=None, hazard_column=None, hazard_name=None)
+.combine(rule)                                 # CappedSum(cap), CompoundDamage(), a CombineRule
+.package(covers, *, label, shares=None)        # covers: component -> cover_label
+.payout_breakdown() -> pyarrow.Table           # execution
+```
+
+- **The components.** `name` names a component, without `.`, `+`, `[` or `]`,
+  and is not taken for a hazard name. A cover on one index reads the component
+  named its `hazard_name`, and a cover on a `CompositeIndex` the components of its
+  names, whose units and tails are checked against theirs by `explain()` and at
+  every execution point; state `.hazard(...)` before `.covers(...)`.
+- **On per-year values**, `.hazard(name, tail=...)` without a `source` names the
+  plan's own hazard, which is the first component whatever the order of the
+  calls, and states its tail; a plan with another component needs it. With a
+  `source`, which takes what `for_annual_extremes` takes (not a pool's runs),
+  `unit`, `tail` and `provenance` are required. `impact` is the component's
+  impact on the plan's value, `value_unit` and context, so the loss models have
+  one value; without one the component is an index only, with no loss of its own.
+  `location` defaults to the plan's, and `year_column` and `hazard_column` to
+  `"year"` and `"value"`; `hazard_name` states the hazard it reads, as
+  `for_annual_extremes(hazard_name=)` does for the plan's own. The plan's
+  `years=`, `missing=` and `trend=` apply to every series, and one basis-risk
+  model draws for every component from the asset's generator, in component
+  order.
+- **On fitted curves**, `source` is a second `PortfolioEvaluation` for the plan's
+  assets, built as the plan's request is, that selects one hazard (and one
+  horizon and pathway, or the plan's under `.scenarios(...)`); its `.impact(...)`,
+  if any, is the component's impact. The plan's own request is the first
+  component, named by the one hazard it selects in `hazard_names`, and each
+  component's unit and tail are its dataset's. `.dependence(model)` is required,
+  with no default, because fitted curves say nothing about how two hazards move
+  together ([dependence across hazards](#dependence-across-hazards)). The
+  asset's child generator draws the first component, so it draws what the plan
+  with one hazard draws, and each other component draws from a child it spawns,
+  in component order; fresh draws are spawned from `FreshDraws.seed` alike.
+- **What is designed on what.** A template on a `CompositeIndex` is designed on
+  the combined loss, and a template on one index on its own hazard's loss,
+  `sample.component(name)`. A template on a component with no impact has no own
+  loss, so the plan raises, naming the function route,
+  `design(template, sample.component(name, loss="combined"))`.
+- **Packages.** `.package(covers, label=...)` maps each component to the
+  `cover_label` of a cover on one index in `.covers(...)`: two or more, all
+  templates or all resolved, each cover in one package at most. Its rows are
+  `CoverPackage`'s, where its first contract sits in `.covers(...)`, and its
+  contracts aren't compared again on their own. A package of templates is built
+  on each design block from the contracts designed there, one package per
+  objective, labelled `label` followed by the objective.
+- **The budget of a package.** With a budget on `.objective(...)`, the budget is
+  that of one contract on every hazard, and `shares` is required for a package
+  of templates: each contract takes `split_budget(budget, block,
+  shares=shares)[component]` on each design block, so the bounds sum to the one
+  bound. `shares="own_loss"` splits it by the components' expected own losses,
+  and a mapping by component states the shares, naming every contract and
+  summing to 1. How to split a budget between hazards is an assumption, so there
+  is no default. A template in no package takes the budget as stated, which on
+  its own hazard's loss is a share of that loss. Without a budget, or for a
+  package of resolved covers, `shares` raises.
+- **Refused.** `Joint()`, `pool=` and `.index(...)` raise `ValueError` on a plan
+  with `.hazard(...)`, at the builder and at `explain()` and every execution
+  point: a sample of several hazards holds one asset, a pool across hazards
+  would need the same model-years of every hazard, and an index read elsewhere
+  has no form per component yet. `.combine(...)` with fewer than two impacts,
+  and a missing rule with two or more, raise `SampleError`.
+- **What is read and written.** `explain()` lists the components (`hazards`), the
+  rule (`combine`), the dependence between the hazards (`hazard_dependence`) and
+  the packages, without I/O, with one `sources` entry per component.
+  `.samples()` returns one sample of several hazards per asset. The written
+  metadata holds each component's source record once in `source_records`, with
+  the components that read it, and each hazard source names its record by its
+  checksum. `.payout_breakdown()` returns `payout_breakdown`'s table of the same
+  entries on every block, and isn't offered with `Joint()` or
+  `.scenarios(...)`.
+
+**Scenarios.** `.scenarios(...)` takes a plan with several hazards too
+([scenarios on the plan](#several-hazards-in-scenarios)): an `AnnualScenario`
+maps each component to its own source. Here another, synthetic, set of years of
+both hazards beside the recorded ones, every cover and design on both blocks:
+
+```python
+from crc_sdk.parametric import AnnualScenario, ScenarioSet
+
+shifted = pa.table({                            # synthetic: the same years, shifted
+    "station": weather["station"], "year": weather["year"],
+    "rx1day": weather["rx1day"].to_numpy() + 5.0,
+    "txx": weather["txx"].to_numpy() + 1.0,
+})
+shifted_years = AnnualScenario(
+    "shifted", {"rx1day": shifted, "txx": shifted},
+    provenance={"rx1day": synthetic, "txx": synthetic},
+    hazard_name={"rx1day": "rx1day", "txx": "txx"}, pathway="ssp585",
+)
+hazard_scenarios = hazard_plan.scenarios(
+    ScenarioSet([shifted_years], reference="baseline")
+).write_parquet("hazard-scenarios.parquet")
+```
+
 ### Reporting several hazards
 
 Every row's metrics are on the combined loss of its block, so a single-hazard
@@ -3665,14 +3855,10 @@ rank and no best flag.
   them.
 - **Different terms per asset on the plan.** Under `Joint()` a plan applies each
   cover to every asset. `design_joint` takes one template per asset.
-- **Other dependence models on the plan.** A plan's `.dependence(...)` takes
-  `Independent()`, `Comonotonic()` and `EmpiricalCopula(reference)`;
-  `GaussianCopula` and a `DependenceModel` of your own go through
-  `sample_curves` and `sample_curve_hazards`.
-- **Several hazards on the plan.** A plan reads one hazard per asset and takes
-  covers on one index. Samples of several hazards, covers on a `CompositeIndex`,
-  packages and `payout_breakdown` are functions ([several
-  hazards](#several-hazards-at-one-asset)).
+- **Several hazards beside `Joint()`, pools or an index read elsewhere, on the
+  plan.** A plan with `.hazard(...)` refuses `Joint()`, `pool=` and
+  `.index(...)`, and `.payout_breakdown()` isn't offered with `Joint()` or
+  `.scenarios(...)`.
 - **Several hazards beyond one asset and two axes.** A sample with index
   components holds one asset, so several assets with several hazards, and a
   joint design over them, are not offered. A `StepGrid` spans two components,
