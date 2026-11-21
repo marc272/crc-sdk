@@ -32,6 +32,28 @@ dropped. On a finite sample the objective is piecewise constant or piecewise
 smooth in the thresholds, so a stated grid is used rather than gradients; the
 objective at every candidate is kept (`DesignResult.profile`).
 
+**A local refinement.** `DesignOptions(refine=True)`, off by default, refines
+the grid's best point by a compass search (`_solver.compass_search`): from a
+step per free threshold of half the larger gap to its grid neighbours (or to
+its bound, at an end of the grid), each round evaluates the point one step up
+and one step down along each threshold, clipped to its `Free` bounds, with the
+amounts solved exactly by the LP or QP at each point, as at a grid point. It
+moves to the best of them when that lowers the objective by more than the
+grid's tie tolerance, and halves every step otherwise. It stops when every
+step is at most `refine_tolerance` times its bounds' width, or after
+`refine_max_points` points. It is deterministic, never ends worse than the
+grid's best point, and ends at a local optimum at the resolution of its last
+step, not a global one. `DesignResult.refinement` records the method, its
+settings, the start, the end, the gain, the points and why it stopped, and
+`refinement_profile` lists the points. Where it ends, the amounts are solved
+again with the uniqueness report; `ties` counts the grid's candidates within
+the tie tolerance of the refined objective, and the search's own points are
+not counted, so whether the thresholds themselves are unique is not checked.
+A design without free thresholds is not refined. A grid evaluated in numpy (a
+`UserObjective`, or a payout not linear in its amounts) has no exact amounts
+to refine around, so the option raises `DesignError` there, as it does in
+`design_joint`, which has no grid.
+
 **Solver.** The LP and QP routes use HiGHS from the optional extra
 `crc-sdk[parametric]` (`pip install crc-sdk[parametric]`), imported only
 when needed; without it they raise `SolverUnavailableError`. A grid
@@ -2258,9 +2280,9 @@ def design(
     `pricing` prices the premium on the sample; `budget` (`Budget(ratio=...)` or
     `Budget(amount=...)`) bounds it; `limit` (`Limit(amount)`) bounds every
     payout. `options` (`DesignOptions`) sets the grid cap, the tolerances,
-    the fill rule of unidentified amounts and whether the LP route ranges
-    its optimal set. The routes, checks and reports are described in the
-    module docstring.
+    the fill rule of unidentified amounts, whether the LP route ranges its
+    optimal set and whether a grid's best point is refined. The routes,
+    checks and reports are described in the module docstring.
 
     The expected uncovered loss and the weighted CVaR need a budget or
     bounded amounts; MSE needs neither.
@@ -2271,7 +2293,9 @@ def design(
     such as a budget below the pricing's fixed expense;
     `UnboundedDesignError` for an unbounded objective (never for `MSE`);
     `SolverLimitError` when a solve stops at its iteration or time limit;
-    `DesignError` for any other failed solve or check; `SampleError` when the
+    `DesignError` for any other failed solve or check, and for
+    `DesignOptions(refine=True)` on a grid evaluated in numpy or on a
+    threshold without a finite upper bound; `SampleError` when the
     sample holds several assets (take one with `sample.asset(asset_id)`), the
     template's units or asset differ from the sample's, its index's
     `hazard_name` differs from the hazard the sample records, or the sample

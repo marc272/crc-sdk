@@ -2716,7 +2716,7 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
 | --- | --- | --- |
 | amounts free, thresholds fixed (any built-in family, or a `LinearInAmounts` user family) | E[U], weighted CVaR | one LP (`route="lp"`) |
 | the same | MSE | one QP in the amounts (`route="qp"`); under a cost-of-capital budget, cutting planes over such QPs |
-| free thresholds on grids (attachment, exhaustion, breakpoints, knots, trigger) | any built-in | a grid over the thresholds, with the LP or QP at each point (`route="grid"`) |
+| free thresholds on grids (attachment, exhaustion, breakpoints, knots, trigger) | any built-in | a grid over the thresholds, with the LP or QP at each point (`route="grid"`); with `DesignOptions(refine=True)`, then a compass search from the grid's best point, with the LP or QP at each point it evaluates |
 | a `UserObjective`, or a payout not linear in its amounts | any | a grid over every free parameter, evaluated in numpy; candidates that break the budget or the limit are dropped |
 | `SumOf`, `MaxOf`, `StepGrid` over several indices | any | one of the routes above, as [design on several indices](#design-on-several-indices) says |
 
@@ -2729,6 +2729,89 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
   gradients. `DesignResult.profile` is a `pyarrow.Table` with one row per
   candidate: its values, `objective` and `status` (`"optimal"` or `"feasible"`,
   `"infeasible"`, `"invalid"`, `"over_budget"`, `"over_limit"`).
+- **A local refinement after the grid.** The grid's best point can miss an
+  optimum between two grid points. `DesignOptions(refine=True)`, off by
+  default, refines it by a compass search, a deterministic search that uses
+  no derivatives (the coordinate search of Kolda, Lewis and Torczon, SIAM
+  Review 45(3), 2003):
+  - it starts at the grid's best point, with a step per free threshold of
+    half the larger gap from it to its neighbours on the grid (at an end of
+    the grid, to that side's bound);
+  - each round evaluates, threshold by threshold in the template's order, the
+    point one step up and the point one step down, each clipped to the
+    threshold's `Free` bounds, with the amounts solved exactly by the LP or QP
+    at each point, as at a grid point. A point whose thresholds are out of
+    order makes no cover (`"invalid"`), and one where no payout meets the
+    constraints has none (`"infeasible"`); the search never moves to either;
+  - it moves to the best of those points when that lowers the objective by
+    more than the grid's tie tolerance, `feasibility_tolerance` ·
+    max(1, |objective|) in scaled units, and keeps its steps; otherwise it
+    halves every step;
+  - it stops when every step is at most `refine_tolerance` (1e-4 by default)
+    times its threshold's bounds' width, `upper − lower`, or after
+    `refine_max_points` points (1,000 by default).
+
+  So the search is deterministic, stays within the bounds, adds no
+  dependency and solves with HiGHS alone, and never ends worse than the
+  grid's best point. It ends where no step of its last size along one
+  threshold gains more than the tie tolerance: a local optimum at that
+  resolution, not a global one. The grid is what searches the whole range;
+  on a step or binary payout, whose objective is constant between the
+  years' index values, an interval that no step lands on is not seen.
+  Under MSE the gains shrink with the square of the distance to a smooth
+  optimum, so the search stops at the tie tolerance before its steps reach
+  their smallest. On a synthetic linear cover whose loss attaches at 3.7, on
+  a grid of 0, 2.5, 5 and 7.5 within bounds of 0 and 10, the default
+  settings found the attachment within 5e-5 under E[U] and the weighted
+  CVaR, and within 1.2e-3 under MSE, after 23 points each.
+
+  ```python
+  refinable = Cover(index, LinearPayout(Free(40.0, 120.0, grid=5), 150.0, Free()),
+                    payout_unit="EUR", asset_id="warehouse-a")
+  refined = design(refinable, design_years, ExpectedUncovered(), budget=Budget(ratio=0.8),
+                   options=DesignOptions(refine=True))
+  refined.refinement["start"], refined.parameters["attachment"], refined.refinement["gain"]
+  ```
+
+  - **The record.** `DesignResult.refinement` holds the method
+    (`"compass_search"`) and its settings (`tolerance`, `max_points`,
+    `initial_steps`), the grid's best point and its objective (`start`,
+    `start_objective`), where the search ended and its objective (`end`,
+    `objective`), the `gain` over the grid (their difference, never below 0,
+    in payout units and squared for MSE), the number of `points` it evaluated
+    and their statuses (`counts`), its `moves`, its `final_steps` and why it
+    `stopped` (`"step_tolerance"` or `"max_points"`).
+    `DesignResult.refinement_profile` lists those points in order, as
+    `profile` lists the grid's, which it leaves as it is. `to_record()` has
+    the record under `"refinement"`, so it reaches the metadata's `designs`,
+    and the setup text's `Design` line states it. The option and its settings
+    enter the options document, and so the `design_id`; without the option
+    the document, the id and every result are those of a design made before
+    it existed, and `refinement` is `None`.
+  - **Ties and non-uniqueness.** Where the search ends, the amounts are
+    solved again with the uniqueness report, so `unique`, `ranges` (with
+    `ranges=True`) and the QP's eigenvalue rule are those of the amounts at
+    the refined thresholds. `ties` counts the grid's candidates within the tie
+    tolerance of the refined objective, which is 0 after any move, since each
+    move gains more than that tolerance; when the search doesn't move, `ties`
+    and `unique` are the grid's. Not checked: whether other thresholds near
+    the refined point give the same objective. The search's own points are
+    not counted as ties, because near its end they lie within one small step
+    of it and, on a continuous objective, tie with it to rounding. So `unique`
+    true says that the amounts are unique at the refined thresholds, not that
+    the thresholds are.
+  - **Where it does not apply.** Without free thresholds a design is one LP
+    or QP, exact already: the option changes only its `design_id`, and
+    `refinement` is `None`. A `UserObjective`, or a payout not linear in its
+    amounts, is searched in numpy on a grid over every free parameter, its
+    amounts included, so no LP or QP solves its amounts: the option raises
+    `DesignError`, naming the reason. `design_joint` has no grid route, since
+    its thresholds are fixed, so the option raises `DesignError` there too,
+    and on a plan under `Joint()`. A threshold without a finite upper bound
+    raises `DesignError`. The plan and `design_frontier` pass the option to
+    every design they make.
+  - **What it costs.** Each point it evaluates is one LP or QP, as a grid
+    point is, and `solves`, `iterations` and `seconds` count them.
 - **Scaling.** Losses and payouts are divided by the largest loss of a draw (1
   if that is at most 1e-6) before solving; results are in payout units.
 - **Solver settings.** HiGHS's simplex for the LPs (a vertex solution). HiGHS's
