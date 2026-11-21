@@ -37,18 +37,37 @@ a test of a difference between them.
 **Rows built together.** Resampling rows treats them as independent draws. The
 rows of an `EmpiricalCopula` block, and of a block built with `HazardNoise(...,
 hold="hazard_distribution")`, are not: each asset's or hazard's draws, or each
-row's hazard at the asset, were assigned by their rank over every row. There an
-interval is not the Monte Carlo error of the draws, and it can be narrower or
-wider. An asset's own row of an `EmpiricalCopula` block reads that asset's draws
-alone, which are independent, so its intervals are those of independent rows; a
-row that reads several assets or hazards is affected, and so is every row of a
-held `HazardNoise` block. `docs/parametric.md` gives a synthetic coverage study.
-Resampling whole reference years instead made most intervals too wide.
+row's hazard at the asset, were assigned by their rank over every row. So on
+those rows each replicate builds the rows again as the block built them:
+
+- **Re-dealt.** A row that reads two columns or more of an `EmpiricalCopula`
+  block (an asset of several, or a hazard of several): each replicate redraws
+  each column's draws on its own, with replacement, and deals them to the
+  reference years again by the copula's rule. The draws sorted by their index
+  fill the ranks each reference year held in that column, and a year's rows
+  take its draws in the order they were drawn.
+- **Re-ranked.** A row that reads a column built with the held form: each
+  replicate resamples by the unit above, and ranks the hazard at the asset
+  again over the resampled rows, as the held form ranks it over the rows of a
+  call. Each row takes the loss of its new hazard at the asset, which the
+  block's own rows give.
+
+A row of both is re-dealt and re-ranked. A replicate holds the rows rebuilt,
+not reweighted: a row drawn twice can take two places in the reference, or two
+hazards at the asset. Across hazards the combined loss is made again by the
+sample's rule. That needs the rule's terms and the value its result is
+multiplied by, which a record never holds, so only a sample with one impact, or
+a built-in rule on damage ratios (a value of 1), can be rebuilt; any other
+raises `EvaluationError`, as do pooled rows of such blocks and a one-hazard view
+whose combined loss reads hazards it doesn't hold. `docs/parametric.md` gives a
+synthetic coverage study. Resampling whole reference years is not offered: it
+made most intervals of a copula block too wide.
+
 `Comonotonic()`, `GaussianCopula` and a model of the caller's also place each
 column's draws by their ranks over every row, so a row that reads several of
-their columns is built together too, though its coverage is unmeasured. The
-column `built_together` flags all those rows by how the block was built, and
-the setup text says what it means; the numbers are those of any other row.
+their columns is built together too. Those rows keep the unit above, and their
+coverage is unmeasured. The column `built_together` flags all those rows by how
+the block was built, and the setup text says how each was resampled.
 
 Both functions rank nothing. They work in memory and do no I/O. Random numbers
 come only from the `rng` a call states, and its state at entry is recorded, so
@@ -57,8 +76,9 @@ the table can be rebuilt.
 
 from __future__ import annotations
 
+import dataclasses
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -67,6 +87,12 @@ import pyarrow as pa  # type: ignore[import-untyped]
 from numpy.typing import NDArray
 
 from crc_sdk.parametric._canonical import content_hash
+from crc_sdk.parametric.combine import (
+    CappedSum,
+    CombineRule,
+    CompoundDamage,
+    _combined_impact,
+)
 from crc_sdk.parametric.cover import Cover
 from crc_sdk.parametric.errors import EvaluationError, SampleError
 from crc_sdk.parametric.evaluate import (
@@ -129,7 +155,9 @@ from crc_sdk.parametric.metrics import (
 )
 from crc_sdk.parametric.pricing import Pricing, PurePremium
 from crc_sdk.parametric.sample import (
+    IndexComponent,
     OutcomeSample,
+    SampleProvenance,
     _cover_index_values,
     _generator_record,
     _holds_hazard_distribution,
@@ -156,6 +184,13 @@ PooledEntry = (
 """What `compare_pooled` takes per entry: see its docstring."""
 
 Unit = Literal["year", "row"]
+"""How the rows of today's method are resampled: by year, or by row."""
+
+RecordedUnit = Literal["year", "row", "as_built"]
+"""What `setup.intervals.unit` records: `"as_built"` when a row was rebuilt."""
+
+_Method = Literal["today", "rerank", "redeal"]
+"""How one wide row is resampled."""
 
 _INT32_MAX = 2**31 - 1
 
@@ -410,7 +445,10 @@ class _Evaluated:
     """A comparison table and what resampling its rows needs.
 
     `together` holds, for each of `reads`, how its rows were built together
-    (`_built_together`).
+    (`_built_together`). On one block, `run` is its evaluation, `entries` its
+    entries, and `positions` says for each of `reads` which entry it is a row of
+    and where in `_arrays(entry, run)`, so that a rebuilt replicate can read the
+    row again; pooled folds have no `run`.
     """
 
     table: Any
@@ -421,6 +459,9 @@ class _Evaluated:
     n_years: int
     unit: Unit
     options: MetricOptions
+    run: _Run | None = None
+    entries: tuple[_Entry, ...] = ()
+    positions: tuple[tuple[int, int], ...] = ()
 
 
 def _no_premium_names(options: MetricOptions) -> frozenset[str]:
@@ -1193,7 +1234,12 @@ def _block(
     run, _, _ = _prepared(checked, sample, **arguments)
     groups = _apply_premiums(premiums, [_rows(entry, run) for entry in checked])
     rows = [row for group in groups for row in group]
-    drawn = [each for entry in checked for each in _arrays(entry, run)]
+    drawn: list[_Arrays] = []
+    places: list[tuple[int, int]] = []
+    for position, entry in enumerate(checked):
+        arrays = _arrays(entry, run)
+        drawn.extend(arrays)
+        places.extend((position, place) for place in range(len(arrays)))
     together = tuple(
         kinds for entry in checked for kinds in _built_together(entry, run)
     )
@@ -1218,6 +1264,9 @@ def _block(
         n_years=int(distinct.size),
         unit=_resampling_unit(sample),
         options=run.options,
+        run=run,
+        entries=tuple(checked),
+        positions=tuple(places),
     )
 
 
@@ -1237,12 +1286,15 @@ def _year_counts(draws: IntArray, n_years: int) -> IntArray:
     return counts
 
 
-def _replicates(evaluated: _Evaluated, counts: IntArray) -> FloatArray:
+def _replicates(
+    evaluated: _Evaluated, counts: IntArray, rows: Sequence[int] | None = None
+) -> FloatArray:
     """The metrics under each row of year counts, `(B, rows, columns)`.
 
     A replicate gives each row its probability times how often its year was
     drawn, rescaled to sum to 1, and leaves out the rows of years not drawn.
-    A metric undefined in a replicate is NaN.
+    A metric undefined in a replicate is NaN. With `rows`, only those wide rows
+    are computed, and the others stay NaN.
     """
     options = evaluated.options
     names = [column.name for column in metric_columns(options)]
@@ -1250,14 +1302,505 @@ def _replicates(evaluated: _Evaluated, counts: IntArray) -> FloatArray:
     result = np.full(
         (counts.shape[0], len(evaluated.reads), len(names)), np.nan, dtype=np.float64
     )
+    computed = range(len(evaluated.reads)) if rows is None else rows
+    if not computed:
+        return result
     for b, count in enumerate(counts):
         weight = evaluated.probability * count[evaluated.year]
         kept = weight > 0.0
         probability = weight[kept] / math.fsum(weight[kept].tolist())
-        for r, read in enumerate(evaluated.reads):
-            values = _metrics(read, kept, probability, options, without)
+        for r in computed:
+            values = _metrics(evaluated.reads[r], kept, probability, options, without)
             result[b, r] = np.array([values[name] for name in names], dtype=np.float64)
     return result
+
+
+# -- rebuilding rows built together --------------------------------------------
+
+
+_REDEALT = "empirical_copula"
+"""The kind of rows that each replicate deals again by the copula's reference."""
+
+_ONE_IMPACT = "one_impact"
+"""The `combine` kind of a sample whose combined loss is one hazard's own loss."""
+
+_BUILT_IN_RULES: Mapping[str, Callable[[Mapping[str, Any]], CombineRule]] = {
+    "capped_sum": lambda record: CappedSum(record["cap"]),
+    "compound_damage": lambda record: CompoundDamage(),
+}
+"""The built-in rules for a combined loss, made again from what a sample records."""
+
+
+def _method(kinds: frozenset[str]) -> _Method:
+    """How a row of these kinds is resampled: re-dealt, re-ranked, or as today."""
+    if _REDEALT in kinds:
+        return "redeal"
+    if _HELD in kinds:
+        return "rerank"
+    return "today"
+
+
+@dataclass(frozen=True, eq=False)
+class _Column:
+    """One column of a block, as its rows hold it: an asset or a hazard.
+
+    `hazard` is the hazard at the asset, `None` where it is the index. `loss`
+    is the column's own loss: an asset's loss, a hazard's own loss, or `None`
+    for a hazard with no impact. `by_hazard` holds, on a held column with a
+    loss, the block's hazards at the asset sorted and the loss of each.
+    """
+
+    name: str
+    index: FloatArray
+    hazard: FloatArray | None
+    loss: FloatArray | None
+    held: bool
+    by_hazard: tuple[FloatArray, FloatArray] | None
+
+
+@dataclass(frozen=True, eq=False)
+class _Builder:
+    """What rebuilding the rows of one block needs.
+
+    `members` holds, for re-dealing, the block's rows of each member of a
+    window (one member for a curve), in row order, with the reference year of
+    each row. `year_rows` holds the rows of each year, for re-ranking.
+    `combine` makes a sample of several hazards' combined loss from its
+    hazards' own losses.
+    """
+
+    sample: OutcomeSample
+    columns: tuple[_Column, ...]
+    members: tuple[tuple[IntArray, IntArray], ...]
+    year_rows: tuple[IntArray, ...]
+    combine: Callable[[Mapping[str, FloatArray]], FloatArray] | None
+    provenance: SampleProvenance
+
+
+def _refused(what: str) -> EvaluationError:
+    return EvaluationError(
+        f"bootstrap_intervals builds rows built together again on each replicate, "
+        f"as the block built them, but {what}"
+    )
+
+
+def _block_columns(sample: OutcomeSample) -> list[_Column]:
+    """The columns of `sample`, without the losses by hazard."""
+    components = sample.index_components
+    if components is None:
+        held = _held_columns(sample, frozenset(sample.asset_ids))
+        return [
+            _Column(
+                asset,
+                sample.index[:, j],
+                None if sample.hazard is None else sample.hazard[:, j],
+                sample.loss[:, j],
+                asset in held,
+                None,
+            )
+            for j, asset in enumerate(sample.asset_ids)
+        ]
+    held = _held_columns(sample, frozenset(components))
+    return [
+        _Column(
+            name,
+            component.values[:, 0],
+            None if component.hazard is None else component.hazard[:, 0],
+            None if component.own_loss is None else component.own_loss[:, 0],
+            name in held,
+            None,
+        )
+        for name, component in components.items()
+    ]
+
+
+def _by_hazard(column: _Column) -> tuple[FloatArray, FloatArray]:
+    """A held column's hazards at the asset, sorted, and the loss of each.
+
+    The held form gives each row one of the index values of the rows the call
+    built, so on a block of all those rows every index value is a row's hazard
+    at the asset, and that row's loss is the loss of the value. Raises unless
+    every index value is one, and unless rows of one hazard have one loss.
+    """
+    assert column.loss is not None
+    hazard = column.index if column.hazard is None else column.hazard
+    order = np.argsort(hazard, kind="stable")
+    hazards, losses = hazard[order], column.loss[order]
+    same = hazards[1:] == hazards[:-1]
+    if (losses[1:][same] != losses[:-1][same]).any():
+        raise _refused(
+            f"in column {column.name!r}, rows with one hazard at the asset have "
+            "different losses, so the loss of a new hazard can't be read from them"
+        )
+    found = np.minimum(np.searchsorted(hazards, column.index), hazards.size - 1)
+    if not (hazards[found] == column.index).all():
+        raise _refused(
+            f"column {column.name!r} holds index values that are no row's hazard at "
+            'the asset: HazardNoise(..., hold="hazard_distribution") gives each row '
+            "one of the index values of the rows its call built, and this block "
+            "doesn't hold them all, as a selection of those rows doesn't. Give the "
+            "sample as the call built it"
+        )
+    return hazards, losses
+
+
+def _loss_of(column: _Column, hazard: FloatArray) -> FloatArray:
+    """The loss of each hazard at the asset, from the block's rows that hold it."""
+    assert column.by_hazard is not None
+    hazards, losses = column.by_hazard
+    found: FloatArray = losses[np.searchsorted(hazards, hazard)]
+    return found
+
+
+def _values_are_one(sample: OutcomeSample) -> bool:
+    """Whether every loss model of a sample of several hazards has a value of 1.
+
+    A loss model without a value gives the loss as the damage ratio, so its
+    record's value source is `"none"`; a stated value or a value column is
+    never recorded.
+    """
+    document = sample.provenance.loss_model or {}
+    listed = document.get("components")
+    if document.get("kind") != "components" or not isinstance(listed, Sequence):
+        return False
+    sources = [
+        ((entry.get("loss_model") or {}).get("value") or {}).get("source")
+        for entry in listed
+        if isinstance(entry, Mapping)
+    ]
+    return len(sources) == len(listed) and all(source == "none" for source in sources)
+
+
+def _own_loss_of(name: str) -> Callable[[Mapping[str, FloatArray]], FloatArray]:
+    """The combined loss of a sample with one impact: that hazard's own loss."""
+
+    def combined(own: Mapping[str, FloatArray]) -> FloatArray:
+        return own[name]
+
+    return combined
+
+
+def _rule_on_damage_ratios(
+    rule: CombineRule, kind: str, impacted: Sequence[str]
+) -> Callable[[Mapping[str, FloatArray]], FloatArray]:
+    """A rule's combined loss where the value is 1, so each own loss is an impact."""
+
+    def combined(own: Mapping[str, FloatArray]) -> FloatArray:
+        return _combined_impact(rule, kind, {name: own[name] for name in impacted})
+
+    return combined
+
+
+def _combine(
+    sample: OutcomeSample, columns: Sequence[_Column]
+) -> Callable[[Mapping[str, FloatArray]], FloatArray]:
+    """The combined loss of a sample of several hazards, from their own losses.
+
+    A sample with one impact has that hazard's own loss. A built-in rule's
+    result is multiplied by the value, which a record never holds, so it is
+    made again on damage ratios only, where the value is 1. Raises
+    `EvaluationError` for any other sample, and unless the rule gives the
+    sample's own combined loss on its rows.
+    """
+    record = sample.provenance.combine or {}
+    kind = str(record.get("kind"))
+    impacted = [column.name for column in columns if column.loss is not None]
+    rule: Callable[[Mapping[str, FloatArray]], FloatArray]
+    if kind == _ONE_IMPACT:
+        only = str(record.get("component"))
+        rule = _own_loss_of(only)
+    elif kind in _BUILT_IN_RULES:
+        if not _values_are_one(sample):
+            raise _refused(
+                f"the combined loss is the result of the rule {kind!r} times the "
+                "value, and the sample's loss models state a value, which a record "
+                "never holds. So the combined loss of hazards dealt to new rows "
+                "can't be made again; a one-hazard view, sample.component(name), "
+                "reads its own loss and can be"
+            )
+        rule = _rule_on_damage_ratios(_BUILT_IN_RULES[kind](record), kind, impacted)
+    else:
+        raise _refused(
+            f"the combined loss comes from {kind!r}, which the sample records as a "
+            "document and not as a rule to apply again, so the combined loss of "
+            "hazards dealt to new rows can't be made"
+        )
+    own = {column.name: column.loss for column in columns if column.loss is not None}
+    if not np.array_equal(rule(own), sample.loss[:, 0]):
+        raise _refused(
+            "the combined loss made again from the hazards' own losses by the "
+            "recorded rule is not the sample's"
+        )
+    return rule
+
+
+def _reference_years(sample: OutcomeSample) -> tuple[tuple[IntArray, IntArray], ...]:
+    """Each member's rows of an `EmpiricalCopula` block, with each row's year.
+
+    A row's period is its draw number in the call that built the sample, and
+    the copula deals within each member of a window (row `d` reads member
+    `d mod m`), `k` rows to each reference year, in reference-year order.
+    """
+    record = (
+        sample.provenance.dependence
+        if sample.index_components is None
+        else sample.provenance.hazard_dependence
+    ) or {}
+    k = record.get("k")
+    if (
+        record.get("kind") != _REDEALT
+        or isinstance(k, bool)
+        or not isinstance(k, int)
+        or k < 1
+    ):
+        raise _refused(
+            "the sample doesn't record the EmpiricalCopula that dealt its columns, "
+            "with its draws per reference year"
+        )
+    window = sample.provenance.details.get("window")
+    m = 1 if window is None else len(window["members"])
+    period = sample.period.astype(np.int64)
+    members: list[tuple[IntArray, IntArray]] = []
+    for member in range(m):
+        rows = np.flatnonzero(period % m == member).astype(np.int64)
+        if rows.size:
+            members.append((rows, (period[rows] // m) // k))
+    return tuple(members)
+
+
+def _builder(evaluated: _Evaluated, methods: Sequence[_Method]) -> _Builder:
+    """What rebuilding the block's rows needs; raises where it can't be done."""
+    run = evaluated.run
+    if run is None:
+        raise _refused(
+            "pooled folds aren't rebuilt: year_block_kfold refuses an EmpiricalCopula "
+            'sample and one built with HazardNoise(..., hold="hazard_distribution"), '
+            "so no split gives such folds; give one block"
+        )
+    sample = run.sample
+    if (
+        sample.index_components is None
+        and len(sample.asset_ids) == 1
+        and len(_view_columns(sample)) > 1
+    ):
+        raise _refused(
+            "this one-hazard view holds a combined loss that reads hazards whose "
+            "draws it doesn't hold; give the sample of several hazards"
+        )
+    columns = _block_columns(sample)
+    redeal = "redeal" in methods
+    columns = [
+        dataclasses.replace(column, by_hazard=_by_hazard(column))
+        if column.held and column.loss is not None
+        else column
+        for column in columns
+    ]
+    rebuilt_loss = redeal or any(
+        column.held and column.loss is not None for column in columns
+    )
+    combine = (
+        _combine(sample, columns)
+        if sample.index_components is not None and rebuilt_loss
+        else None
+    )
+    year_rows = tuple(
+        np.flatnonzero(evaluated.year == year).astype(np.int64)
+        for year in range(evaluated.n_years)
+    )
+    provenance = sample.provenance
+    return _Builder(
+        sample=sample,
+        columns=tuple(columns),
+        members=_reference_years(sample) if redeal else (),
+        year_rows=year_rows,
+        combine=combine,
+        # Only the arrays are read again, so the rebuilt rows need no record.
+        provenance=SampleProvenance(
+            source_kind=provenance.source_kind,
+            sources=(),
+            semantics_source=provenance.semantics_source,
+            dependence=None if len(sample.asset_ids) == 1 else {"kind": "as_built"},
+            hazard_dependence=(
+                None if sample.index_components is None else {"kind": "as_built"}
+            ),
+        ),
+    )
+
+
+def _redeal_draws(
+    builder: _Builder, rng: np.random.Generator, n_bootstrap: int
+) -> list[IntArray]:
+    """Each column's draws dealt again, as rows of the block: `(B, n)` per column.
+
+    For each column in the block's order, and each member in order, one call
+    `rng.integers(0, n_w, size=(B, n_w))` redraws the member's `n_w` draws with
+    replacement. The redrawn draws, sorted by their index (ties in the order
+    drawn), fill the ranks that each reference year's rows held in the column,
+    and a year's rows take its draws in the order they were drawn, as the copula
+    deals them.
+    """
+    n = len(builder.sample)
+    sources: list[IntArray] = []
+    for column in builder.columns:
+        source = np.empty((n_bootstrap, n), dtype=np.int64)
+        for rows, years in builder.members:
+            size = rows.size
+            drawn = rng.integers(0, size, size=(n_bootstrap, size), dtype=np.int64)
+            index = column.index[rows]
+            rank = np.empty(size, dtype=np.int64)
+            rank[np.argsort(index, kind="stable")] = np.arange(size, dtype=np.int64)
+            ranked = np.argsort(index[drawn], axis=1, kind="stable")
+            held = ranked[:, rank]
+            dealt = np.lexsort((held, np.broadcast_to(years, held.shape)), axis=-1)
+            taken = np.take_along_axis(held, dealt, axis=1)
+            source[:, rows] = rows[np.take_along_axis(drawn, taken, axis=1)]
+        sources.append(source)
+    return sources
+
+
+def _reranked(column: _Column, rows: IntArray) -> tuple[FloatArray, FloatArray | None]:
+    """A held column's hazard at the asset ranked again over `rows`, and its loss.
+
+    The rows are ranked by their hazard at the asset, which holds the rank the
+    held form gave them, ties by the index and then by row, and the row of rank
+    r takes the r-th smallest index value among them.
+    """
+    index = column.index[rows]
+    hazard = index if column.hazard is None else column.hazard[rows]
+    order = np.lexsort((np.arange(rows.size), index, hazard))
+    placed = np.empty_like(index)
+    placed[order] = np.sort(index)
+    return placed, None if column.loss is None else _loss_of(column, placed)
+
+
+def _rebuilt_sample(
+    builder: _Builder, sources: Sequence[IntArray], probability: FloatArray
+) -> OutcomeSample:
+    """The block's columns with each column's rows taken from `sources`.
+
+    A held column's hazard at the asset is ranked again over its rows, and a
+    sample of several hazards takes its combined loss again from its rule.
+    """
+    sample = builder.sample
+    index: list[FloatArray] = []
+    hazard: list[FloatArray] = []
+    loss: list[FloatArray | None] = []
+    for column, rows in zip(builder.columns, sources, strict=True):
+        index.append(column.index[rows])
+        if column.held:
+            placed, own = _reranked(column, rows)
+        else:
+            placed = index[-1] if column.hazard is None else column.hazard[rows]
+            own = None if column.loss is None else column.loss[rows]
+        hazard.append(placed)
+        loss.append(own)
+    n = probability.shape[0]
+    components = sample.index_components
+    if components is None:
+        # Every asset has a loss.
+        losses = [value for value in loss if value is not None]
+        return OutcomeSample(
+            asset_ids=sample.asset_ids,
+            period=np.arange(n, dtype=np.int64),
+            probability=probability,
+            index=np.column_stack(index),
+            loss=np.column_stack(losses),
+            hazard=None if sample.hazard is None else np.column_stack(hazard),
+            index_unit=sample.index_unit,
+            loss_unit=sample.loss_unit,
+            semantics=sample.semantics,
+            provenance=builder.provenance,
+            scenario=sample.scenario,
+        )
+    rebuilt = {
+        column.name: IndexComponent(
+            index[j],
+            unit=components[column.name].unit,
+            tail=components[column.name].tail,
+            hazard=None if column.hazard is None else hazard[j],
+            own_loss=loss[j],
+        )
+        for j, column in enumerate(builder.columns)
+    }
+    impacts = {
+        name: value
+        for name, value in zip(rebuilt, loss, strict=True)
+        if value is not None
+    }
+    combined = (
+        sample.loss[sources[0], 0]
+        if builder.combine is None
+        else builder.combine(impacts)
+    )
+    first = next(iter(rebuilt.values()))
+    return OutcomeSample(
+        asset_ids=sample.asset_ids,
+        period=np.arange(n, dtype=np.int64),
+        probability=probability,
+        index=first.values,
+        loss=combined,
+        hazard=first.hazard,
+        index_unit=sample.index_unit,
+        loss_unit=sample.loss_unit,
+        semantics=sample.semantics,
+        provenance=builder.provenance,
+        scenario=sample.scenario,
+        index_components=rebuilt,
+    )
+
+
+def _rebuilt_replicates(
+    evaluated: _Evaluated,
+    builder: _Builder,
+    methods: Sequence[_Method],
+    draws: IntArray,
+    redealt: Sequence[IntArray],
+    result: FloatArray,
+) -> None:
+    """Fill `result` for the rows re-dealt or re-ranked, replicate by replicate.
+
+    A re-ranked replicate holds the rows of the years drawn, in the order
+    drawn, each as often as its year was drawn. A re-dealt replicate holds the
+    block's rows, each column's from its own redrawn draws. Each replicate
+    builds one sample per method, and every entry's rows of that method read it.
+    """
+    run = evaluated.run
+    assert run is not None
+    options = evaluated.options
+    names = [column.name for column in metric_columns(options)]
+    without = _no_premium_names(options)
+    by_method = {
+        method: [r for r, each in enumerate(methods) if each == method]
+        for method in ("rerank", "redeal")
+    }
+    for b in range(draws.shape[0]):
+        for method, rows in by_method.items():
+            if not rows:
+                continue
+            if method == "rerank":
+                read = np.concatenate([builder.year_rows[year] for year in draws[b]])
+                sources = [read] * len(builder.columns)
+                weight = evaluated.probability[read]
+                probability = weight / math.fsum(weight.tolist())
+            else:
+                sources = [source[b] for source in redealt]
+                probability = evaluated.probability
+            rebuilt = dataclasses.replace(
+                run, sample=_rebuilt_sample(builder, sources, probability)
+            )
+            every_row = np.ones(probability.shape[0], dtype=np.bool_)
+            arrays: dict[int, list[_Arrays]] = {}
+            for r in rows:
+                entry, place = evaluated.positions[r]
+                if entry not in arrays:
+                    arrays[entry] = _arrays(evaluated.entries[entry], rebuilt)
+                read_again = dataclasses.replace(
+                    evaluated.reads[r], arrays=arrays[entry][place]
+                )
+                values = _metrics(read_again, every_row, probability, options, without)
+                result[b, r] = np.array(
+                    [values[name] for name in names], dtype=np.float64
+                )
 
 
 def _short_block(column: MetricColumn, n_rows: int) -> bool | None:
@@ -1295,11 +1838,24 @@ def _interval_table(
     wide = evaluated.table
     columns = metric_columns(evaluated.options)
     n_rows = int(evaluated.probability.shape[0])
+    methods = [_method(kinds) for kinds in evaluated.together]
+    today = [r for r, method in enumerate(methods) if method == "today"]
+    # Before any draw, so a refused call leaves the generator untouched.
+    builder = None if len(today) == len(methods) else _builder(evaluated, methods)
     record = _generator_record(rng, "bootstrap")
     draws = rng.integers(
         0, evaluated.n_years, size=(n_bootstrap, evaluated.n_years), dtype=np.int64
     )
-    replicates = _replicates(evaluated, _year_counts(draws, evaluated.n_years))
+    replicates = _replicates(
+        evaluated, _year_counts(draws, evaluated.n_years), rows=today
+    )
+    unit: RecordedUnit = evaluated.unit
+    if builder is not None:
+        redealt = (
+            _redeal_draws(builder, rng, n_bootstrap) if "redeal" in methods else []
+        )
+        _rebuilt_replicates(evaluated, builder, methods, draws, redealt, replicates)
+        unit = "as_built"
     low, high = np.quantile(
         replicates, [(1.0 - ci_level) / 2.0, (1.0 + ci_level) / 2.0], axis=0
     )
@@ -1363,7 +1919,7 @@ def _interval_table(
                     for column, flag in zip(columns, flags, strict=True)
                     if flag
                 ],
-                "unit": evaluated.unit,
+                "unit": unit,
                 "built_together": [
                     kind
                     for kind in _BUILT_TOGETHER

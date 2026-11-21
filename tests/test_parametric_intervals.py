@@ -1304,6 +1304,8 @@ def test_folds_with_their_own_trend_fits_read_each_years_own_loss() -> None:
 
 
 def test_an_empirical_copula_block_is_resampled_by_row() -> None:
+    # Each asset's own row is resampled by row, and the total re-dealt by the
+    # reference, here one row per reference year.
     joined = _book(12)
     sample = OutcomeSample(
         asset_ids=joined.asset_ids,
@@ -1315,7 +1317,7 @@ def test_an_empirical_copula_block_is_resampled_by_row() -> None:
         index_unit="mm/day",
         loss_unit="EUR",
         semantics="annual",
-        provenance=_provenance(dependence={"kind": "empirical_copula"}),
+        provenance=_provenance(dependence={"kind": "empirical_copula", "k": 1}),
     )
     covers = {asset: _cover(asset=asset) for asset in ("a", "b")}
     table = UNTYPED_INTERVALS(
@@ -1327,7 +1329,7 @@ def test_an_empirical_copula_block_is_resampled_by_row() -> None:
         options=FEW,
     )
     intervals = _metadata(table).setup.intervals
-    assert intervals is not None and intervals["unit"] == "row"
+    assert intervals is not None and intervals["unit"] == "as_built"
     assert "resamples of the evaluated rows" in setup_text(table)
 
 

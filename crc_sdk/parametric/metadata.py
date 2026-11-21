@@ -223,6 +223,33 @@ _BUILT_TOGETHER = {
 this order.
 """
 
+_AS_BUILT = "as_built"
+"""`setup.intervals.unit` of a call that built a row again on each replicate."""
+
+_REDEALT = "empirical_copula"
+_RERANKED = "hazard_distribution"
+
+_REBUILT = {
+    _REDEALT: (
+        "where an EmpiricalCopula dealt the draws, each resample redraws each "
+        "column's draws on its own, with replacement, and deals them to the "
+        "reference years again by the copula's rule"
+    ),
+    _RERANKED: (
+        "where HazardNoise(..., hold='hazard_distribution') gave the hazard at the "
+        "asset, each resample ranks it again over the resampled rows, and each row "
+        "takes the loss of its new hazard at the asset"
+    ),
+}
+"""How a call with `unit` `"as_built"` resampled the rows of each kind it rebuilt."""
+
+_PLACED_BY = {
+    "comonotonic": "Comonotonic()",
+    "gaussian_copula": "a GaussianCopula",
+    "dependence_model": "a dependence model of the caller's",
+}
+"""What placed the draws of the rows of each kind, which a call resampled as today."""
+
 KEY_COLUMNS = (
     "cover_hash",
     "design_id",
@@ -2176,7 +2203,13 @@ def _of_rows(
         and "built_together" in table.column_names
         and not any(table.column("built_together").to_pylist())
     ):
-        intervals = {**intervals, "built_together": []}
+        # The rows left were resampled as today: by row on a block an
+        # EmpiricalCopula dealt, and by year on any other.
+        kinds = intervals["built_together"]
+        unit = intervals.get("unit")
+        if unit == _AS_BUILT:
+            unit = "row" if _REDEALT in kinds else "year"
+        intervals = {**intervals, "built_together": [], "unit": unit}
     return (
         {
             **setup,
@@ -3140,10 +3173,20 @@ def _intervals(intervals: Mapping[str, Any]) -> str:
     resamples = _number(intervals.get("n_bootstrap"), f"{where}.n_bootstrap")
     level = _number(intervals.get("ci_level"), f"{where}.ci_level")
     unit = _get(intervals, "unit", str, where)
+    kinds = [str(kind) for kind in _list(intervals, "built_together", where)]
+    unknown = [kind for kind in kinds if kind not in _BUILT_TOGETHER]
+    if unknown:
+        raise EvaluationError(
+            f"{where}.built_together names kinds of rows it doesn't know: {unknown}; "
+            f"it takes {list(_BUILT_TOGETHER)}"
+        )
+    rebuilt = unit == _AS_BUILT
+    # With "as_built", the rows of today's method were resampled by row where
+    # an EmpiricalCopula dealt the draws, and by year otherwise.
     redrawn = (
         "the evaluated rows, as the reference of an EmpiricalCopula is part of the "
         "stated model"
-        if unit == "row"
+        if unit == "row" or (rebuilt and _REDEALT in kinds)
         else "the evaluated years, each with every row of that year"
     )
     text = (
@@ -3163,23 +3206,38 @@ def _intervals(intervals: Mapping[str, Any]) -> str:
             "bounds cannot reach beyond the block's largest rows and understate how "
             f"far the number could move: {', '.join(short)}."
         )
-    kinds = [str(kind) for kind in _list(intervals, "built_together", where)]
-    unknown = [kind for kind in kinds if kind not in _BUILT_TOGETHER]
-    if unknown:
-        raise EvaluationError(
-            f"{where}.built_together names kinds of rows it doesn't know: {unknown}; "
-            f"it takes {list(_BUILT_TOGETHER)}"
-        )
-    if kinds:
-        text += (
-            " The rows with built_together true read draws that were built "
-            f"together: {'; or '.join(_BUILT_TOGETHER[kind] for kind in kinds)}. "
-            "Resampling treats them as independent, so on these rows an interval "
+    if not kinds:
+        return text
+    text += (
+        " The rows with built_together true read draws that were built "
+        f"together: {'; or '.join(_BUILT_TOGETHER[kind] for kind in kinds)}."
+    )
+    done = [kind for kind in kinds if rebuilt and kind in _REBUILT]
+    if not done:
+        return text + (
+            " Resampling treats them as independent, so on these rows an interval "
             "is not the sampling error of the number, and it can be narrower or "
             "wider; crc-sdk's docs/parametric.md, "
             '"Rows built together", gives a synthetic coverage study.'
         )
-    return text
+    text += (
+        " Each resample builds those rows again as the block built them: "
+        f"{'; and '.join(_REBUILT[kind] for kind in done)}."
+    )
+    kept = [_PLACED_BY[kind] for kind in kinds if kind not in done]
+    if kept:
+        text += (
+            f" On the rows whose draws {' or '.join(kept)} placed, resampling treats "
+            "the draws as independent, so there an interval is not the sampling "
+            "error of the number, and it can be narrower or wider."
+        )
+    return text + (
+        ' crc-sdk\'s docs/parametric.md, "Rows built together", gives a synthetic '
+        'coverage study, which measured these methods only on the "total" rows of '
+        "two assets under one EmpiricalCopula, on the rows of two hazards under one "
+        "EmpiricalCopula, with their losses as damage ratios, and on one asset's "
+        "held blocks of curves."
+    )
 
 
 def _frontier_budget(budget: Mapping[str, Any], unit: str, where: str) -> str:
@@ -3934,8 +3992,9 @@ def setup_text(
       table names no best budget;
     - `Intervals`, for a table of `bootstrap_intervals`: the resamples, the
       level, the unit, what an interval leaves out, that two rows' intervals
-      are not a test of a difference between them, and the columns whose level
-      reaches the block's worst row;
+      are not a test of a difference between them, the columns whose level
+      reaches the block's worst row and, where a row is flagged
+      `built_together`, how its rows were built and how they were resampled;
     - `Metrics`: the levels beta, the return periods and the loss and payout
       thresholds.
 
