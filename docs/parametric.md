@@ -3678,8 +3678,9 @@ setup text calls it one.
   still sees its source, and the component's tail, so a cover on one index read
   on the view or on a block of it, by `design`, `evaluate` and the functions
   built on them, must have that tail, as on the sample itself: another raises
-  `SampleError`. The tail isn't in the view's hash, table or provenance, so a
-  view read back from its table has none.
+  `SampleError`. The tail isn't in the view's hash, columns or provenance:
+  `to_table` records the component's name and tail in the table's metadata, as
+  `view_of`, so a view read back with `from_written_table` keeps them.
 - **Splits.** `select`, `holdout` and `year_block_kfold` act on every
   component. On an `EmpiricalCopula` sample `holdout` and `year_block_kfold`
   raise, and two blocks cut with `select` raise `LeakageError` at an
