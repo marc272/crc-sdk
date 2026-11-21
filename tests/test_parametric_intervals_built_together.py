@@ -5,11 +5,13 @@ each column's draws to its reference years by rank, and `HazardNoise(...,
 hold="hazard_distribution")` ranks each row's hazard at the asset over every
 row, so their rows are not. A synthetic coverage study found intervals
 miscalibrated on the rows of an `EmpiricalCopula` block that read several
-columns, and on every row of a held `HazardNoise` block, and calibrated on an
-asset's own row of a copula block and on independent rows. These tests check
-that the flag marks exactly those rows, by how the block was built; how it
-carries over to what the study didn't measure (the other models that move
-draws, hazards, joins, views, pooled folds); and that the metadata and the
+columns, and on every row of a held `HazardNoise` block, when they were
+resampled as independent rows, and calibrated on an asset's own row of a copula
+block and on independent rows. Those rows are now built again on each replicate
+(`test_parametric_intervals_as_built.py`). These tests check that the flag
+marks exactly those rows, by how the block was built and not by the method;
+how it carries over to what the study didn't measure (the other models that
+move draws, hazards, joins, views, pooled folds); and that the metadata and the
 setup text say so. Every number is synthetic.
 """
 
@@ -123,16 +125,22 @@ def _loss(name: str) -> LossModel:
     return LossModel(RAMP, value=100.0, value_unit="EUR", name=f"loss of {name}")
 
 
+def _ratio(name: str) -> LossModel:
+    """A loss model without a value, so a combined loss can be made again."""
+    return LossModel(RAMP, name=f"damage ratio of {name}")
+
+
 def _cover(
     asset: str | None = None,
     index: Any = INDEX,
     label: str = "c",
     limit: float = 60.0,
+    unit: str = "EUR",
 ) -> Cover:
     return Cover(
         index,
         LinearPayout(55.0, 90.0, limit),
-        payout_unit="EUR",
+        payout_unit=unit,
         asset_id=asset,
         label=label,
     )
@@ -206,6 +214,11 @@ def _copula() -> EmpiricalCopula:
 def _hazards(
     impacted: tuple[str, ...] = HAZARDS, dependence: Any = None
 ) -> OutcomeSample:
+    """Two hazards at one asset, their losses as damage ratios.
+
+    A replicate makes the combined loss of hazards dealt to new rows again by
+    the rule, which needs the value it multiplies: 1 on damage ratios.
+    """
     return sample_curve_hazards(
         {name: _curve(name) for name in HAZARDS},
         dependence=(
@@ -214,8 +227,8 @@ def _hazards(
         metadata={name: _metadata(UNITS[name]) for name in HAZARDS},
         n_draws=N,
         rngs={name: np.random.default_rng(21 + j) for j, name in enumerate(HAZARDS)},
-        loss_models={name: _loss(name) for name in impacted},
-        combine=CappedSum(100.0) if len(impacted) > 1 else None,
+        loss_models={name: _ratio(name) for name in impacted},
+        combine=CappedSum(1.0) if len(impacted) > 1 else None,
         basis_risk=ImpactNoise(0.2, upper=1.0),
         asset_id="site",
     )
@@ -382,7 +395,10 @@ def test_a_written_copula_sample_keeps_its_flags() -> None:
 
 def _package() -> CoverPackage:
     return CoverPackage(
-        {"rain": _cover(index=RAIN, label="r"), "heat": _cover(index=HEAT, label="h")},
+        {
+            "rain": _cover(index=RAIN, label="r", limit=0.6, unit="1"),
+            "heat": _cover(index=HEAT, label="h", limit=0.6, unit="1"),
+        },
         label="package",
     )
 
@@ -390,8 +406,8 @@ def _package() -> CoverPackage:
 def test_with_two_impacts_every_row_reads_several_hazards() -> None:
     entries = [
         _package(),
-        _cover(index=RAIN, label="on rain", limit=70.0),
-        _cover(index=HEAT, label="on heat", limit=70.0),
+        _cover(index=RAIN, label="on rain", limit=0.7, unit="1"),
+        _cover(index=HEAT, label="on heat", limit=0.7, unit="1"),
     ]
     table = _intervals(entries, _hazards())
     assert set(table.column("built_together").to_pylist()) == {True}
@@ -403,8 +419,8 @@ def test_with_one_impact_a_row_on_that_hazard_alone_is_not_flagged() -> None:
     table = _intervals(
         [
             _package(),
-            _cover(index=RAIN, label="on rain", limit=70.0),
-            _cover(index=HEAT, label="on heat", limit=70.0),
+            _cover(index=RAIN, label="on rain", limit=0.7, unit="1"),
+            _cover(index=HEAT, label="on heat", limit=0.7, unit="1"),
         ],
         sample,
     )
@@ -436,8 +452,14 @@ def test_a_hazards_view_is_flagged_when_its_loss_reads_another_hazard(
 ) -> None:
     view = _hazards(impacted).component(name, loss=loss)
     index = RAIN if name == "rain" else HEAT
-    table = _intervals([_cover(index=index)], view)
+    table = _intervals([_cover(index=index, limit=0.6, unit="1")], view)
     assert set(table.column("built_together").to_pylist()) == {flagged}
+    # Its combined loss reads another hazard, whose draws the view doesn't hold,
+    # so a replicate can't deal them again: the view keeps today's method.
+    kept = EvaluationMetadata.from_table(table).setup.intervals.get("kept_today")  # type: ignore[union-attr]
+    assert kept == (
+        [{"kind": "empirical_copula", "reason": "combined_view"}] if flagged else None
+    )
 
 
 def test_independent_hazards_are_not_flagged() -> None:
@@ -450,10 +472,13 @@ def test_a_gaussian_copula_across_hazards_flags_rows_of_several() -> None:
     table = _intervals([_package()], sample)
     assert set(table.column("built_together").to_pylist()) == {True}
     assert _record(table) == ["gaussian_copula"]
-    own = _intervals([_cover(index=HEAT)], sample.component("heat"))
+    own = _intervals(
+        [_cover(index=HEAT, limit=0.6, unit="1")], sample.component("heat")
+    )
     assert not any(own.column("built_together").to_pylist())
     combined = _intervals(
-        [_cover(index=HEAT)], sample.component("heat", loss="combined")
+        [_cover(index=HEAT, limit=0.6, unit="1")],
+        sample.component("heat", loss="combined"),
     )
     assert set(combined.column("built_together").to_pylist()) == {True}
 
@@ -477,7 +502,8 @@ def test_every_row_of_a_held_block_is_flagged() -> None:
     table = _intervals([_cover()], _curve_sample(HELD))
     assert set(table.column("built_together").to_pylist()) == {True}
     assert _record(table) == ["hazard_distribution"]
-    assert EvaluationMetadata.from_table(table).setup.intervals["unit"] == "year"  # type: ignore[index]
+    # Its rows were re-ranked on each replicate.
+    assert EvaluationMetadata.from_table(table).setup.intervals["unit"] == "as_built"  # type: ignore[index]
 
 
 def test_the_default_hold_is_not_flagged() -> None:
@@ -522,6 +548,7 @@ def test_pooled_folds_of_held_blocks_are_flagged() -> None:
     # refuses two cuts of one, so these folds are made by hand: the blocks of a
     # plain sample, each recording the held model and no parent. A pooled row
     # reads every fold's rows, so one fold's rows built together flag it.
+    # Pooled rows aren't built again: they keep today's method, and say why.
     def held(sample: OutcomeSample) -> OutcomeSample:
         provenance = dataclasses.replace(
             sample.provenance, basis_risk=HELD.to_document(), parent=None
@@ -538,6 +565,12 @@ def test_pooled_folds_of_held_blocks_are_flagged() -> None:
         [_cover("a")], marked, rng=np.random.default_rng(1), n_bootstrap=3
     )
     assert set(table.column("built_together").to_pylist()) == {True}
+    intervals = EvaluationMetadata.from_table(table).setup.intervals
+    assert intervals is not None
+    assert intervals["unit"] == "year"
+    assert intervals["kept_today"] == [
+        {"kind": "hazard_distribution", "reason": "pooled_by_hand"}
+    ]
 
 
 # -- the table, the metadata and the setup text ----------------------------------------
@@ -555,8 +588,12 @@ def test_the_setup_text_states_the_rows_built_together() -> None:
     assert SENTENCE in line
     assert COPULA_TEXT in line
     assert HELD_TEXT not in line
-    assert "is not the sampling error of the number" in line
+    # Re-dealt rows state their method in place of erratum 34's sentence.
+    assert "is not the sampling error of the number" not in line
+    assert "deals them to the reference years again" in line
     assert '"Rows built together"' in line
+    kept = _intervals_line(_intervals([_covers()], _assets(Comonotonic())))
+    assert "is not the sampling error of the number" in kept
     held = _intervals_line(_intervals([_cover()], _curve_sample(HELD)))
     assert HELD_TEXT in held
     assert COPULA_TEXT not in held
