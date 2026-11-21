@@ -1039,9 +1039,10 @@ class OutcomeSample:
     )
     """The component a `component` view reads, and its tail; else `None`.
 
-    It is not part of the content hash, the table or the provenance document:
-    it lets a cover's tail be checked against the component's on the view, and
-    a split of the view keeps it.
+    It is not part of the content hash, the table's columns or the provenance
+    document: it lets a cover's tail be checked against the component's on the
+    view, and a split of the view keeps it. `to_table` records it in the
+    table's metadata, as `view_of`, and `from_written_table` restores it.
     """
 
     def __post_init__(self) -> None:
@@ -1332,9 +1333,12 @@ class OutcomeSample:
         `holdout`, `year_block_kfold`): a cover on one index read on the view,
         by `design`, `evaluate` and the functions built on them, must have that
         tail, as it must on the sample of several hazards. The tail is not in
-        the view's `content_hash`, its table or its provenance, so a view read
-        back from its table has none, and its covers' tails are the caller's
-        to know, as on any one-hazard sample.
+        the view's `content_hash`, its table's columns or its provenance:
+        `to_table` records the component's name and tail in the table's
+        metadata (`view_of`), so a view read back with `from_written_table`
+        keeps them. A view's table written without them reads back with no
+        tail, and its covers' tails are then the caller's to know, as on any
+        one-hazard sample.
 
         Raises `SampleError` on a sample without index components, for a
         component the sample does not hold, an unknown `loss`, and for
@@ -1597,6 +1601,12 @@ class OutcomeSample:
         `index[<name>]`, `hazard[<name>]` and `own_loss[<name>]`, null where it
         has none, and the metadata adds `components`, each one's name, unit
         and tail, in order.
+
+        A component's view (`component`, and its blocks) adds `view_of` to the
+        metadata, `{"name": name, "tail": tail}`, the component it reads, so
+        `from_written_table` gives the view back its tail. Its columns, content
+        hash and provenance are a plain one-hazard sample's, and the table of
+        a sample that is no view holds no `view_of`.
         """
         order = sorted(
             range(len(self.asset_ids)), key=lambda j: self.asset_ids[j].encode("utf-8")
@@ -1628,6 +1638,9 @@ class OutcomeSample:
                 {"name": name, "tail": component.tail, "unit": component.unit}
                 for name, component in components.items()
             ]
+        if self._view_of is not None:
+            viewed, tail = self._view_of
+            metadata["view_of"] = {"name": viewed, "tail": tail}
         hazard = (
             pa.nulls(rows, pa.float64()) if self.hazard is None else flat(self.hazard)
         )
@@ -1687,11 +1700,18 @@ class OutcomeSample:
         was written (rows filtered, sorted or edited) is rejected; build a
         sample from such a table with `from_table`.
 
+        A component's view keeps the name and tail of its component, which
+        the metadata's `view_of` records, so a cover of another tail is
+        refused on it as on the view that was written. A table without
+        `view_of` reads back as a plain one-hazard sample.
+
         Raises `SampleError` if the metadata is missing, unreadable or of
         another schema or semantics version, a column is missing or holds
         values the metadata contradicts (another scenario or asset, nulls),
-        a field is invalid, or the content hash differs; `TypeError` for a
-        file path (this module does no I/O) or a non-table.
+        a field is invalid, the content hash differs, or `view_of` is not a
+        name and a tail, or names another component than the last one the
+        provenance's `selection` takes; `TypeError` for a file path (this
+        module does no I/O) or a non-table.
         """
         data = _arrow_table(table, "a written sample")
         metadata = _written_metadata(data)
@@ -1791,6 +1811,10 @@ class OutcomeSample:
                 f"the table's rows do not match the content hash its metadata "
                 f"records ({metadata['content_hash']}): the table was changed after "
                 "it was written"
+            )
+        if "view_of" in metadata:
+            object.__setattr__(
+                sample, "_view_of", _written_view(metadata["view_of"], sample)
             )
         return sample
 
@@ -2453,7 +2477,9 @@ def _written_metadata(table: Any) -> dict[str, Any]:
     missing = sorted(expected_keys - set(document))
     if missing:
         raise SampleError(f"the {SAMPLE_METADATA_KEY!r} metadata lacks {missing}")
-    unknown = sorted(set(document) - expected_keys)
+    # A component's view, which holds one hazard, may say whose view it is.
+    optional_keys = set() if with_components else {"view_of"}
+    unknown = sorted(set(document) - expected_keys - optional_keys)
     if unknown:
         raise SampleError(
             f"the {SAMPLE_METADATA_KEY!r} metadata has unknown keys {unknown}"
@@ -2478,6 +2504,37 @@ def _written_components(documents: Any) -> list[tuple[str, str, Any]]:
             "objects with a name, a unit and a tail"
         )
     return [(entry["name"], entry["unit"], entry["tail"]) for entry in documents]
+
+
+def _written_view(document: Any, sample: OutcomeSample) -> tuple[str, Tail]:
+    """The (name, tail) of the component a written view reads, from `view_of`.
+
+    The name must be the one of the last `component` step of the sample's
+    `selection`, the step `OutcomeSample.component` recorded.
+    """
+    what = f"the {SAMPLE_METADATA_KEY!r} metadata's view_of"
+    if not isinstance(document, dict) or set(document) != {"name", "tail"}:
+        raise SampleError(f"{what} must be an object with a name and a tail")
+    name = _component_name(document["name"], SampleError, what)
+    tail = document["tail"]
+    if tail not in get_args(Tail):
+        raise SampleError(f"{what} tail must be 'upper' or 'lower', got {tail!r}")
+    taken = [
+        step.get("name")
+        for step in sample.provenance.selection
+        if step.get("kind") == "component"
+    ]
+    if not taken or taken[-1] != name:
+        took = (
+            "takes no component"
+            if not taken
+            else f"last takes the component {taken[-1]!r}"
+        )
+        raise SampleError(
+            f"{what} names the component {name!r}, but the provenance's selection "
+            f"{took}: the record is not the one to_table wrote"
+        )
+    return name, tail
 
 
 def _written_provenance(document: Any) -> SampleProvenance:
