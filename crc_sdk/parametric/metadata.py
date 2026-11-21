@@ -562,8 +562,74 @@ def _merged_draws(stated: Sequence[Mapping[str, Any]]) -> Any:
     return {**first, "rng": rng}
 
 
+_ACROSS_YEARS = (
+    ". A per-year scenario's horizon is the centre of its series' whole window, "
+    "(first + last) // 2, so assets whose series span different years, as "
+    "missing='drop_year' can leave them, read different horizons: state years= "
+    "that every asset's series holds, or evaluate those assets apart"
+)
+"""What a merge error adds when two tables read a scenario at two horizons."""
+
+
+def _read_by(entry: Mapping[str, Any], samples: Mapping[str, Mapping[str, Any]]) -> str:
+    """Whose blocks a scenario's entry describes, and the years each series spans."""
+    parts: list[str] = []
+    for block in entry.get("blocks") or ():
+        sample = samples.get(str(block.get("sample_hash")))
+        if sample is None:
+            continue
+        ids = [repr(str(asset)) for asset in sample.get("asset_ids") or ()]
+        years = (sample.get("details") or {}).get("years")
+        span = (
+            f", whose series spans {years[0]} to {years[1]}"
+            if isinstance(years, (list, tuple)) and len(years) == 2
+            else ""
+        )
+        part = f"{'asset' if len(ids) == 1 else 'assets'} {_join(ids)}{span}"
+        if part not in parts:
+            parts.append(part)
+    return f" ({'; '.join(parts)})" if parts else ""
+
+
+def _scenarios_difference(
+    stated: Sequence[Mapping[str, Any]],
+    samples: Sequence[Mapping[str, Mapping[str, Any]]],
+) -> str:
+    """The first thing two tables' `setup.scenarios` differ in, beyond the blocks.
+
+    A scenario's field names the assets of each table's blocks and the years each
+    series spans, from the tables' `setup.samples`, so that an asset whose years
+    differ from the others' can be found.
+    """
+    first = _without_blocks(stated[0])
+    for i, record in enumerate(stated[1:], 1):
+        other = _without_blocks(record)
+        mine, theirs = first["scenarios"], other["scenarios"]
+        for label in [*mine, *(label for label in theirs if label not in mine)]:
+            ours, yours = mine.get(label), theirs.get(label)
+            if ours is None or yours is None:
+                return f"scenario {label!r} is in one table and not in another"
+            for field in sorted(set(ours) | set(yours)):
+                if _json_text(ours.get(field)) == _json_text(yours.get(field)):
+                    continue
+                return (
+                    f"scenario {label!r} has the {field} {ours.get(field)!r} in one "
+                    f"table{_read_by(stated[0]['scenarios'][label], samples[0])} and "
+                    f"{yours.get(field)!r} in another"
+                    f"{_read_by(record['scenarios'][label], samples[i])}"
+                    + (_ACROSS_YEARS if field == "horizon" else "")
+                )
+        for key in sorted(set(first) | set(other)):
+            if key != "scenarios" and _json_text(first.get(key)) != _json_text(
+                other.get(key)
+            ):
+                return f"their {key} differ: {first.get(key)!r} and {other.get(key)!r}"
+    return "they describe different sets"
+
+
 def _merged_scenarios(
     records: Sequence[dict[str, Any] | None],
+    samples: Sequence[Iterable[Mapping[str, Any]]] = (),
 ) -> dict[str, Any] | None:
     """One `setup.scenarios` for several tables; `None` if none has any.
 
@@ -571,7 +637,8 @@ def _merged_scenarios(
     set differ in their blocks, where each asset reads the index and each asset's
     generator records only: the blocks and places are combined without repeats, a
     scenario's `n_rows` is the sum over its blocks, and the generator records of
-    the shared draws are combined by owner.
+    the shared draws are combined by owner. `samples` holds each table's
+    `setup.samples`, which a refusal reads to name the assets and their years.
     """
     if all(record is None for record in records):
         return None
@@ -582,9 +649,14 @@ def _merged_scenarios(
         )
     stated = [record for record in records if record is not None]
     if len({_json_text(_without_blocks(record)) for record in stated}) > 1:
+        by_hash = [
+            {str(sample.get("sample_hash")): sample for sample in held}
+            for held in samples
+        ] or [{} for _ in stated]
         raise EvaluationError(
             "the metadata differ in their scenarios: only the blocks of one set of "
-            "scenarios may differ between tables"
+            "scenarios may differ between tables, but "
+            f"{_scenarios_difference(stated, by_hash)}"
         )
     first = stated[0]
     merged: dict[str, Any] = {}
@@ -796,7 +868,9 @@ class EvaluationMetadata(_EvaluationModel):
         their flagged columns are combined. Tables of `compare_scenarios` must
         state one set of scenarios, of which only the blocks may differ, with
         where each asset reads the index and each asset's generator records, and
-        those are combined, so the folds and the assets of one set merge. The
+        those are combined, so the folds and the assets of one set merge; a
+        refusal names the first field that differs and, for a scenario's field,
+        each table's assets with the years each series spans. The
         entries of `setup.frontier` are combined without repeats. `created_at`
         is the latest one.
 
@@ -897,7 +971,10 @@ class EvaluationMetadata(_EvaluationModel):
                     entry for item in items for entry in item.setup.evaluations
                 ),
                 intervals=_merged_intervals([item.setup.intervals for item in items]),
-                scenarios=_merged_scenarios([item.setup.scenarios for item in items]),
+                scenarios=_merged_scenarios(
+                    [item.setup.scenarios for item in items],
+                    [item.setup.samples for item in items],
+                ),
                 drift=_merged_drift([item.setup.drift for item in items]),
                 frontier=_merged_frontier([item.setup.frontier for item in items]),
             ),
@@ -2833,6 +2910,9 @@ def _design(
         parts.append(f"design premium: {premium} {unit}{on_total}")
     if record.get("route") is not None:
         parts.append(f"route: {record['route']}")
+    refinement = _get(record, "refinement", Mapping, where)
+    if refinement is not None:
+        parts.append(_refinement(refinement, f"{where}.refinement"))
     unique = _get(record, "unique", bool, where)
     answer = "not checked" if unique is None else "yes" if unique else "no"
     parts.append(f"unique optimum: {answer}")
@@ -2860,6 +2940,49 @@ def _design(
         parts.append("tail: not degenerate")
     name = f"{label} ({design_id})" if label else design_id
     return f"Design {name}: {'; '.join(parts)}."
+
+
+_REFINE_METHODS = {"compass_search": "a compass search"}
+"""How the setup text names a refinement's method."""
+
+
+def _refinement(refinement: Mapping[str, Any], where: str) -> str:
+    """A design's refinement after its grid, in words.
+
+    It names the method and its settings, the grid's best point it started
+    from, where it ended, the gain, the points it evaluated and, if it
+    stopped at its cap, that it did.
+    """
+
+    def point(key: str) -> str:
+        values = _get(refinement, key, Mapping, where) or {}
+        return ", ".join(
+            f"{name} {_number(value, f'{where}.{key}.{name}')}"
+            for name, value in values.items()
+        )
+
+    method = _get(refinement, "method", str, where)
+    named = _REFINE_METHODS.get(str(method), f"the method {method}")
+    start = _number(refinement.get("start_objective"), f"{where}.start_objective")
+    text = f"refined by {named} from the grid's best point ({point('start')}, "
+    text += f"objective {start})"
+    moves = _get(refinement, "moves", int, where)
+    if moves:
+        objective = _number(refinement.get("objective"), f"{where}.objective")
+        gain = _number(refinement.get("gain"), f"{where}.gain")
+        text += f" to {point('end')}, objective {objective}, a gain of {gain}"
+    else:
+        text += ", not moved"
+    points = _get(refinement, "points", int, where)
+    tolerance = _number(refinement.get("tolerance"), f"{where}.tolerance")
+    most = _number(refinement.get("max_points"), f"{where}.max_points")
+    text += (
+        f", after {points} points (smallest step {tolerance} of each "
+        f"parameter's bounds, at most {most} points"
+    )
+    if _get(refinement, "stopped", str, where) == "max_points":
+        text += "; it stopped at that cap"
+    return text + ")"
 
 
 def _planned_designs(
@@ -3965,7 +4088,9 @@ def setup_text(
       Rows that are all allocated, as `allocate` returns them, hold no premium,
       and the line says so;
     - `Design`, one line per design: the objective, pricing, budget and
-      limit, the design premium, the route, the non-uniqueness report
+      limit, the design premium, the route, a refinement after the grid (its
+      method and settings, the grid's best point it started from, where it
+      ended, the gain and the points it evaluated), the non-uniqueness report
       (`unique`, `ties`, amounts no design year reaches) and a degenerate
       tail; for a joint design also its scope and which assets it covers,
       and for a design on a sample of several hazards the loss it read.
