@@ -62,6 +62,15 @@ from crc_sdk.parametric import (
     sample_curves,
     setup_text,
 )
+from crc_sdk.parametric.intervals import (
+    _block,
+    _block_columns,
+    _builder,
+    _by_hazard,
+    _method,
+    _redeal_draws,
+    _reranked,
+)
 from crc_sdk.parametric.metrics import metric_columns, metric_values
 from crc_sdk.types import HazardDatasetMetadata, SourceProvenance
 
@@ -455,6 +464,76 @@ def test_a_joint_design_on_a_copula_block_is_re_dealt() -> None:
     assert _intervals_record(table)["unit"] == "as_built"
 
 
+def _horizon(horizon: int, location: float) -> dict[str, Any]:
+    """One canonical row of a fitted curve at one horizon."""
+    return {
+        "cell_index": 613196570331971583,
+        "source_id": "fixture-1",
+        "source_geometry": None,
+        "hazard_name": "rx1day",
+        "horizon": horizon,
+        "pathway": "ssp245",
+        "curve_kind": "fitted",
+        "curve_type": "gumbel_r",
+        "curve_shape": None,
+        "curve_location": location,
+        "curve_scale": 10.0,
+        "curve_atom_probability": None,
+        "curve_atom_location": None,
+    }
+
+
+def test_a_window_is_re_dealt_within_each_member() -> None:
+    # Row d reads member d mod 2 in every column, and the copula deals within
+    # each member's rows, so a replicate keeps every column's draws in their
+    # member and each reference year's draws in its band of that member.
+    window = sample_curves(
+        {
+            "site-a": [_horizon(2045, 50.0), _horizon(2055, 60.0)],
+            "site-b": [_horizon(2045, 55.0), _horizon(2055, 70.0)],
+        },
+        dependence=_copula(),
+        metadata={asset: _metadata() for asset in ASSETS},
+        n_draws=2 * M * K,
+        rngs={asset: np.random.default_rng(31 + j) for j, asset in enumerate(ASSETS)},
+        loss_models={asset: _loss(asset) for asset in ASSETS},
+        basis_risk=HazardNoise(0.3),
+    )
+    evaluated = _block(
+        [_covers()],
+        window,
+        split="in_sample",
+        fold=0,
+        pricing=PurePremium(),
+        premiums=None,
+        options=FEW,
+        design_sample=None,
+        allocation=None,
+        values=None,
+    )
+    builder = _builder(evaluated, [_method(kinds) for kinds in evaluated.together])
+    assert [rows.tolist() for rows, _ in builder.members] == [
+        [0, 2, 4, 6, 8, 10],
+        [1, 3, 5, 7, 9, 11],
+    ]
+    assert [years.tolist() for _, years in builder.members] == [[0, 0, 1, 1, 2, 2]] * 2
+    sources = _redeal_draws(builder, np.random.default_rng(0), 30)
+    for j in range(2):
+        assert (sources[j] % 2 == np.arange(2 * M * K) % 2).all()
+        for rows, years in builder.members:
+            index = window.index[rows, j]
+            held = np.argsort(np.argsort(index, kind="stable"), kind="stable")
+            for b in range(30):
+                redrawn = np.sort(window.index[sources[j][b][rows], j])
+                for year in range(M):
+                    mine = years == year
+                    assert sorted(window.index[sources[j][b][rows[mine]], j]) == (
+                        sorted(redrawn[np.sort(held[mine])])
+                    )
+    table = _intervals([_covers()], window)
+    assert _intervals_record(table)["unit"] == "as_built"
+
+
 def test_an_independent_block_draws_nothing_more() -> None:
     sample = _assets(Independent())
     rng = np.random.default_rng(6)
@@ -555,12 +634,21 @@ def test_re_ranking_reads_todays_draws_and_draws_nothing_more() -> None:
     assert RERANKED_TEXT in _intervals_line(table)
 
 
-def test_a_held_curve_block_loses_no_loss_level() -> None:
-    # The held form gives each row one of the index values, so every replicate's
-    # hazards at the asset are its rows' index values, whose losses the block holds.
+def test_a_re_ranked_replicate_holds_the_drawn_rows_index_values() -> None:
+    # The held form gives each row one of the index values of its call's rows,
+    # so a replicate's hazards at the asset are its own rows' index values, and
+    # each row's loss is the loss the block's rows give that hazard.
     sample = _curve_sample(n=40)
-    table = _intervals([_cover()], sample, n_bootstrap=30)
-    assert table.column("ci_low").null_count < table.num_rows
+    assert sample.hazard is not None
+    column = _block_columns(sample)[0]
+    column = dataclasses.replace(column, by_hazard=_by_hazard(column))
+    rows = np.random.default_rng(1).integers(0, 40, size=40)
+    placed, loss = _reranked(column, rows)
+    assert loss is not None
+    assert sorted(placed) == sorted(sample.index[rows, 0])
+    for value, own in zip(placed, loss, strict=True):
+        given = sample.loss[sample.hazard[:, 0] == value, 0]
+        assert given.size and (given == own).all()
 
 
 def test_a_held_copula_block_is_re_dealt_and_re_ranked() -> None:

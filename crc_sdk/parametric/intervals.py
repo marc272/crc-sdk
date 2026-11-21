@@ -58,8 +58,10 @@ hazards at the asset. Across hazards the combined loss is made again by the
 sample's rule. That needs the rule's terms and the value its result is
 multiplied by, which a record never holds, so only a sample with one impact, or
 a built-in rule on damage ratios (a value of 1), can be rebuilt; any other
-raises `EvaluationError`, as do pooled rows of such blocks and a one-hazard view
-whose combined loss reads hazards it doesn't hold. `docs/parametric.md` gives a
+raises `EvaluationError` before any draw, as do pooled rows of such blocks, a
+one-hazard view whose combined loss reads hazards it doesn't hold, and a
+selection of a held sample, whose hazards at the asset came from rows it
+doesn't hold. `docs/parametric.md` gives a
 synthetic coverage study. Resampling whole reference years is not offered: it
 made most intervals of a copula block too wide.
 
