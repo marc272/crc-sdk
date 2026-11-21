@@ -452,16 +452,14 @@ def test_a_hazards_view_is_flagged_when_its_loss_reads_another_hazard(
 ) -> None:
     view = _hazards(impacted).component(name, loss=loss)
     index = RAIN if name == "rain" else HEAT
-    entries = [_cover(index=index, limit=0.6, unit="1")]
-    if flagged:
-        # Its combined loss reads another hazard, whose draws the view doesn't
-        # hold, so a replicate can't deal them again; GaussianCopula's rows
-        # keep today's method and show the flag (below).
-        with pytest.raises(EvaluationError, match="one-hazard view"):
-            _intervals(entries, view)
-        return
-    table = _intervals(entries, view)
-    assert set(table.column("built_together").to_pylist()) == {False}
+    table = _intervals([_cover(index=index, limit=0.6, unit="1")], view)
+    assert set(table.column("built_together").to_pylist()) == {flagged}
+    # Its combined loss reads another hazard, whose draws the view doesn't hold,
+    # so a replicate can't deal them again: the view keeps today's method.
+    kept = EvaluationMetadata.from_table(table).setup.intervals.get("kept_today")  # type: ignore[union-attr]
+    assert kept == (
+        [{"kind": "empirical_copula", "reason": "combined_view"}] if flagged else None
+    )
 
 
 def test_independent_hazards_are_not_flagged() -> None:
@@ -545,12 +543,12 @@ def test_a_held_copula_block_records_both_kinds() -> None:
     assert HELD_TEXT in line
 
 
-def test_pooled_folds_of_held_blocks_are_refused() -> None:
+def test_pooled_folds_of_held_blocks_are_flagged() -> None:
     # year_block_kfold refuses to split a held sample, and the leakage check
     # refuses two cuts of one, so these folds are made by hand: the blocks of a
     # plain sample, each recording the held model and no parent. A pooled row
-    # reads every fold's rows, so one fold's rows built together flag it, and
-    # pooled rows built together are not built again: the call is refused.
+    # reads every fold's rows, so one fold's rows built together flag it.
+    # Pooled rows aren't built again: they keep today's method, and say why.
     def held(sample: OutcomeSample) -> OutcomeSample:
         provenance = dataclasses.replace(
             sample.provenance, basis_risk=HELD.to_document(), parent=None
@@ -563,10 +561,16 @@ def test_pooled_folds_of_held_blocks_are_refused() -> None:
     )
     assert not any(plain.column("built_together").to_pylist())
     marked = tuple((held(train), held(test)) for train, test in folds)
-    with pytest.raises(EvaluationError, match="pooled folds aren't rebuilt"):
-        UNTYPED_INTERVALS(
-            [_cover("a")], marked, rng=np.random.default_rng(1), n_bootstrap=3
-        )
+    table = UNTYPED_INTERVALS(
+        [_cover("a")], marked, rng=np.random.default_rng(1), n_bootstrap=3
+    )
+    assert set(table.column("built_together").to_pylist()) == {True}
+    intervals = EvaluationMetadata.from_table(table).setup.intervals
+    assert intervals is not None
+    assert intervals["unit"] == "year"
+    assert intervals["kept_today"] == [
+        {"kind": "hazard_distribution", "reason": "pooled_by_hand"}
+    ]
 
 
 # -- the table, the metadata and the setup text ----------------------------------------

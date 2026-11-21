@@ -61,15 +61,18 @@ from crc_sdk.parametric import (
     sample_curve_hazards,
     sample_curves,
     setup_text,
+    year_block_kfold,
 )
 from crc_sdk.parametric.intervals import (
     _block,
     _block_columns,
-    _builder,
     _by_hazard,
-    _method,
+    _plan,
+    _pooled,
     _redeal_draws,
+    _replicates,
     _reranked,
+    _year_counts,
 )
 from crc_sdk.parametric.metrics import metric_columns, metric_values
 from crc_sdk.types import HazardDatasetMetadata, SourceProvenance
@@ -511,7 +514,8 @@ def test_a_window_is_re_dealt_within_each_member() -> None:
         allocation=None,
         values=None,
     )
-    builder = _builder(evaluated, [_method(kinds) for kinds in evaluated.together])
+    builder = _plan(evaluated).builder
+    assert builder is not None
     assert [rows.tolist() for rows, _ in builder.members] == [
         [0, 2, 4, 6, 8, 10],
         [1, 3, 5, 7, 9, 11],
@@ -732,24 +736,103 @@ def test_one_impact_across_hazards_is_re_dealt_with_that_hazards_loss() -> None:
     assert _intervals_record(table)["unit"] == "as_built"
 
 
-# -- what is refused ------------------------------------------------------------
+# -- what is kept on today's method --------------------------------------------
 
 
-def _refused(entries: list[Any], sample: OutcomeSample, match: str) -> None:
-    rng = np.random.default_rng(5)
-    before = rng.bit_generator.state
-    with pytest.raises(EvaluationError, match=match):
-        UNTYPED_INTERVALS(
-            entries, sample, split="in_sample", rng=rng, n_bootstrap=3, options=FEW
+def _todays_bounds(
+    entries: list[Any], on: Any, seed: int, n_bootstrap: int, **arguments: Any
+) -> tuple[np.ndarray, np.ndarray]:
+    """Every row's bounds as today's method gives them, in the long table's order.
+
+    Written from today's steps: one draw of the years, each replicate
+    reweighting the rows, the percentile bounds.
+    """
+    evaluated = (
+        _block(
+            entries,
+            on,
+            split="in_sample",
+            fold=0,
+            pricing=PurePremium(),
+            premiums=None,
+            options=FEW,
+            design_sample=None,
+            allocation=None,
+            values=None,
+            **arguments,
         )
-    assert rng.bit_generator.state == before  # refused before any draw
+        if isinstance(on, OutcomeSample)
+        else _pooled(
+            entries,
+            on,
+            pricing=PurePremium(),
+            options=FEW,
+            allocation=None,
+            values=None,
+        )
+    )
+    years = evaluated.n_years
+    draws = np.random.default_rng(seed).integers(
+        0, years, size=(n_bootstrap, years), dtype=np.int64
+    )
+    replicates = _replicates(evaluated, _year_counts(draws, years))
+    low, high = np.quantile(replicates, [(1.0 - 0.9) / 2.0, (1.0 + 0.9) / 2.0], axis=0)
+    return low.ravel(order="F"), high.ravel(order="F")
 
 
-def test_a_stated_value_across_hazards_is_refused() -> None:
+def _kept(
+    entries: list[Any], on: Any, kept: list[dict[str, str]], unit: str = "row"
+) -> Any:
+    """The call's intervals, checked to be today's on every row, with the record."""
+    rng = np.random.default_rng(5)
+    arguments: dict[str, Any] = (
+        {"split": "in_sample"} if isinstance(on, OutcomeSample) else {}
+    )
+    table = UNTYPED_INTERVALS(
+        entries, on, rng=rng, n_bootstrap=7, options=FEW, **arguments
+    )
+    low, high = _todays_bounds(entries, on, 5, 7)
+    found_low = np.array(
+        [np.nan if v is None else v for v in table.column("ci_low").to_pylist()]
+    )
+    found_high = np.array(
+        [np.nan if v is None else v for v in table.column("ci_high").to_pylist()]
+    )
+    defined = ~np.isnan(found_low)
+    assert np.array_equal(found_low[defined], low[defined])
+    assert np.array_equal(found_high[defined], high[defined])
+    # Today's one draw, and nothing more.
+    copy = np.random.default_rng(5)
+    years = _todays_years(entries, on)
+    copy.integers(0, years, size=(7, years), dtype=np.int64)
+    assert rng.integers(0, 2**62) == copy.integers(0, 2**62)
+    record = _intervals_record(table)
+    assert record["unit"] == unit
+    assert record["kept_today"] == kept
+    assert any(table.column("built_together").to_pylist())
+    return table
+
+
+def _todays_years(entries: list[Any], on: Any) -> int:
+    if isinstance(on, OutcomeSample):
+        return int(np.unique(on.period).size)
+    return int(sum(len(test) for _, test in on))
+
+
+def test_a_stated_value_across_hazards_keeps_todays_method() -> None:
     sample = _hazards(
         loss_models={name: _loss(name) for name in HAZARDS}, combine=CappedSum(100.0)
     )
-    _refused([_package("EUR")], sample, "a record never holds")
+    table = _kept(
+        [_package("EUR")],
+        sample,
+        [{"kind": "empirical_copula", "reason": "combined_loss_needs_value"}],
+    )
+    line = _intervals_line(table)
+    assert UNMEASURED_TEXT in line
+    assert REBUILT_TEXT not in line
+    assert "couldn't be built again on each replicate" in line
+    assert "which a record never holds" in line
 
 
 class _Larger:
@@ -765,14 +848,36 @@ class _Larger:
         return np.maximum(*impacts.values())
 
 
-def test_a_rule_of_the_callers_across_hazards_is_refused() -> None:
-    _refused([_package()], _hazards(combine=_Larger()), "'larger'")
+def test_a_rule_of_the_callers_across_hazards_keeps_todays_method() -> None:
+    _kept(
+        [_package()],
+        _hazards(combine=_Larger()),
+        [{"kind": "empirical_copula", "reason": "caller_rule"}],
+    )
 
 
-def test_a_view_whose_combined_loss_reads_other_hazards_is_refused() -> None:
+def test_a_held_block_of_several_hazards_with_a_value_keeps_todays_method() -> None:
+    # Re-ranking moves each hazard's own loss, so the combined loss is needed.
+    sample = _hazards(
+        loss_models={name: _loss(name) for name in HAZARDS},
+        combine=CappedSum(100.0),
+        basis_risk=HELD,
+        dependence=Independent(),
+    )
+    _kept(
+        [_package("EUR")],
+        sample,
+        [{"kind": "hazard_distribution", "reason": "combined_loss_needs_value"}],
+        unit="year",
+    )
+
+
+def test_a_view_whose_combined_loss_reads_other_hazards_keeps_todays_method() -> None:
     view = _hazards().component("rain", loss="combined")
-    _refused(
-        [_cover(index=INDICES["rain"], limit=0.6, unit="1")], view, "one-hazard view"
+    _kept(
+        [_cover(index=INDICES["rain"], limit=0.6, unit="1")],
+        view,
+        [{"kind": "empirical_copula", "reason": "combined_view"}],
     )
 
 
@@ -781,23 +886,146 @@ def test_an_own_loss_view_of_a_copula_sample_keeps_todays_method() -> None:
     table = _intervals([_cover(index=INDICES["rain"], limit=0.6, unit="1")], view)
     assert not any(table.column("built_together").to_pylist())
     assert _intervals_record(table)["unit"] == "row"
+    assert "kept_today" not in _intervals_record(table)
 
 
-def test_a_cut_of_a_held_sample_is_refused() -> None:
+def test_a_selection_of_a_held_sample_keeps_todays_method() -> None:
     sample = _curve_sample(n=20)
-    _refused([_cover()], sample.select(sample.period[:10]), "no row's hazard")
+    _kept(
+        [_cover()],
+        sample.select(sample.period[:10]),
+        [{"kind": "hazard_distribution", "reason": "held_select"}],
+        unit="year",
+    )
 
 
-def test_a_copula_record_without_its_draws_per_year_is_refused() -> None:
-    sample = _assets(_copula())
+def test_pooled_folds_of_held_blocks_keep_todays_method() -> None:
+    # year_block_kfold refuses a held sample, so these folds are made by hand:
+    # the blocks of a plain per-year sample, each recording the held model.
+    years = np.arange(1991, 2015)
+    series = AnnualSeries(
+        years,
+        np.random.default_rng(1).gumbel(50.0, 10.0, years.size),
+        "mm/day",
+        {"source": {"name": "series of a"}},
+    )
+    sample = sample_annual(
+        series,
+        loss_model=_loss("a"),
+        basis_risk=HazardNoise(0.3),
+        asset_id="a",
+        rng=np.random.default_rng(101),
+    )
+
+    def held(block: OutcomeSample) -> OutcomeSample:
+        provenance = dataclasses.replace(
+            block.provenance, basis_risk=HELD.to_document(), parent=None
+        )
+        return dataclasses.replace(block, provenance=provenance)
+
+    folds = tuple(
+        (held(train), held(test)) for train, test in year_block_kfold(sample, 3)
+    )
+    _kept(
+        [_cover("a")],
+        folds,
+        [{"kind": "hazard_distribution", "reason": "pooled_by_hand"}],
+        unit="year",
+    )
+
+
+def _without_k(sample: OutcomeSample) -> OutcomeSample:
     provenance = sample.provenance
     assert provenance.dependence is not None
     document = dict(provenance.dependence)
     del document["k"]
-    stated = dataclasses.replace(
+    return dataclasses.replace(
         sample, provenance=dataclasses.replace(provenance, dependence=document)
     )
-    _refused([_covers()], stated, "draws per reference year")
+
+
+def test_a_copula_record_without_its_draws_per_year_keeps_todays_method() -> None:
+    _kept(
+        [_covers()],
+        _without_k(_assets(_copula())),
+        [{"kind": "empirical_copula", "reason": "copula_without_k"}],
+    )
+
+
+def test_rows_kept_beside_rows_rebuilt_are_stated_apart() -> None:
+    # Without k the total can't be dealt again; each asset's held row is still
+    # re-ranked, so the call is "as_built" and states both.
+    sample = _without_k(_assets(_copula(), HELD))
+    rng = np.random.default_rng(5)
+    table = UNTYPED_INTERVALS(
+        [_covers()], sample, split="in_sample", rng=rng, n_bootstrap=7, options=FEW
+    )
+    record = _intervals_record(table)
+    assert record["unit"] == "as_built"
+    assert record["kept_today"] == [
+        {"kind": "empirical_copula", "reason": "copula_without_k"}
+    ]
+    low, _ = _todays_bounds([_covers()], sample, 5, 7)
+    rows = table.to_pylist()
+    total = [i for i, row in enumerate(rows) if row["level"] == "total"]
+    assert total
+    for i in total:
+        assert rows[i]["ci_low"] == (None if np.isnan(low[i]) else low[i])
+    line = _intervals_line(table)
+    assert RERANKED_TEXT in line and REDEALT_TEXT not in line
+    assert "The rows that couldn't be built again were resampled as before" in line
+    assert "draws per reference year" in line
+
+
+def test_kept_rows_merge_and_filter_away() -> None:
+    kept = _intervals(
+        [_package("EUR")],
+        _hazards(
+            loss_models={name: _loss(name) for name in HAZARDS},
+            combine=CappedSum(100.0),
+        ),
+    )
+    view = _intervals(
+        [_cover(index=INDICES["rain"])],
+        _hazards(
+            loss_models={name: _loss(name) for name in HAZARDS},
+            combine=CappedSum(100.0),
+        ).component("rain", loss="combined"),
+    )
+    merged = EvaluationMetadata.merge(
+        EvaluationMetadata.from_table(kept), EvaluationMetadata.from_table(view)
+    )
+    assert merged.setup.intervals is not None
+    assert merged.setup.intervals["kept_today"] == [
+        {"kind": "empirical_copula", "reason": "combined_loss_needs_value"},
+        {"kind": "empirical_copula", "reason": "combined_view"},
+    ]
+    plain = EvaluationMetadata.from_table(
+        _intervals(
+            [_cover("site-b", label="site-b")], _assets(_copula()).asset("site-b")
+        )
+    )
+    assert "kept_today" not in plain.setup.intervals  # type: ignore[operator]
+    again = EvaluationMetadata.merge(EvaluationMetadata.from_table(kept), plain)
+    assert again.setup.intervals["kept_today"] == [  # type: ignore[index]
+        {"kind": "empirical_copula", "reason": "combined_loss_needs_value"}
+    ]
+    unflagged = _intervals([_covers()], _without_k(_assets(_copula())))
+    rows = unflagged.filter(
+        pa.array([not flag for flag in unflagged.column("built_together").to_pylist()])
+    )
+    assert "kept_today" not in _intervals_line(rows)
+    assert "couldn't be built again" not in _intervals_line(rows)
+
+
+def test_an_unknown_reason_is_refused_by_the_setup_text() -> None:
+    table = _intervals([_covers()], _without_k(_assets(_copula())))
+    document = json.loads(EvaluationMetadata.from_table(table).to_json())
+    document["setup"]["intervals"]["kept_today"] = [
+        {"kind": "empirical_copula", "reason": "tired"}
+    ]
+    with pytest.raises(EvaluationError, match="kept_today names a kind or a reason"):
+        setup_text(EvaluationMetadata.from_json(json.dumps(document)))
 
 
 def test_resampling_by_reference_year_is_not_offered() -> None:

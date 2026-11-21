@@ -250,6 +250,47 @@ _PLACED_BY = {
 }
 """What placed the draws of the rows of each kind, which a call resampled as today."""
 
+_KEPT_ROWS = {
+    _REDEALT: "the rows of several columns an EmpiricalCopula dealt",
+    _RERANKED: "the rows that read a held HazardNoise",
+}
+"""The rows of each kind that `kept_today` names, in the setup text."""
+
+_KEPT_TODAY = {
+    "combined_loss_needs_value": (
+        "the combined loss of several hazards is the rule's result times the "
+        "asset value, which a record never holds"
+    ),
+    "caller_rule": (
+        "the combined loss of several hazards comes from a rule of the caller's, "
+        "which the record holds as a document and not as a rule to apply again"
+    ),
+    "table_loss": (
+        "a table states the combined loss of several hazards, with no rule to "
+        "make it again"
+    ),
+    "combined_loss_not_reproduced": (
+        "the recorded rule doesn't give the sample's combined loss again"
+    ),
+    "combined_view": (
+        "a one-hazard view of the combined loss doesn't hold the draws of the "
+        "other hazards that loss reads"
+    ),
+    "pooled_by_hand": (
+        "pooled rows of such blocks come only from folds built by hand, as "
+        "year_block_kfold refuses those samples"
+    ),
+    "held_select": (
+        "the block holds hazards at the asset that came from rows it doesn't hold, "
+        "as a selection of a held sample does"
+    ),
+    "held_loss_not_one": "rows with one hazard at the asset have different losses",
+    "copula_without_k": (
+        "the record doesn't state the EmpiricalCopula's draws per reference year"
+    ),
+}
+"""Why a call kept rows built together on today's method, by `kept_today` reason."""
+
 KEY_COLUMNS = (
     "cover_hash",
     "design_id",
@@ -461,6 +502,17 @@ def _merged_intervals(
                 kind for record in stated for kind in record.get("built_together") or ()
             )
         )
+    kept = {
+        (str(entry["kind"]), str(entry["reason"])): None
+        for record in stated
+        for entry in record.get("kept_today") or ()
+    }
+    merged.pop("kept_today", None)
+    if kept:
+        # A record without `kept_today` kept no row on today's method.
+        merged["kept_today"] = [
+            {"kind": kind, "reason": reason} for kind, reason in kept
+        ]
     return merged
 
 
@@ -2294,7 +2346,11 @@ def _of_rows(
         unit = intervals.get("unit")
         if unit == _AS_BUILT:
             unit = "row" if _REDEALT in kinds else "year"
-        intervals = {**intervals, "built_together": [], "unit": unit}
+        intervals = {
+            **{key: value for key, value in intervals.items() if key != "kept_today"},
+            "built_together": [],
+            "unit": unit,
+        }
     return (
         {
             **setup,
@@ -3336,6 +3392,7 @@ def _intervals(intervals: Mapping[str, Any]) -> str:
             f"it takes {list(_BUILT_TOGETHER)}"
         )
     rebuilt = unit == _AS_BUILT
+    kept = _kept_today(intervals, where)
     # With "as_built", the rows of today's method were resampled by row where
     # an EmpiricalCopula dealt the draws, and by year otherwise.
     redrawn = (
@@ -3367,31 +3424,83 @@ def _intervals(intervals: Mapping[str, Any]) -> str:
         " The rows with built_together true read draws that were built "
         f"together: {'; or '.join(_BUILT_TOGETHER[kind] for kind in kinds)}."
     )
-    done = [kind for kind in kinds if rebuilt and kind in _REBUILT]
+    kept_kinds = {kind for kind, _ in kept}
+    done = [
+        kind
+        for kind in kinds
+        if rebuilt and kind in _REBUILT and kind not in kept_kinds
+    ]
     if not done:
-        return text + (
-            " Resampling treats them as independent, so on these rows an interval "
-            "is not the sampling error of the number, and it can be narrower or "
-            "wider; crc-sdk's docs/parametric.md, "
-            '"Rows built together", gives a synthetic coverage study.'
+        return (
+            text
+            + (
+                " Resampling treats them as independent, so on these rows an "
+                "interval is not the sampling error of the number, and it can be "
+                "narrower or wider; crc-sdk's docs/parametric.md, "
+                '"Rows built together", gives a synthetic coverage study.'
+            )
+            + _kept_sentence(kept, alone=True)
         )
     text += (
         " Each resample builds those rows again as the block built them: "
         f"{'; and '.join(_REBUILT[kind] for kind in done)}."
     )
-    kept = [_PLACED_BY[kind] for kind in kinds if kind not in done]
-    if kept:
+    others = [_PLACED_BY[kind] for kind in kinds if kind in _PLACED_BY]
+    if others:
         text += (
-            f" On the rows whose draws {' or '.join(kept)} placed, resampling treats "
-            "the draws as independent, so there an interval is not the sampling "
-            "error of the number, and it can be narrower or wider."
+            f" On the rows whose draws {' or '.join(others)} placed, resampling "
+            "treats the draws as independent, so there an interval is not the "
+            "sampling error of the number, and it can be narrower or wider."
         )
+    text += _kept_sentence(kept, alone=False)
     return text + (
         ' crc-sdk\'s docs/parametric.md, "Rows built together", gives a synthetic '
         'coverage study, which measured these methods only on the "total" rows of '
         "two assets under one EmpiricalCopula, on the rows of two hazards under one "
         "EmpiricalCopula, with their losses as damage ratios, and on one asset's "
         "held blocks of curves."
+    )
+
+
+def _kept_today(intervals: Mapping[str, Any], where: str) -> list[tuple[str, str]]:
+    """`kept_today` as (kind, reason) pairs; raises for one it doesn't know."""
+    pairs: list[tuple[str, str]] = []
+    for entry in _list(intervals, "kept_today", where):
+        if not isinstance(entry, Mapping):
+            raise EvaluationError(
+                f"{where}.kept_today holds a kind and a reason per entry, got {entry!r}"
+            )
+        kind, reason = str(entry.get("kind")), str(entry.get("reason"))
+        if kind not in _KEPT_ROWS or reason not in _KEPT_TODAY:
+            raise EvaluationError(
+                f"{where}.kept_today names a kind or a reason it doesn't know: "
+                f"{dict(entry)}; it takes the kinds {list(_KEPT_ROWS)} and the "
+                f"reasons {list(_KEPT_TODAY)}"
+            )
+        pairs.append((kind, reason))
+    return pairs
+
+
+def _kept_sentence(kept: Sequence[tuple[str, str]], *, alone: bool) -> str:
+    """The rows kept on today's method, each kind with its reason.
+
+    `alone` when no row was built again, so the sentence before already says
+    what an interval is on these rows.
+    """
+    if not kept:
+        return ""
+    clauses = "; and ".join(
+        f"{_KEPT_ROWS[kind]}, as {_KEPT_TODAY[reason]}" for kind, reason in kept
+    )
+    if alone:
+        return (
+            " These rows were resampled as before, by the unit above, because they "
+            f"couldn't be built again on each replicate: {clauses}."
+        )
+    return (
+        " The rows that couldn't be built again were resampled as before, by the "
+        "unit above, so there an interval is not the sampling error of the number, "
+        f"and it can be narrower or wider: {clauses}."
     )
 
 

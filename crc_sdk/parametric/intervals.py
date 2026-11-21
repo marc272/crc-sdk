@@ -57,13 +57,19 @@ not reweighted: a row drawn twice can take two places in the reference, or two
 hazards at the asset. Across hazards the combined loss is made again by the
 sample's rule. That needs the rule's terms and the value its result is
 multiplied by, which a record never holds, so only a sample with one impact, or
-a built-in rule on damage ratios (a value of 1), can be rebuilt; any other
-raises `EvaluationError` before any draw, as do pooled rows of such blocks, a
-one-hazard view whose combined loss reads hazards it doesn't hold, and a
-selection of a held sample, whose hazards at the asset came from rows it
-doesn't hold. `docs/parametric.md` gives a
-synthetic coverage study. Resampling whole reference years is not offered: it
-made most intervals of a copula block too wide.
+a built-in rule on damage ratios (a value of 1), can be rebuilt.
+
+**Rows that can't be built again keep today's method**, with today's draws and
+numbers, and `setup.intervals.kept_today` lists each kind of them with the
+reason, which the setup text states: a sample of several hazards whose
+combined loss can't be made again (a stated value or a value column, a rule of
+the caller's, a table's loss), a one-hazard view whose combined loss reads
+hazards it doesn't hold, a selection of a held sample, whose hazards at the
+asset came from rows it doesn't hold, a record of an `EmpiricalCopula` without
+its draws per reference year, and pooled rows of such blocks.
+`docs/parametric.md` gives a synthetic coverage study. Resampling whole
+reference years is not offered: it made most intervals of a copula block too
+wide.
 
 `Comonotonic()`, `GaussianCopula` and a model of the caller's also place each
 column's draws by their ranks over every row, so a row that reads several of
@@ -1388,11 +1394,27 @@ class _Builder:
         return np.concatenate([self.year_rows[year] for year in years])
 
 
-def _refused(what: str) -> EvaluationError:
-    return EvaluationError(
-        f"bootstrap_intervals builds rows built together again on each replicate, "
-        f"as the block built them, but {what}"
-    )
+class _Unbuildable(Exception):
+    """A block's rows can't be built again; `reason` is what the record says."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+_POOLED_BY_HAND = "pooled_by_hand"
+_COMBINED_VIEW = "combined_view"
+_COMBINED_LOSS_NEEDS_VALUE = "combined_loss_needs_value"
+_CALLER_RULE = "caller_rule"
+_TABLE_LOSS = "table_loss"
+_COMBINED_LOSS_NOT_REPRODUCED = "combined_loss_not_reproduced"
+_HELD_SELECT = "held_select"
+_HELD_LOSS_NOT_ONE = "held_loss_not_one"
+_COPULA_WITHOUT_K = "copula_without_k"
+"""Why the rows of a block were not built again, as `kept_today` records it."""
+
+_KEPT_KIND: Mapping[_Method, str] = {"redeal": _REDEALT, "rerank": _HELD}
+"""The kind of rows each method builds again, as `kept_today` names it."""
 
 
 def _block_columns(sample: OutcomeSample) -> list[_Column]:
@@ -1439,19 +1461,13 @@ def _by_hazard(column: _Column) -> tuple[FloatArray, FloatArray]:
     hazards, losses = hazard[order], column.loss[order]
     same = hazards[1:] == hazards[:-1]
     if (losses[1:][same] != losses[:-1][same]).any():
-        raise _refused(
-            f"in column {column.name!r}, rows with one hazard at the asset have "
-            "different losses, so the loss of a new hazard can't be read from them"
-        )
+        # The loss of a new hazard can't be read from these rows.
+        raise _Unbuildable(_HELD_LOSS_NOT_ONE)
     found = np.minimum(np.searchsorted(hazards, column.index), hazards.size - 1)
     if not (hazards[found] == column.index).all():
-        raise _refused(
-            f"column {column.name!r} holds index values that are no row's hazard at "
-            'the asset: HazardNoise(..., hold="hazard_distribution") gives each row '
-            "one of the index values of the rows its call built, and this block "
-            "doesn't hold them all, as a selection of those rows doesn't. Give the "
-            "sample as the call built it"
-        )
+        # The held form gives each row one of the index values of its call's
+        # rows, and this block doesn't hold them all, as a selection doesn't.
+        raise _Unbuildable(_HELD_SELECT)
     return hazards, losses
 
 
@@ -1510,8 +1526,8 @@ def _combine(
     A sample with one impact has that hazard's own loss. A built-in rule's
     result is multiplied by the value, which a record never holds, so it is
     made again on damage ratios only, where the value is 1. Raises
-    `EvaluationError` for any other sample, and unless the rule gives the
-    sample's own combined loss on its rows.
+    `_Unbuildable` for any other sample, and unless the rule gives the sample's
+    own combined loss on its rows.
     """
     record = sample.provenance.combine or {}
     kind = str(record.get("kind"))
@@ -1521,27 +1537,15 @@ def _combine(
         only = str(record.get("component"))
         rule = _own_loss_of(only)
     elif kind in _BUILT_IN_RULES:
+        # The rule's result is multiplied by the value, which a record never holds.
         if not _values_are_one(sample):
-            raise _refused(
-                f"the combined loss is the result of the rule {kind!r} times the "
-                "value, and the sample's loss models state a value, which a record "
-                "never holds. So the combined loss of hazards dealt to new rows "
-                "can't be made again; a one-hazard view, sample.component(name), "
-                "reads its own loss and can be"
-            )
+            raise _Unbuildable(_COMBINED_LOSS_NEEDS_VALUE)
         rule = _rule_on_damage_ratios(_BUILT_IN_RULES[kind](record), kind, impacted)
     else:
-        raise _refused(
-            f"the combined loss comes from {kind!r}, which the sample records as a "
-            "document and not as a rule to apply again, so the combined loss of "
-            "hazards dealt to new rows can't be made"
-        )
+        raise _Unbuildable(_TABLE_LOSS if kind == "table" else _CALLER_RULE)
     own = {column.name: column.loss for column in columns if column.loss is not None}
     if not np.array_equal(rule(own), sample.loss[:, 0]):
-        raise _refused(
-            "the combined loss made again from the hazards' own losses by the "
-            "recorded rule is not the sample's"
-        )
+        raise _Unbuildable(_COMBINED_LOSS_NOT_REPRODUCED)
     return rule
 
 
@@ -1564,10 +1568,7 @@ def _reference_years(sample: OutcomeSample) -> tuple[tuple[IntArray, IntArray], 
         or not isinstance(k, int)
         or k < 1
     ):
-        raise _refused(
-            "the sample doesn't record the EmpiricalCopula that dealt its columns, "
-            "with its draws per reference year"
-        )
+        raise _Unbuildable(_COPULA_WITHOUT_K)
     window = sample.provenance.details.get("window")
     m = 1 if window is None else len(window["members"])
     period = sample.period.astype(np.int64)
@@ -1579,50 +1580,81 @@ def _reference_years(sample: OutcomeSample) -> tuple[tuple[IntArray, IntArray], 
     return tuple(members)
 
 
-def _builder(evaluated: _Evaluated, methods: Sequence[_Method]) -> _Builder:
-    """What rebuilding the block's rows needs; raises where it can't be done."""
+@dataclass(frozen=True, eq=False)
+class _Plan:
+    """How each row of a call is resampled, and what rebuilding rows needs.
+
+    `methods` holds each row's method once the rows that can't be built again
+    are taken back to today's. `kept` holds, for each of those rows, the
+    reason. `builder` is `None` when no row is built again.
+    """
+
+    methods: tuple[_Method, ...]
+    kept: Mapping[int, str]
+    builder: _Builder | None
+
+
+def _reasons(
+    evaluated: _Evaluated, methods: Sequence[_Method]
+) -> tuple[dict[_Method, str], _Builder | None]:
+    """Why each method can't build the block's rows again, and what it needs."""
     run = evaluated.run
     if run is None:
-        raise _refused(
-            "pooled folds aren't rebuilt: year_block_kfold refuses an EmpiricalCopula "
-            'sample and one built with HazardNoise(..., hold="hazard_distribution"), '
-            "so no split gives such folds; give one block"
-        )
+        # year_block_kfold refuses these samples, so their folds are built by hand.
+        return {"rerank": _POOLED_BY_HAND, "redeal": _POOLED_BY_HAND}, None
     sample = run.sample
     if (
         sample.index_components is None
         and len(sample.asset_ids) == 1
         and len(_view_columns(sample)) > 1
     ):
-        raise _refused(
-            "this one-hazard view holds a combined loss that reads hazards whose "
-            "draws it doesn't hold; give the sample of several hazards"
-        )
+        # The view's loss reads hazards whose draws it doesn't hold.
+        return {"rerank": _COMBINED_VIEW, "redeal": _COMBINED_VIEW}, None
     columns = _block_columns(sample)
+    held_reason: str | None = None
+    try:
+        columns = [
+            dataclasses.replace(column, by_hazard=_by_hazard(column))
+            if column.held and column.loss is not None
+            else column
+            for column in columns
+        ]
+    except _Unbuildable as unbuildable:
+        held_reason = unbuildable.reason
     redeal = "redeal" in methods
-    columns = [
-        dataclasses.replace(column, by_hazard=_by_hazard(column))
-        if column.held and column.loss is not None
-        else column
-        for column in columns
-    ]
-    rebuilt_loss = redeal or any(
-        column.held and column.loss is not None for column in columns
-    )
-    combine = (
-        _combine(sample, columns)
-        if sample.index_components is not None and rebuilt_loss
-        else None
-    )
+    held_loss = any(column.held and column.loss is not None for column in columns)
+    several = sample.index_components is not None
+    combine = None
+    combine_reason: str | None = None
+    if several and (redeal or held_loss):
+        try:
+            combine = _combine(sample, columns)
+        except _Unbuildable as unbuildable:
+            combine_reason = unbuildable.reason
+    members: tuple[tuple[IntArray, IntArray], ...] = ()
+    copula_reason: str | None = None
+    if redeal:
+        try:
+            members = _reference_years(sample)
+        except _Unbuildable as unbuildable:
+            copula_reason = unbuildable.reason
+    reasons: dict[_Method, str] = {}
+    rerank_reason = held_reason or (combine_reason if held_loss else None)
+    if rerank_reason is not None:
+        reasons["rerank"] = rerank_reason
+    held = any(column.held for column in columns)
+    redeal_reason = copula_reason or combine_reason or (held_reason if held else None)
+    if redeal_reason is not None:
+        reasons["redeal"] = redeal_reason
     year_rows = tuple(
         np.flatnonzero(evaluated.year == year).astype(np.int64)
         for year in range(evaluated.n_years)
     )
     provenance = sample.provenance
-    return _Builder(
+    return reasons, _Builder(
         sample=sample,
         columns=tuple(columns),
-        members=_reference_years(sample) if redeal else (),
+        members=members,
         year_rows=year_rows,
         year_row=(
             np.array([rows[0] for rows in year_rows], dtype=np.int64)
@@ -1641,6 +1673,39 @@ def _builder(evaluated: _Evaluated, methods: Sequence[_Method]) -> _Builder:
             ),
         ),
     )
+
+
+def _plan(evaluated: _Evaluated) -> _Plan:
+    """Each row's method; rows that can't be built again keep today's method.
+
+    A row that can't be built again, as the block doesn't hold what that needs,
+    is resampled as before, with today's draws and numbers, and `kept` says why.
+    """
+    wanted = [_method(kinds) for kinds in evaluated.together]
+    if all(method == "today" for method in wanted):
+        return _Plan(tuple(wanted), {}, None)
+    reasons, builder = _reasons(evaluated, wanted)
+    kept = {r: reasons[method] for r, method in enumerate(wanted) if method in reasons}
+    methods = tuple("today" if r in kept else method for r, method in enumerate(wanted))
+    rebuilt = any(method != "today" for method in methods)
+    return _Plan(methods, kept, builder if rebuilt else None)
+
+
+def _kept_record(
+    evaluated: _Evaluated, kept: Mapping[int, str]
+) -> list[dict[str, str]]:
+    """`kept_today`: each kind of rows kept as today, with its reason, once each."""
+    found = {
+        (_KEPT_KIND[_method(evaluated.together[r])], reason)
+        for r, reason in kept.items()
+    }
+    order = list(_BUILT_TOGETHER)
+    return [
+        {"kind": kind, "reason": reason}
+        for kind, reason in sorted(
+            found, key=lambda pair: (order.index(pair[0]), pair[1])
+        )
+    ]
 
 
 def _redeal_draws(
@@ -1854,10 +1919,9 @@ def _interval_table(
     wide = evaluated.table
     columns = metric_columns(evaluated.options)
     n_rows = int(evaluated.probability.shape[0])
-    methods = [_method(kinds) for kinds in evaluated.together]
+    plan = _plan(evaluated)
+    methods, builder = plan.methods, plan.builder
     today = [r for r, method in enumerate(methods) if method == "today"]
-    # Before any draw, so a refused call leaves the generator untouched.
-    builder = None if len(today) == len(methods) else _builder(evaluated, methods)
     record = _generator_record(rng, "bootstrap")
     draws = rng.integers(
         0, evaluated.n_years, size=(n_bootstrap, evaluated.n_years), dtype=np.int64
@@ -1941,6 +2005,13 @@ def _interval_table(
                     for kind in _BUILT_TOGETHER
                     if any(kind in kinds for kinds in evaluated.together)
                 ],
+                # Left out when every row was built as its block built it, so a
+                # call with nothing kept writes the document it wrote before.
+                **(
+                    {"kept_today": _kept_record(evaluated, plan.kept)}
+                    if plan.kept
+                    else {}
+                ),
             },
         ),
         rng=(*metadata.rng, {**record, "sample_hash": sample_hashes[0]}),
@@ -2060,7 +2131,13 @@ def bootstrap_intervals(
     hold="hazard_distribution")` is re-ranked over the years drawn by the call
     above. Every other row reads that call as before. `setup.intervals.unit` is
     `"as_built"` when a row was rebuilt, and `"row"` (an `EmpiricalCopula`
-    block) or `"year"` otherwise.
+    block) or `"year"` otherwise. A row built together that can't be built
+    again, as the block doesn't hold what that needs, reads that call as
+    before, and `setup.intervals.kept_today` lists `{"kind", "reason"}` for
+    each kind of such rows: `"combined_loss_needs_value"`, `"caller_rule"`,
+    `"table_loss"`, `"combined_loss_not_reproduced"`, `"combined_view"`,
+    `"held_select"`, `"held_loss_not_one"`, `"copula_without_k"` or
+    `"pooled_by_hand"`. The key is left out when there is none.
 
     The table has `to_long`'s columns and, for each wide row and metric column:
 
@@ -2091,23 +2168,19 @@ def bootstrap_intervals(
     design, and on a curve block it is the Monte Carlo error of the draws and
     says nothing about the curve. Two rows' intervals are not a test of a
     difference between them. On the rows with `built_together` true that
-    `Comonotonic()`, `GaussianCopula` or a model of the caller's moved, an
-    interval can be narrower or wider than the Monte Carlo error of the draws,
-    and the setup text says so; it states the method of the rows rebuilt.
+    `Comonotonic()`, `GaussianCopula` or a model of the caller's moved, and on
+    those kept on today's method, an interval can be narrower or wider than the
+    Monte Carlo error of the draws, and the setup text says so; it states the
+    method of the rows rebuilt and the reason of the rows kept.
 
     The table holds an `EvaluationMetadata` under the same key as a
     comparison's, with `setup.intervals`, and `write_comparison` writes it.
 
     Raises as `compare` or `compare_pooled` does; `EvaluationError` for an
     invalid `n_bootstrap` or `ci_level`, for `split` missing on one block, for
-    `split`, `fold`, `design_sample` or `premiums` with folds, for a
-    `premiums` key that matches no cover given as is, and, before any draw, for
-    rows built together that can't be built again: on a sample of several
-    hazards whose combined loss can't be made again (loss models that state a
-    value, a rule of the caller's, a table's loss), on a one-hazard view whose
-    combined loss reads hazards it doesn't hold, on a selection of a held
-    sample, and on pooled folds of such blocks; `TypeError` for an `rng` that is
-    not a `numpy.random.Generator`.
+    `split`, `fold`, `design_sample` or `premiums` with folds, and for a
+    `premiums` key that matches no cover given as is; `TypeError` for an `rng`
+    that is not a `numpy.random.Generator`.
     """
     generator = _require_generator(rng)
     count = _n_bootstrap(n_bootstrap)

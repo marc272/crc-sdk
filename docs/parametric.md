@@ -1383,7 +1383,8 @@ statements that every split or sample shares are written once.
   re-ranked on each replicate, the method and what the
   [coverage study](#pooled-folds-and-intervals) measured; for the others,
   whether their coverage is unmeasured, that their intervals are not the
-  sampling error of their numbers, and where the study is.
+  sampling error of their numbers, and where the study is; and, for rows that
+  couldn't be built again, the reason.
 - On a table of [`compare_scenarios`](#several-scenarios-in-one-table), one
   `Scenario` line each (its label, whether it is the reference, the hazard it
   reads and whether the caller stated that name, its product, pathway and
@@ -2495,14 +2496,27 @@ difference between them.
   value, which a sample's record never holds, so two kinds of sample can be
   rebuilt: one with a single impact, whose combined loss is that hazard's own
   loss, and one under `CappedSum` or `CompoundDamage` whose loss models give the
-  damage ratio, with no value. `bootstrap_intervals` raises `EvaluationError`
-  before any draw for a row it would have to rebuild and can't: on any other
-  sample of several hazards (loss models that state a value or a value column, a
-  rule of your own, a combined loss a table states); on a view
-  `component(name, loss="combined")`, whose loss reads hazards it doesn't hold;
-  on a selection of a held sample, which holds hazards at the asset from rows
-  it lacks; and on pooled folds of these blocks, which `year_block_kfold`
-  refuses to make. Resampling whole reference years is not offered: on a copula
+  damage ratio, with no value.
+
+  A row built together that can't be built again keeps the resampling of the
+  unit above, with the draws and numbers it had before, and the record says so:
+  `setup.intervals.kept_today` lists `{"kind", "reason"}` for each kind of such
+  rows, and the setup text's `Intervals` line names the reason. Those rows are:
+
+  | Rows | `reason` |
+  | --- | --- |
+  | On a sample of several hazards, rows whose combined loss is a built-in rule's result times a stated value or a value column, which a record never holds | `"combined_loss_needs_value"` |
+  | The same, with a rule of your own, or a combined loss a table states | `"caller_rule"`, `"table_loss"` |
+  | A view `component(name, loss="combined")` whose loss reads hazards it doesn't hold | `"combined_view"` |
+  | A selection of a held sample, which holds hazards at the asset from rows it lacks | `"held_select"` |
+  | A sample that records an `EmpiricalCopula` without its draws per reference year | `"copula_without_k"` |
+  | Pooled rows of these blocks, from folds built by hand, as `year_block_kfold` refuses such samples | `"pooled_by_hand"` |
+
+  Two more reasons guard against a sample whose rows contradict its record:
+  `"combined_loss_not_reproduced"`, when the recorded rule doesn't give the
+  sample's combined loss again, and `"held_loss_not_one"`, when rows with one
+  hazard at the asset have different losses. `kept_today` is left out when no
+  row was kept. Resampling whole reference years is not offered: on a copula
   block it made most intervals too wide, up to about four times the Monte Carlo
   error.
 
@@ -2577,7 +2591,8 @@ difference between them.
   When a row is flagged, the setup text's `Intervals` line says how its rows
   were built and how they were resampled: for rows re-dealt or re-ranked, the
   method and what the study measured; for the others, that their intervals are
-  not the sampling error of their numbers.
+  not the sampling error of their numbers, and for rows kept on today's method,
+  why they couldn't be built again.
 - **Replicates.** One call `rng.integers(0, Y, size=(n_bootstrap, Y))` draws the
   block's Y years, and it stays the first draw from `rng`. A replicate of the
   unit above reweights the rows by how often their year was drawn, which gives
@@ -4177,9 +4192,10 @@ rank and no best flag.
   the difference between two rows is not offered.
 - **Intervals on every row built together.** `bootstrap_intervals` builds the
   rows of an `EmpiricalCopula` block and of a held `HazardNoise` block again on
-  each replicate, but it refuses those it can't build again: on a sample of
-  several hazards whose loss models state a value or whose rule is your own, on
-  a view whose combined loss reads hazards it doesn't hold, on a selection of a
-  held sample, and on pooled folds of these blocks. It resamples the rows of a
+  each replicate, but not those it can't build again: on a sample of several
+  hazards whose loss models state a value or whose rule is your own, on a view
+  whose combined loss reads hazards it doesn't hold, on a selection of a held
+  sample, and on pooled folds of these blocks. Those keep the resampling they
+  had, and `setup.intervals.kept_today` says why. It resamples the rows of a
   block that `Comonotonic()`, `GaussianCopula` or a model of your own moved as
   independent rows, and flags them with `built_together`.
