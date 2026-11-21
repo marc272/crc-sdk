@@ -44,6 +44,7 @@ from crc_sdk.parametric import (
     IndexDefinition,
     Joint,
     KFold,
+    LeakageError,
     LinearPayout,
     LinearTrend,
     LossModel,
@@ -1332,3 +1333,44 @@ def test_curve_scenario_rows_are_compare_scenarios(tmp_path: Path) -> None:
         "component 'txx' of asset 'depot-b'",
         "component 'txx' of asset 'warehouse-a'",
     ]
+
+
+def test_a_window_of_horizons_reads_every_component(tmp_path: Path) -> None:
+    horizons = (2030, 2050)
+    datasets = {
+        "rx1day": _curves(tmp_path / "rx1day.parquet", "rx1day", horizons),
+        "txx": _curves(tmp_path / "txx.parquet", "txx", horizons),
+    }
+    select = {"horizons": list(horizons), "pathways": ["ssp585"]}
+    window = {"window": [("ssp585", year) for year in horizons]}
+    plan = (
+        _curve_plan(datasets, **select)
+        .dependence(GaussianCopula(0.3))
+        .basis_risk(NOISE)
+        .covers(_rain().with_values({"levels[0]": 1e5}))
+        .split(FreshDraws(400, seed=8))
+        .scenarios(ScenarioSet(reference="window", labels=window))
+    )
+    sample = plan.scenario_samples()["window"]["warehouse-a"]
+    drawn = _drawn_by_hand(
+        datasets, 42, 400, GaussianCopula(0.3), horizons, scenario="window"
+    )
+    assert sample.content_hash == drawn["warehouse-a"].content_hash
+    entry = plan.explain(format="json")["setup"]["scenarios"]["scenarios"]["window"]
+    assert entry["members"] == [["ssp585", 2030], ["ssp585", 2050]]
+
+
+def test_a_holdout_of_curve_draws_under_a_stated_dependence(
+    datasets: dict[str, Path], tmp_path: Path
+) -> None:
+    independent = _designed(_curve_plan(datasets).dependence(Independent()))
+    result = independent.split(Holdout(0.5)).write_parquet(tmp_path / "a.parquet")
+    assert {row["split"] for row in result.table.to_pylist()} == {
+        "in_sample",
+        "out_of_sample",
+    }
+    # A copula reorders the draws, so two blocks of one sample share their rows'
+    # draws; compare refuses it out of sample, and fresh draws are the test.
+    copula = _designed(_curve_plan(datasets).dependence(GaussianCopula(0.3)))
+    with pytest.raises(LeakageError):
+        copula.split(Holdout(0.5)).write_parquet(tmp_path / "b.parquet")
