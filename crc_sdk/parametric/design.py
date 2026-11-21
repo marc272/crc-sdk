@@ -145,7 +145,7 @@ import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Literal, Self, cast
+from typing import Annotated, Any, Literal, NoReturn, Self, cast
 
 import numpy as np
 import pyarrow as pa  # type: ignore[import-untyped]
@@ -249,6 +249,15 @@ DEGENERATE_TAIL_TOLERANCE = 1e-9
 BASIS_ROW_TOLERANCE = 1e-9
 """The rounding allowance of a basis row summing to at most 1."""
 
+REFINE_METHOD = "compass_search"
+"""The method of `DesignOptions(refine=True)`, as the record names it."""
+
+REFINE_TOLERANCE = 1e-4
+"""The default smallest step of a refinement, as a share of a parameter's bounds."""
+
+REFINE_MAX_POINTS = 1_000
+"""The default most points a refinement evaluates."""
+
 StrictInt = Annotated[int, Strict()]
 StrictBool = Annotated[bool, Strict()]
 
@@ -268,14 +277,25 @@ class DesignOptions(_DefinitionModel):
     - `ranges`: on the LP route, range every identified amount over the
       near-optimal designs and report `unique` (four range ends per amount,
       each an LP, solved on reduced LPs; see the module docstring).
+    - `refine`: after a grid over free thresholds, refine its best point by
+      a compass search, with the amounts solved exactly at every point it
+      evaluates (see the module docstring). `refine_tolerance` is its
+      smallest step, as a share of each parameter's bounds (`upper -
+      lower`), and `refine_max_points` the most points it evaluates. Both
+      apply only with `refine=True`.
 
-    Raises `CoverDefinitionError` (a `ValueError`) for invalid values.
+    Raises `CoverDefinitionError` (a `ValueError`) for invalid values, and
+    for `refine_tolerance` or `refine_max_points` changed without
+    `refine=True`.
     """
 
     max_grid_points: StrictInt = 10_000
     feasibility_tolerance: FiniteFloat = 1e-7
     fill: Fill = "lowest"
     ranges: StrictBool = False
+    refine: StrictBool = False
+    refine_tolerance: FiniteFloat = REFINE_TOLERANCE
+    refine_max_points: StrictInt = REFINE_MAX_POINTS
 
     def __init__(
         self,
@@ -284,12 +304,18 @@ class DesignOptions(_DefinitionModel):
         feasibility_tolerance: float = 1e-7,
         fill: Fill = "lowest",
         ranges: bool = False,
+        refine: bool = False,
+        refine_tolerance: float = REFINE_TOLERANCE,
+        refine_max_points: int = REFINE_MAX_POINTS,
     ) -> None:
         super().__init__(
             max_grid_points=max_grid_points,
             feasibility_tolerance=feasibility_tolerance,
             fill=fill,
             ranges=ranges,
+            refine=refine,
+            refine_tolerance=refine_tolerance,
+            refine_max_points=refine_max_points,
         )
 
     @model_validator(mode="after")
@@ -298,16 +324,39 @@ class DesignOptions(_DefinitionModel):
             raise CoverDefinitionError("max_grid_points must be at least 1")
         if not 0.0 < self.feasibility_tolerance < 1.0:
             raise CoverDefinitionError("feasibility_tolerance must lie in (0, 1)")
+        if not 0.0 < self.refine_tolerance < 1.0:
+            raise CoverDefinitionError("refine_tolerance must lie in (0, 1)")
+        if self.refine_max_points < 1:
+            raise CoverDefinitionError("refine_max_points must be at least 1")
+        if not self.refine and (
+            self.refine_tolerance != REFINE_TOLERANCE
+            or self.refine_max_points != REFINE_MAX_POINTS
+        ):
+            raise CoverDefinitionError(
+                "refine_tolerance and refine_max_points apply only with refine=True"
+            )
         return self
 
     def to_document(self) -> dict[str, Any]:
-        """Return every option as plain JSON types."""
-        return {
+        """Return every option as plain JSON types.
+
+        The refinement's options are left out when `refine` is false, so the
+        document, and the `design_id` it enters, of a design without a
+        refinement is that of a design made before the option existed.
+        """
+        document: dict[str, Any] = {
             "feasibility_tolerance": self.feasibility_tolerance,
             "fill": self.fill,
             "max_grid_points": self.max_grid_points,
             "ranges": self.ranges,
         }
+        if self.refine:
+            document |= {
+                "refine": True,
+                "refine_max_points": self.refine_max_points,
+                "refine_tolerance": self.refine_tolerance,
+            }
+        return document
 
 
 @dataclass(frozen=True, eq=False)
@@ -344,6 +393,17 @@ class DesignResult:
     - The degenerate-tail flags `p_zero_loss`, `tail_outcomes` and
       `degenerate_tail`.
     - `design_sample`, the sample the cover was designed on.
+    - `refinement`: with `DesignOptions(refine=True)` on a grid, the record
+      of the compass search after it, as plain JSON types: `method`,
+      `tolerance`, `max_points` and `initial_steps` (its settings), `start`
+      and `start_objective` (the grid's best point), `end` and `objective`
+      (where it ended), `gain` (`start_objective - objective`, never below
+      0), `points` (how many points it evaluated, the start left out),
+      `counts` (their statuses), `moves`, `final_steps` and `stopped`
+      (`"step_tolerance"` or `"max_points"`). Objectives are in payout units
+      (squared for MSE). `None` without a refinement.
+      `refinement_profile` is a `pyarrow.Table` of the points it evaluated,
+      in order: their values, `objective` and `status`, as in `profile`.
 
     `evaluate` and `compare` take a `DesignResult` in place of a cover: its
     rows use the design premium and carry `unique`, `ties` and
@@ -391,6 +451,8 @@ class DesignResult:
     design_sample: OutcomeSample = field(repr=False)
     solved_by: _solver.Method | None = None
     fallbacks: int = 0
+    refinement: Mapping[str, Any] | None = None
+    refinement_profile: Any | None = None
 
     @property
     def sample_hash(self) -> str:
@@ -404,15 +466,16 @@ class DesignResult:
         limit and options, the values, the solve (`solver` with the name and
         version; `solve` with the status, message, iterations, solves, time,
         options, `solved_by` and `fallbacks`), the non-uniqueness report and
-        the degenerate-tail flags. `evaluate` writes it to its metadata's
-        `designs`.
+        the degenerate-tail flags, and, after a refinement, its record under
+        `refinement` (left out without one). `evaluate` writes it to its
+        metadata's `designs`.
         """
         ranges = (
             None
             if self.ranges is None
             else {name: [low, high] for name, (low, high) in self.ranges.items()}
         )
-        return {
+        record: dict[str, Any] = {
             "design_id": self.design_id,
             "template_hash": self.template_hash,
             "cover_hash": self.cover.definition_hash,
@@ -452,6 +515,9 @@ class DesignResult:
             "tail_outcomes": self.tail_outcomes,
             "degenerate_tail": self.degenerate_tail,
         }
+        if self.refinement is not None:
+            record["refinement"] = copy.deepcopy(dict(self.refinement))
+        return record
 
 
 # -- the problem -------------------------------------------------------------
@@ -1659,11 +1725,46 @@ def _design_amounts(
 
 @dataclass(frozen=True, eq=False)
 class _GridOutcome:
+    """A grid's chosen candidate, its report and its profile.
+
+    `point` is the chosen candidate's values, `objective` its objective in
+    payout units and `feasible` the objectives of every candidate that has
+    one, scaled, for a later count of ties.
+    """
+
     cover: Cover
     amounts: _Amounts | None
     ties: int
     profile: Any
     counts: dict[str, int]
+    point: tuple[float, ...]
+    objective: float
+    feasible: tuple[float, ...]
+
+
+def _solved_point(
+    template: Cover,
+    names: Sequence[str],
+    point: Sequence[float],
+    context: _Context,
+    solves: _Solves,
+) -> tuple[float | None, str, str | None]:
+    """The objective of a point of the thresholds, its amounts solved exactly.
+
+    Returns the objective in payout units and `"optimal"`; or `None` and
+    `"invalid"` when the values make no valid cover (unordered thresholds),
+    or `"infeasible"` with the error's message when no payout meets the
+    constraints there.
+    """
+    try:
+        candidate = template.with_values(dict(zip(names, point, strict=True)))
+    except CoverDefinitionError:
+        return None, "invalid", None
+    try:
+        amounts = _design_amounts(candidate, context, solves, report=False)
+    except InfeasibleDesignError as error:
+        return None, "infeasible", str(error)
+    return amounts.objective_value, "optimal", None
 
 
 def _grid(
@@ -1673,8 +1774,14 @@ def _grid(
     solves: _Solves,
     *,
     inner: bool,
+    finish: bool = True,
 ) -> _GridOutcome:
-    """Search the grids of `names`; solve the amounts at each point if `inner`."""
+    """Search the grids of `names`; solve the amounts at each point if `inner`.
+
+    With `finish`, an inner grid solves the chosen candidate's amounts again
+    with the uniqueness report; without it, a refinement does so where it
+    ends, and `amounts` is `None`.
+    """
     parameters = template.payout.parameters()
     grids: list[tuple[float, ...]] = []
     for name in names:
@@ -1699,20 +1806,17 @@ def _grid(
     first_infeasible: str | None = None
     began = time.perf_counter()
     for point in itertools.product(*grids):
-        values = dict(zip(names, point, strict=True))
+        if inner:
+            objective, status, message = _solved_point(
+                template, names, point, context, solves
+            )
+            first_infeasible = first_infeasible or message
+            rows.append((point, objective, status))
+            continue
         try:
-            candidate = template.with_values(values)
+            candidate = template.with_values(dict(zip(names, point, strict=True)))
         except CoverDefinitionError:
             rows.append((point, None, "invalid"))
-            continue
-        if inner:
-            try:
-                amounts = _design_amounts(candidate, context, solves, report=False)
-            except InfeasibleDesignError as error:
-                first_infeasible = first_infeasible or str(error)
-                rows.append((point, None, "infeasible"))
-                continue
-            rows.append((point, amounts.objective_value, "optimal"))
             continue
         payout = candidate.payout_values(context.index)
         status = _grid_status(context, template, candidate, payout, linear)
@@ -1742,24 +1846,37 @@ def _grid(
     allowance = context.options.feasibility_tolerance * max(1.0, abs(best))
     within = [position for position, value in feasible if value - best <= allowance]
     chosen = within[0]
-    point = rows[chosen][0]
+    point, objective, _ = rows[chosen]
+    assert objective is not None
     cover = template.with_values(dict(zip(names, point, strict=True)))
     chosen_amounts = (
-        _design_amounts(cover, context, solves, report=True) if inner else None
+        _design_amounts(cover, context, solves, report=True)
+        if inner and finish
+        else None
     )
+    return _GridOutcome(
+        cover=cover if chosen_amounts is None else chosen_amounts.cover,
+        amounts=chosen_amounts,
+        ties=len(within) - 1,
+        profile=_profile_table(names, rows),
+        counts=counts,
+        point=point,
+        objective=objective,
+        feasible=tuple(value for _, value in feasible),
+    )
+
+
+def _profile_table(
+    names: Sequence[str], rows: Sequence[tuple[Sequence[float], float | None, str]]
+) -> Any:
+    """One row per point: its values, `objective` and `status`."""
     columns: dict[str, Any] = {
         name: pa.array([row[0][i] for row in rows], pa.float64())
         for i, name in enumerate(names)
     }
     columns["objective"] = pa.array([row[1] for row in rows], pa.float64())
     columns["status"] = pa.array([row[2] for row in rows], pa.string())
-    return _GridOutcome(
-        cover=cover if chosen_amounts is None else chosen_amounts.cover,
-        amounts=chosen_amounts,
-        ties=len(within) - 1,
-        profile=pa.table(columns),
-        counts=counts,
-    )
+    return pa.table(columns)
 
 
 def _counts_text(counts: Mapping[str, int]) -> str:
@@ -1814,6 +1931,156 @@ def _grid_status(
     return "feasible"
 
 
+# -- the refinement ----------------------------------------------------------
+
+
+@dataclass(frozen=True, eq=False)
+class _Refined:
+    """A refinement's outcome: the amounts where it ended, ties and its record."""
+
+    amounts: _Amounts
+    ties: int
+    record: dict[str, Any]
+    profile: Any
+
+
+def _refinement_bounds(
+    template: Cover, names: Sequence[str], context: _Context
+) -> tuple[list[float], list[float]]:
+    """The bounds of the parameters a refinement moves; each must be finite."""
+    parameters = template.payout.parameters()
+    lower: list[float] = []
+    upper: list[float] = []
+    for name in names:
+        parameter = parameters[name]
+        assert isinstance(parameter, Free)
+        if parameter.upper is None:
+            raise context.error(
+                DesignError,
+                f"DesignOptions(refine=True) moves {name} within its bounds, and it "
+                "has no upper bound (give Free(lower, upper, grid=...))",
+            )
+        lower.append(parameter.lower)
+        upper.append(parameter.upper)
+    return lower, upper
+
+
+def _initial_step(
+    value: float, grid: Sequence[float], lower: float, upper: float
+) -> float:
+    """Half the larger gap from a grid value to its neighbours on the grid.
+
+    At either end of the grid, the bound on that side is the neighbour.
+    """
+    position = list(grid).index(value)
+    below = grid[position - 1] if position > 0 else lower
+    above = grid[position + 1] if position + 1 < len(grid) else upper
+    return max(value - below, above - value) / 2.0
+
+
+def _named(names: Sequence[str], values: Sequence[float]) -> dict[str, float]:
+    return {name: float(value) + 0.0 for name, value in zip(names, values, strict=True)}
+
+
+def _refine(
+    template: Cover,
+    names: Sequence[str],
+    outcome: _GridOutcome,
+    context: _Context,
+    solves: _Solves,
+) -> _Refined:
+    """Refine a grid's chosen candidate by a compass search over `names`.
+
+    The search (`_solver.compass_search`) starts at the chosen candidate,
+    with a step per parameter of half the larger gap to its grid neighbours
+    (or to its bound, at an end of the grid), and stops when every step is at
+    most `refine_tolerance` times its bounds' width, or after
+    `refine_max_points` points. At every point it evaluates, the amounts are
+    solved exactly, as at a grid point; a point whose values make no valid
+    cover, or where no payout meets the constraints, has no objective. It
+    moves only to a point whose objective lies below the current one by more
+    than the tie tolerance of the grid, so it never ends worse than the grid.
+
+    Where it ends, the amounts are solved again with the uniqueness report.
+    `ties` counts the grid's candidates within the tie tolerance of that
+    objective, as on the grid; the search's own points are not counted.
+    """
+    options = context.options
+    parameters = template.payout.parameters()
+    lower, upper = _refinement_bounds(template, names, context)
+    steps: list[float] = []
+    for name, value, low, high in zip(names, outcome.point, lower, upper, strict=True):
+        grid = cast(Free, parameters[name]).grid
+        assert grid is not None  # the grid has checked it
+        steps.append(_initial_step(value, grid, low, high))
+    smallest = [
+        options.refine_tolerance * (high - low)
+        for low, high in zip(lower, upper, strict=True)
+    ]
+    objectives: dict[tuple[float, ...], float | None] = {}
+
+    def evaluate(point: tuple[float, ...]) -> tuple[float | None, str]:
+        objective, status, _ = _solved_point(template, names, point, context, solves)
+        objectives[point] = objective
+        return (None if objective is None else context.scaled(objective)), status
+
+    def allowance(value: float) -> float:
+        return options.feasibility_tolerance * max(1.0, abs(value))
+
+    start = context.scaled(outcome.objective)
+    search = _solver.compass_search(
+        evaluate,
+        outcome.point,
+        start,
+        steps=steps,
+        smallest=smallest,
+        lower=lower,
+        upper=upper,
+        max_points=options.refine_max_points,
+        allowance=allowance,
+    )
+    moved = search.moves > 0
+    cover = template.with_values(_named(names, search.best))
+    amounts = _design_amounts(cover, context, solves, report=True)
+    end = amounts.objective_value
+    final = context.scaled(end)
+    if final > search.objective + allowance(search.objective):
+        raise context.error(
+            DesignError,
+            f"the refined point's objective solved again ({final:.12g}, scaled) "
+            f"lies above the one the search found there ({search.objective:.12g})",
+            status="inconsistent_objective",
+        )
+    if moved:
+        ties = sum(1 for value in outcome.feasible if value - final <= allowance(final))
+    else:
+        ties = outcome.ties
+    counts: dict[str, int] = {}
+    for point in search.points:
+        counts[point.status] = counts.get(point.status, 0) + 1
+    record = {
+        "method": REFINE_METHOD,
+        "tolerance": options.refine_tolerance,
+        "max_points": options.refine_max_points,
+        "initial_steps": _named(names, steps),
+        "start": _named(names, outcome.point),
+        "start_objective": outcome.objective + 0.0,
+        "end": _named(names, search.best),
+        "objective": end + 0.0,
+        "gain": max(0.0, outcome.objective - end) + 0.0,
+        "points": len(search.points),
+        "counts": dict(sorted(counts.items())),
+        "moves": search.moves,
+        "final_steps": _named(names, search.steps),
+        "stopped": search.stopped,
+    }
+    rows = [
+        (point.values, objectives[point.values], point.status)
+        for point in search.points
+    ]
+    return _Refined(amounts, ties, record, _profile_table(names, rows))
+
+
 # -- the public function -----------------------------------------------------
 
 
@@ -1853,10 +2120,34 @@ def _check_inputs(
 ) -> None:
     if not isinstance(template, Cover):
         raise TypeError(f"template must be a Cover, got {type(template).__name__}")
-    _check_terms(sample, objective, pricing, budget, limit, options)
+    _check_arguments(sample, objective, pricing, budget, limit, options)
 
 
 def _check_terms(
+    sample: Any,
+    objective: Any,
+    pricing: Any,
+    budget: Any,
+    limit: Any,
+    options: Any,
+) -> None:
+    """Check the terms of a design without a grid route: `design_joint`'s.
+
+    The arguments besides the templates are checked as `design` checks them.
+    Its thresholds are fixed, so it has no grid point to refine, and
+    `DesignOptions(refine=True)` raises `DesignError`.
+    """
+    _check_arguments(sample, objective, pricing, budget, limit, options)
+    if options.refine:
+        raise DesignError(
+            "design_joint has no grid route: its thresholds are fixed (a free "
+            "threshold raises), so DesignOptions(refine=True) has no grid point "
+            "to refine; leave refine off, and compare threshold choices by running "
+            "design_joint once per choice"
+        )
+
+
+def _check_arguments(
     sample: Any,
     objective: Any,
     pricing: Any,
@@ -1914,6 +2205,22 @@ def _check_units(
             f"is in {sample.loss_unit!r}"
         )
     _check_reads(template.index_definition, sample, asset)
+
+
+def _no_refinement(objective: Objective, context: _Context) -> NoReturn:
+    """Raise `DesignError`: a grid in numpy has no exact amounts to refine around."""
+    reason = (
+        "a UserObjective is evaluated in numpy"
+        if isinstance(objective, UserObjective)
+        else "a payout that is not linear in its amounts is evaluated in numpy"
+    )
+    raise context.error(
+        DesignError,
+        "DesignOptions(refine=True) solves the amounts exactly, by an LP or a QP, "
+        f"at every point it evaluates, but {reason} on a grid over every free "
+        "parameter, its amounts included, so no LP or QP solves them; leave "
+        "refine off, or search a finer grid",
+    )
 
 
 def _tail_flags(
@@ -2000,18 +2307,26 @@ def design(
     free = template.free_parameters()
     solves = _Solves()
     linear = _has_amounts(payout) and not isinstance(objective, UserObjective)
+    if options.refine and not linear:
+        _no_refinement(objective, context)
     ties = 0
     profile: Any = None
     counts: dict[str, int] | None = None
     amounts: _Amounts | None
+    refined: _Refined | None = None
     if linear:
         _solver.require()
         amount_names = set(cast(LinearInAmounts, payout).amount_names())
         shape = [name for name in free if name not in amount_names]
         if shape:
-            outcome = _grid(template, shape, context, solves, inner=True)
+            outcome = _grid(
+                template, shape, context, solves, inner=True, finish=not options.refine
+            )
             amounts, ties = outcome.amounts, outcome.ties
             profile, counts = outcome.profile, outcome.counts
+            if options.refine:
+                refined = _refine(template, shape, outcome, context, solves)
+                amounts, ties = refined.amounts, refined.ties
         else:
             amounts = _design_amounts(template, context, solves, report=True)
         assert amounts is not None
@@ -2095,4 +2410,6 @@ def design(
         design_sample=sample,
         solved_by=solved_by,
         fallbacks=solves.fallbacks,
+        refinement=None if refined is None else refined.record,
+        refinement_profile=None if refined is None else refined.profile,
     )
