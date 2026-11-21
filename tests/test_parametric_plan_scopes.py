@@ -37,6 +37,7 @@ from crc_sdk.parametric import (
     ExpectedUncovered,
     Free,
     FreshDraws,
+    GaussianCopula,
     Holdout,
     ImpactNoise,
     Independent,
@@ -56,6 +57,7 @@ from crc_sdk.parametric import (
     ParametricPlan,
     RecentYears,
     SampleError,
+    ScenarioSet,
     StationColumn,
     StepPayout,
     allocate,
@@ -67,6 +69,7 @@ from crc_sdk.parametric import (
     setup_text,
     year_block_kfold,
 )
+from crc_sdk.parametric import plan as plan_module
 from crc_sdk.parametric.sample import _check_out_of_sample
 from crc_sdk.types import HazardDatasetMetadata, SourceProvenance
 from crc_sdk.workflows import (
@@ -863,20 +866,152 @@ def test_an_empirical_copula_plan_equals_the_function_route(dataset: Path) -> No
 
 def test_a_joint_holdout_of_a_comonotonic_sample_is_refused(dataset: Path) -> None:
     # Comonotonic() placed each moved asset's draws by the ranks of every row,
-    # so the design block's rows depend on the held-out block's draws.
+    # so the design block's rows depend on the held-out block's draws. The plan
+    # refuses it before anything is drawn.
     plan = (
         _designed_on_curves(dataset)
         .split(Holdout(0.75))
         .scopes(Joint())
         .dependence(Comonotonic())
     )
+    with pytest.raises(LeakageError, match="depend on the other block") as raised:
+        plan.explain()
+    assert str(raised.value) == (
+        "Holdout cuts one sample of curve draws into blocks, and Comonotonic put "
+        "each asset's draws in the rows by their ranks over every row, so each "
+        "block's values of one asset depend on the other block's values of the "
+        "others: a joint design's rows are on the owner's total, which reads every "
+        "asset, so its out-of-sample rows would raise LeakageError once the covers "
+        "were designed. Test the designs on fresh draws under the same model: "
+        ".split(FreshDraws(n_draws, seed=...))"
+    )
     with pytest.raises(LeakageError, match="depend on the other block"):
         plan.write_parquet(dataset.parent / "out.parquet")
+    # The comparison's own check refuses the same blocks, as it did before.
     train, test = holdout(_drawn(dataset, Comonotonic()), 0.75)
     with pytest.raises(LeakageError, match="depend on the other block"):
         _check_out_of_sample(train, test)
     # One asset's blocks still are out of sample.
     _check_out_of_sample(train.asset(ALL[1]), test.asset(ALL[1]))
+
+
+class _Reversed:
+    """A dependence model of the caller's: every column after the first reversed."""
+
+    def to_document(self) -> dict[str, Any]:
+        return {"kind": "reversed"}
+
+    def record(self, n_draws: int, columns: Sequence[str]) -> dict[str, Any]:
+        del n_draws, columns
+        return self.to_document()
+
+    def statement(self, n_draws: int, between: str) -> str:
+        del n_draws, between
+        return "every column after the first is reversed."
+
+    def reorder(self, uniforms: Any, columns: Sequence[str]) -> Any:
+        del columns
+        n, d = uniforms.shape
+        order = np.tile(np.arange(n, dtype=np.int64)[:, np.newaxis], (1, d))
+        order[:, 1:] = order[::-1, 1:]
+        return order
+
+
+CORRELATED = GaussianCopula([[1.0, 0.3, 0.3], [0.3, 1.0, 0.3], [0.3, 0.3, 1.0]])
+
+
+@pytest.mark.parametrize(
+    "model",
+    [Comonotonic(), CORRELATED, _Reversed()],
+    ids=["comonotonic", "gaussian", "own"],
+)
+@pytest.mark.parametrize("rule", [Holdout(0.75), KFold(3)], ids=["holdout", "kfold"])
+def test_a_joint_split_by_rows_under_a_moving_model_is_refused_before_any_draw(
+    dataset: Path, monkeypatch: pytest.MonkeyPatch, model: Any, rule: Any
+) -> None:
+    def drawn(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the refusal comes before anything is drawn")
+
+    # Nothing is drawn, and so nothing designed, before the refusal.
+    monkeypatch.setattr(plan_module, "sample_curves", drawn)
+    out = dataset.parent / "out.parquet"
+    name = type(model).__name__
+    message = (
+        rf"{type(rule).__name__} cuts one sample of curve draws into blocks, and "
+        rf"{name}.*a joint design's rows are on the owner's total.*"
+        r"\.split\(FreshDraws\(n_draws, seed=\.\.\.\)\)"
+    )
+    plan = _designed_on_curves(dataset).split(rule).scopes(Joint()).dependence(model)
+    for run in (
+        plan.explain,
+        plan.samples,
+        plan.joint_sample,
+        plan.designs,
+        lambda: plan.write_parquet(out),
+    ):
+        with pytest.raises(LeakageError, match=message):
+            run()
+    # Whichever builder comes first, and with both scopes or resolved covers only.
+    for stated in (
+        _designed_on_curves(dataset).dependence(model).scopes(Joint()).split(rule),
+        _designed_on_curves(dataset)
+        .split(rule)
+        .scopes(Individual(), Joint())
+        .dependence(model),
+        _on_curves(dataset)
+        .monte_carlo(400, seed=42)
+        .basis_risk(ImpactNoise(0.3, upper=1.0))
+        .covers(_linear())
+        .split(rule)
+        .scopes(Joint())
+        .dependence(model),
+    ):
+        with pytest.raises(LeakageError, match=message):
+            stated.explain()
+        with pytest.raises(LeakageError, match=message):
+            stated.write_parquet(out)
+    # With scenarios too.
+    request = (
+        HazardDataset.local(dataset)
+        .for_assets(_asset_table())
+        .select(hazard_names=["rx1day"], horizons=[2050], pathways=["ssp245"])
+        .impact(RAMP, name="ramp", value_unit="1", value_semantics="damage ratio")
+    )
+    scenarios = (
+        UNTYPED_PLAN.for_evaluation(request, value_column="value_eur", value_unit="EUR")
+        .monte_carlo(400, seed=42)
+        .basis_risk(ImpactNoise(0.3, upper=1.0))
+        .covers(_step())
+        .objective(MSE(), budget=Budget(ratio=0.8))
+        .split(rule)
+        .scenarios(ScenarioSet(reference="ssp245_2050"))
+        .scopes(Joint())
+        .dependence(model)
+    )
+    for run in (scenarios.explain, scenarios.scenario_samples, scenarios.designs):
+        with pytest.raises(LeakageError, match=message):
+            run()
+    assert not out.exists()
+
+
+def test_a_joint_split_by_rows_under_independent_draws_is_not_refused(
+    dataset: Path,
+) -> None:
+    # Independent() keeps every column in draw order, so blocks of rows pass.
+    for rule, folds in ((Holdout(0.75), 1), (KFold(2), 2)):
+        plan = (
+            _designed_on_curves(dataset)
+            .split(rule)
+            .scopes(Joint())
+            .dependence(Independent())
+        )
+        plan.explain()
+        result = plan.write_parquet(dataset.parent / "out.parquet")
+        assert len(result.designs) == folds
+        assert {row["split"] for row in result.table.to_pylist()} == {
+            "in_sample",
+            "out_of_sample",
+        }
 
 
 def test_each_curve_records_its_spatial_match_under_its_asset(dataset: Path) -> None:

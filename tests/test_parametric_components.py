@@ -1212,6 +1212,266 @@ def test_a_component_with_no_impact_has_no_own_loss() -> None:
     assert sample.component("heat", loss="combined").loss.shape == (8, 1)
 
 
+def _on_the_low_side(amount: Any = None) -> Cover:
+    """A cover on heat's index with the lower tail, which the sample's heat lacks."""
+    return Cover(
+        IndexDefinition("heat", "degC", tail="lower", aggregation="annual_maximum"),
+        BinaryPayout(30.0, Free() if amount is None else amount, tail="lower"),
+        payout_unit="EUR",
+    )
+
+
+def _on_the_high_side() -> Cover:
+    return Cover(
+        IndexDefinition("heat", "degC", aggregation="annual_maximum"),
+        BinaryPayout(38.0, Free()),
+        payout_unit="EUR",
+    )
+
+
+VIEW_TAIL = (
+    "the cover's index has the tail 'lower', but the sample is the view of "
+    "component 'heat', which has 'upper'"
+)
+
+
+def test_a_component_keeps_its_tail_and_design_refuses_another() -> None:
+    sample = _from_table()
+    view = sample.component("heat")
+    budget = Budget(amount=2.0)
+    with pytest.raises(SampleError, match=VIEW_TAIL):
+        design(_on_the_low_side(), view, ExpectedUncovered(), budget=budget)
+    # As on the sample of several hazards itself.
+    with pytest.raises(SampleError, match="the sample's component has 'upper'"):
+        design(_on_the_low_side(), sample, ExpectedUncovered(), budget=budget)
+    # Every block of the view is still the view, whichever step comes first, and
+    # so is the view with the combined loss.
+    blocks = (
+        holdout(view, 0.75)[0],
+        holdout(sample, 0.75)[0].component("heat"),
+        year_block_kfold(view, 2)[1][0],
+        view.select(PERIOD[:5]),
+        view.asset("site"),
+        sample.component("heat", loss="combined"),
+    )
+    for block in blocks:
+        with pytest.raises(SampleError, match=VIEW_TAIL):
+            design(_on_the_low_side(), block, ExpectedUncovered(), budget=budget)
+    # A cover given as is meets the same check wherever it meets the view.
+    resolved = _on_the_low_side(4.0)
+    with pytest.raises(SampleError, match=VIEW_TAIL):
+        evaluate(resolved, view, split="in_sample", design_sample=view)
+    # The component's own tail designs, as before.
+    made = design(_on_the_high_side(), view, ExpectedUncovered(), budget=budget)
+    assert made.design_sample is view
+
+
+def _plain(view: OutcomeSample) -> OutcomeSample:
+    """The view's rows and record, built as a one-hazard sample: it is no view."""
+    plain: OutcomeSample = UNTYPED_SAMPLE(
+        asset_ids=view.asset_ids,
+        period=view.period,
+        probability=view.probability,
+        index=view.index,
+        loss=view.loss,
+        hazard=view.hazard,
+        index_unit=view.index_unit,
+        loss_unit=view.loss_unit,
+        semantics=view.semantics,
+        provenance=view.provenance,
+        scenario=view.scenario,
+    )
+    return plain
+
+
+def _written(table: Any) -> dict[str, Any]:
+    document: dict[str, Any] = json.loads(
+        table.schema.metadata[SAMPLE_METADATA_KEY.encode()]
+    )
+    return document
+
+
+def test_a_views_tail_changes_no_hash_columns_or_provenance() -> None:
+    view = _from_table().component("heat")
+    # On a plain sample of the same rows and record, a cover's tail is the
+    # caller's to know, as on any one-hazard sample.
+    plain = _plain(view)
+    assert plain.content_hash == view.content_hash
+    # The columns are the same; the view's metadata adds whose view it is.
+    assert plain.to_table().equals(view.to_table())
+    assert plain.to_table().schema == view.to_table().schema
+    written = _written(view.to_table())
+    assert written.pop("view_of") == {"name": "heat", "tail": "upper"}
+    assert written == _written(plain.to_table())
+    assert plain.provenance.to_document() == view.provenance.to_document()
+    assert repr(plain) == repr(view)
+    budget = Budget(amount=2.0)
+    on_view = design(_on_the_high_side(), view, ExpectedUncovered(), budget=budget)
+    on_plain = design(_on_the_high_side(), plain, ExpectedUncovered(), budget=budget)
+    assert on_view.design_id == on_plain.design_id
+    low = design(_on_the_low_side(), plain, ExpectedUncovered(), budget=budget)
+    assert low.design_sample is plain
+
+
+def _views() -> list[OutcomeSample]:
+    """A view of `heat` and its blocks, whichever step comes first."""
+    sample = _from_table()
+    view = sample.component("heat")
+    return [
+        view,
+        holdout(view, 0.75)[1],
+        holdout(sample, 0.75)[0].component("heat"),
+        year_block_kfold(view, 2)[1][0],
+        view.select(PERIOD[:5]),
+        sample.component("heat", loss="combined"),
+    ]
+
+
+def test_a_written_view_keeps_its_component_and_tail(tmp_path: Path) -> None:
+    budget = Budget(amount=2.0)
+    for number, view in enumerate(_views()):
+        table = view.to_table()
+        path = tmp_path / f"view-{number}.parquet"
+        pq.write_table(table, path)
+        for read in (
+            OutcomeSample.from_written_table(table),
+            OutcomeSample.from_written_table(pq.read_table(path)),
+        ):
+            assert read._view_of == ("heat", "upper")
+            assert read.content_hash == view.content_hash
+            assert read.provenance.to_document() == view.provenance.to_document()
+            assert read.lineage == view.lineage
+            # Written again, it writes the same table.
+            assert read.to_table().equals(table)
+            assert read.to_table().schema.metadata == table.schema.metadata
+            # A cover of another tail is refused on the view read back, by
+            # design and wherever a cover given as is meets it.
+            with pytest.raises(SampleError, match=VIEW_TAIL):
+                design(_on_the_low_side(), read, ExpectedUncovered(), budget=budget)
+            with pytest.raises(SampleError, match=VIEW_TAIL):
+                evaluate(
+                    _on_the_low_side(4.0), read, split="in_sample", design_sample=read
+                )
+            # Its blocks are still the view.
+            with pytest.raises(SampleError, match=VIEW_TAIL):
+                design(
+                    _on_the_low_side(),
+                    holdout(read, 0.5)[0],
+                    ExpectedUncovered(),
+                    budget=budget,
+                )
+            # The component's own tail designs, as on the view that was written.
+            made = design(_on_the_high_side(), read, ExpectedUncovered(), budget=budget)
+            own = design(_on_the_high_side(), view, ExpectedUncovered(), budget=budget)
+            assert made.design_id == own.design_id
+
+
+def test_a_written_view_of_a_lower_tail_refuses_an_upper_one() -> None:
+    sample = _sample(
+        index_components=_other_components(
+            heat=_component(HEAT_VALUES, "degC", own_loss=HEAT_LOSS, tail="lower")
+        )
+    )
+    view = sample.component("heat")
+    assert _written(view.to_table())["view_of"] == {"name": "heat", "tail": "lower"}
+    read = OutcomeSample.from_written_table(view.to_table())
+    assert read._view_of == ("heat", "lower")
+    with pytest.raises(
+        SampleError,
+        match="has the tail 'upper', but the sample is the view of component 'heat', "
+        "which has 'lower'",
+    ):
+        design(
+            _on_the_high_side(), read, ExpectedUncovered(), budget=Budget(amount=2.0)
+        )
+    made = design(
+        _on_the_low_side(), read, ExpectedUncovered(), budget=Budget(amount=2.0)
+    )
+    assert made.design_sample is read
+
+
+def test_a_view_written_without_its_tail_reads_back_as_before() -> None:
+    # A view's table written before `view_of` was recorded reads back with no
+    # tail, as it did then: its covers' tails are the caller's to know.
+    view = _from_table().component("heat")
+    older = _metadata_edited(view.to_table(), view_of=None)
+    read = OutcomeSample.from_written_table(older)
+    assert read._view_of is None
+    assert read.content_hash == view.content_hash
+    assert "view_of" not in _written(read.to_table())
+    low = design(
+        _on_the_low_side(), read, ExpectedUncovered(), budget=Budget(amount=2.0)
+    )
+    assert low.design_sample is read
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [
+        pytest.param(_DIRECT, id="one hazard"),
+        pytest.param(holdout(_DIRECT, 0.5)[1], id="a block"),
+        pytest.param(_sample(), id="several hazards"),
+        pytest.param(holdout(_sample(), 0.5)[0], id="a block of several hazards"),
+    ],
+)
+def test_a_sample_that_is_no_view_writes_no_view_of(sample: OutcomeSample) -> None:
+    assert sample._view_of is None
+    assert "view_of" not in _written(sample.to_table())
+    assert OutcomeSample.from_written_table(sample.to_table())._view_of is None
+
+
+_VIEW_RECORD = "metadata's view_of"
+
+
+@pytest.mark.parametrize(
+    ("view_of", "message"),
+    [
+        pytest.param("heat", "must be an object with a name and a tail", id="text"),
+        pytest.param({"name": "heat"}, "must be an object with", id="no tail"),
+        pytest.param(
+            {"name": "heat", "tail": "upper", "unit": "degC"},
+            "must be an object with",
+            id="another key",
+        ),
+        pytest.param(
+            {"name": "he.at", "tail": "upper"},
+            "name must be a non-empty string",
+            id="bad name",
+        ),
+        pytest.param(
+            {"name": "heat", "tail": "both"},
+            "tail must be 'upper' or 'lower', got 'both'",
+            id="bad tail",
+        ),
+        pytest.param(
+            {"name": "rain", "tail": "upper"},
+            "names the component 'rain', but the provenance's selection last takes "
+            "the component 'heat'",
+            id="another component",
+        ),
+    ],
+)
+def test_a_written_view_of_with_an_invalid_record_raises(
+    view_of: Any, message: str
+) -> None:
+    table = _from_table().component("heat").to_table()
+    with pytest.raises(SampleError, match=f"{_VIEW_RECORD}.*{message}"):
+        OutcomeSample.from_written_table(_metadata_edited(table, view_of=view_of))
+
+
+def test_view_of_is_refused_on_a_sample_that_is_no_view() -> None:
+    view_of = {"name": "heat", "tail": "upper"}
+    with pytest.raises(SampleError, match="selection takes no component"):
+        OutcomeSample.from_written_table(
+            _metadata_edited(_DIRECT.to_table(), view_of=view_of)
+        )
+    # A sample of several hazards is no component's view.
+    with pytest.raises(SampleError, match=r"unknown keys \['view_of'\]"):
+        OutcomeSample.from_written_table(
+            _metadata_edited(_sample().to_table(), view_of=view_of)
+        )
+
+
 @pytest.mark.parametrize(
     ("sample", "name", "loss", "message"),
     [
