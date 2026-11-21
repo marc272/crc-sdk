@@ -392,7 +392,7 @@ semantics the caller states and the fresh draws; the dataset's own metadata
 | `.joint_sample()` | With `Joint()` only: the `OutcomeSample` of all the assets, all draws or years |
 | `.designs()` | Every `DesignResult`, in asset, fold, cover and objective order; with `Joint()`, every `JointDesignResult`, in fold, cover and objective order; with `.scenarios(...)`, by scenario first |
 | `.scenario_samples()` | With `.scenarios(...)` only: every scenario's samples, by label and then by asset |
-| `.payout_breakdown()` | Each entry's expected payout in its parts, on every block, as `payout_breakdown` gives it; nothing is written. Not with `Joint()` or `.scenarios(...)` |
+| `.payout_breakdown()` | Each entry's expected payout in its parts, on every block, as `payout_breakdown` gives it, or with `.scenarios(...)` as `payout_breakdown_scenarios` gives it; nothing is written. Not with `Joint()` |
 | `.write_parquet(path)` | A `ParametricResult`: `output`, `table`, `metadata`, `samples`, `designs`, `fresh_samples`, `joint_sample`, `fresh_joint_sample`, `allocated`, `allocated_output`, `scenario_samples`, `scenario_fresh_samples` and `row_count` |
 
 `write_parquet` writes the rows of every asset, split and fold to one local
@@ -1126,8 +1126,48 @@ row is one draw or year of every hazard in each scenario:
 - **Joint designs.** Under `Joint()` each scenario has one sample of all the
   assets per block, and a joint design gets one `"total"` row per scenario, as in
   [the rows of a joint design](#the-rows-of-a-joint-design).
-  `.allocation(...)` is not offered with `.scenarios(...)` yet; on the function
-  route `compare_scenarios(..., allocation=...)` gives the allocated rows.
+
+### Allocated rows and breakdowns
+
+- **Allocated rows.** Under `Joint()` and `.allocation(rule)`, each joint design's
+  allocated rows on every scenario's block go to the second file,
+  `<stem>.allocated<suffix>`, as on a plan without scenarios ([allocated
+  rows](#allocated-rows-in-a-table-of-their-own)), and the main file keeps the
+  `"total"` rows. An allocated row shares the design's total payout on that block
+  out over the assets, under the stated rule: an accounting statement about the
+  total, not the payout of an asset's cover, with no premium,
+  `premium_repriced` or net-loss values. `scenario` and `design_scenario` say
+  where the row is evaluated and where the design was made, and the file's
+  metadata records the set, the rule and the plan's records. The rows are
+  `allocate_scenarios`' on each fold's blocks.
+- **Breakdowns.** `.payout_breakdown()` gives each entry's expected payout in its
+  parts on every scenario's evaluation block, one asset at a time, as
+  `payout_breakdown` gives them on one block, with `scenario` and
+  `design_scenario`; the parts of one entry add up to its expected payout on
+  that block, and nothing is written. The rows are
+  `payout_breakdown_scenarios`' on each fold's blocks. It isn't offered under
+  `Joint()`, whose designs are on the owner's total.
+
+On the function route they take a `ScenarioSet` of built samples, as
+`compare_scenarios` does, and every row is out of sample:
+
+```text
+allocate_scenarios(designs, scenarios, *, allocation, values, fold=0,
+                   options=MetricOptions())             # JointDesignResults only
+payout_breakdown_scenarios(covers, scenarios, *, fold=0, options=MetricOptions(),
+                           design_sample=None)          # one asset's samples
+```
+
+`allocate_scenarios` gives the rows at `level` `"asset_by_value"` or
+`"asset_by_loss"` that `compare_scenarios(designs, scenarios, allocation=...,
+values=...)` puts beside the totals, in a table of their own; on one scenario
+they are `allocate`'s rows on its block. `payout_breakdown_scenarios` takes the
+reference's design block as `design_sample` for a cover given as is, as
+`compare_scenarios` does. Here each window's breakdown of the plan above:
+
+```python
+scenario_parts = scenario_plan.payout_breakdown()   # each window's parts
+```
 
 ### What stays fixed, and what doesn't
 
@@ -1154,21 +1194,30 @@ row is one draw or year of every hazard in each scenario:
 labels (the reference first), `design_on`, `mixed_products`, `premiums` and each
 scenario's kind and members; in `setup.scenarios`, the form the written metadata
 has, with each scenario's hazard, pathway, horizon and members; and one entry of
-`sources` per scenario source, with the labels that read it. The rows, the
-blocks and where each scenario reads the index are known only at execution.
+`sources` per scenario source, with the labels that read it. A per-year
+scenario's horizon is the centre of its series' whole window, so `explain()`
+states it where `years=` states the window, the plan's or the scenario's own,
+and leaves it null without one or under `missing="drop_year"`, where a year may
+drop out at either end. The rows, the blocks and where each scenario reads the
+index are known only at execution.
 
 | Execution point | Returns |
 | --- | --- |
 | `.samples()` | The reference's samples |
 | `.scenario_samples()` | Every scenario's samples, by label and then by asset, the reference first |
-| `.write_parquet(path)` | One file, written atomically; `ParametricResult.scenario_samples` and, with `FreshDraws`, `scenario_fresh_samples`, every curve scenario's fresh draws on one set of uniforms |
+| `.payout_breakdown()` | Each scenario's breakdown, as `payout_breakdown_scenarios` gives it; nothing is written |
+| `.write_parquet(path)` | One file, written atomically, and under `.allocation(...)` the allocated file beside it; `ParametricResult.scenario_samples` and, with `FreshDraws`, `scenario_fresh_samples`, every curve scenario's fresh draws on one set of uniforms |
 
 The written metadata records the set under `setup.scenarios`, with `design_on`,
 each scenario's blocks per asset and fold and where each asset reads the index.
 `source_records` holds each dataset or per-year source once, with the scenarios
 that read it under `scenarios`, and each hazard source in `sources` names its
 `scenario` and its record's checksum. `setup_text` states every scenario next to
-the numbers.
+the numbers. The tables of several assets merge into one only where the assets'
+scenarios differ in their blocks alone: a per-year asset whose series spans
+other years than the others', as `missing="drop_year"` can leave it, reads
+another horizon, and the merge raises `EvaluationError`, naming the scenario,
+each table's assets and the years each series spans.
 
 ## The function route
 
@@ -3910,9 +3959,13 @@ form does better.
 
 - **The components.** `name` names a component, without `.`, `+`, `[` or `]`,
   and is not taken for a hazard name. A cover on one index reads the component
-  named its `hazard_name`, and a cover on a `CompositeIndex` the components of its
-  names, whose units and tails are checked against theirs by `explain()` and at
-  every execution point; state `.hazard(...)` before `.covers(...)`.
+  named its `hazard_name`, a package's contract the component its package names,
+  and a cover on a `CompositeIndex` the components of its names. Their units and
+  tails are checked against the components' by `explain()` and at every
+  execution point, before anything is designed; on fitted curves a component's
+  unit and tail are its dataset's `value_unit` and `return_period_tail`, checked
+  once the dataset is opened, before anything is drawn. State `.hazard(...)`
+  before `.covers(...)`.
 - **On per-year values**, `.hazard(name, tail=...)` without a `source` names the
   plan's own hazard, which is the first component whatever the order of the
   calls, and states its tail; a plan with another component needs it. With a
@@ -3933,7 +3986,14 @@ form does better.
   component, named by the one hazard it selects in `hazard_names`, and each
   component's unit and tail are its dataset's. `.dependence(model)` is required,
   with no default, because fitted curves say nothing about how two hazards move
-  together ([dependence across hazards](#dependence-across-hazards)). The
+  together ([dependence across hazards](#dependence-across-hazards)). Every row
+  is on the combined loss, which reads every hazard, so `Holdout` and `KFold`
+  take `Independent()` only: under `Comonotonic()`, `GaussianCopula` or a model
+  of your own, a block's draws of one hazard were placed by ranks over both
+  blocks ([cuts of one sample](#several-assets-from-fitted-curves)), and
+  `explain()` and every execution point raise `LeakageError`, naming
+  `FreshDraws`, the out-of-sample test there. `EmpiricalCopula` takes
+  `FreshDraws` only, as everywhere. The
   asset's child generator draws the first component, so it draws what the plan
   with one hazard draws, and each other component draws from a child it spawns,
   in component order; fresh draws are spawned from `FreshDraws.seed` alike.
@@ -3972,8 +4032,9 @@ form does better.
   metadata holds each component's source record once in `source_records`, with
   the components that read it, and each hazard source names its record by its
   checksum. `.payout_breakdown()` returns `payout_breakdown`'s table of the same
-  entries on every block, and isn't offered with `Joint()` or
-  `.scenarios(...)`.
+  entries on every block, or with `.scenarios(...)` each scenario's breakdown
+  ([allocated rows and breakdowns](#allocated-rows-and-breakdowns)), and isn't
+  offered with `Joint()`.
 
 **Scenarios.** `.scenarios(...)` takes a plan with several hazards too
 ([scenarios on the plan](#several-hazards-in-scenarios)): an `AnnualScenario`
@@ -4022,18 +4083,14 @@ rank and no best flag.
   cover to every asset. `design_joint` takes one template per asset.
 - **Several hazards beside `Joint()`, pools or an index read elsewhere, on the
   plan.** A plan with `.hazard(...)` refuses `Joint()`, `pool=` and
-  `.index(...)`, and `.payout_breakdown()` isn't offered with `Joint()` or
-  `.scenarios(...)`.
+  `.index(...)`, and `.payout_breakdown()` isn't offered with `Joint()`.
 - **Several hazards beyond one asset and two axes.** A sample with index
   components holds one asset, so several assets with several hazards, and a
   joint design over them, are not offered. A `StepGrid` spans two components,
   a `CoverPackage` holds covers on one index each, and a payout on one hazard
   scaled by another is not built in (a family of your own can be registered).
-- **Allocated rows, and a design robust over scenarios, on a plan with
-  scenarios.** `.allocation(...)` beside `.scenarios(...)` raises `ValueError`;
-  `compare_scenarios(..., allocation=...)` gives the allocated rows on the
-  function route. A design is made on one scenario's block at a time, and none
-  minimises the worst case over the scenarios.
+- **A design robust over scenarios.** A design is made on one scenario's block
+  at a time, and none minimises the worst case over the scenarios.
 - **Several members of one model in a pool.** A model appears once, whatever
   its member. **An index read elsewhere on a pool**, even from the same run at
   another cell, is refused.

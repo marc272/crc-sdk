@@ -45,7 +45,9 @@ budget, and reads the designs on one block, one row per budget.
 `ScenarioSet` holds one evaluation block per scenario under a named reference,
 and refuses a set in which anything but the hazard differs. `compare_scenarios`
 puts every cover or design on every scenario's block in one table, and `to_drift`
-adds each row's difference and ratio against a reference scenario.
+adds each row's difference and ratio against a reference scenario;
+`allocate_scenarios` and `payout_breakdown_scenarios` are the forms of
+`allocate` and `payout_breakdown` across scenarios.
 `AnnualScenario` and `CurveScenario` describe the sources a plan's scenarios read
 beside its own.
 `PurePremium`, `CostOfCapitalLoad` and `ExpectedPayoutMultiple` price the
@@ -178,7 +180,9 @@ from crc_sdk.parametric.scenarios import (
     AnnualScenario,
     CurveScenario,
     ScenarioSet,
+    allocate_scenarios,
     compare_scenarios,
+    payout_breakdown_scenarios,
     to_drift,
 )
 from crc_sdk.parametric.sources import (
@@ -279,6 +283,7 @@ __all__ = [
     "UserObjective",
     "WeightedCVaR",
     "allocate",
+    "allocate_scenarios",
     "bootstrap_intervals",
     "compare",
     "compare_pooled",
@@ -289,6 +294,7 @@ __all__ = [
     "evaluate",
     "holdout",
     "payout_breakdown",
+    "payout_breakdown_scenarios",
     "register_payout",
     "sample_annual",
     "sample_annual_hazards",
