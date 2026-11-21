@@ -9,6 +9,7 @@ ones are picked up when they are copied. The metrics of the total are in
 
 from __future__ import annotations
 
+import importlib
 import json
 import math
 import sys
@@ -377,6 +378,45 @@ def test_one_budget_is_shared_and_its_split_is_reported(budget: Budget) -> None:
     assert result.ranges is not None
     assert result.ranges["A"]["levels[0]"] == pytest.approx((10.0, 30.0), abs=1e-4)
     assert result.ranges["B"]["levels[0]"] == pytest.approx((0.0, 20.0), abs=1e-4)
+
+
+def test_the_joint_ranges_free_draws_and_match_the_full_lp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # On this case the reduced ranging LPs free draws of every kind: an
+    # uncovered loss, a CVaR excess and a premium's tail cross their kinks.
+    case = _case(CASES / "step-wcvar-b0_9-coc-joint-synthetic.json")
+    module = importlib.import_module("crc_sdk.parametric.design")
+    kinds = ("uncovered", "excess", "tail")
+    freed = dict.fromkeys(kinds, 0)
+    release = module._release
+
+    def counted(pieces: Any, *args: Any) -> int:
+        before = {
+            kind: np.count_nonzero(getattr(pieces, kind) == module._FREE)
+            for kind in kinds
+        }
+        count: int = release(pieces, *args)
+        for kind in kinds:
+            after = np.count_nonzero(getattr(pieces, kind) == module._FREE)
+            freed[kind] += int(after - before[kind])
+        return count
+
+    def run() -> JointDesignResult:
+        return _design_case(case, _case_sample(case), _templates(case))
+
+    monkeypatch.setattr(module, "_release", counted)
+    got = run()
+    assert all(freed.values()), freed
+    monkeypatch.setattr(module, "RANGING_ROUND_LIMIT", 0)
+    full = run()
+    assert got.unique == full.unique and got.parameters == full.parameters
+    assert got.ranges is not None and full.ranges is not None
+    scale = _scale(case)
+    for asset, ranges in full.ranges.items():
+        assert set(got.ranges[asset]) == set(ranges)
+        for name, bounds in ranges.items():
+            assert got.ranges[asset][name] == pytest.approx(bounds, abs=1e-9 * scale)
 
 
 def test_without_ranges_the_lp_route_reports_no_uniqueness() -> None:
