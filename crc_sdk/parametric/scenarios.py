@@ -2334,7 +2334,7 @@ def compare_scenarios(
     takes joint designs only, across the whole call: any other entry raises
     `EvaluationError`, as in `compare`, whichever scenario each entry was designed
     on, so allocated rows never share a table with the rows of covers that stand on
-    their own.
+    their own. `allocate_scenarios` gives them alone, without the totals.
 
     Raises `TypeError` for a `scenarios` that isn't a `ScenarioSet` or that
     describes what a plan reads, and for arguments of the wrong type;
