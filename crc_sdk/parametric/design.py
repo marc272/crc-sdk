@@ -84,7 +84,15 @@ unbounded raises `DesignError`, not `UnboundedDesignError`. Free amounts below
   `max(1, |optimum|)`, in scaled units). An amount is pinned when its narrow
   range is at most half its wide one, or narrower than 1e-7 of the scale;
   `unique` is true when every identified amount is pinned. Without ranges,
-  `unique` is `None` on the LP route;
+  `unique` is `None` on the LP route. Each range end is the optimum of an LP
+  over the near-optimal set, solved on a reduced LP: draws with the same
+  basis row and loss are merged, and a draw away from the kinks of its
+  uncovered loss and of the CVaR terms keeps the linear piece it is on at the
+  design's optimum, summed into one row with the others. A fixed piece is
+  below the function, so the reduced LP is a relaxation; when its solution
+  keeps every fixed piece it solves the full LP, and otherwise the draws whose
+  piece broke are freed and it is solved again. After 100 such LPs, or one
+  that is not solved to optimality, the full LP solves that end;
 - on the QP route, `unique` is true when `H = B' diag(p) B` over the
   identified amounts is positive definite (smallest eigenvalue above 1e-10
   of the largest);
@@ -222,6 +230,16 @@ PINNED_SHRINK = 0.5
 PINNED_WIDTH = 1e-7
 """An amount whose narrow range is below this share of the scale is pinned."""
 
+RANGING_KINK = 1e-9
+"""A draw this close to a kink at the design's optimum starts free (scaled units).
+
+The ranging LPs keep every other draw on the piece it is on there (see
+`_ranges`); a draw that crosses its kink is freed when it does.
+"""
+
+RANGING_ROUND_LIMIT = 100
+"""The most reduced LPs for one range end; past them the full LP solves it."""
+
 MSE_EIGEN_TOLERANCE = 1e-10
 """QP route: unique when H's smallest eigenvalue exceeds this share of its largest."""
 
@@ -248,7 +266,8 @@ class DesignOptions(_DefinitionModel):
       objective, whose scaling is unknown).
     - `fill`: `"lowest"` or `"highest"`, the value of unidentified amounts.
     - `ranges`: on the LP route, range every identified amount over the
-      near-optimal designs and report `unique` (four extra LPs per amount).
+      near-optimal designs and report `unique` (four range ends per amount,
+      each an LP, solved on reduced LPs; see the module docstring).
 
     Raises `CoverDefinitionError` (a `ValueError`) for invalid values.
     """
@@ -941,49 +960,385 @@ def _fill(
     return filled
 
 
+# -- ranging -----------------------------------------------------------------
+#
+# A range end is `min sign * theta_j` over the near-optimal set: the design
+# LP's feasible set with the row `cost @ x <= upper`. In the amounts (and the
+# free ζ and η), that row is `G(theta, ζ) <= upper`, a sum over the draws of
+# p_d u_d, with u_d = (L_d - B_d theta)^+, and of the CVaR's p_d e_d, with e_d
+# = (u_d - ζ)^+; a cost-of-capital budget sums t_d = (B_d theta - η)^+ in the
+# same way. Each term is the larger of two linear pieces, and either piece is
+# below it. So keeping a draw on one piece relaxes the LP, and summing the
+# draws on fixed pieces into one row makes it small; only the draws near a
+# kink keep their own columns and rows. If the reduced LP's solution keeps
+# every fixed piece, it is feasible in the full LP, so it solves it.
+
+_BELOW, _ABOVE, _FREE = 0, 1, 2
+"""A draw's piece of `x^+`: `0` (x below the kink), `x` (above it), or free."""
+
+
+@dataclass(eq=False)
+class _Pieces:
+    """The draws of a ranging, merged into groups, and each group's pieces.
+
+    `basis`, `loss` (scaled) and `probability` are the groups of draws with
+    one basis row and loss; `constant` marks a zero basis row, whose
+    uncovered loss is the loss itself. `uncovered` is each group's piece of
+    `u = (L - B theta)^+` and `excess` an uncovered group's piece of `e = (u -
+    ζ)^+`. A covered group's `e = (-ζ)^+` is one column for all of them. For a
+    cost-of-capital budget, `payout_basis` and `payout_probability` are the
+    groups of draws with one basis row, and `tail` their pieces of `t = (B
+    theta - η)^+`. A piece only ever becomes free.
+    """
+
+    basis: FloatArray
+    loss: FloatArray
+    probability: FloatArray
+    constant: NDArray[np.bool_]
+    uncovered: NDArray[np.int8]
+    excess: NDArray[np.int8]
+    payout_basis: FloatArray | None = None
+    payout_probability: FloatArray | None = None
+    tail: NDArray[np.int8] | None = None
+
+
+def _merged(rows: FloatArray, probability: FloatArray) -> tuple[FloatArray, FloatArray]:
+    """The distinct rows, and the summed probability of the draws on each."""
+    distinct, inverse = np.unique(rows, axis=0, return_inverse=True)
+    summed = np.bincount(
+        inverse.reshape(-1), weights=probability, minlength=distinct.shape[0]
+    )
+    return distinct, summed
+
+
+def _tail_value(values: FloatArray, probability: FloatArray, level: float) -> float:
+    """The value at which the largest values reach `1 - level` of the probability."""
+    order = np.argsort(-values, kind="stable")
+    mass = np.cumsum(probability[order])
+    position = int(np.searchsorted(mass, (1.0 - level) * (1.0 - 1e-12)))
+    return float(values[order[min(position, values.shape[0] - 1)]])
+
+
+def _piece(margin: FloatArray) -> NDArray[np.int8]:
+    """The piece of `margin^+` a draw is on, free within `RANGING_KINK` of 0."""
+    return np.where(
+        margin > RANGING_KINK,
+        _ABOVE,
+        np.where(margin < -RANGING_KINK, _BELOW, _FREE),
+    ).astype(np.int8)
+
+
+def _broken(piece: NDArray[np.int8], margin: FloatArray) -> NDArray[np.bool_]:
+    """The draws whose fixed piece of `margin^+` is not the function's at `margin`."""
+    above: NDArray[np.bool_] = (piece == _ABOVE) & (margin < 0.0)
+    below: NDArray[np.bool_] = (piece == _BELOW) & (margin > 0.0)
+    return above | below
+
+
+def _cvar_weight(objective: Objective) -> float | None:
+    """`alpha / (1 - beta)` of a weighted CVaR with a CVaR term, else `None`."""
+    if isinstance(objective, WeightedCVaR) and objective.alpha > 0.0:
+        return objective.alpha / (1.0 - objective.beta)
+    return None
+
+
+def _priced_tail(context: _Context) -> CostOfCapitalLoad | None:
+    """The cost-of-capital pricing whose CVaR a budget adds to the LP, if any."""
+    pricing = context.pricing
+    if (
+        context.bound is not None
+        and isinstance(pricing, CostOfCapitalLoad)
+        and pricing.rate > 0.0
+    ):
+        return pricing
+    return None
+
+
+def _pieces(block: _Block, theta: FloatArray, context: _Context) -> _Pieces:
+    """Merge the draws and put each on its piece at the design's `theta`.
+
+    ζ and η are the CVaR's value at risk of the uncovered loss and of the
+    payout there; a draw within `RANGING_KINK` of a kink starts free.
+    """
+    k = block.basis.shape[1]
+    rows, probability = _merged(
+        np.column_stack([block.basis, context.loss / context.scale]),
+        context.probability,
+    )
+    basis, loss = rows[:, :k], rows[:, k]
+    constant = ~np.any(basis != 0.0, axis=1)
+    margin = loss - basis @ theta
+    uncovered = np.where(constant, np.int8(_ABOVE), _piece(margin)).astype(np.int8)
+    excess = np.full(loss.shape[0], _BELOW, dtype=np.int8)
+    objective = context.objective
+    if _cvar_weight(objective) is not None:
+        assert isinstance(objective, WeightedCVaR)
+        zeta = _tail_value(np.maximum(margin, 0.0), probability, objective.beta)
+        excess = _piece(margin - zeta)
+    pieces = _Pieces(basis, loss, probability, constant, uncovered, excess)
+    pricing = _priced_tail(context)
+    if pricing is not None:
+        payout_basis, payout_probability = _merged(block.basis, context.probability)
+        payout = payout_basis @ theta
+        eta = _tail_value(payout, payout_probability, pricing.q)
+        pieces.payout_basis = payout_basis
+        pieces.payout_probability = payout_probability
+        pieces.tail = _piece(payout - eta)
+    return pieces
+
+
+def _fsum(values: FloatArray) -> float:
+    return math.fsum(values.tolist())
+
+
+def _reduced_programme(
+    pieces: _Pieces, block: _Block, context: _Context, cost: FloatArray, upper: float
+) -> tuple[_solver.Programme, int | None, int | None]:
+    """The reduced ranging LP: `min cost @ theta` over the relaxed near-optimal set.
+
+    The amounts are the first columns, as in `_programme`. Returns the
+    programme and the columns of ζ and η (`None` without them).
+    """
+    k = block.basis.shape[1]
+    scale = context.scale
+    constraints = block.constraints
+    objective = context.objective
+    weight = _cvar_weight(objective)
+    alpha = objective.alpha if isinstance(objective, WeightedCVaR) else 0.0
+    basis, loss, p = pieces.basis, pieces.loss, pieces.probability
+    builder = _Builder()
+    builder.variables(k, constraints.lower / scale, constraints.upper / scale, cost)
+    zeta = None if weight is None else builder.variables(1, -math.inf, math.inf, 0.0)
+    # The near-optimal row: the fixed pieces summed, and the free columns.
+    above = pieces.uncovered == _ABOVE
+    on_theta = -(1.0 - alpha) * (p[above] @ basis[above])
+    on_zeta = alpha
+    bound = upper - (1.0 - alpha) * _fsum(p[above] * loss[above])
+    near: list[tuple[NDArray[np.int64], FloatArray]] = []
+    free = np.flatnonzero(pieces.uncovered == _FREE)
+    if free.size:
+        steps = np.arange(free.size)
+        u = builder.variables(free.size, 0.0, math.inf, 0.0) + steps
+        first = builder.constraints(free.size, loss[free], math.inf)
+        _block(builder, first, basis[free], 1.0)
+        builder.entries(first + steps, u, 1.0)
+        near.append((u, (1.0 - alpha) * p[free]))
+        if zeta is not None and weight is not None:
+            e = builder.variables(free.size, 0.0, math.inf, 0.0) + steps
+            rows = builder.constraints(free.size, 0.0, math.inf) + steps
+            builder.entries(rows, e, 1.0)
+            builder.entries(rows, u, -1.0)
+            builder.entries(rows, np.full(free.size, zeta), 1.0)
+            near.append((e, weight * p[free]))
+    if zeta is not None and weight is not None:
+        tail = above & (pieces.excess == _ABOVE)
+        on_theta = on_theta - weight * (p[tail] @ basis[tail])
+        on_zeta -= weight * _fsum(p[tail])
+        bound -= weight * _fsum(p[tail] * loss[tail])
+        kink = np.flatnonzero(above & (pieces.excess == _FREE))
+        if kink.size:
+            steps = np.arange(kink.size)
+            e = builder.variables(kink.size, 0.0, math.inf, 0.0) + steps
+            first = builder.constraints(kink.size, loss[kink], math.inf)
+            _block(builder, first, basis[kink], 1.0)
+            builder.entries(first + steps, e, 1.0)
+            builder.entries(first + steps, np.full(kink.size, zeta), 1.0)
+            near.append((e, weight * p[kink]))
+        covered = pieces.uncovered == _BELOW
+        if covered.any():
+            e_covered = builder.variables(1, 0.0, math.inf, 0.0)
+            row = builder.constraints(1, 0.0, math.inf)
+            builder.entries([row, row], [e_covered, zeta], [1.0, 1.0])
+            near.append((np.array([e_covered]), np.array([weight * _fsum(p[covered])])))
+    row = builder.constraints(1, -math.inf, bound)
+    builder.entries(np.full(k, row), np.arange(k), on_theta)
+    if zeta is not None:
+        builder.entries([row], [zeta], on_zeta)
+    for columns, values in near:
+        builder.entries(np.full(columns.size, row), columns, values)
+    eta = _reduced_budget(builder, pieces, block, context)
+    m = constraints.a_ub.shape[0]
+    if m:
+        first = builder.constraints(m, -math.inf, constraints.b_ub / scale)
+        _block(builder, first, constraints.a_ub, 1.0)
+    return builder.programme(), zeta, eta
+
+
+def _reduced_budget(
+    builder: _Builder, pieces: _Pieces, block: _Block, context: _Context
+) -> int | None:
+    """Add the budget's row as `_programme` does, a premium's CVaR reduced.
+
+    Returns the column of η, or `None` without it.
+    """
+    if context.bound is None:
+        return None
+    k = block.basis.shape[1]
+    scale = context.scale
+    expected = context.probability @ block.basis
+    pricing = context.pricing
+    tail = _priced_tail(context)
+    if tail is not None:
+        assert pieces.payout_basis is not None
+        assert pieces.payout_probability is not None and pieces.tail is not None
+        basis, p = pieces.payout_basis, pieces.payout_probability
+        weight = tail.rate / (1.0 - tail.q)
+        above = pieces.tail == _ABOVE
+        eta = builder.variables(1, -math.inf, math.inf, 0.0)
+        row = builder.constraints(1, -math.inf, context.bound / scale)
+        on_theta = (1.0 - tail.rate) * expected + weight * (p[above] @ basis[above])
+        builder.entries(np.full(k, row), np.arange(k), on_theta)
+        builder.entries([row], [eta], tail.rate - weight * _fsum(p[above]))
+        free = np.flatnonzero(pieces.tail == _FREE)
+        if free.size:
+            steps = np.arange(free.size)
+            t = builder.variables(free.size, 0.0, math.inf, 0.0) + steps
+            first = builder.constraints(free.size, 0.0, math.inf)
+            builder.entries(first + steps, t, 1.0)
+            _block(builder, first, basis[free], -1.0)
+            builder.entries(first + steps, np.full(free.size, eta), 1.0)
+            builder.entries(np.full(free.size, row), t, weight * p[free])
+        return eta
+    if isinstance(pricing, ExpectedPayoutMultiple):
+        row = builder.constraints(
+            1, -math.inf, (context.bound - pricing.expense) / scale
+        )
+        builder.entries(np.full(k, row), np.arange(k), pricing.multiple * expected)
+    else:
+        row = builder.constraints(1, -math.inf, context.bound / scale)
+        builder.entries(np.full(k, row), np.arange(k), expected)
+    return None
+
+
+def _release(
+    pieces: _Pieces, values: FloatArray, k: int, zeta: int | None, eta: int | None
+) -> int:
+    """Free the groups whose fixed piece a reduced solution breaks; count them."""
+    theta = values[:k]
+    margin = pieces.loss - pieces.basis @ theta
+    broken = _broken(pieces.uncovered, margin)
+    count = int(broken.sum())
+    if zeta is not None:
+        excess = (pieces.uncovered == _ABOVE) & _broken(
+            pieces.excess, margin - values[zeta]
+        )
+        pieces.excess[excess] = _FREE
+        count += int(excess.sum())
+    pieces.uncovered[broken] = _FREE
+    if eta is not None:
+        assert pieces.payout_basis is not None and pieces.tail is not None
+        tail = _broken(pieces.tail, pieces.payout_basis @ theta - values[eta])
+        pieces.tail[tail] = _FREE
+        count += int(tail.sum())
+    return count
+
+
+class _FullRanging:
+    """The range ends that the reduced LPs leave, solved on the full LP.
+
+    One HiGHS instance holds the programme with the near-optimal row, made
+    at the first such end; its first solve starts from the design LP's basis
+    with the row basic, each later one from the previous solve's basis.
+    """
+
+    def __init__(
+        self,
+        programme: _solver.Programme,
+        basis: _solver.Basis | None,
+        context: _Context,
+        solves: _Solves,
+    ) -> None:
+        self._programme = programme
+        self._basis = basis
+        self._context = context
+        self._solves = solves
+        self._session: _solver.LPSession | None = None
+        self._near = 0
+
+    def end(self, column: int, sign: float, upper: float) -> float:
+        if self._session is None:
+            self._session = _solver.LPSession(
+                self._programme, _solver.RANGING_OPTIONS, basis=self._basis
+            )
+            self._near = self._session.add_row(
+                self._programme.cost, -math.inf, math.inf
+            )
+        self._session.change_row_bounds(self._near, -math.inf, upper)
+        cost = np.zeros(self._programme.n_columns)
+        cost[column] = sign
+        self._session.change_cost(cost)
+        solution = _checked(self._session.solve, self._context, self._solves)
+        assert solution.values is not None
+        return float(solution.values[column])
+
+
+def _range_end(
+    pieces: _Pieces,
+    block: _Block,
+    context: _Context,
+    solves: _Solves,
+    full: _FullRanging,
+    end: tuple[int, float, float],
+) -> float:
+    """The range end `(column, sign, upper)`, from reduced LPs or the full LP."""
+    column, sign, upper = end
+    k = block.basis.shape[1]
+    cost = np.zeros(k)
+    cost[column] = sign
+    for _ in range(RANGING_ROUND_LIMIT):
+        programme, zeta, eta = _reduced_programme(pieces, block, context, cost, upper)
+        solution = solves.add(_solver.solve_lp(programme, _solver.RANGING_OPTIONS))
+        if solution.status != "optimal" or solution.values is None:
+            break
+        if not _release(pieces, solution.values, k, zeta, eta):
+            return float(solution.values[column])
+    return full.end(column, sign, upper)
+
+
 def _ranges(
-    programme: _solver.Programme,
-    solution: _solver.Solution,
+    block: _Block,
+    solved: _SolvedBlock,
     identified: Sequence[int],
     context: _Context,
     solves: _Solves,
 ) -> tuple[dict[int, tuple[float, float]], bool]:
     """Range the identified amounts over two near-optimal sets.
 
-    `solution` is the programme's optimal solution. Each near-optimal set is
-    the programme's feasible set with one more row, `cost @ x <= optimum +
-    tolerance * max(1, |optimum|)`. The four LPs per amount (its smallest and
-    largest value, at each tolerance) share one HiGHS instance: each changes
-    only the objective or that row's bound. The first starts from the
-    solution's basis, if it has one, with the new row basic (the optimum
-    meets it); every later one from the previous solve's basis.
+    `solved.solution` is the LP's optimal solution. Each near-optimal set is
+    the LP's feasible set with one more row, `cost @ x <= optimum + tolerance
+    * max(1, |optimum|)`; each amount's smallest and largest value there, at
+    each tolerance, is the optimum of an LP. Each is solved on reduced LPs
+    (see the comment above `_Pieces`), which share one set of pieces: a group
+    freed for one end stays free for the next. An end whose reduced LP is not
+    solved to optimality, or that takes `RANGING_ROUND_LIMIT` of them, is
+    solved on the full LP (`_FullRanging`). Every solve is counted.
 
     Returns each amount's wide range in scaled units, and whether every one
     is pinned.
     """
-    assert solution.objective is not None
+    solution = solved.solution
+    assert solution.objective is not None and solution.values is not None
+    if not identified:
+        return {}, True
     optimum = solution.objective
-    session = _solver.LPSession(
-        programme, _solver.RANGING_OPTIONS, basis=solution.basis
-    )
-    near = session.add_row(programme.cost, -math.inf, math.inf)
+    pieces = _pieces(block, solution.values[: block.basis.shape[1]], context)
+    full = _FullRanging(solved.programme, solution.basis, context, solves)
     found: list[dict[int, tuple[float, float]]] = []
     for tolerance in NEAR_OPTIMAL_TOLERANCES:
-        session.change_row_bounds(
-            near, -math.inf, optimum + tolerance * max(1.0, abs(optimum))
+        upper = optimum + tolerance * max(1.0, abs(optimum))
+        found.append(
+            {
+                column: (
+                    _range_end(
+                        pieces, block, context, solves, full, (column, 1.0, upper)
+                    ),
+                    _range_end(
+                        pieces, block, context, solves, full, (column, -1.0, upper)
+                    ),
+                )
+                for column in identified
+            }
         )
-        bounds: dict[int, tuple[float, float]] = {}
-        for column in identified:
-            ends: list[float] = []
-            for sign in (1.0, -1.0):
-                cost = np.zeros(programme.n_columns)
-                cost[column] = sign
-                session.change_cost(cost)
-                solution = _checked(session.solve, context, solves)
-                assert solution.values is not None
-                ends.append(float(solution.values[column]))
-            bounds[column] = (ends[0], ends[1])
-        found.append(bounds)
     wide, narrow = found
     pinned = True
     for column in identified:
@@ -1250,9 +1605,7 @@ def _uniqueness(
         eigen = np.linalg.eigvalsh(gram)
         return bool(eigen.min() > MSE_EIGEN_TOLERANCE * eigen.max()), None
     if solved.ranging:
-        wide, unique = _ranges(
-            solved.programme, solved.solution, ranged, context, solves
-        )
+        wide, unique = _ranges(block, solved, ranged, context, solves)
         return unique, {
             j: (low * context.scale + 0.0, high * context.scale + 0.0)
             for j, (low, high) in wide.items()

@@ -2804,28 +2804,43 @@ rather than presenting one solver's answer as the design.
   rule sets its payout.
 - **The LP route.** With `DesignOptions(ranges=True)` every identified amount
   is ranged over the near-optimal designs, those within ε · max(1, |optimum|)
-  of the optimum in scaled units, at ε = 1e-9 and ε = 1e-11 (four more LPs per
-  amount, at HiGHS feasibility tolerances of 1e-10). The ranging LPs share one
-  HiGHS instance, each starting from the basis of the one before it and the
-  first from the design LP's. An amount is pinned when
-  its narrow range is at most half its wide one, or narrower than 1e-7 of the
-  scale; `unique` is true when every identified amount is pinned, and
+  of the optimum in scaled units, at ε = 1e-9 and ε = 1e-11: four range ends
+  per amount, each the optimum of an LP, at HiGHS feasibility tolerances of
+  1e-10. An amount is pinned when its narrow range is at most half its wide
+  one, or narrower than 1e-7 of the scale; `unique` is true when every
+  identified amount is pinned, and
   `DesignResult.ranges` gives the wide ranges in payout units. At a unique
   vertex a range shrinks with ε; on a set of optimal designs it keeps the set's
   width. Without `ranges=True`, `unique` is `None` on the LP route.
-- **Why ranging is off by default.** It solves four more LPs per identified
-  amount, each the size of the design LP and at tighter tolerances, so its cost
-  grows with the draws and the amounts, and it is paid again for every design
-  (every objective, fold and budget). On one synthetic setup (one asset, a step
-  cover with six free amounts, weighted CVaR with α = 0.9 and β = 0.9, pure
-  premium, `Budget(ratio=0.8)`, on one laptop), the design with ranging took
-  about twenty times as long as without it at 2,000 draws, and of the order of a
-  hundred times as long at 20,000 draws: minutes against about a second. So by
-  default an LP design's rows have `unique` null, the setup text says "unique
-  optimum: not checked", and `DesignResult.ranges` is `None`; state
-  `DesignOptions(ranges=True)` when you need the report, and read a design whose
-  `unique` is null as one member of a set that may hold others. The QP route
-  reports `unique` either way.
+- **How a range end is solved.** Its LP is as large as the design's, with
+  columns and rows for every draw, but only the draws whose payout crosses
+  their loss (or the CVaR's threshold) within the near-optimal set change
+  anything there. So `design` solves a smaller LP. Draws with the same basis
+  row and loss are merged. Each draw keeps the linear piece it is on at the
+  design's optimum: a draw paid at least its loss keeps an uncovered loss of
+  0, one paid less keeps loss minus payout, and likewise for the CVaR's excess
+  over its threshold and a cost-of-capital premium's tail. Those draws are
+  summed into one row; only the draws within 1e-9 of a kink, in scaled units,
+  keep columns and rows of their own. Each kept piece lies below the function
+  it stands for, so the smaller LP is a relaxation: when its solution keeps
+  every piece, it is feasible in the full LP, so it solves it. Otherwise the
+  draws whose piece broke get their own columns and rows, for this end and
+  every later one, and the LP is solved again. An end whose smaller LP is not
+  solved to optimality, or that takes 100 of them, is solved on the full LP,
+  on one HiGHS instance that starts from the design LP's basis. The design
+  record counts every solve. `design_joint` ranges the same way.
+- **What ranging costs.** Four range ends per identified amount, each a small
+  LP that grows with the draws near a kink rather than with all of them, paid
+  again for every design (every objective, fold and budget). On one synthetic
+  setup (one asset, 20,000 draws, a piecewise linear cover with five free
+  levels, weighted CVaR with α = 0.9 and β = 0.9, pure premium, a budget and a
+  limit, on one laptop), the design took 1.39 s without ranges and 1.43 s
+  with them, where solving every range end on the full LP took 30 s. Ranging is
+  off by default: an LP design's rows then have `unique` null, the setup text
+  says "unique optimum: not checked", and `DesignResult.ranges` is `None`;
+  state `DesignOptions(ranges=True)` when you need the report, and read a
+  design whose `unique` is null as one member of a set that may hold others.
+  The QP route reports `unique` either way.
 - **The QP route.** `unique` is true when H = Bᵀ diag(p) B, over the identified
   amounts, is positive definite (smallest eigenvalue above 1e-10 of the
   largest).

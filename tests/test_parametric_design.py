@@ -9,6 +9,7 @@ cases (other families, the grid route) are picked up when they are copied.
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import itertools
 import json
 import math
@@ -777,19 +778,45 @@ def test_non_unique_lp_optimum_is_reported_with_ranges() -> None:
     assert row["unique"] is False
 
 
-# -- ranging on one solver instance ------------------------------------------
+# -- ranging on reduced LPs --------------------------------------------------
 
 
 NON_UNIQUE = _sample([0.0, 1.0, 2.0, 3.0], [0.0, 10.0, 20.0, 40.0])
+DESIGN_MODULE = importlib.import_module("crc_sdk.parametric.design")
 
 
-def test_the_ranging_lps_share_one_solver_instance(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fresh: list[tuple[Mapping[str, Any] | None, bool]] = []
-    solved: list[_solver.Solution] = []
-    sessions: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
-    solve_lp, session = _solver.solve_lp, _solver.LPSession
+def _many_draws(n: int = 400, seed: int = 3) -> OutcomeSample:
+    """Draws on three bands: no loss below the first breakpoint, so many repeat."""
+    rng = np.random.default_rng(seed)
+    index = rng.gumbel(1.0, 0.6, size=n)
+    noise = rng.normal(0.0, 4.0, size=n)
+    loss = np.where(
+        index < 1.0, 0.0, np.clip(np.round(12.0 * index + noise, 1), 0, None)
+    )
+    return _sample(index.tolist(), loss.tolist())
+
+
+def _three_bands() -> Cover:
+    return _step(
+        [Free(upper=40.0), Free(upper=40.0), Free(upper=40.0)], (1.0, 2.0, 3.0)
+    )
+
+
+def _same_ranges(got: DesignResult, full: DesignResult, scale: float) -> None:
+    """The reduced LPs' report is the full LPs' within 1e-9 of the scale."""
+    assert got.unique == full.unique and got.unidentified == full.unidentified
+    assert got.parameters == full.parameters and got.design_id == full.design_id
+    assert got.ranges is not None and full.ranges is not None
+    assert set(got.ranges) == set(full.ranges)
+    for name, (low, high) in full.ranges.items():
+        assert got.ranges[name] == pytest.approx((low, high), abs=1e-9 * scale)
+
+
+def test_the_ranges_are_solved_on_reduced_lps(monkeypatch: pytest.MonkeyPatch) -> None:
+    sample = _many_draws()
+    lps: list[tuple[int, Mapping[str, Any] | None, bool]] = []
+    groups: list[int] = []
+    solve_lp, pieces = _solver.solve_lp, DESIGN_MODULE._pieces
 
     def counted_solve(
         programme: _solver.Programme,
@@ -797,35 +824,236 @@ def test_the_ranging_lps_share_one_solver_instance(
         *,
         keep_basis: bool = False,
     ) -> _solver.Solution:
-        fresh.append((options, keep_basis))
-        solved.append(solve_lp(programme, options, keep_basis=keep_basis))
-        return solved[-1]
+        lps.append((programme.n_columns, options, keep_basis))
+        return solve_lp(programme, options, keep_basis=keep_basis)
 
-    def counted_session(*args: Any, **kwargs: Any) -> _solver.LPSession:
-        sessions.append((args, kwargs))
-        return session(*args, **kwargs)
+    def counted_pieces(*args: Any) -> Any:
+        made = pieces(*args)
+        groups.append(made.loss.shape[0])
+        return made
+
+    def no_session(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("no range end needs the full LP here")
 
     monkeypatch.setattr(_solver, "solve_lp", counted_solve)
-    monkeypatch.setattr(_solver, "LPSession", counted_session)
+    monkeypatch.setattr(_solver, "LPSession", no_session)
+    monkeypatch.setattr(DESIGN_MODULE, "_pieces", counted_pieces)
     result = design(
-        _step([Free(), Free()]),
-        NON_UNIQUE,
-        ExpectedUncovered(),
-        budget=Budget(amount=5.0),
+        _three_bands(),
+        sample,
+        WeightedCVaR(0.5, 0.9),
+        budget=Budget(ratio=0.5),
         options=DesignOptions(ranges=True),
     )
-    # The design LP is solved on its own and keeps its basis; the 4 ranging
-    # LPs of each of the 2 amounts share one instance, which starts from that
-    # basis, and are still counted as solves.
-    assert fresh == [(None, True)]
-    assert len(sessions) == 1
-    args, kwargs = sessions[0]
-    assert args[1] == _solver.RANGING_OPTIONS
-    assert solved[0].basis is not None
-    assert kwargs["basis"] is solved[0].basis
-    assert result.solves == 1 + 4 * 2
-    assert result.ranges is not None
-    assert result.ranges["levels[1]"] == pytest.approx((20 / 3, 20.0))
+    # The design LP keeps its basis, for an end the full LP would solve. The
+    # 400 draws merge into fewer groups (the years without a loss below the
+    # first breakpoint are one), and each of the 4 x 3 range ends takes at
+    # least one reduced LP, far smaller than the design LP; all are counted.
+    (design_columns, options, keep), *ranging = lps
+    assert options is None and keep is True
+    assert groups == [groups[0]] and groups[0] < len(sample.period) - 100
+    assert len(ranging) >= 4 * 3
+    assert all(
+        options == _solver.RANGING_OPTIONS and not keep for _, options, keep in ranging
+    )
+    assert max(columns for columns, _, _ in ranging) < design_columns / 4
+    assert result.solves == len(lps)
+    assert result.unique is True and result.ranges is not None
+    assert set(result.ranges) == {"levels[0]", "levels[1]", "levels[2]"}
+
+
+@pytest.mark.parametrize(
+    ("objective", "pricing", "budget"),
+    [
+        (ExpectedUncovered(), PurePremium(), Budget(ratio=0.5)),
+        (ExpectedUncovered(), PurePremium(), None),
+        (WeightedCVaR(0.7, 0.9), PurePremium(), Budget(ratio=0.5)),
+        (WeightedCVaR(1.0, 0.8), CostOfCapitalLoad(0.1, 0.9), Budget(ratio=0.6)),
+        (
+            WeightedCVaR(0.5, 0.95),
+            ExpectedPayoutMultiple(1.2, expense=1.0),
+            Budget(ratio=0.8),
+        ),
+        (WeightedCVaR(0.0, 0.9), CostOfCapitalLoad(0.2, 0.5), Budget(ratio=0.4)),
+    ],
+    ids=[
+        "eu-pure",
+        "eu-bounded",
+        "wcvar-pure",
+        "cvar-coc",
+        "wcvar-multiple",
+        "alpha0-coc",
+    ],
+)
+def test_the_reduced_lps_range_as_the_full_lp_does(
+    monkeypatch: pytest.MonkeyPatch,
+    objective: ExpectedUncovered | WeightedCVaR,
+    pricing: PurePremium | CostOfCapitalLoad | ExpectedPayoutMultiple,
+    budget: Budget | None,
+) -> None:
+    sample = _many_draws()
+
+    def run() -> DesignResult:
+        return design(
+            _three_bands(),
+            sample,
+            objective,
+            pricing=pricing,
+            budget=budget,
+            options=DesignOptions(ranges=True),
+        )
+
+    got = run()
+    # With no round allowed, every end is solved on the full LP, on one HiGHS
+    # instance, as before the reduced LPs.
+    monkeypatch.setattr(DESIGN_MODULE, "RANGING_ROUND_LIMIT", 0)
+    _same_ranges(got, run(), float(sample.loss.max()))
+
+
+def test_a_non_unique_optimum_is_ranged_on_reduced_lps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def run() -> DesignResult:
+        return design(
+            _step([Free(), Free()]),
+            NON_UNIQUE,
+            ExpectedUncovered(),
+            budget=Budget(amount=5.0),
+            options=DesignOptions(ranges=True),
+        )
+
+    got = run()
+    assert got.unique is False and got.ranges is not None
+    assert got.ranges["levels[1]"] == pytest.approx((20 / 3, 20.0))
+    monkeypatch.setattr(DESIGN_MODULE, "RANGING_ROUND_LIMIT", 0)
+    _same_ranges(got, run(), 40.0)
+
+
+def test_nothing_to_range_when_no_free_amount_is_identified() -> None:
+    # No year reaches band 1, so its free level is unidentified, and the
+    # other level is fixed: the LP route ranges nothing, and the design is
+    # unique on the sample.
+    result = design(
+        _step([10.0, Free(upper=50.0)]),
+        _sample([0.0, 1.5, 2.0], [0.0, 10.0, 30.0]),
+        ExpectedUncovered(),
+        options=DesignOptions(ranges=True),
+    )
+    assert result.route == "lp" and result.unidentified == ("levels[1]",)
+    assert result.ranges == {} and result.unique is True
+    assert result.solves == 1
+
+
+def test_a_draw_whose_piece_breaks_is_freed() -> None:
+    # Two amounts, three draws: one on each band, and one without a loss on
+    # neither. At theta = (5, 5) the first draw (loss 10) is uncovered and the
+    # second (loss 2) covered; the third has a zero basis row.
+    pieces = DESIGN_MODULE._Pieces(
+        basis=np.array([[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]),
+        loss=np.array([10.0, 2.0, 0.0]),
+        probability=np.full(3, 1 / 3),
+        constant=np.array([False, False, True]),
+        uncovered=np.array([1, 0, 1], dtype=np.int8),
+        excess=np.array([1, 0, 0], dtype=np.int8),
+        payout_basis=np.array([[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]),
+        payout_probability=np.full(3, 1 / 3),
+        tail=np.array([1, 1, 0], dtype=np.int8),
+    )
+    # theta, zeta, eta: nothing crosses a kink.
+    assert DESIGN_MODULE._release(pieces, np.array([5.0, 5.0, 4.0, 3.0]), 2, 2, 3) == 0
+    # The first draw becomes covered, the second's payout falls below eta.
+    count = DESIGN_MODULE._release(pieces, np.array([12.0, 5.0, 4.0, 6.0]), 2, 2, 3)
+    assert count == 3
+    assert pieces.uncovered.tolist() == [2, 0, 1]
+    assert pieces.excess.tolist() == [2, 0, 0]
+    assert pieces.tail.tolist() == [1, 2, 0]
+    # A covered draw that becomes uncovered, an uncovered one whose uncovered
+    # loss rises past zeta, and a payout that rises past eta are freed too.
+    # The zero basis row keeps its uncovered loss: it is the loss itself.
+    count = DESIGN_MODULE._release(pieces, np.array([12.0, 1.0, -1.0, -0.5]), 2, 2, 3)
+    assert count == 3
+    assert pieces.uncovered.tolist() == [2, 2, 1]
+    assert pieces.excess.tolist() == [2, 0, 2]
+    assert pieces.tail.tolist() == [1, 2, 2]
+
+
+def test_a_reduced_lp_that_fails_leaves_its_end_to_the_full_lp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = design(
+        _three_bands(),
+        _many_draws(),
+        WeightedCVaR(0.5, 0.9),
+        budget=Budget(ratio=0.5),
+        options=DesignOptions(ranges=True),
+    )
+    solve_lp, session = _solver.solve_lp, _solver.LPSession
+    sessions: list[dict[str, Any]] = []
+    failed: list[int] = []
+
+    def unbounded(
+        programme: _solver.Programme,
+        options: Mapping[str, Any] | None = None,
+        *,
+        keep_basis: bool = False,
+    ) -> _solver.Solution:
+        if options is _solver.RANGING_OPTIONS:
+            failed.append(programme.n_columns)
+            return _solver.Solution("unbounded", None, None, "patched", 3, 0.0)
+        return solve_lp(programme, options, keep_basis=keep_basis)
+
+    def counted_session(*args: Any, **kwargs: Any) -> _solver.LPSession:
+        sessions.append(kwargs)
+        return session(*args, **kwargs)
+
+    monkeypatch.setattr(_solver, "solve_lp", unbounded)
+    monkeypatch.setattr(_solver, "LPSession", counted_session)
+    result = design(
+        _three_bands(),
+        _many_draws(),
+        WeightedCVaR(0.5, 0.9),
+        budget=Budget(ratio=0.5),
+        options=DesignOptions(ranges=True),
+    )
+    # Every end tries one reduced LP, then the full LP solves it, on one
+    # instance that starts from the design LP's basis.
+    assert len(failed) == 4 * 3
+    assert len(sessions) == 1 and sessions[0]["basis"] is not None
+    assert result.solves == 1 + 2 * 4 * 3
+    _same_ranges(result, expected, float(_many_draws().loss.max()))
+
+
+def test_the_round_limit_leaves_an_end_to_the_full_lp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without a budget, any levels from the losses up to the bound of 40 are
+    # optimal, so ranging a level moves payouts past many losses.
+    sample = _many_draws()
+
+    def run() -> DesignResult:
+        return design(
+            _three_bands(),
+            sample,
+            ExpectedUncovered(),
+            options=DesignOptions(ranges=True),
+        )
+
+    expected = run()
+    assert expected.unique is False
+    released: list[int] = []
+    release = DESIGN_MODULE._release
+
+    def counted(*args: Any) -> int:
+        released.append(release(*args))
+        return released[-1]
+
+    monkeypatch.setattr(DESIGN_MODULE, "_release", counted)
+    monkeypatch.setattr(DESIGN_MODULE, "RANGING_ROUND_LIMIT", 1)
+    got = run()
+    # An end freed draws in its one round, so the full LP solved it.
+    assert len(released) == 4 * 3 and sum(1 for count in released if count) >= 1
+    assert got.solves == 1 + 4 * 3 + sum(1 for count in released if count)
+    _same_ranges(got, expected, float(sample.loss.max()))
 
 
 def _small_lp(cost: Sequence[float], upper: float | None = None) -> _solver.Programme:
@@ -953,7 +1181,20 @@ def test_a_session_rejects_bad_changes() -> None:
 def test_a_failed_ranging_solve_raises(
     monkeypatch: pytest.MonkeyPatch, status: str
 ) -> None:
+    # A reduced LP that fails leaves its end to the full LP; when that fails
+    # too, the design raises its typed error.
     calls: list[Mapping[str, Any] | None] = []
+    solve_lp = _solver.solve_lp
+
+    def reduced_fails(
+        programme: _solver.Programme,
+        options: Mapping[str, Any] | None = None,
+        *,
+        keep_basis: bool = False,
+    ) -> _solver.Solution:
+        if options is _solver.RANGING_OPTIONS:
+            return _solver.Solution("error", None, None, "patched reduced", 0, 0.0)
+        return solve_lp(programme, options, keep_basis=keep_basis)
 
     def failed(
         self: _solver.LPSession, options: Mapping[str, Any] | None = None
@@ -961,6 +1202,7 @@ def test_a_failed_ranging_solve_raises(
         calls.append(options)
         return _solver.Solution(status, None, None, f"patched {status}", 0, 0.0)  # type: ignore[arg-type]
 
+    monkeypatch.setattr(_solver, "solve_lp", reduced_fails)
     monkeypatch.setattr(_solver.LPSession, "solve", failed)
     with pytest.raises(DesignError) as raised:
         design(
