@@ -1034,6 +1034,15 @@ class OutcomeSample:
     provenance: SampleProvenance
     scenario: str = "baseline"
     index_components: Mapping[str, IndexComponent] | None = None
+    _view_of: tuple[str, Tail] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    """The component a `component` view reads, and its tail; else `None`.
+
+    It is not part of the content hash, the table or the provenance document:
+    it lets a cover's tail be checked against the component's on the view, and
+    a split of the view keeps it.
+    """
 
     def __post_init__(self) -> None:
         ids = self.asset_ids
@@ -1224,7 +1233,7 @@ class OutcomeSample:
             step=step,
             rows=rows,
         )
-        return OutcomeSample(
+        subset = OutcomeSample(
             asset_ids=self.asset_ids,
             period=self.period[rows],
             probability=probability,
@@ -1245,6 +1254,9 @@ class OutcomeSample:
                 }
             ),
         )
+        # A block of a component's view is still that component's view.
+        object.__setattr__(subset, "_view_of", self._view_of)
+        return subset
 
     def asset(self, asset_id: str) -> OutcomeSample:
         """Return one asset's sample: the same periods and probabilities.
@@ -1316,6 +1328,14 @@ class OutcomeSample:
         sources the view reads: its own, and with `loss="combined"` those of
         every component with an impact, which are in that loss.
 
+        The view keeps its component's tail, and so do its blocks (`select`,
+        `holdout`, `year_block_kfold`): a cover on one index read on the view,
+        by `design`, `evaluate` and the functions built on them, must have that
+        tail, as it must on the sample of several hazards. The tail is not in
+        the view's `content_hash`, its table or its provenance, so a view read
+        back from its table has none, and its covers' tails are the caller's
+        to know, as on any one-hazard sample.
+
         Raises `SampleError` on a sample without index components, for a
         component the sample does not hold, an unknown `loss`, and for
         `loss="own"` on a component with no impact, which has no own loss.
@@ -1385,7 +1405,7 @@ class OutcomeSample:
                 }
             ),
         )
-        return OutcomeSample(
+        view = OutcomeSample(
             asset_ids=self.asset_ids,
             period=self.period,
             probability=self.probability,
@@ -1398,6 +1418,8 @@ class OutcomeSample:
             provenance=provenance,
             scenario=self.scenario,
         )
+        object.__setattr__(view, "_view_of", (name, chosen.tail))
+        return view
 
     @classmethod
     def join(cls, samples: Iterable[OutcomeSample]) -> OutcomeSample:
@@ -3048,12 +3070,24 @@ def _named_components(
 def _check_cover_index(
     index: IndexDefinition | CompositeIndex, sample: OutcomeSample
 ) -> None:
-    """Raise `SampleError` unless a cover on `index` can read `sample`."""
+    """Raise `SampleError` unless a cover on `index` can read `sample`.
+
+    On a one-hazard sample the unit must be the sample's and, on a component's
+    view, the tail the component's; on a sample of several hazards each
+    component read must have the cover's unit and tail (`_named_components`).
+    """
     if isinstance(index, IndexDefinition) and sample.index_components is None:
         if index.unit != sample.index_unit:
             raise SampleError(
                 f"the cover's index is in {index.unit!r}, but the sample's "
                 f"index is in {sample.index_unit!r}"
+            )
+        viewed = sample._view_of
+        if viewed is not None and index.tail != viewed[1]:
+            raise SampleError(
+                f"the cover's index has the tail {index.tail!r}, but the sample is "
+                f"the view of component {viewed[0]!r}, which has {viewed[1]!r}: "
+                "a cover on a component reads it on the component's own tail"
             )
         return
     _named_components(index, sample)

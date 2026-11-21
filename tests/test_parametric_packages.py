@@ -262,6 +262,83 @@ def test_a_package_keeps_each_key_as_the_component_it_reads() -> None:
     assert row["expected_payout"] == pytest.approx(8.0 * (RAIN_VALUES >= 50.0).mean())
 
 
+WET = IndexDefinition("wet", "mm/day", aggregation="annual_maximum")
+"""A second rain index, in rain's unit and with its tail."""
+
+
+def _alike() -> OutcomeSample:
+    """Two components of one unit and tail, which nothing but their key tells apart."""
+    return _sample(
+        index_components={
+            "rain": IndexComponent(
+                RAIN_VALUES, unit="mm/day", tail="upper", own_loss=RAIN_LOSS
+            ),
+            "wet": IndexComponent(
+                HEAT_VALUES, unit="mm/day", tail="upper", own_loss=HEAT_LOSS
+            ),
+        }
+    )
+
+
+def test_a_design_sits_under_the_key_of_the_component_it_was_designed_on() -> None:
+    sample = _alike()
+    train, test = holdout(sample, train_fraction=0.75)
+    rain = design(
+        Cover(RAIN, BinaryPayout(50.0, Free()), payout_unit="EUR", label="rain"),
+        train.component("rain"),
+        ExpectedUncovered(),
+        budget=Budget(amount=2.0),
+    )
+    wet = design(
+        Cover(WET, BinaryPayout(38.0, Free()), payout_unit="EUR", label="wet"),
+        train.component("wet"),
+        ExpectedUncovered(),
+        budget=Budget(amount=2.0),
+    )
+    # Swapped, each contract would be read on the other component's index: the
+    # units, tails and records agree, so nothing else would tell.
+    with pytest.raises(EvaluationError) as raised:
+        CoverPackage({"rain": wet, "wet": rain})
+    message = str(raised.value)
+    assert "the design under 'rain' was made on component 'wet'" in message
+    assert "so put it under 'wet', or design it on sample.component('rain')" in (
+        message
+    )
+    with pytest.raises(EvaluationError, match="made on component 'rain'"):
+        CoverPackage({"wet": rain, "heat": wet})
+    # A design on a block of a component's view is that component's too.
+    view_train, _ = holdout(sample.component("wet"), train_fraction=0.75)
+    blocked = design(
+        Cover(WET, BinaryPayout(38.0, Free()), payout_unit="EUR"),
+        view_train,
+        ExpectedUncovered(),
+        budget=Budget(amount=2.0),
+    )
+    with pytest.raises(EvaluationError, match="made on component 'wet'"):
+        CoverPackage({"rain": rain, "rain2": blocked})
+    # Keyed by their components, each contract reads its own component's index.
+    package = CoverPackage({"rain": rain, "wet": wet}, label="separate")
+    table = compare([package], test, split="out_of_sample")
+    for name, result in (("rain", rain), ("wet", wet)):
+        alone = compare([result], test.component(name), split="out_of_sample")
+        row = _row(table, design_id=result.design_id)
+        assert row["expected_payout"] == _column(alone, "expected_payout")[0]
+
+
+def test_a_design_on_no_components_view_takes_its_key_as_before() -> None:
+    # A design on a one-hazard sample that is no view records no component, so
+    # its key is the caller's to know, as a cover's is.
+    rain = design(
+        _rain_cover(Free(), label="rain"),
+        _one_hazard(),
+        ExpectedUncovered(),
+        budget=Budget(amount=2.0),
+    )
+    heat = _Designs().heat
+    package = CoverPackage({"wet": rain, "heat": heat})
+    assert list(package.covers) == ["wet", "heat"]
+
+
 def _dry_cover(**rest: Any) -> Cover:
     """A cover on rain's index with a lower tail, which the sample's rain lacks."""
     lower = IndexDefinition(

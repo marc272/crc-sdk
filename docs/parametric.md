@@ -1216,8 +1216,11 @@ that read it under `scenarios`, and each hazard source in `sources` names its
 the numbers. The tables of several assets merge into one only where the assets'
 scenarios differ in their blocks alone: a per-year asset whose series spans
 other years than the others', as `missing="drop_year"` can leave it, reads
-another horizon, and the merge raises `EvaluationError`, naming the scenario,
-each table's assets and the years each series spans.
+another horizon. Every execution point raises that refusal once the samples are
+built and before anything is designed: `EvaluationError`, naming the scenario,
+each table's assets and the years each series spans, as
+`EvaluationMetadata.merge` words it. `explain()` reads nothing, so it can't see
+the years each asset keeps under `missing="drop_year"`.
 
 ## The function route
 
@@ -3376,11 +3379,13 @@ joint_result.allocated_output       # joint-comparison.allocated.parquet, beside
 
   `.joint_sample()` returns the sample and `.samples()` each asset's view of it.
   `EmpiricalCopula` takes `FreshDraws`: `Holdout` and `KFold` raise `SampleError`,
-  as a block of its rows is a set of reference years. Under `Comonotonic()`, a
-  `Holdout` or `KFold` raises `LeakageError` when the plan runs, at the joint
-  design's held-out block: the moved assets' draws were placed by the first
-  asset's ranks over both blocks ([cuts of one
-  sample](#several-assets-from-fitted-curves)). Take `FreshDraws` there.
+  as a block of its rows is a set of reference years. A joint design's rows are
+  on the owner's total, which reads every asset, so `Holdout` and `KFold` take
+  `Independent()` only: under `Comonotonic()`, `GaussianCopula` or a model of
+  your own, the moved assets' draws were placed by ranks over both blocks ([cuts
+  of one sample](#several-assets-from-fitted-curves)), and `explain()` and every
+  execution point raise `LeakageError`, naming `FreshDraws`, before anything is
+  drawn. Take `FreshDraws` there.
 - **The covers.** A cover must be written for no asset, as it applies to every
   asset (the plan raises otherwise); `design_joint` takes different terms per
   asset. A resolved cover is evaluated as one contract per asset, with
@@ -3670,7 +3675,11 @@ setup text calls it one.
   with `loss="combined"` it keeps the combined loss. A component with no impact
   has no own loss, so the default raises `SampleError` and names
   `loss="combined"`. The view keeps the sample's lineage, so the leakage check
-  still sees its source.
+  still sees its source, and the component's tail, so a cover on one index read
+  on the view or on a block of it, by `design`, `evaluate` and the functions
+  built on them, must have that tail, as on the sample itself: another raises
+  `SampleError`. The tail isn't in the view's hash, table or provenance, so a
+  view read back from its table has none.
 - **Splits.** `select`, `holdout` and `year_block_kfold` act on every
   component. On an `EmpiricalCopula` sample `holdout` and `year_block_kfold`
   raise, and two blocks cut with `select` raise `LeakageError` at an
@@ -3875,6 +3884,11 @@ and `unidentified_share` shows how much of an evaluation block falls in them.
 hazards and makes them one row of a comparison. `covers` maps each component
 name to the one-index cover or design of the contract on that component: two or
 more, all covers or all designs, with one `payout_unit` and one `asset_id`. A
+design goes under the key of the component it was designed on: its design
+sample records the step `sample.component(name)`, and under another key
+`CoverPackage` raises `EvaluationError`, since the contract would be read on
+another component's index. A cover given as is, or a design on a sample that
+is no component's view, records no component, so its key is yours to state. A
 package has `covers`, `index` (their `CompositeIndex`), `payout` (the `SumOf` of
 the covers as designed, every amount fixed), `as_cover()` (the same payout as
 one contract) and `package_hash`. `compare` and `evaluate` give one `"asset"` row

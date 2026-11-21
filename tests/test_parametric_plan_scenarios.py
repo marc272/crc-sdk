@@ -68,6 +68,7 @@ from crc_sdk.parametric import (
     to_drift,
     year_block_kfold,
 )
+from crc_sdk.parametric import plan as plan_module
 from crc_sdk.types import HazardDatasetMetadata, SourceProvenance
 from crc_sdk.workflows import (
     AssetPortfolio,
@@ -1668,6 +1669,89 @@ def test_an_asset_whose_kept_years_differ_is_named_at_the_merge(
             reference="historical",
         )
     ).write_parquet(tmp_path / "years.parquet")
+
+
+def _without(table: Any, year: int, latitude: float) -> Any:
+    """`table` without one year of one asset's cell."""
+    return table.filter(
+        pc.invert(
+            pc.and_(
+                pc.equal(table["year"], year), pc.equal(table["latitude"], latitude)
+            )
+        )
+    )
+
+
+def _shorter_future(table: Any) -> AnnualScenario:
+    entry = _future()
+    return AnnualScenario(
+        "ssp585",
+        table,
+        provenance=entry.provenance,
+        pathway="ssp585",
+        hazard_name="rx1day",
+    )
+
+
+@pytest.mark.parametrize("rule", [Holdout(0.7), KFold(3)], ids=["holdout", "kfold"])
+def test_an_asset_whose_kept_years_differ_is_refused_before_any_design(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rule: Any
+) -> None:
+    # depot-b's series has no value in 2041, so it spans 2042 to 2070.
+    future = _without(_years(2041, location=58.0, seed=2), 2041, 51.0)
+    plan = (
+        _annual_plan(missing="drop_year")
+        .split(rule)
+        .scenarios(ScenarioSet([_shorter_future(future)], reference="historical"))
+    )
+    # explain() reads nothing: under drop_year a year may drop out at either end,
+    # so it states no horizon, and it can't see the years each asset keeps.
+    document: Any = plan.explain(format="json")
+    assert document["setup"]["scenarios"]["scenarios"]["ssp585"]["horizon"] is None
+    # The merge refused the plan's tables after the designs; it is the same error.
+    with monkeypatch.context() as patched:
+        patched.setattr(plan_module, "_check_scenario_horizons", lambda built: None)
+        with pytest.raises(EvaluationError) as merged:
+            plan.write_parquet(tmp_path / "merged.parquet")
+    message = str(merged.value)
+    assert "scenario 'ssp585' has the horizon 2055 in one table" in message
+    assert "2056 in another (asset 'depot-b', whose series spans 2042 to 2070)" in (
+        message
+    )
+
+    def designed(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the refusal comes before any design")
+
+    monkeypatch.setattr(plan_module, "design", designed)
+    out = tmp_path / "years.parquet"
+    for run in (
+        plan.samples,
+        plan.scenario_samples,
+        plan.designs,
+        plan.payout_breakdown,
+        lambda: plan.write_parquet(out),
+    ):
+        with pytest.raises(EvaluationError) as raised:
+            run()
+        assert str(raised.value) == message
+    assert not out.exists()
+
+
+def test_an_asset_whose_kept_years_keep_the_horizon_is_not_refused(
+    tmp_path: Path,
+) -> None:
+    # A year dropped inside the window leaves its centre, so both assets read
+    # one horizon and the tables merge.
+    future = _without(_years(2041, location=58.0, seed=2), 2050, 51.0)
+    result = (
+        _annual_plan(missing="drop_year")
+        .split(Holdout(0.7))
+        .scenarios(ScenarioSet([_shorter_future(future)], reference="historical"))
+        .write_parquet(tmp_path / "years.parquet")
+    )
+    stated = result.metadata.setup.scenarios
+    assert stated is not None
+    assert stated["scenarios"]["ssp585"]["horizon"] == 2055
 
 
 def test_explain_states_a_per_year_horizon_where_years_states_it(
