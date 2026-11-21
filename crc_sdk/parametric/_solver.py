@@ -1376,10 +1376,10 @@ def coordinate_search(
     A pass takes each parameter in order, holds the others where they are,
     and tries its `width` candidates nearest the current value (the current
     value left out), nearest first, the lower one first at equal distance;
-    `width` is `first_width` in the first pass and doubles with each pass. It skips a candidate in
-    the current point's class, which can't gain, and evaluates one of a
-    class it has evaluated before only once. Of the candidates whose
-    objective lies below the current one by more than
+    `width` is `first_width` in the first pass and doubles with each pass.
+    It skips a candidate in the current point's class, which can't gain, and
+    evaluates one of a class it has evaluated before only once. Of the
+    candidates whose objective lies below the current one by more than
     `allowance(current objective)`, it moves to the first, in that order,
     whose objective is within `allowance(least)` of the least of them. It
     stops after a pass whose `width` covers every parameter's candidates and
