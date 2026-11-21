@@ -2008,6 +2008,7 @@ def _refine(
     template: Cover,
     names: Sequence[str],
     outcome: _GridOutcome,
+    bounds: tuple[list[float], list[float]],
     context: _Context,
     solves: _Solves,
 ) -> _Refined:
@@ -2029,7 +2030,7 @@ def _refine(
     """
     options = context.options
     parameters = template.payout.parameters()
-    lower, upper = _refinement_bounds(template, names, context)
+    lower, upper = bounds
     steps: list[float] = []
     for name, value, low, high in zip(names, outcome.point, lower, upper, strict=True):
         grid = cast(Free, parameters[name]).grid
@@ -2343,13 +2344,17 @@ def design(
         amount_names = set(cast(LinearInAmounts, payout).amount_names())
         shape = [name for name in free if name not in amount_names]
         if shape:
+            # A refinement's bounds are checked before the grid runs.
+            bounds = (
+                _refinement_bounds(template, shape, context) if options.refine else None
+            )
             outcome = _grid(
-                template, shape, context, solves, inner=True, finish=not options.refine
+                template, shape, context, solves, inner=True, finish=bounds is None
             )
             amounts, ties = outcome.amounts, outcome.ties
             profile, counts = outcome.profile, outcome.counts
-            if options.refine:
-                refined = _refine(template, shape, outcome, context, solves)
+            if bounds is not None:
+                refined = _refine(template, shape, outcome, bounds, context, solves)
                 amounts, ties = refined.amounts, refined.ties
         else:
             amounts = _design_amounts(template, context, solves, report=True)
