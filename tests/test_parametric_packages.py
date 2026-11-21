@@ -264,8 +264,12 @@ def test_a_package_keeps_each_key_as_the_component_it_reads() -> None:
 
 def _dry_cover(**rest: Any) -> Cover:
     """A cover on rain's index with a lower tail, which the sample's rain lacks."""
-    lower = IndexDefinition("rain", "mm/day", tail="lower", aggregation="annual_maximum")
-    return Cover(lower, BinaryPayout(15.0, 8.0, tail="lower"), payout_unit="EUR", **rest)
+    lower = IndexDefinition(
+        "rain", "mm/day", tail="lower", aggregation="annual_maximum"
+    )
+    return Cover(
+        lower, BinaryPayout(15.0, 8.0, tail="lower"), payout_unit="EUR", **rest
+    )
 
 
 def test_a_contract_whose_tail_differs_from_its_components_is_refused() -> None:

@@ -1022,9 +1022,9 @@ def test_allocate_scenarios_gives_compare_scenarios_allocated_rows_alone(
     # 2 designs x 2 scenarios x 2 assets, and no "total" or "asset" row.
     assert table.num_rows == 8
     assert {row["level"] for row in table.to_pylist()} == {level}
-    assert {
-        (row["design_scenario"], row["scenario"]) for row in table.to_pylist()
-    } == {(d, s) for d in ("early", "late") for s in ("early", "late")}
+    assert {(row["design_scenario"], row["scenario"]) for row in table.to_pylist()} == {
+        (d, s) for d in ("early", "late") for s in ("early", "late")
+    }
     for row in table.to_pylist():
         assert row["premium"] is None and row["premium_repriced"] is None
         assert row["premium_basis"] is None
@@ -1071,7 +1071,9 @@ def test_allocate_scenarios_refuses_what_allocate_refuses() -> None:
     designed, scenarios = _joint_setup()
     untyped: Any = allocate_scenarios
     with pytest.raises(TypeError, match="ScenarioSet"):
-        untyped([designed], scenarios.sample("early"), allocation="value", values=VALUES)
+        untyped(
+            [designed], scenarios.sample("early"), allocation="value", values=VALUES
+        )
     with pytest.raises(TypeError, match="JointDesignResult"):
         untyped([_book_covers()], scenarios, allocation="value", values=VALUES)
     with pytest.raises(EvaluationError, match="at least one joint design"):

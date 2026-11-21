@@ -1399,7 +1399,7 @@ VALUES = {"warehouse-a": 2e6, "depot-b": 3e6}
 
 
 def _joint_by_hand(curves: Path, fraction: float = 0.5) -> dict[str, Any]:
-    """Each window's sample of both assets, from the plan's generators, then a holdout."""
+    """Each window's sample of both assets, from the plan's generators, held out."""
     rows = _rows(curves)
     metadata = HazardDataset.local(curves).metadata()
     blocks: dict[str, Any] = {}

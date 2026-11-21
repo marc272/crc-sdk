@@ -1173,7 +1173,9 @@ def test_a_breakdown_of_several_hazards_across_scenarios() -> None:
             _annual_plan(hazard_name="rx1day", scenario="early"), hazard_name="txx"
         )
     ).split(Holdout(0.7))
-    parts = plan.scenarios(ScenarioSet([scenario], reference="early")).payout_breakdown()
+    parts = plan.scenarios(
+        ScenarioSet([scenario], reference="early")
+    ).payout_breakdown()
     names = {"rx1day": "rx1day", "txx": "txx"}
     for asset_id in STATIONS:
         early_train, early_test = holdout(
