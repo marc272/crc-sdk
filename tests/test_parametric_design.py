@@ -1177,6 +1177,64 @@ def test_a_session_rejects_bad_changes() -> None:
         session.solve({"no_such_option": 1})
 
 
+def _two_row_lp(values: list[float]) -> _solver.Programme:
+    """`_small_lp([0.5, -1.0], 1.2)` with its second row's coefficients `values`."""
+    rows, columns, entries = [0, 0], [0, 1], [1.0, 1.0]
+    for column, value in enumerate(values):
+        if value != 0.0:
+            rows, columns, entries = rows + [1], columns + [column], entries + [value]
+    lp = _small_lp([0.5, -1.0], 1.2)
+    matrix = _solver.sparse_columns(
+        np.array(rows), np.array(columns), np.array(entries), (2, 2)
+    )
+    return dataclasses.replace(lp, matrix=matrix)
+
+
+def test_a_session_changes_coefficients_and_keeps_its_basis() -> None:
+    session = _solver.LPSession(_two_row_lp([1.0, 2.0]), _solver.RANGING_OPTIONS)
+    assert session.solve().objective == pytest.approx(0.2, abs=1e-12)
+    for values in ([0.5, 3.0], [0.0, 3.0], [1.0, 2.0]):
+        session.change_coefficients(
+            np.array([1, 1]), np.array([0, 1]), np.array(values)
+        )
+        warm = session.solve()
+        cold = _solver.solve_lp(_two_row_lp(values), _solver.RANGING_OPTIONS)
+        assert warm.status == cold.status == "optimal"
+        assert warm.objective == pytest.approx(cold.objective, abs=1e-12)
+        assert warm.values is not None and cold.values is not None
+        np.testing.assert_allclose(warm.values, cold.values, atol=1e-12)
+    # Back at the first LP, from its own optimal basis: no iteration.
+    assert session.solve().iterations == 0
+    with pytest.raises(ValueError, match="one entry each"):
+        session.change_coefficients(np.array([1]), np.array([0, 1]), np.ones(2))
+    with pytest.raises(ValueError, match="outside the matrix"):
+        session.change_coefficients(np.array([2]), np.array([0]), np.ones(1))
+    with pytest.raises(ValueError, match="outside the matrix"):
+        session.change_coefficients(np.array([0]), np.array([-1]), np.ones(1))
+    with pytest.raises(ValueError, match="finite"):
+        session.change_coefficients(np.array([0]), np.array([0]), np.array([math.inf]))
+
+
+def test_a_sessions_basis_starts_another_session() -> None:
+    programme = _small_lp([1.0, 2.0])
+    one = _solver.LPSession(programme, _solver.RANGING_OPTIONS)
+    assert one.solve().status == "optimal"
+    basis = one.basis()
+    assert basis is not None and (basis.n_columns, basis.n_rows) == (2, 1)
+    other = _solver.LPSession(programme, _solver.RANGING_OPTIONS)
+    other.set_basis(basis)
+    started = other.solve({"presolve": "off"})
+    assert started.status == "optimal" and started.iterations == 0
+    with pytest.raises(ValueError, match="basis is for 2 columns and 1 rows"):
+        _solver.LPSession(_small_lp([1.0, 2.0], 1.5)).set_basis(basis)
+    empty = _solver.Basis(2, 1, _solver.require().HighsBasis())
+    with pytest.raises(ValueError, match="rejected the basis"):
+        other.set_basis(empty)
+    infeasible = _solver.LPSession(_small_lp([1.0, 2.0], 0.5))
+    assert infeasible.solve().status == "infeasible"
+    assert infeasible.basis() is None
+
+
 @pytest.mark.parametrize("status", ["infeasible_or_unbounded", "error"])
 def test_a_failed_ranging_solve_raises(
     monkeypatch: pytest.MonkeyPatch, status: str

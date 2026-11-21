@@ -9,10 +9,12 @@ known in closed form (an objective of 0 at the generating thresholds).
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import json
 import math
 from collections.abc import Callable, Mapping, Sequence
+from types import SimpleNamespace
 from typing import Any, ClassVar, Self
 
 import numpy as np
@@ -23,24 +25,32 @@ from crc_sdk.parametric import (
     MSE,
     BinaryPayout,
     Budget,
+    CompositeIndex,
+    CostOfCapitalLoad,
     Cover,
     DesignError,
     DesignOptions,
     DesignResult,
     EvaluationMetadata,
+    ExpectedPayoutMultiple,
     ExpectedUncovered,
     Free,
+    IndexComponent,
     IndexDefinition,
     Joint,
     Limit,
     LinearConstraints,
     LinearPayout,
+    MaxOf,
     NoBasisRisk,
     OutcomeSample,
     ParametricPlan,
     PiecewiseLinearPayout,
+    PurePremium,
     SampleProvenance,
+    StepGrid,
     StepPayout,
+    SumOf,
     UserObjective,
     WeightedCVaR,
     _solver,
@@ -1400,3 +1410,552 @@ def test_the_coordinate_search_checks_its_inputs(bad: dict[str, Any]) -> None:
         _solver.coordinate_search(
             lambda point: (0.0, "optimal"), [0.0], 0.0, **arguments
         )
+
+
+def test_the_coordinate_search_tries_extra_candidates_of_the_point() -> None:
+    # The extra candidate of the first parameter is the second's value minus
+    # 0.5, so it moves with it: at (0, 3) the first may take 2.5 too.
+    found, calls = _coordinate(
+        lambda x: abs(x[0] - 2.5) + abs(x[1] - 3.0),
+        [0.0, 3.0],
+        [[0.0, 1.0, 2.0], [3.0]],
+        extra=lambda i, point: (point[1] - 0.5,) if i == 0 else (),
+    )
+    assert found.best == (2.5, 3.0) and found.objective == 0.0
+    assert (2.5, 3.0) in calls
+
+
+def test_the_coordinate_search_reports_its_moves() -> None:
+    moves: list[tuple[float, ...]] = []
+    found, _ = _coordinate(
+        lambda x: (x[0] - 3.0) ** 2 + (x[1] - 1.0) ** 2,
+        [0.0, 0.0],
+        [[0.0, 1.0, 2.0, 3.0], [0.0, 1.0, 2.0]],
+        moved=moves.append,
+    )
+    assert found.best == (3.0, 1.0)
+    assert len(moves) == found.moves and moves[-1] == found.best
+
+
+# -- payouts built from steps ---------------------------------------------------
+
+HEAT = IndexDefinition("heat", "degC")
+HEAT_INDEX = [6.0, 1.0, 2.0, 7.0, 3.0, 8.0, 1.0, 2.0, 9.0, 3.0]
+HOT = [30.0 if x >= 5.0 else 0.0 for x in HEAT_INDEX]
+# Rain pays 50 from 4.31 and 100 from 8.5, as above; heat 30 from 5.
+RAIN_STEP = [50.0 * (x >= 4.31) + 50.0 * (x >= 8.5) for x in STEP_INDEX]
+
+
+def _two(
+    rain: Sequence[float],
+    loss: Sequence[float],
+    tail: Tail = "upper",
+    heat: Sequence[float] = HEAT_INDEX,
+) -> Any:
+    n = len(rain)
+    fields: dict[str, Any] = {
+        "asset_ids": ("A",),
+        "period": np.arange(n, dtype=np.int64),
+        "probability": np.full(n, 1.0 / n),
+        "index": np.asarray(rain, dtype=np.float64),
+        "loss": np.asarray(loss, dtype=np.float64),
+        "hazard": None,
+        "index_unit": "mm/day",
+        "loss_unit": "EUR",
+        "semantics": "annual",
+        "provenance": SampleProvenance(
+            source_kind="table",
+            sources=(),
+            semantics_source="caller",
+            hazard_dependence={"kind": "data"},
+            combine={"kind": "table"},
+        ),
+        "index_components": {
+            "rain": IndexComponent(
+                np.asarray(rain, dtype=np.float64),
+                unit="mm/day",
+                tail=tail,
+                hazard=None,
+                own_loss=None,
+            ),
+            "heat": IndexComponent(
+                np.asarray(heat, dtype=np.float64),
+                unit="degC",
+                tail="upper",
+                hazard=None,
+                own_loss=None,
+            ),
+        },
+    }
+    untyped: Any = OutcomeSample
+    return untyped(**fields)
+
+
+def _two_cover(payout: Any, tail: Tail = "upper") -> Cover:
+    rain = IndexDefinition("rain", "mm/day", tail=tail)
+    return Cover(
+        CompositeIndex({"rain": rain, "heat": HEAT}), payout, payout_unit="EUR"
+    )
+
+
+def _rain_part(
+    levels: Sequence[float | Free] = (Free(), Free()), tail: Tail = "upper"
+) -> StepPayout:
+    if tail == "upper":
+        return StepPayout([Free(0.0, 8.0, grid=[0.0, 5.0, 8.0]), 8.5], list(levels))
+    return StepPayout(
+        [Free(2.0, 10.0, grid=[2.0, 5.0, 10.0]), 1.5], list(levels), tail="lower"
+    )
+
+
+def _composites() -> dict[str, tuple[Cover, Any, str]]:
+    """Payouts built from steps, their samples and the rain threshold's name."""
+    both = [a + b for a, b in zip(RAIN_STEP, HOT, strict=True)]
+    larger = [max(a, b) for a, b in zip(RAIN_STEP, HOT, strict=True)]
+    grid_loss = [50.0 * (x >= 4.31) + h for x, h in zip(STEP_INDEX, HOT, strict=True)]
+    return {
+        "sum_of": (
+            _two_cover(
+                SumOf({"rain": _rain_part(), "heat": BinaryPayout(5.0, Free())})
+            ),
+            _two(STEP_INDEX, both),
+            "rain.breakpoints[0]",
+        ),
+        "sum_of_lower": (
+            _two_cover(
+                SumOf(
+                    {
+                        "rain": _rain_part(tail="lower"),
+                        "heat": BinaryPayout(5.0, Free()),
+                    }
+                ),
+                tail="lower",
+            ),
+            _two([10.0 - x for x in STEP_INDEX], both, tail="lower"),
+            "rain.breakpoints[0]",
+        ),
+        "max_of": (
+            _two_cover(
+                MaxOf(
+                    {
+                        "rain": _rain_part([50.0, 100.0]),
+                        "heat": BinaryPayout(5.0, 30.0),
+                    },
+                    scale=Free(),
+                )
+            ),
+            _two(STEP_INDEX, larger),
+            "rain.breakpoints[0]",
+        ),
+        "step_grid": (
+            _two_cover(
+                StepGrid(
+                    {"rain": [Free(0.0, 8.0, grid=[0.0, 5.0, 8.0])], "heat": [5.0]},
+                    [[0.0, Free()], [Free(), Free()]],
+                )
+            ),
+            _two(STEP_INDEX, grid_loss),
+            "rain.breakpoints[0]",
+        ),
+    }
+
+
+@pytest.mark.parametrize("family", ["sum_of", "sum_of_lower", "max_of", "step_grid"])
+@pytest.mark.parametrize(("objective", "terms"), OBJECTIVES, ids=OBJECTIVE_IDS)
+def test_a_payout_built_from_steps_is_refined_over_the_index_values(
+    family: str,
+    objective: Objective,
+    terms: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Each loss is the family's payout with the rain threshold at 4.31 (5.69
+    # on the mirrored rain of a lower tail), between the grid's points and in
+    # a set of years that no compass step from the grid's best point reaches.
+    template, sample, name = _composites()[family]
+    exact = 4.31 if family != "sum_of_lower" else 10.0 - 4.31
+    plain = design(template, sample, objective, **terms)
+    refined = design(template, sample, objective, options=REFINE, **terms)
+    compass = _compass(monkeypatch, template, sample, objective, **terms)
+    record = refined.refinement
+    assert record is not None and record["method"] == INDEX_VALUES_METHOD
+    assert refined.parameters[name] == exact
+    assert 0.0 <= _scaled(refined, refined.objective_value) <= 1e-12
+    assert _scaled(plain, plain.objective_value) > 1e-3
+    assert record["end"] == {name: exact} and record["stopped"] == "no_move"
+    low, high = record["windows"][name]
+    assert low <= plain.parameters[name] <= high and low <= exact <= high
+    assert compass.refinement is not None
+    assert compass.refinement["method"] == REFINE_METHOD
+    assert compass.parameters[name] != exact
+    assert _scaled(compass, compass.objective_value) > 1e-3
+
+
+def test_a_payout_with_another_free_threshold_keeps_the_compass_search() -> None:
+    # A linear component's free attachment is not a step's threshold, so the
+    # whole payout keeps the compass search.
+    template = _two_cover(
+        SumOf(
+            {
+                "rain": _rain_part(),
+                "heat": LinearPayout(Free(0.0, 9.0, grid=[1.0, 5.0]), 9.5, Free()),
+            }
+        )
+    )
+    both = [a + b for a, b in zip(RAIN_STEP, HOT, strict=True)]
+    refined = design(template, _two(STEP_INDEX, both), MSE(), options=REFINE)
+    assert refined.refinement is not None
+    assert refined.refinement["method"] == REFINE_METHOD
+
+
+def test_a_payout_whose_steps_have_fixed_thresholds_keeps_the_compass_search() -> None:
+    # Only a linear component's threshold is free: the compass search.
+    template = _two_cover(
+        SumOf(
+            {
+                "rain": StepPayout([4.31, 8.5], [Free(), Free()]),
+                "heat": LinearPayout(Free(0.0, 9.0, grid=[1.0, 5.0]), 9.5, Free()),
+            }
+        )
+    )
+    both = [a + b for a, b in zip(RAIN_STEP, HOT, strict=True)]
+    refined = design(template, _two(STEP_INDEX, both), MSE(), options=REFINE)
+    assert refined.refinement is not None
+    assert refined.refinement["method"] == REFINE_METHOD
+
+
+# -- a band left without a year -------------------------------------------------
+
+# Six years, a loss of 100 in the last. Every breakpoint at an index value
+# below the fixed 5.5 puts the year at 5 in the first band, which pays its
+# level of at least 20 on a year without a loss; one between 5 and 5.5 leaves
+# that band empty, and the second band pays the loss exactly.
+EMPTY_INDEX = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+EMPTY_LOSS = [0.0, 0.0, 0.0, 0.0, 0.0, 100.0]
+
+
+def _emptied(level: float | Free, tail: Tail = "upper") -> Cover:
+    if tail == "upper":
+        payout = StepPayout([Free(0.0, 6.0, grid=[1.0, 3.0]), 5.5], [level, Free()])
+        return Cover(INDEX, payout, payout_unit="EUR")
+    payout = StepPayout(
+        [Free(4.0, 10.0, grid=[7.0, 9.0]), 4.5], [level, Free()], tail="lower"
+    )
+    return Cover(LOWER, payout, payout_unit="EUR")
+
+
+@pytest.mark.parametrize("tail", ["upper", "lower"])
+@pytest.mark.parametrize("level", [20.0, Free(20.0, 50.0)], ids=["fixed", "bounded"])
+@pytest.mark.parametrize(("objective", "terms"), OBJECTIVES, ids=OBJECTIVE_IDS)
+def test_an_empty_band_is_tried_with_a_fixed_or_bounded_level(
+    objective: Objective, terms: dict[str, Any], level: float | Free, tail: Tail
+) -> None:
+    index = EMPTY_INDEX if tail == "upper" else [10.0 - x for x in EMPTY_INDEX]
+    sample = _sample(index, EMPTY_LOSS)
+    plain = design(_emptied(level, tail), sample, objective, **terms)
+    refined = design(_emptied(level, tail), sample, objective, options=REFINE, **terms)
+    middle = 5.25 if tail == "upper" else 4.75
+    assert refined.parameters["breakpoints[0]"] == middle
+    assert refined.parameters["levels[1]"] == pytest.approx(100.0, rel=1e-9)
+    assert "levels[0]" in refined.unidentified or not isinstance(level, Free)
+    assert 0.0 <= _scaled(refined, refined.objective_value) <= 1e-12
+    assert _scaled(plain, plain.objective_value) > 1e-3
+    record = refined.refinement
+    assert record is not None and record["stopped"] == "no_move"
+    # The index values and the window's ends; the empty band's value is extra.
+    assert record["candidates"] == {"breakpoints[0]": 6}
+    # Without that value, the best is the index value next to it, which pays
+    # the level on the year without a loss.
+    best_index_value = min(
+        (row["objective"], row["breakpoints[0]"])
+        for row in _rows(refined)
+        if row["objective"] is not None and row["breakpoints[0]"] != middle
+    )
+    assert _scaled(refined, best_index_value[0]) > 1e-3
+
+
+@pytest.mark.parametrize(("objective", "terms"), OBJECTIVES, ids=OBJECTIVE_IDS)
+def test_an_empty_band_is_not_tried_with_free_levels(
+    objective: Objective, terms: dict[str, Any]
+) -> None:
+    # With the first level free, a breakpoint at any index value up to 5 pays
+    # it 0 and does as well, so only the index values and the window's ends
+    # are tried: the grid's best point, 1, ties with them and is kept.
+    sample = _sample(EMPTY_INDEX, EMPTY_LOSS)
+    refined = design(_emptied(Free()), sample, objective, options=REFINE, **terms)
+    assert refined.parameters["breakpoints[0]"] in EMPTY_INDEX
+    assert 0.0 <= _scaled(refined, refined.objective_value) <= 1e-12
+    assert {row["breakpoints[0]"] for row in _rows(refined)} <= set(EMPTY_INDEX)
+
+
+def test_the_empty_band_follows_the_next_threshold() -> None:
+    # Two free breakpoints, the first with a fixed level: its empty band's
+    # value lies between the last index value below the second and the
+    # second, wherever the second is.
+    template = Cover(
+        INDEX,
+        StepPayout(
+            [Free(0.0, 6.0, grid=[1.0, 3.0]), Free(3.0, 7.0, grid=[4.5, 6.5])],
+            [20.0, Free()],
+        ),
+        payout_unit="EUR",
+    )
+    sample = _sample(EMPTY_INDEX, EMPTY_LOSS)
+    context: Any = SimpleNamespace(index=np.asarray(EMPTY_INDEX))
+    names = ["breakpoints[0]", "breakpoints[1]"]
+    axes = DESIGN_MODULE._threshold_axes(template.payout, names, context)
+    extra = DESIGN_MODULE._empty_bands(
+        template, names, axes, [(1.0, 6.0), (4.5, 6.5)], context
+    )
+    assert extra is not None
+    assert extra(0, (3.0, 5.5)) == (5.25,)
+    assert extra(0, (3.0, 4.5)) == (4.25,)
+    assert extra(0, (3.0, 6.5)) == ()  # 6.5 lies beyond the first's window
+    assert extra(1, (3.0, 5.5)) == ()  # the last breakpoint closes no band
+    refined = design(template, sample, MSE(), options=REFINE)
+    end = refined.parameters
+    assert 0.0 <= _scaled(refined, refined.objective_value) <= 1e-12
+    assert end["breakpoints[0]"] < end["breakpoints[1]"]
+    assert not any(
+        end["breakpoints[0]"] <= x < end["breakpoints[1]"] for x in EMPTY_INDEX
+    )
+
+
+def test_an_empty_band_of_a_step_grid_is_tried_with_fixed_levels() -> None:
+    # The grid's second row has fixed levels of 20, which the years of rain
+    # 5 would pay: a rain breakpoint between 5 and the fixed 5.5 empties it.
+    template = _two_cover(
+        StepGrid(
+            {"rain": [Free(0.0, 6.0, grid=[1.0, 3.0]), 5.5], "heat": [5.0]},
+            [[0.0, Free()], [20.0, 20.0], [Free(), Free()]],
+        )
+    )
+    sample = _two(EMPTY_INDEX, EMPTY_LOSS, heat=[1.0] * len(EMPTY_INDEX))
+    refined = design(template, sample, MSE(), options=REFINE)
+    assert refined.parameters["rain.breakpoints[0]"] == 5.25
+    assert 0.0 <= _scaled(refined, refined.objective_value) <= 1e-12
+
+
+# -- warm starts ------------------------------------------------------------------
+
+WARM_TERMS: list[tuple[str, Objective, dict[str, Any]]] = [
+    ("eu-pure", ExpectedUncovered(), {"budget": Budget(ratio=0.6)}),
+    (
+        "wcvar-coc",
+        WeightedCVaR(0.7, 0.9),
+        {"pricing": CostOfCapitalLoad(0.06, 0.95), "budget": Budget(ratio=0.6)},
+    ),
+    (
+        "eu-multiple",
+        ExpectedUncovered(),
+        {"pricing": ExpectedPayoutMultiple(1.3, 1000.0), "budget": Budget(ratio=0.6)},
+    ),
+    ("wcvar-limit", WeightedCVaR(1.0, 0.8), {"limit": Limit(1.5e6)}),
+]
+
+
+def _warm_battery() -> dict[str, tuple[Cover, OutcomeSample]]:
+    rng = np.random.default_rng(5)
+    x = rng.gumbel(50.0, 12.0, 300)
+    loss = 2e6 * np.clip((x - 45.0) / 100.0, 0.0, 0.6) * rng.lognormal(0.0, 0.3, 300)
+    sample = _sample(x.tolist(), loss.tolist())
+    lower = _sample((200.0 - x).tolist(), loss.tolist())
+    return {
+        "step": (
+            Cover(
+                INDEX,
+                StepPayout(
+                    [
+                        Free(40.0, 80.0, grid=5),
+                        90.0,
+                        Free(95.0, 140.0, grid=[100.0, 120.0]),
+                    ],
+                    [Free(), Free(), Free()],
+                ),
+                payout_unit="EUR",
+            ),
+            sample,
+        ),
+        "binary_lower": (
+            Cover(
+                LOWER,
+                BinaryPayout(Free(100.0, 160.0, grid=13), Free(), tail="lower"),
+                payout_unit="EUR",
+            ),
+            lower,
+        ),
+        "step_fixed_level": (
+            Cover(
+                INDEX,
+                StepPayout(
+                    [Free(40.0, 80.0, grid=5), Free(85.0, 120.0, grid=3)],
+                    [2e5, Free()],
+                ),
+                payout_unit="EUR",
+            ),
+            sample,
+        ),
+    }
+
+
+@pytest.mark.parametrize("terms_id", [item[0] for item in WARM_TERMS])
+def test_warm_starts_give_the_designs_of_solves_from_scratch(
+    terms_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, objective, terms = next(item for item in WARM_TERMS if item[0] == terms_id)
+    warm_solves: list[int] = []
+    solve = DESIGN_MODULE._WarmLP.solve
+
+    def counted(self: Any, *arguments: Any) -> Any:
+        found = solve(self, *arguments)
+        warm_solves.append(found is not None)
+        return found
+
+    for name, (template, sample) in _warm_battery().items():
+        with monkeypatch.context() as patched:
+            patched.setattr(DESIGN_MODULE._WarmLP, "solve", counted)
+            warm = design(template, sample, objective, options=REFINE, **terms)
+        with monkeypatch.context() as patched:
+            patched.setattr(DESIGN_MODULE, "WARM_SEATS", 0)
+            cold = design(template, sample, objective, options=REFINE, **terms)
+        assert warm.design_id == cold.design_id, name
+        assert warm.parameters == cold.parameters, name
+        assert warm.cover.definition_hash == cold.cover.definition_hash, name
+        assert warm.objective_value == cold.objective_value, name
+        assert warm.refinement == cold.refinement, name
+        assert (warm.ties, warm.unique) == (cold.ties, cold.unique), name
+        warm_rows, cold_rows = _rows(warm), _rows(cold)
+        assert len(warm_rows) == len(cold_rows), name
+        for one, other in zip(warm_rows, cold_rows, strict=True):
+            assert one["status"] == other["status"], name
+            if one["objective"] is None:
+                assert other["objective"] is None
+            else:
+                assert one["objective"] == pytest.approx(other["objective"], rel=1e-9)
+    assert sum(warm_solves) > 0.9 * len(warm_solves)
+
+
+def test_the_warm_lp_has_the_optimum_of_the_design_lp() -> None:
+    # Over the years with a loss, with a shared excess column for the others:
+    # on random step bases, every objective and pricing gives the optimum of
+    # the full design LP.
+    rng = np.random.default_rng(2)
+    n = 120
+    loss = np.where(rng.uniform(size=n) < 0.6, 0.0, rng.lognormal(0.0, 1.0, n))
+    index = rng.uniform(0.0, 10.0, n)
+    template = StepPayout([Free(0.0, 10.0, grid=3), 7.0], [Free(), Free(0.0, 9.0)])
+    for objective, pricing, ratio in [
+        (ExpectedUncovered(), PurePremium(), 0.5),
+        (WeightedCVaR(0.6, 0.85), PurePremium(), 0.5),
+        (WeightedCVaR(1.0, 0.9), CostOfCapitalLoad(0.1, 0.9), 0.7),
+        (ExpectedUncovered(), ExpectedPayoutMultiple(1.2, 0.01), 0.8),
+        (WeightedCVaR(0.5, 0.9), PurePremium(), None),
+    ]:
+        expected_loss = float(np.mean(loss))
+        context = DESIGN_MODULE._Context(
+            asset_id="A",
+            index=index,
+            loss=loss,
+            probability=np.full(n, 1.0 / n),
+            scale=float(loss.max()),
+            expected_loss=expected_loss,
+            bound=None if ratio is None else ratio * expected_loss,
+            limit=None,
+            objective=objective,
+            pricing=pricing,
+            options=DesignOptions(),
+        )
+        for first in rng.uniform(0.0, 6.9, 5):
+            payout = template.with_values({"breakpoints[0]": float(first)})
+            basis = payout.basis(index)
+            constraints = payout.amount_constraints(None)
+            full, _, _ = DESIGN_MODULE._programme(basis, constraints, context)
+            reduced, layout = DESIGN_MODULE._warm_programme(basis, constraints, context)
+            assert reduced.n_columns < full.n_columns
+            one = _solver.solve_lp(full)
+            other = _solver.solve_lp(reduced)
+            assert one.status == other.status == "optimal"
+            assert one.objective is not None and other.objective is not None
+            assert other.objective == pytest.approx(one.objective, rel=1e-9, abs=1e-12)
+            assert (layout.budget is None) == (ratio is None)
+
+
+def test_a_warm_solve_that_fails_is_solved_from_scratch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Every third warm solve reports an error: the point is solved from
+    # scratch, its seat dropped, and the design is that of solves from scratch.
+    template, sample = _warm_battery()["step"]
+    terms: dict[str, Any] = {"budget": Budget(ratio=0.6)}
+    calls = [0]
+    solve = _solver.LPSession.solve
+
+    def failing(self: Any, *arguments: Any) -> Any:
+        calls[0] += 1
+        found = solve(self, *arguments)
+        if calls[0] % 3 == 0:
+            return dataclasses.replace(found, status="error", values=None)
+        return found
+
+    with monkeypatch.context() as patched:
+        patched.setattr(_solver.LPSession, "solve", failing)
+        warm = design(template, sample, ExpectedUncovered(), options=REFINE, **terms)
+    with monkeypatch.context() as patched:
+        patched.setattr(DESIGN_MODULE, "WARM_SEATS", 0)
+        cold = design(template, sample, ExpectedUncovered(), options=REFINE, **terms)
+    assert calls[0] > 3
+    assert warm.parameters == cold.parameters
+    assert warm.refinement == cold.refinement
+
+
+def test_a_warm_solution_that_fails_its_checks_is_solved_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A warm solution whose objective is wrong fails the check against numpy;
+    # the point is solved again from scratch, and the design is unchanged.
+    template, sample = _warm_battery()["step"]
+    terms: dict[str, Any] = {"budget": Budget(ratio=0.6)}
+    solve = DESIGN_MODULE._WarmLP.solve
+    spoiled = [0]
+
+    def spoiling(self: Any, *arguments: Any) -> Any:
+        found = solve(self, *arguments)
+        if found is None:
+            return None
+        spoiled[0] += 1
+        return dataclasses.replace(found, objective=found.objective + 1.0)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(DESIGN_MODULE._WarmLP, "solve", spoiling)
+        warm = design(template, sample, ExpectedUncovered(), options=REFINE, **terms)
+    with monkeypatch.context() as patched:
+        patched.setattr(DESIGN_MODULE, "WARM_SEATS", 0)
+        cold = design(template, sample, ExpectedUncovered(), options=REFINE, **terms)
+    assert spoiled[0] > 0
+    assert warm.parameters == cold.parameters
+    assert warm.refinement == cold.refinement
+
+
+def test_warm_starts_keep_a_few_seats_and_skip_the_qp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    template, sample = _warm_battery()["step"]
+    seats: list[int] = []
+    new = DESIGN_MODULE._WarmLP._new
+
+    def counted(self: Any, *arguments: Any) -> Any:
+        seat = new(self, *arguments)
+        seats.append(len(self._seats))
+        return seat
+
+    monkeypatch.setattr(DESIGN_MODULE._WarmLP, "_new", counted)
+    design(
+        template,
+        sample,
+        ExpectedUncovered(),
+        budget=Budget(ratio=0.6),
+        options=REFINE,
+    )
+    assert 1 <= len(seats) and max(seats) <= DESIGN_MODULE.WARM_SEATS
+    seats.clear()
+    design(template, sample, MSE(), options=REFINE)
+    assert seats == []
