@@ -2482,7 +2482,7 @@ difference between them.
   | --- | --- |
   | Two columns or more of an `EmpiricalCopula` block: the `"total"` row of a set of covers, every row of a joint design, and on a sample of several hazards a row whose index and combined loss read two hazards or more | **Re-deals the draws.** It redraws each column's draws on its own, with replacement, and deals them to the reference years again by the copula's rule: the redrawn draws, sorted by their index, fill the ranks that each reference year's rows held in that column, and a year's rows take its draws in the order they were drawn. On a window of horizons, within each member |
   | A column built with `HazardNoise(..., hold="hazard_distribution")` | **Re-ranks the hazard at the asset.** It resamples by the unit above, and ranks the hazard at the asset again over the resampled rows, as the held form ranks it over the rows of a call. Each row takes the loss of its new hazard at the asset, which the block's own rows give |
-  | Two columns or more of a block that `Comonotonic()`, `GaussianCopula` or a model of your own moved, and no held column | Resamples by the unit above. The coverage of these intervals is unmeasured |
+  | Two columns or more of a block that `Comonotonic()`, `GaussianCopula` or a model of your own moved, and no held column | Resamples by the unit above. The study below measured these intervals under `Comonotonic()` and `GaussianCopula`; under a model of your own their coverage is unmeasured |
   | Anything else, which `built_together` leaves unflagged: an asset's own row, one asset's view, a hazard's view on its own loss, and every row under `Independent()` with the default `hold` | Resamples by the unit above, with the same draws and numbers as before |
 
   A row of both kinds, on a held `EmpiricalCopula` block, is re-dealt and
@@ -2554,6 +2554,66 @@ difference between them.
   On the rows re-dealt, `correlation` held the true value in 0.890 to 0.960 of
   the replications.
 
+  A second run, on the same setup and with 300 rows a block, measured the rows
+  the first left out, each resampled as the module resamples it: two assets
+  under `Comonotonic()`, `GaussianCopula(0.8)` and `GaussianCopula(-0.8)`; held
+  blocks of the two assets under `Independent()`, of 300 years of one asset's
+  per-year values drawn from its curve, of a pool of three independent runs of
+  100 years each (Gumbel locations 46, 50 and 54 mm/day, scale 10), and of the
+  two assets under each `EmpiricalCopula` above; the two assets under each
+  `EmpiricalCopula` on a window of two horizons, the second with locations 5
+  mm/day higher, and 5 draws a year in each member; held blocks of the two
+  hazards with damage ratios and `CompoundDamage()`, under `Independent()` and
+  under the `EmpiricalCopula` at +0.8; the two hazards under each
+  `EmpiricalCopula` with a stated value of 100 EUR, under `CappedSum(1.0)` and
+  `CompoundDamage()`, which keep the unit above (`"combined_loss_needs_value"`);
+  and the pooled rows of the five folds of a held block of one asset, or of two
+  under `Independent()`, cut by hand, which keep the unit above
+  (`"pooled_by_hand"`). Every held block had sigma 0.3. "The counts" are
+  `payout_frequency` and `false_negative_rate`. Each share has a Monte Carlo
+  error of at most 0.016.
+
+  | Block | Rows | Resampled | Columns | Share that held the true value |
+  | --- | --- | --- | --- | --- |
+  | `Comonotonic()`, two assets | an asset's own row | by year | every column | 0.870 to 0.916 |
+  | The same | the `"total"` row | by year | the means, the counts | 0.913 to 0.975 |
+  | The same | the `"total"` row | by year | `rmse`, the tail columns | 0.890 to 0.954 |
+  | The same | the `"total"` row | by year | `false_positive_rate` | 0.588 |
+  | `GaussianCopula(0.8)` and `GaussianCopula(-0.8)`, two assets | an asset's own row | by year | every column | 0.867 to 0.931 |
+  | `GaussianCopula(0.8)` | the `"total"` row | by year | the means, the counts | 0.892 to 0.960 |
+  | The same | the `"total"` row | by year | `rmse`, the tail columns | 0.878 to 0.946 |
+  | The same | the `"total"` row | by year | `false_positive_rate` | 0.807 |
+  | `GaussianCopula(-0.8)` | the `"total"` row | by year | the means, the counts | 0.774 to 0.894 |
+  | The same | the `"total"` row | by year | `rmse`, the tail columns | 0.854 to 0.902 |
+  | Held, two assets under `Independent()` | every row | re-ranked | every column | 0.851 to 0.934 |
+  | Held, per-year values | the asset's row | re-ranked | every column | 0.858 to 0.928 |
+  | Held, a pool of three runs | the asset's row | re-ranked | every column | 0.869 to 0.909 |
+  | Held `EmpiricalCopula` of two assets | an asset's own row | re-ranked | every column | 0.855 to 0.932 |
+  | The same | the `"total"` row | re-dealt and re-ranked | the means, the counts, `rmse` | 0.881 to 0.925 |
+  | The same | the `"total"` row | re-dealt and re-ranked | the tail columns | 0.943 to 0.994 |
+  | `EmpiricalCopula` of two assets, a window of two horizons | an asset's own row | by row | every column | 0.871 to 0.919 |
+  | The same | the `"total"` row | re-dealt | the means, the counts, `rmse` | 0.881 to 0.916 |
+  | The same | the `"total"` row | re-dealt | the tail columns, and `false_positive_rate` under +0.8 | 0.935 to 0.994 |
+  | Held, two hazards under `Independent()` | the package row and its covers' rows | re-ranked | every column | 0.883 to 0.936 |
+  | Held `EmpiricalCopula` of two hazards, +0.8 | the package row and its covers' rows | re-dealt and re-ranked | the means, the counts, `rmse` | 0.897 to 0.933 |
+  | The same | the same | re-dealt and re-ranked | the tail columns | 0.913 to 0.952 |
+  | `EmpiricalCopula` of two hazards, a stated value | the package row, +0.8 | by row | the means, the counts | 0.746 to 0.982 |
+  | The same | the package row, -0.8 | by row | the means, the counts | 0.549 to 0.894 |
+  | The same | the covers' rows | by row | the means, the counts | 0.842 to 0.929; `expected_loss`, which reads the combined loss, 0.928 and 0.929 under +0.8, 0.842 and 0.858 under -0.8 |
+  | The same | every row | by row | `rmse`, the tail columns | 0.847 to 1.000; `var_loss` and `cvar_loss` 0.973 to 1.000 |
+  | The same | every row, under +0.8 | by row | `false_positive_rate` | 0.768 to 0.849 |
+  | Pooled rows of held folds, one asset or two | every row | by year | the means, the counts | 0.884 to 0.998: `expected_uncovered` 0.987 to 0.998, `coverage_ratio` 0.948 to 0.972, the others 0.884 to 0.913 |
+  | The same | every row | by year | `rmse` | 0.972 to 0.989 |
+  | The same | every row | by year | the tail columns | 0.870 to 0.949 |
+  | The same | every row | by year | `false_positive_rate` | 0.754 to 0.787 |
+
+  On the rows rebuilt in that run, `correlation` held the true value in 0.883
+  to 0.955 of the replications, and on the `"total"` rows of `Comonotonic()`
+  and `GaussianCopula` in 0.898 to 0.922. Pooled rows of an `EmpiricalCopula`
+  block were not measured: the leakage checks refuse folds cut by hand from one
+  such block (`LeakageError`), so of the pooled rows only those of held blocks
+  can be made.
+
   On the same setup, with these rows resampled as independent rows as before,
   an earlier run of the study found the copula's `"total"` rows at 0.55 to
   0.97, lowest for `payout_frequency` and `false_negative_rate`, and the held
@@ -2583,13 +2643,13 @@ difference between them.
     `component(name)` reads one hazard and isn't flagged, and
     `component(name, loss="combined")` is flagged when its loss reads another
     hazard.
-  - Of the models that move draws, the study measured `EmpiricalCopula` alone.
-    Under `Comonotonic()` and `GaussianCopula` the rows of several columns are
+  - Under `Comonotonic()` and `GaussianCopula` the rows of several columns are
     exchangeable, not independent ([cuts of one
-    sample](#several-assets-from-fitted-curves)), and the coverage of their
-    intervals is unmeasured; they are flagged by construction, and so is a model
-    of your own. `Independent()` keeps every column in draw order. It was
-    measured, and isn't flagged.
+    sample](#several-assets-from-fitted-curves)). They are flagged by
+    construction, and the study's second run measured their `"total"` rows as
+    the unit above resamples them. A model of your own is flagged too, and the
+    coverage of its intervals is unmeasured. `Independent()` keeps every column
+    in draw order. It was measured, and isn't flagged.
 
   When a row is flagged, the setup text's `Intervals` line says how its rows
   were built and how they were resampled: for rows re-dealt or re-ranked, the
