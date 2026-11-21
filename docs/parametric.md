@@ -2946,7 +2946,7 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
 | --- | --- | --- |
 | amounts free, thresholds fixed (any built-in family, or a `LinearInAmounts` user family) | E[U], weighted CVaR | one LP (`route="lp"`) |
 | the same | MSE | one QP in the amounts (`route="qp"`); under a cost-of-capital budget, cutting planes over such QPs |
-| free thresholds on grids (attachment, exhaustion, breakpoints, knots, trigger) | any built-in | a grid over the thresholds, with the LP or QP at each point (`route="grid"`); with `DesignOptions(refine=True)`, then a refinement from the grid's best point, with the LP or QP at each point it evaluates: over the sample's index values for a step or binary payout, by a compass search otherwise |
+| free thresholds on grids (attachment, exhaustion, breakpoints, knots, trigger) | any built-in | a grid over the thresholds, with the LP or QP at each point (`route="grid"`); with `DesignOptions(refine=True)`, then a refinement from the grid's best point, with the LP or QP at each point it evaluates: over the sample's index values for a payout built from steps (a step or binary payout, a `StepGrid`, or a `SumOf` or `MaxOf` whose free thresholds are those of step and binary components), by a compass search otherwise |
 | a `UserObjective`, or a payout not linear in its amounts | any | a grid over every free parameter, evaluated in numpy; candidates that break the budget or the limit are dropped |
 | `SumOf`, `MaxOf`, `StepGrid` over several indices | any | one of the routes above, as [design on several indices](#design-on-several-indices) says |
 
@@ -2977,16 +2977,23 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
   dependency and solves with HiGHS alone, and never ends worse than the
   grid's best point. The grid is what searches the whole range.
 
-  - **A step or binary payout: over the sample's index values.** A
+  - **A payout built from steps: over the sample's index values.** A
     `StepPayout` or `BinaryPayout` pays from a threshold the years whose
     severity is at or beyond it: with an upper tail, the years whose index
     value is at or above it; with a lower tail, at or below it. So its
     objective is constant between two consecutive index values of the design
     sample and changes only where a threshold crosses one, and a threshold's
-    best value, the others held, is one of them. The refinement tries them:
+    best value, the others held, is one of them. The same holds for the
+    thresholds of a `StepGrid`, and for those of the step and binary
+    components of a `SumOf` or `MaxOf`, each on its own component's index
+    values. Such a payout takes this method when every free threshold is
+    one of these; a `SumOf` with a linear component's free attachment, say,
+    takes the compass search. The refinement tries them:
     - a threshold's candidates are the sample's distinct index values within
-      its window, and the window's two ends, which stand for the thresholds
-      beyond the last index value in it;
+      its window, on its own component, and the window's two ends, which
+      stand for the thresholds beyond the last index value in it;
+    - a band with a fixed or bounded level is also tried without a year (see
+      below);
     - a pass takes the free thresholds in the template's order. Holding the
       others, it tries the candidates nearest the threshold's current value,
       nearest first (the lower one first at equal distance): 2 in the first
@@ -3008,12 +3015,30 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
     best combination. A refined threshold lies on an index value, where the
     payout changes: on the design sample, every threshold between it and the
     next index value on the less severe side pays the same years.
-    `refine_tolerance` doesn't apply. Not tried, unless a window's end lies
-    there: a breakpoint between the next breakpoint and the last index value
-    below it, which leaves its band without a year. With that band's level
-    free, and its bounds allowing the level of the band below it, a
-    breakpoint at that index value does at least as well, since it can pay
-    the same.
+    `refine_tolerance` doesn't apply.
+
+    A band left without a year: a breakpoint above the last index value
+    below the next breakpoint of its part (in severity), and below that
+    breakpoint, leaves the band it opens without a year, whose years then
+    pay as the band below it, or nothing below the first. No index value
+    pays that set of years, and a window end does only if it lies between
+    the two. With the band's level `Free()`, bounded below by 0 alone, the
+    breakpoint at that index value does at least as well: setting the band's
+    level to the one below pays the same. With a fixed level, or a bounded
+    one, it might not: a fixed first level of 20 pays 20 on every year of
+    the band, loss or none. So for such a band (a `StepPayout` or component
+    level that is fixed or has bounds of its own, a `MaxOf`'s fixed
+    component levels, a row or column of a `StepGrid` with such a level)
+    the refinement also tries the midpoint between that index value and the
+    next breakpoint, when both lie in the window; when the next breakpoint
+    is free too, the midpoint moves with it. On six years with the index
+    values 1 to 6 and a loss of 100 in the last, a `StepPayout` with a free
+    first breakpoint on the grid 1 and 3 within bounds of 0 and 6, a second
+    fixed at 5.5 and the levels 20 (fixed) and `Free()`: every index value
+    puts the year at 5 in the first band, which pays it 20, and the
+    refinement ends at 5.25, where the first band is empty and the objective
+    0. `candidates` in the record counts the index values and the window's
+    ends; the midpoint is tried on top.
 
     One synthetic illustration, on the design sample itself: ten years with
     the index values 1, 2, 3, 4, 4.3, 4.31, 6, 7, 8 and 9, whose loss is 50
@@ -3129,6 +3154,29 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
     values it tried near each threshold lead, and says so. A finer grid
     narrows the windows, and a larger `refine_max_points` lets the search
     finish.
+
+    Two neighbouring values pay the same years but one, so their LPs differ in
+    a few coefficients. Under E[U] and the weighted CVaR the search keeps up
+    to four HiGHS instances, each holding the LP of a point it solved: the
+    search's current point, the best point since its last move, and points on
+    either side. Each point's LP is solved on the instance that needs the
+    fewest years changed, after changing those years' coefficients, from the
+    optimal basis there: a few simplex iterations instead of a solve from
+    scratch. That LP leaves out the years without a loss, whose uncovered loss
+    is 0 at any payout (under the weighted CVaR they share one excess column),
+    which changes neither its optimum nor the amounts it allows. The amounts
+    then pass the same checks as at any point, and a point whose LP isn't
+    solved to optimality that way, or whose amounts fail a check, is solved
+    from scratch. So each point's objective is that of a solve from scratch,
+    to rounding. MSE's QP has one column per amount and is solved as at a grid
+    point. On one laptop, on 20,000 synthetic draws, a `StepPayout` with two
+    free breakpoints on grids of 6 and 5 points took about 10 ms a point under
+    E[U] (50 ms solved from scratch), 7 to 20 ms under a weighted CVaR (2.4 s)
+    and 5 to 9 ms under MSE, as before. Its windows held 5,558 and 442 index
+    values, and the search ended after 6,211 to 6,298 points, in about a
+    minute under each objective (after a grid of 35 to 60 s under the weighted
+    CVaR), where the default cap of 1,000 points stops it first: give it
+    `refine_max_points=10_000` at that size.
 - **Scaling.** Losses and payouts are divided by the largest loss of a draw (1
   if that is at most 1e-6) before solving; results are in payout units.
 - **Solver settings.** HiGHS's simplex for the LPs (a vertex solution). HiGHS's
