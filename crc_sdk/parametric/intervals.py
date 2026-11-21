@@ -1364,17 +1364,26 @@ class _Builder:
 
     `members` holds, for re-dealing, the block's rows of each member of a
     window (one member for a curve), in row order, with the reference year of
-    each row. `year_rows` holds the rows of each year, for re-ranking.
-    `combine` makes a sample of several hazards' combined loss from its
-    hazards' own losses.
+    each row. `year_rows` holds the rows of each year, for re-ranking, and
+    `year_row` the one row of each year where every year has one. `combine`
+    makes a sample of several hazards' combined loss from its hazards' own
+    losses.
     """
 
     sample: OutcomeSample
     columns: tuple[_Column, ...]
     members: tuple[tuple[IntArray, IntArray], ...]
     year_rows: tuple[IntArray, ...]
+    year_row: IntArray | None
     combine: Callable[[Mapping[str, FloatArray]], FloatArray] | None
     provenance: SampleProvenance
+
+    def drawn_rows(self, years: IntArray) -> IntArray:
+        """The rows of the years drawn, in the order drawn."""
+        if self.year_row is not None:
+            single: IntArray = self.year_row[years]
+            return single
+        return np.concatenate([self.year_rows[year] for year in years])
 
 
 def _refused(what: str) -> EvaluationError:
@@ -1613,6 +1622,11 @@ def _builder(evaluated: _Evaluated, methods: Sequence[_Method]) -> _Builder:
         columns=tuple(columns),
         members=_reference_years(sample) if redeal else (),
         year_rows=year_rows,
+        year_row=(
+            np.array([rows[0] for rows in year_rows], dtype=np.int64)
+            if all(rows.size == 1 for rows in year_rows)
+            else None
+        ),
         combine=combine,
         # Only the arrays are read again, so the rebuilt rows need no record.
         provenance=SampleProvenance(
@@ -1633,7 +1647,7 @@ def _redeal_draws(
     """Each column's draws dealt again, as rows of the block: `(B, n)` per column.
 
     For each column in the block's order, and each member in order, one call
-    `rng.integers(0, n_w, size=(B, n_w))` redraws the member's `n_w` draws with
+    `rng.integers(0, n_m, size=(B, n_m))` redraws the member's `n_m` draws with
     replacement. The redrawn draws, sorted by their index (ties in the order
     drawn), fill the ranks that each reference year's rows held in the column,
     and a year's rows take its draws in the order they were drawn, as the copula
@@ -1778,7 +1792,7 @@ def _rebuilt_replicates(
             if not rows:
                 continue
             if method == "rerank":
-                read = np.concatenate([builder.year_rows[year] for year in draws[b]])
+                read = builder.drawn_rows(draws[b])
                 sources = [read] * len(builder.columns)
                 weight = evaluated.probability[read]
                 probability = weight / math.fsum(weight.tolist())
@@ -2034,6 +2048,18 @@ def bootstrap_intervals(
     replicates serves every entry and every metric, and the designs are held
     fixed.
 
+    Rows built together are built again on each replicate, as the block built
+    them (the module docstring has the rules). A row that reads two columns or
+    more of an `EmpiricalCopula` block is re-dealt: after the call above, for
+    each column of the block in order and each member of a window in order, one
+    call `rng.integers(0, n_m, size=(n_bootstrap, n_m))` redraws the member's
+    n_m draws, which are dealt to the reference years again by the copula's
+    rule. A row that reads a column built with `HazardNoise(...,
+    hold="hazard_distribution")` is re-ranked over the years drawn by the call
+    above. Every other row reads that call as before. `setup.intervals.unit` is
+    `"as_built"` when a row was rebuilt, and `"row"` (an `EmpiricalCopula`
+    block) or `"year"` otherwise.
+
     The table has `to_long`'s columns and, for each wide row and metric column:
 
     - `value`: the wide table's number, which resampling never changes;
@@ -2062,18 +2088,24 @@ def bootstrap_intervals(
     leaves out uncertainty in the hazard data, the impact function and the
     design, and on a curve block it is the Monte Carlo error of the draws and
     says nothing about the curve. Two rows' intervals are not a test of a
-    difference between them. On the rows with `built_together` true an
-    interval can be narrower or wider than the Monte Carlo error of the draws
-    (the module docstring says why), and the setup text says so.
+    difference between them. On the rows with `built_together` true that
+    `Comonotonic()`, `GaussianCopula` or a model of the caller's moved, an
+    interval can be narrower or wider than the Monte Carlo error of the draws,
+    and the setup text says so; it states the method of the rows rebuilt.
 
     The table holds an `EvaluationMetadata` under the same key as a
     comparison's, with `setup.intervals`, and `write_comparison` writes it.
 
     Raises as `compare` or `compare_pooled` does; `EvaluationError` for an
     invalid `n_bootstrap` or `ci_level`, for `split` missing on one block, for
-    `split`, `fold`, `design_sample` or `premiums` with folds, and for a
-    `premiums` key that matches no cover given as is; `TypeError` for an `rng`
-    that is not a `numpy.random.Generator`.
+    `split`, `fold`, `design_sample` or `premiums` with folds, for a
+    `premiums` key that matches no cover given as is, and, before any draw, for
+    rows built together that can't be built again: on a sample of several
+    hazards whose combined loss can't be made again (loss models that state a
+    value, a rule of the caller's, a table's loss), on a one-hazard view whose
+    combined loss reads hazards it doesn't hold, on a selection of a held
+    sample, and on pooled folds of such blocks; `TypeError` for an `rng` that is
+    not a `numpy.random.Generator`.
     """
     generator = _require_generator(rng)
     count = _n_bootstrap(n_bootstrap)
