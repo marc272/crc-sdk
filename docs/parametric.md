@@ -3006,11 +3006,16 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
   - it moves only to a point that lowers the objective by more than the
     grid's tie tolerance, `feasibility_tolerance` · max(1, |objective|) in
     scaled units;
-  - it evaluates at most `refine_max_points` points (1,000 by default).
+  - it evaluates at most `refine_max_points` points (10,000 by default), and
+    when that cap stops it the record says so (`stopped="max_points"`);
+    "What it costs" below says when it can.
 
   So a refinement is deterministic, stays within the bounds, adds no
   dependency and solves with HiGHS alone, and never ends worse than the
   grid's best point. The grid is what searches the whole range.
+  `refine_tolerance` and `refine_max_points` apply only with `refine=True`:
+  without it, either one stated at a value other than its default raises
+  `CoverDefinitionError`, since it would change nothing.
 
   - **A payout built from steps: over the sample's index values.** A
     `StepPayout` or `BinaryPayout` pays from a threshold the years whose
@@ -3183,12 +3188,24 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
     point is, and `solves`, `iterations` and `seconds` count them. A search
     over the index values tries every distinct index value in each window,
     so its points grow with the sample: in the example above, on 28 years,
-    the window of 40 to 80 holds 24 values; on the 7,000 design draws of
-    `design_years`, the same window holds 5,787, and the cap of 1,000 points
-    stops the search before it has tried them all. It then ends where the
-    values it tried near each threshold lead, and says so. A finer grid
-    narrows the windows, and a larger `refine_max_points` lets the search
-    finish.
+    the window of 40 to 80 holds 24 values, and the search ends after 22
+    points; on the 7,000 design draws of `design_years`, the same window
+    holds 5,787, and the search ends by itself after 5,785 points, within
+    the default cap (stopped at 1,000 points, it ended at another
+    breakpoint). With one free threshold it solves each set of years its
+    window's values pay at most once, so it takes at most as many points as
+    its window holds values (`candidates`), and one more where a band is
+    tried empty. With several, a move of one threshold makes the others'
+    values new points, so it can take more points than its windows hold
+    together (below). So a search can still stop at the cap: on a larger
+    sample, with wider windows (a coarser grid) or with more free
+    thresholds. It then ends where the values it tried near each threshold
+    lead, and says so (`stopped="max_points"`). A finer grid narrows the
+    windows, and a larger `refine_max_points` lets the search finish. A
+    compass search's points don't grow with the sample: it halves its steps
+    until they reach `refine_tolerance`. For a `LinearPayout` with a free
+    attachment and exhaustion on 2,000 and 20,000 synthetic draws that took
+    45 to 59 points, far below the cap.
 
     Two neighbouring values pay the same years but one, so their LPs differ in
     a few coefficients. Under E[U] and the weighted CVaR the search keeps up
@@ -3205,13 +3222,15 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
     from scratch. So each point's objective is that of a solve from scratch,
     to rounding. MSE's QP has one column per amount and is solved as at a grid
     point. On one laptop, on 20,000 synthetic draws, a `StepPayout` with two
-    free breakpoints on grids of 6 and 5 points took about 10 ms a point under
-    E[U] (50 ms solved from scratch), 7 to 20 ms under a weighted CVaR (2.4 s)
-    and 5 to 9 ms under MSE, as before. Its windows held 5,558 and 442 index
-    values, and the search ended after 6,211 to 6,298 points, in about a
-    minute under each objective (after a grid of 35 to 60 s under the weighted
-    CVaR), where the default cap of 1,000 points stops it first: give it
-    `refine_max_points=10_000` at that size.
+    free breakpoints on grids of 6 and 5 points took 3.5 to 10 ms a point
+    under E[U] (50 ms solved from scratch), 6 to 20 ms under a weighted CVaR
+    (2.4 s) and 3 to 9 ms under MSE, as before. Its windows held 5,558 and
+    442 index values, and the search ended by itself (`stopped="no_move"`)
+    after 6,211 to 6,298 points, within the default cap, in 18 s to about a
+    minute under each objective, depending on the machine's load (after a
+    grid of 25 to 60 s under the weighted CVaR). Stopped at 1,000 points,
+    the same searches ended at the same thresholds there, but only the full
+    search shows that no single threshold improves anywhere in its window.
 - **Scaling.** Losses and payouts are divided by the largest loss of a draw (1
   if that is at most 1e-6) before solving; results are in payout units.
 - **Solver settings.** HiGHS's simplex for the LPs (a vertex solution). HiGHS's
