@@ -10,8 +10,8 @@ total loss and `pi_d = sum_j pi_{d,j}` the total payout. The objective (`MSE`,
 `ExpectedUncovered` or `WeightedCVaR`) and the premium (`PurePremium`,
 `CostOfCapitalLoad` or `ExpectedPayoutMultiple`) are taken on `L_d` and `pi_d`.
 `Budget(ratio=k)` means premium <= `k * E[L]` on the total, and
-`Budget(amount=B)` means premium <= `B` on the total. Each asset keeps its own cover, on its own index, and each cover
-pays by its own terms.
+`Budget(amount=B)` means premium <= `B` on the total. Each asset keeps its own
+cover, on its own index, and each cover pays by its own terms.
 
 **How it is solved.** The LP or QP of `design`, on the block basis
 `[B_1 | ... | B_m]` with the amounts in asset order, the covers' constraints
