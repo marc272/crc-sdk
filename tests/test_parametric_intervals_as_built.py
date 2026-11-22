@@ -40,7 +40,6 @@ from crc_sdk.parametric import (
     EvaluationError,
     EvaluationMetadata,
     Free,
-    GaussianCopula,
     HazardNoise,
     Independent,
     IndexDefinition,
