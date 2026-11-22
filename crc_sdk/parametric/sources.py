@@ -132,6 +132,7 @@ from crc_sdk.parametric.dependence import (
     DependenceModel,
     EmpiricalCopula,
     _checked_order,
+    _draw_ranks,
     _model_record,
     _require_model,
 )
@@ -770,6 +771,30 @@ def _member_order(
     return order
 
 
+_KEEPS_RANKS = "gaussian_copula"
+"""The kind of model whose sample keeps its rows' ranks, as `latent_ranks`."""
+
+
+def _latent_ranks(
+    kind: str, uniforms: FloatArray, order: IntArray, m: int
+) -> IntArray | None:
+    """The ranks a `GaussianCopula` sample keeps; `None` under any other model.
+
+    Each row's rank in each column among the draws of its member of a window
+    (all the rows of a curve), by the draws' uniforms, which under the copula
+    are the ranks of its latent normal scores there. Re-dealing the rows by
+    the model's ranks needs them, as `bootstrap_intervals` does: the sample's
+    index ties where a curve has an atom, and a basis-risk model may move it.
+    """
+    if kind != _KEEPS_RANKS:
+        return None
+    ranks = np.empty(order.shape, dtype=np.int64)
+    for member in range(m):
+        rows = np.arange(member, order.shape[0], m, dtype=np.int64)
+        ranks[rows] = _draw_ranks(uniforms[rows], (order[rows] - member) // m)
+    return ranks
+
+
 @dataclass(frozen=True, eq=False)
 class _CurveDraws:
     """One curve's draws, in draw order, and what a sample records of them.
@@ -1369,7 +1394,10 @@ def sample_curves(
     hazard, index and loss stay together, no value changes and no further
     random number is used. So each column holds the rows of `sample_curve`
     with the same generator, and under `Independent()` in the same order.
-    `period` is the row number, 0 to `n_draws - 1`.
+    `period` is the row number, 0 to `n_draws - 1`. Under `GaussianCopula` the
+    sample keeps each row's rank in each asset's column, the rank of its
+    latent normal score there, as `latent_ranks`; under every other model it
+    keeps none.
 
     An asset's curve may be a window of horizons, as in `sample_curve`, with the
     same horizons of one pathway for every asset. A row then reads one horizon
@@ -1454,6 +1482,7 @@ def sample_curves(
         [parts[asset].provenance.generator(0).random(n) for asset in assets]
     )
     order = _member_order(dependence, document["kind"], uniforms, assets, members)
+    latent_ranks = _latent_ranks(document["kind"], uniforms, order, members)
 
     def reordered(values: Mapping[str, FloatArray]) -> FloatArray:
         return np.column_stack(
@@ -1503,6 +1532,7 @@ def sample_curves(
         semantics="annual",
         provenance=provenance,
         scenario=scenario,
+        latent_ranks=latent_ranks,
     )
 
 
@@ -1563,7 +1593,10 @@ def sample_curve_hazards(
     the rows of `sample_curve`, and under `Independent()`
     `sample.component(name)` has its `content_hash` for the same generator.
     `period` is the row number, 0 to `n_draws - 1`, and each row has
-    probability `1/n_draws`.
+    probability `1/n_draws`. Under `GaussianCopula` the sample keeps each row's
+    rank in each component's column, the rank of its latent normal score
+    there, as `latent_ranks`, one column per component; under every other
+    model it keeps none.
 
     **The loss.** A component's impact comes from its `LossModel`, on its
     hazard at the asset, after the basis-risk model, and its `own_loss` is that
@@ -1655,13 +1688,9 @@ def sample_curve_hazards(
         )
         for name in names
     }
-    order = _member_order(
-        dependence,
-        document["kind"],
-        np.column_stack([each.uniforms for each in draws.values()]),
-        names,
-        members,
-    )
+    uniforms = np.column_stack([each.uniforms for each in draws.values()])
+    order = _member_order(dependence, document["kind"], uniforms, names, members)
+    latent_ranks = _latent_ranks(document["kind"], uniforms, order, members)
     components: dict[str, IndexComponent] = {}
     impacts: dict[str, FloatArray] = {}
     for j, (name, each) in enumerate(draws.items()):
@@ -1724,6 +1753,7 @@ def sample_curve_hazards(
         ),
         scenario=scenario,
         index_components=components,
+        latent_ranks=latent_ranks,
     )
     for name, each in draws.items():
         _warn_rarer(each.rarer, n, f"component {name}: ")

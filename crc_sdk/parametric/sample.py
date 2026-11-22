@@ -92,6 +92,7 @@ __all__ = [
     "SAMPLE_COMPONENTS_SCHEMA_VERSION",
     "SAMPLE_DAMAGE_SCHEMA_VERSION",
     "SAMPLE_METADATA_KEY",
+    "SAMPLE_RANKS_SCHEMA_VERSION",
     "SAMPLE_SCHEMA_VERSION",
     "SAMPLE_SEMANTICS_VERSION",
     "ComponentLoss",
@@ -119,6 +120,13 @@ SAMPLE_COMPONENTS_SCHEMA_VERSION = "1.1"
 
 SAMPLE_DAMAGE_SCHEMA_VERSION = "1.2"
 """The `schema_version` of those documents when the components keep their damage."""
+
+SAMPLE_RANKS_SCHEMA_VERSION = "1.3"
+"""The `schema_version` of those documents when the sample keeps its latent ranks.
+
+A `GaussianCopula` sample keeps them, with or without index components, and
+with or without their damage.
+"""
 
 SAMPLE_SEMANTICS_VERSION = "crc-parametric-sample/1"
 """The `semantics_version` of a sample's hash document and table metadata."""
@@ -391,6 +399,7 @@ def _hash_document(
     semantics: str,
     scenario: str,
     components: Mapping[str, IndexComponent] | None = None,
+    latent_ranks: IntArray | None = None,
 ) -> dict[str, Any]:
     """The document behind `content_hash`: the long table, sorted, and its units.
 
@@ -398,7 +407,9 @@ def _hash_document(
     under another `schema_version`; a one-hazard sample's document holds no
     trace of them. Components that keep their damage add it, under a third
     `schema_version`, so a sample without damages hashes as it did before they
-    were kept.
+    were kept. A sample that keeps its latent ranks adds them, as the long
+    table's `latent_rank` or each component's, under a fourth, so a sample
+    without them hashes as it did before they were kept.
     """
     order = sorted(range(len(asset_ids)), key=lambda j: asset_ids[j].encode("utf-8"))
     n_assets = len(order)
@@ -444,6 +455,13 @@ def _hash_document(
                 document["components"], components.values(), strict=True
             ):
                 entry["damage"] = column(component.damage)
+    if latent_ranks is not None:
+        document["schema_version"] = SAMPLE_RANKS_SCHEMA_VERSION
+        if components is None:
+            document["latent_rank"] = latent_ranks[:, order].reshape(-1).tolist()
+        else:
+            for j, entry in enumerate(document["components"]):
+                entry["latent_rank"] = latent_ranks[:, j].tolist()
     return document
 
 
@@ -1031,6 +1049,51 @@ def _checked_components(
     return MappingProxyType(dict(components))
 
 
+_RANKED_MODEL = "gaussian_copula"
+"""The kind of dependence model whose sample keeps its latent ranks."""
+
+
+def _checked_latent_ranks(
+    value: Any,
+    *,
+    n: int,
+    asset_ids: Sequence[str],
+    components: Mapping[str, IndexComponent] | None,
+    provenance: SampleProvenance,
+) -> IntArray:
+    """Check a sample's latent ranks and return them as a read-only copy.
+
+    One column per asset of a sample of several assets, or per component of a
+    sample of several hazards, each row's rank there: non-negative integers,
+    kept only where the provenance records the `GaussianCopula` that placed
+    the rows.
+    """
+    names = list(asset_ids if components is None else components)
+    columns = "asset" if components is None else "component"
+    array = np.asarray(value)
+    if array.dtype.kind not in "iu":
+        raise SampleError(f"latent_ranks must hold integers, got dtype {array.dtype}")
+    if len(names) < 2 or array.shape != (n, len(names)):
+        raise SampleError(
+            f"latent_ranks has one column per {columns} of a sample of several, "
+            f"{names}: shape ({n}, {len(names)}); got {array.shape}"
+        )
+    if (array < 0).any():
+        raise SampleError("latent_ranks must be non-negative")
+    model = (
+        provenance.dependence if components is None else provenance.hazard_dependence
+    )
+    kind = None if model is None else model.get("kind")
+    if kind != _RANKED_MODEL:
+        raise SampleError(
+            "latent_ranks are the ranks of a GaussianCopula's latent normal scores, "
+            "kept only where the provenance records the GaussianCopula that placed "
+            f"the rows; this one records {kind!r}"
+        )
+    ranks: IntArray = _read_only(array.astype(np.int64))
+    return ranks
+
+
 # -- the sample --------------------------------------------------------------
 
 
@@ -1067,6 +1130,20 @@ class OutcomeSample:
     combined loss. Each name is non-empty, with no surrounding whitespace and
     no `.`, `+`, `[` or `]`. `component` takes one hazard's sample out of it.
 
+    `latent_ranks` holds, on a sample whose rows a `GaussianCopula` placed,
+    each row's rank in each column, `(n, d)`, with one column per asset of a
+    sample of several assets, in `asset_ids` order, or per component of a
+    sample of several hazards, in component order: the rank of the row's
+    latent normal score there, which is the rank of its draw among the
+    column's draws by their uniforms, 0 for the smallest, among the rows of
+    its member of a window of horizons. Dealing the draws again by the
+    model's ranks, as `bootstrap_intervals` does, needs them: the index ties
+    at a curve's atom. They are non-negative integers, kept only where the
+    provenance records a `GaussianCopula` (`dependence` across assets,
+    `hazard_dependence` across hazards), and `None` on every other sample.
+    A block keeps its rows' ranks, and one asset's or one hazard's sample
+    keeps none.
+
     Raises `SampleError` for any invalid field.
     """
 
@@ -1082,6 +1159,7 @@ class OutcomeSample:
     provenance: SampleProvenance
     scenario: str = "baseline"
     index_components: Mapping[str, IndexComponent] | None = None
+    latent_ranks: IntArray | None = None
     _view_of: tuple[str, Tail] | None = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -1179,7 +1257,19 @@ class OutcomeSample:
                 "a sample without index components has no dependence between hazards, "
                 "no rule for a combined loss and no components in its provenance"
             )
+        latent_ranks = (
+            None
+            if self.latent_ranks is None
+            else _checked_latent_ranks(
+                self.latent_ranks,
+                n=n,
+                asset_ids=asset_ids,
+                components=components,
+                provenance=self.provenance,
+            )
+        )
         object.__setattr__(self, "index_components", components)
+        object.__setattr__(self, "latent_ranks", latent_ranks)
         object.__setattr__(self, "asset_ids", asset_ids)
         object.__setattr__(self, "period", _read_only(period))
         object.__setattr__(self, "probability", _read_only(probability))
@@ -1223,7 +1313,8 @@ class OutcomeSample:
         semantics and the scenario, in the canonical JSON of cover documents.
         A sample with index components adds each one's name, unit, tail,
         values, hazard and own loss, and its damage when the components keep
-        it. The provenance is not part of it.
+        it. A sample that keeps its latent ranks adds them. The provenance is
+        not part of it.
         """
         return content_hash(
             _hash_document(
@@ -1238,6 +1329,7 @@ class OutcomeSample:
                 semantics=self.semantics,
                 scenario=self.scenario,
                 components=self.index_components,
+                latent_ranks=self.latent_ranks,
             )
         )
 
@@ -1303,6 +1395,7 @@ class OutcomeSample:
                     for name, component in self.index_components.items()
                 }
             ),
+            latent_ranks=None if self.latent_ranks is None else self.latent_ranks[rows],
         )
         # A block of a component's view is still that component's view.
         object.__setattr__(subset, "_view_of", self._view_of)
@@ -1655,6 +1748,14 @@ class OutcomeSample:
         (`SAMPLE_DAMAGE_SCHEMA_VERSION`), so a reader that knows only `"1.1"`
         refuses the table rather than dropping the damages.
 
+        A sample that keeps its latent ranks adds them as int64 columns: on a
+        sample of several assets `latent_rank`, after `hazard`, and on a
+        sample of several hazards `latent_rank[<name>]`, after each
+        component's other columns. Its metadata then takes `schema_version`
+        `"1.3"` (`SAMPLE_RANKS_SCHEMA_VERSION`), with `components` when it has
+        them, so a reader that knows only the earlier versions refuses the
+        table rather than dropping the ranks.
+
         A component's view (`component`, and its blocks) adds `view_of` to the
         metadata, `{"name": name, "tail": tail}`, the component it reads, so
         `from_written_table` gives the view back its tail. Its columns, content
@@ -1696,6 +1797,9 @@ class OutcomeSample:
                 {"name": name, "tail": component.tail, "unit": component.unit}
                 for name, component in components.items()
             ]
+        ranks = self.latent_ranks
+        if ranks is not None:
+            metadata["schema_version"] = SAMPLE_RANKS_SCHEMA_VERSION
         if self._view_of is not None:
             viewed, tail = self._view_of
             metadata["view_of"] = {"name": viewed, "tail": tail}
@@ -1725,7 +1829,12 @@ class OutcomeSample:
             flat(self.loss),
             hazard,
         ]
-        for name, component in (components or {}).items():
+        if ranks is not None and components is None:
+            fields.append(("latent_rank", pa.int64()))
+            arrays.append(
+                pa.array(np.ascontiguousarray(ranks[:, order]).reshape(-1), pa.int64())
+            )
+        for j, (name, component) in enumerate((components or {}).items()):
             for column, values in (
                 ("index", component.values),
                 ("hazard", component.hazard),
@@ -1736,6 +1845,9 @@ class OutcomeSample:
                 arrays.append(
                     pa.nulls(rows, pa.float64()) if values is None else flat(values)
                 )
+            if ranks is not None:
+                fields.append((f"latent_rank[{name}]", pa.int64()))
+                arrays.append(pa.array(ranks[:, j], pa.int64()))
         schema = pa.schema(
             fields,
             metadata={
@@ -1767,7 +1879,11 @@ class OutcomeSample:
         A table of `schema_version` `"1.2"` gives each component its damage
         back, from `damage[<name>]`. One of `"1.1"`, written before samples
         kept the damage or from a table of yours, reads back without it, with
-        the content hash it was written with.
+        the content hash it was written with. A table of `"1.3"` gives the
+        sample its latent ranks back, from `latent_rank` or `latent_rank[<name>]`,
+        and its components their damage when it has `damage[<name>]`. A
+        `GaussianCopula` sample's table written before samples kept the ranks
+        reads back without them, with the content hash it was written with.
 
         Raises `SampleError` if the metadata is missing, unreadable or of
         another schema or semantics version, a column is missing or holds
@@ -1836,9 +1952,17 @@ class OutcomeSample:
                 f"null in every row ({meaning}) or in none"
             )
 
+        def ranks_of(name: str) -> IntArray:
+            values = _integer_values(_column(data, name, what), name)
+            return values.reshape(n, n_assets)[:, columns]
+
         hazard = optional("hazard", "the hazard is the index")
         index_components: dict[str, IndexComponent] | None = None
-        damaged = metadata["schema_version"] == SAMPLE_DAMAGE_SCHEMA_VERSION
+        ranked = metadata["schema_version"] == SAMPLE_RANKS_SCHEMA_VERSION
+        damaged = metadata["schema_version"] == SAMPLE_DAMAGE_SCHEMA_VERSION or (
+            ranked and _written_damage(data, metadata.get("components"))
+        )
+        latent_ranks: IntArray | None = None
         if "components" in metadata:
             index_components = {
                 name: IndexComponent(
@@ -1857,6 +1981,15 @@ class OutcomeSample:
                 )
                 for name, unit, tail in _written_components(metadata["components"])
             }
+            if ranked:
+                latent_ranks = np.column_stack(
+                    [
+                        ranks_of(f"latent_rank[{name}]")[:, 0]
+                        for name in index_components
+                    ]
+                )
+        elif ranked:
+            latent_ranks = ranks_of("latent_rank")
         sample = cls(
             asset_ids=tuple(asset_ids),
             period=per_period(
@@ -1875,6 +2008,7 @@ class OutcomeSample:
             provenance=_written_provenance(metadata["provenance"]),
             scenario=scenario,
             index_components=index_components,
+            latent_ranks=latent_ranks,
         )
         if sample.content_hash != metadata["content_hash"]:
             raise SampleError(
@@ -2522,6 +2656,7 @@ _WRITTEN_VERSIONS = (
     SAMPLE_SCHEMA_VERSION,
     SAMPLE_COMPONENTS_SCHEMA_VERSION,
     SAMPLE_DAMAGE_SCHEMA_VERSION,
+    SAMPLE_RANKS_SCHEMA_VERSION,
 )
 """The `schema_version`s `from_written_table` reads."""
 
@@ -2548,10 +2683,15 @@ def _written_metadata(table: Any) -> dict[str, Any]:
         raise SampleError(
             f"the written sample has schema_version {version!r}; this version of "
             f"crc-sdk reads {SAMPLE_SCHEMA_VERSION!r}, "
-            f"{SAMPLE_COMPONENTS_SCHEMA_VERSION!r} and "
-            f"{SAMPLE_DAMAGE_SCHEMA_VERSION!r}"
+            f"{SAMPLE_COMPONENTS_SCHEMA_VERSION!r}, "
+            f"{SAMPLE_DAMAGE_SCHEMA_VERSION!r} and "
+            f"{SAMPLE_RANKS_SCHEMA_VERSION!r}"
         )
-    with_components = version != SAMPLE_SCHEMA_VERSION
+    # A sample that keeps its latent ranks may hold index components or not.
+    with_components = version in (
+        SAMPLE_COMPONENTS_SCHEMA_VERSION,
+        SAMPLE_DAMAGE_SCHEMA_VERSION,
+    ) or (version == SAMPLE_RANKS_SCHEMA_VERSION and "components" in document)
     expected_keys = _WRITTEN_KEYS | ({"components"} if with_components else set())
     missing = sorted(expected_keys - set(document))
     if missing:
@@ -2570,6 +2710,23 @@ def _written_metadata(table: Any) -> dict[str, Any]:
             f"{SAMPLE_SEMANTICS_VERSION!r}"
         )
     return document
+
+
+def _written_damage(table: Any, documents: Any) -> bool:
+    """Whether a table of `"1.3"` holds its components' damage: all or none.
+
+    `to_table` writes `damage[<name>]` for every component of a sample whose
+    components keep their damage, and for none of another's.
+    """
+    names = [name for name, _, _ in _written_components(documents or [])]
+    held = [f"damage[{name}]" in table.schema.names for name in names]
+    if any(held) and not all(held):
+        missing = [name for name, found in zip(names, held, strict=True) if not found]
+        raise SampleError(
+            f"the written sample holds the damage of some components but not of "
+            f"{missing}: every component's column is written, or none is"
+        )
+    return bool(names) and all(held)
 
 
 def _written_components(documents: Any) -> list[tuple[str, str, Any]]:

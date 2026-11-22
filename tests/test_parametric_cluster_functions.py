@@ -619,7 +619,9 @@ def test_a_held_block_of_a_cluster_design_is_re_ranked() -> None:
     assert record["built_together"] == ["hazard_distribution"]
 
 
-def test_a_comonotonic_block_keeps_todays_method_on_its_clusters() -> None:
+def test_a_comonotonic_block_re_deals_its_clusters_of_several_assets() -> None:
+    # A cluster of two assets or more is re-dealt, as the total is; the
+    # one-asset cluster reads one column and keeps today's method.
     sample = _curves(Comonotonic())
     made = _design(False, sample, objective=MSE())
     table = _intervals_on(made, sample)
@@ -629,8 +631,9 @@ def test_a_comonotonic_block_keeps_todays_method_on_its_clusters() -> None:
         ("total", None, None): True,
     }
     record = _intervals_record(table)
-    assert record["unit"] == "year"
+    assert record["unit"] == "as_built"
     assert record["built_together"] == ["comonotonic"]
+    assert "kept_today" not in record
 
 
 # -- scenarios -------------------------------------------------------------------
