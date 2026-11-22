@@ -35,17 +35,22 @@ error of the draws and says nothing about the curve. Two rows' intervals are not
 a test of a difference between them.
 
 **Rows built together.** Resampling rows treats them as independent draws. The
-rows of an `EmpiricalCopula` block, and of a block built with `HazardNoise(...,
+rows of a block whose columns `EmpiricalCopula`, `Comonotonic()` or
+`GaussianCopula` moved, and of a block built with `HazardNoise(...,
 hold="hazard_distribution")`, are not: each asset's or hazard's draws, or each
-row's hazard at the asset, were assigned by their rank over every row. So on
+row's hazard at the asset, were placed by their rank over every row. So on
 those rows each replicate builds the rows again as the block built them:
 
-- **Re-dealt.** A row that reads two columns or more of an `EmpiricalCopula`
-  block (an asset of several, or a hazard of several): each replicate redraws
-  each column's draws on its own, with replacement, and deals them to the
-  reference years again by the copula's rule. The draws sorted by their index
-  fill the ranks each reference year held in that column, and a year's rows
-  take its draws in the order they were drawn.
+- **Re-dealt.** A row that reads two columns or more of such a block (an
+  asset of several, or a hazard of several): each replicate redraws each
+  column's draws on its own, with replacement, and deals them to the rows
+  again by the model's rule. Under an `EmpiricalCopula` the draws sorted by
+  their index fill the ranks each reference year held in that column, and a
+  year's rows take its draws in the order they were drawn. Under
+  `Comonotonic()` the draws of equal rank in every column share a row, and
+  under `GaussianCopula` each row takes the draw of the rank its latent normal
+  score held in the column, which the sample keeps (`latent_ranks`); copies of
+  one draw are ranked in the order drawn.
 - **Re-ranked.** A row that reads a column built with the held form: each
   replicate resamples by the unit above, and ranks the hazard at the asset
   again over the resampled rows, as the held form ranks it over the rows of a
@@ -69,17 +74,22 @@ combined loss can't be made again (a rule of the caller's, a table's loss, or
 a stated value or a value column on a sample without damages), a one-hazard
 view whose combined loss reads hazards it doesn't hold, a selection of a held
 sample, whose hazards at the asset came from rows it doesn't hold, a record of
-an `EmpiricalCopula` without its draws per reference year, and pooled rows of
-such blocks.
+an `EmpiricalCopula` without its draws per reference year, a `GaussianCopula`
+sample without its latent ranks (written before samples kept them), a
+`Comonotonic()` block whose indices don't rise together (a basis-risk model of
+the caller's moved one), a block that several models moved, and pooled rows of
+an `EmpiricalCopula` or a held block, which come only from folds built by
+hand. Pooled rows of `Comonotonic()` and `GaussianCopula` folds are re-dealt
+within each fold's held-out block, and joined again in fold order.
 `docs/parametric.md` gives a synthetic coverage study. Resampling whole
 reference years is not offered: it made most intervals of a copula block too
 wide.
 
-`Comonotonic()`, `GaussianCopula` and a model of the caller's also place each
-column's draws by their ranks over every row, so a row that reads several of
-their columns is built together too. Those rows keep the unit above, and their
-coverage is unmeasured. The column `built_together` flags all those rows by how
-the block was built, and the setup text says how each was resampled.
+A model of the caller's also places each column's draws by a rule over every
+row, so a row that reads several of its columns is built together too. Nothing
+says how its reorder places the draws, so those rows keep the unit above, and
+their coverage is unmeasured. The column `built_together` flags all those rows
+by how the block was built, and the setup text says how each was resampled.
 
 **Clusters.** Under `Clustered`, a `"cluster"` row reads its cluster's assets,
 whose index its cover averages and whose losses it sums, and so does each of
@@ -2590,7 +2600,11 @@ def bootstrap_intervals(
     each column of the block in order and each member of a window in order, one
     call `rng.integers(0, n_m, size=(n_bootstrap, n_m))` redraws the member's
     n_m draws, which are dealt to the reference years again by the copula's
-    rule. A row that reads a column built with `HazardNoise(...,
+    rule. A row that reads two columns or more of a block that `Comonotonic()`
+    or `GaussianCopula` moved is re-dealt the same way, with the same layout of
+    the draws, by the model's ranks: the identity of ranks, or the ranks of the
+    latent normal scores the sample keeps; on folds, each fold's held-out block
+    in fold order. A row that reads a column built with `HazardNoise(...,
     hold="hazard_distribution")` is re-ranked over the years drawn by the call
     above. Every other row reads that call as before. `setup.intervals.unit` is
     `"as_built"` when a row was rebuilt, and `"row"` (an `EmpiricalCopula`
@@ -2601,7 +2615,8 @@ def bootstrap_intervals(
     damages, with a stated value or a value column), `"caller_rule"`,
     `"table_loss"`, `"combined_loss_not_reproduced"`, `"value_not_found"`,
     `"combined_view"`, `"held_select"`, `"held_loss_not_one"`,
-    `"copula_without_k"` or `"pooled_by_hand"`. The key is left out when there
+    `"copula_without_k"`, `"gaussian_without_ranks"`, `"index_not_comonotone"`,
+    `"several_models"` or `"pooled_by_hand"`. The key is left out when there
     is none.
 
     The table has `to_long`'s columns and, for each wide row and metric column:
@@ -2633,11 +2648,11 @@ def bootstrap_intervals(
     leaves out uncertainty in the hazard data, the impact function and the
     design, and on a curve block it is the Monte Carlo error of the draws and
     says nothing about the curve. Two rows' intervals are not a test of a
-    difference between them. On the rows with `built_together` true that
-    `Comonotonic()`, `GaussianCopula` or a model of the caller's moved, and on
-    those kept on today's method, an interval can be narrower or wider than the
-    Monte Carlo error of the draws, and the setup text says so; it states the
-    method of the rows rebuilt and the reason of the rows kept.
+    difference between them. On the rows with `built_together` true that a
+    model of the caller's moved, and on those kept on today's method, an
+    interval can be narrower or wider than the Monte Carlo error of the draws,
+    and the setup text says so; it states the method of the rows rebuilt and
+    the reason of the rows kept.
 
     The table holds an `EvaluationMetadata` under the same key as a
     comparison's, with `setup.intervals`, and `write_comparison` writes it.

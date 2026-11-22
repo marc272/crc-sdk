@@ -35,6 +35,10 @@ hazards (`sample_annual_hazards`), from fitted curves under a stated dependence
 keep each component's damage, its impact before the rule for the combined loss,
 beside its own loss, so the combined loss can be made again from the rows.
 
+A sample whose rows a `GaussianCopula` placed, across assets or hazards, keeps
+each row's rank in each column, the rank of its latent normal score there, as
+`latent_ranks`, so its draws can be dealt again by the model's ranks.
+
 `holdout` and `year_block_kfold` split a sample into contiguous blocks of
 periods, so the held-out block of a per-year sample is its latest years. A
 pool of model-years is split by its distinct years, not by its rows, so every

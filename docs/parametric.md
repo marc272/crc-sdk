@@ -2060,7 +2060,19 @@ rows, each model-year taking a block of its own, and `first_year` and
 **The record.** `sample.provenance.dependence` holds the model's document:
 `{"kind": "independent"}`, `{"kind": "comonotonic"}`, or for `EmpiricalCopula`
 the reference's `content_hash`, `sources`, `licences`, `first_year`, `last_year`,
-`m` and `k`. The reference's licences are listed in `provenance.licences` too.
+`m` and `k`. A `GaussianCopula` sample also keeps `sample.latent_ranks`, an
+int64 array `(n, assets)` in asset order: each row's rank in each asset's
+column, which is the rank of its latent normal score y_j there and of its draw
+among that asset's uniforms, 0 for the smallest, within each member of a window
+of horizons. [Intervals](#pooled-folds-and-intervals) deal the draws again by
+these ranks, which the index doesn't give where it ties, as at a curve's atom,
+or where a basis-risk model of yours moved it. The ranks are part of
+`content_hash`, and `to_table` writes them as an int64 column `latent_rank`
+with `schema_version` `"1.3"`, so a reader that knows only the earlier versions
+refuses the table rather than dropping them. A block cut from the sample keeps
+its rows' ranks, and one asset's sample keeps none. A `GaussianCopula` sample
+written before samples kept them reads back without them, with its hash; every
+other sample hashes and writes as before. The reference's licences are listed in `provenance.licences` too.
 `provenance.notes` start with a sentence that names the model and calls the
 dependence an assumption. `sample.asset(asset_id)` gives one asset's sample,
 with its own provenance; a reordering is a step of its `selection`.
@@ -2475,27 +2487,34 @@ difference between them.
   is resampled by row, because its reference is part of the stated model. The
   rows built together, below, are built again on each replicate instead.
 - **Rows built together.** Resampling rows treats them as independent draws. The
-  rows of an `EmpiricalCopula` block, and of a block built with
-  `HazardNoise(..., hold="hazard_distribution")`, are not: each asset's or
-  hazard's draws, or each row's hazard at the asset, were assigned by their rank
-  over every row of the block. So on those rows each replicate builds the rows
-  again, as the block built them:
+  rows of a block whose columns `EmpiricalCopula`, `Comonotonic()` or
+  `GaussianCopula` moved, and of a block built with `HazardNoise(...,
+  hold="hazard_distribution")`, are not: each asset's or hazard's draws, or
+  each row's hazard at the asset, were placed by their rank over every row of
+  the block. So on those rows each replicate builds the rows again, as the
+  block built them:
 
   | A row that reads | Each replicate |
   | --- | --- |
   | Two columns or more of an `EmpiricalCopula` block: the `"total"` row of a set of covers, every row of a joint design, under `Clustered` the `"total"` row and the rows of a cluster of two assets or more, and on a sample of several hazards a row whose index and combined loss read two hazards or more | **Re-deals the draws.** It redraws each column's draws on its own, with replacement, and deals them to the reference years again by the copula's rule: the redrawn draws, sorted by their index, fill the ranks that each reference year's rows held in that column, and a year's rows take its draws in the order they were drawn. On a window of horizons, within each member |
   | A column built with `HazardNoise(..., hold="hazard_distribution")` | **Re-ranks the hazard at the asset.** It resamples by the unit above, and ranks the hazard at the asset again over the resampled rows, as the held form ranks it over the rows of a call. Each row takes the loss of its new hazard at the asset, and on a sample of several hazards its damage, which the block's own rows give |
-  | Two columns or more of a block that `Comonotonic()`, `GaussianCopula` or a model of your own moved, and no held column | Resamples by the unit above. The study below measured these intervals under `Comonotonic()` and `GaussianCopula`; under a model of your own their coverage is unmeasured |
+  | Two columns or more of a block that `Comonotonic()` or `GaussianCopula` moved, with the same rows as above | **Re-deals the draws by the model's ranks.** It redraws each column's draws on its own, with replacement, puts them in the order of their ranks in the column, and each row takes the draw of the rank it held: under `Comonotonic()` the same rank in every column, so the draws of equal rank share a row, and under `GaussianCopula` the rank of the row's latent normal score in that column, which the sample keeps (`latent_ranks`). On a window of horizons, within each member |
+  | Two columns or more of a block that a model of your own moved, and no held column | Resamples by the unit above. Nothing says how its reorder places the draws, and the coverage of these intervals is unmeasured |
   | Anything else, which `built_together` leaves unflagged: an asset's own row, one asset's view, a hazard's view on its own loss, the rows of a one-asset cluster, and every row under `Independent()` with the default `hold` | Resamples by the unit above, with the same draws and numbers as before |
 
-  A row of both kinds, on a held `EmpiricalCopula` block, is re-dealt and
-  re-ranked. A rebuilt replicate holds the rows rebuilt, not reweighted: a row
-  drawn twice can take two places in the reference, or two hazards at the asset.
-  The ranks each reference year held are read from the block's rows. Reference
-  years tied in a column, whose pooled ranks the copula dealt in the order
-  drawn, keep the ranks each one's rows held, and draws tied in their index, as
-  at a curve's atom, are ranked by row, where the copula ranked them by their
-  uniforms.
+  A row of both kinds, on a held block of `EmpiricalCopula`, `Comonotonic()`
+  or `GaussianCopula`, is re-dealt and re-ranked. A rebuilt replicate holds the
+  rows rebuilt, not reweighted: a row drawn twice can take two places in the
+  reference, two ranks, or two hazards at the asset. The ranks each reference
+  year held are read from the block's rows. Reference years tied in a column,
+  whose pooled ranks the copula dealt in the order drawn, keep the ranks each
+  one's rows held, and draws tied in their index, as at a curve's atom, are
+  ranked by row, where the copula ranked them by their uniforms. Under
+  `Comonotonic()` a row's one rank is read from the block's indices: by the
+  first column's, ties by the next column's and then by row, along which every
+  column's index must rise. Under `GaussianCopula` the sample keeps each row's
+  rank, so draws tied in their index keep the places the copula gave them. Two
+  copies of one redrawn draw are ranked in the order drawn.
 
   Across hazards each replicate makes the combined loss again by the sample's
   rule, as the sampler made it. A sample with a single impact takes that
@@ -2523,7 +2542,17 @@ difference between them.
   | A view `component(name, loss="combined")` whose loss reads hazards it doesn't hold | `"combined_view"` |
   | A selection of a held sample, which holds hazards at the asset from rows it lacks | `"held_select"` |
   | A sample that records an `EmpiricalCopula` without its draws per reference year | `"copula_without_k"` |
-  | Pooled rows of these blocks, from folds built by hand, as `year_block_kfold` refuses such samples | `"pooled_by_hand"` |
+  | A `GaussianCopula` sample without its latent ranks, as one written before samples kept them, or whose ranks tie within a column | `"gaussian_without_ranks"` |
+  | A `Comonotonic()` block whose columns' indices don't rise together over the rows, as where a basis-risk model of yours moved an index | `"index_not_comonotone"` |
+  | A block whose columns more than one dependence model moved, which only a provenance made by hand records | `"several_models"` |
+  | Pooled rows of `EmpiricalCopula` and held blocks, from folds built by hand, as `year_block_kfold` refuses such samples | `"pooled_by_hand"` |
+
+  Pooled rows of `Comonotonic()` and `GaussianCopula` blocks, whose folds
+  `year_block_kfold` cuts, are re-dealt fold by fold: each year pays the
+  contract of its own fold, so each replicate deals every fold's held-out block
+  again on its own, as a row of that block is, and joins the blocks' rows in
+  fold order, as `compare_pooled` joins them. A row that one fold can't deal
+  again keeps the unit above, with that fold's reason.
 
   Three more reasons guard against a sample whose rows contradict its record:
   `"combined_loss_not_reproduced"`, when the recorded rule doesn't give the
@@ -2676,10 +2705,11 @@ difference between them.
   - Under `Comonotonic()` and `GaussianCopula` the rows of several columns are
     exchangeable, not independent ([cuts of one
     sample](#several-assets-from-fitted-curves)). They are flagged by
-    construction, and the study's second run measured their `"total"` rows as
-    the unit above resamples them. A model of your own is flagged too, and the
-    coverage of its intervals is unmeasured. `Independent()` keeps every column
-    in draw order. It was measured, and isn't flagged.
+    construction, and re-dealt; the study's second run measured their `"total"`
+    rows as the unit above resampled them before, and its fourth run as they
+    are re-dealt. A model of your own is flagged too, and the coverage of its
+    intervals is unmeasured. `Independent()` keeps every column in draw order.
+    It was measured, and isn't flagged.
 
   When a row is flagged, the setup text's `Intervals` line says how its rows
   were built and how they were resampled: for rows re-dealt or re-ranked, the
@@ -2693,7 +2723,8 @@ difference between them.
   years' rows, in the order drawn. A call that re-deals a row then draws, for
   each column of the block in order and each member of a window in order, one
   call `rng.integers(0, n_m, size=(n_bootstrap, n_m))` for the member's n_m rows,
-  and every entry's re-dealt rows read them. One set of replicates serves every
+  and every entry's re-dealt rows read them; on folds, the same for each fold's
+  held-out block, in fold order. One set of replicates serves every
   entry and every metric of a call, within each method. Nothing is solved again.
 - **The premium.** A design's premium is a fixed price, so on one block its
   interval is the value itself. On pooled folds, the mean of the years' premiums
@@ -3784,8 +3815,9 @@ cluster_shares = allocate([cluster_design], book_held_out, split="out_of_sample"
   [intervals](#pooled-folds-and-intervals), on an `EmpiricalCopula` block the
   rows of a cluster of two assets or more are re-dealt as a `"total"` row is,
   on a held `HazardNoise` block every row that reads a held column is
-  re-ranked, and under `Comonotonic()`, `GaussianCopula` or a model of your own
-  they keep the unit above, flagged. The rows of a one-asset cluster read one
+  re-ranked, under `Comonotonic()` and `GaussianCopula` they are re-dealt by
+  the model's ranks, and under a model of your own they keep the unit above,
+  flagged. The rows of a one-asset cluster read one
   column, as an asset's own row does. The coverage study of [those
   intervals](#pooled-folds-and-intervals) measured no row of a cluster, so
   their coverage is unmeasured.
@@ -4072,7 +4104,11 @@ setup text calls it one.
   table rather than dropping the damages. A sample without damages, such as a
   table of yours, or one written before samples kept them, hashes and writes as
   `"1.1"`, so such a table reads back with its hash, without damages. A sample of
-  one hazard hashes and writes as before. The damage makes the asset's value
+  one hazard hashes and writes as before. Under `GaussianCopula` the sample
+  keeps `latent_ranks`, one column per component in component order, as across
+  assets ([the record](#several-assets-from-fitted-curves)): they enter the hash
+  and the table as `latent_rank[<name>]`, after each component's other columns,
+  with `schema_version` `"1.3"`, beside the damages. The damage makes the asset's value
   readable from the arrays, as a component's own loss against its damage; the
   sample is your own data.
 
@@ -4602,7 +4638,9 @@ rank and no best flag.
   hazards whose rule is your own or whose combined loss a table states, or that
   keeps no damages and whose loss models state a value, on a view whose
   combined loss reads hazards it doesn't hold, on a selection of a held sample,
-  and on pooled folds of these blocks. Those keep the resampling they
-  had, and `setup.intervals.kept_today` says why. It resamples the rows of a
-  block that `Comonotonic()`, `GaussianCopula` or a model of your own moved as
-  independent rows, and flags them with `built_together`.
+  on a `GaussianCopula` sample written without its latent ranks, and on pooled
+  folds of `EmpiricalCopula` and held blocks. Those keep the resampling they
+  had, and `setup.intervals.kept_today` says why. It builds the rows of
+  `Comonotonic()` and `GaussianCopula` blocks again too, but resamples the rows
+  of a block that a model of your own moved as independent rows, and flags them
+  with `built_together`.
