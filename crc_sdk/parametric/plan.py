@@ -151,13 +151,14 @@ joint design's allocated rows, with the values the plan's loss model read, in a
 table and a file of their own (`allocate`), so they never sit beside the rows
 of covers that stand on their own. `docs/parametric.md` describes the rows.
 
-`Clustered(assignment, values=..., joint=...)` designs on the same sample of all
-the assets, as `Joint()` does, and under the same rules: each template once per
+`Clustered(assignment, joint=...)` designs on the same sample of all the
+assets, as `Joint()` does, and under the same rules: each template once per
 objective with `design_joint` under that scope, one cover per cluster on the
 value-weighted mean of its assets' indices, with the rows `compare` gives it.
 Its weights are the values the plan's loss model reads (the asset column
-`value_column`, or 1 for a damage ratio), so its `values` must be those, and
-execution raises otherwise; its assignment must hold exactly the plan's assets.
+`value_column`, or 1 for a damage ratio): the plan fills them in when
+`values=` is left out, and stated values must be those, as execution raises
+otherwise; its assignment must hold exactly the plan's assets.
 Its allocated rows share each cluster's payout over that cluster's assets.
 `.index(...)` is refused beside it: a cluster's cover pays on one index
 definition over its assets, so it can't name each asset's station or point.
@@ -2606,16 +2607,17 @@ class ParametricPlan:
         objective and one budget on the asset owner's total (`design_joint`),
         one cover per asset, on one sample of all the assets, and every
         evaluation gets a row at the level of that total.
-        `Clustered(assignment, values=..., joint=...)` designs each template
-        once per objective with `design_joint` under that scope, one cover per
-        cluster on the value-weighted mean of its assets' indices, on the same
-        sample of all the assets: under `joint=True` one objective and one
-        budget on the total, under `joint=False` one design problem per
-        cluster, each with its own budget. Its `values` must be those the
-        plan's loss model reads (the asset column `value_column`, or 1 for a
-        damage ratio), so that the weights are the plan's values; execution
-        raises otherwise. A plan may hold several scopes, each once: the
-        `scope` column keeps the rows of each scope apart.
+        `Clustered(assignment, joint=...)` designs each template once per
+        objective with `design_joint` under that scope, one cover per cluster
+        on the value-weighted mean of its assets' indices, on the same sample
+        of all the assets: under `joint=True` one objective and one budget on
+        the total, under `joint=False` one design problem per cluster, each
+        with its own budget. Its weights are the values the plan's loss model
+        reads (the asset column `value_column`, or 1 for a damage ratio): the
+        plan fills them in when `values=` is left out, and stated values must
+        be those, as execution raises otherwise. A plan may hold several
+        scopes, each once: the `scope` column keeps the rows of each scope
+        apart.
 
         `Joint()` and `Clustered` need at least two assets; on fitted curves
         they also need `.dependence(...)`, and with `Holdout` or `KFold` that
@@ -6058,19 +6060,23 @@ class ParametricPlan:
         """Check the assets of `Joint()` or `Clustered`, before any source is read.
 
         Both need several assets. `Clustered`'s assignment must hold exactly the
-        plan's assets, and its values must be those the plan's loss model reads,
-        so that each cluster's weights are the plan's values, as on the function
-        route with `values=` those values.
+        plan's assets, and any values it states must be those the plan's loss
+        model reads, so that each cluster's weights are the plan's values, as on
+        the function route with `values=` those values. Values left out are
+        filled in here once to check them, as `Clustered` checks stated ones: a
+        cluster whose values are all zero raises `SampleError`.
         """
         _require_several_assets(asset_ids, self._together_name())
         clustered = self._clustered
         if clustered is None:
             return
         _check_assigned(clustered, asset_ids)
+        stated = clustered.values
+        if stated is None:
+            self._cluster_scope(portfolio, asset_ids)
+            return
         read = self._asset_values(portfolio, asset_ids)
-        differ = [
-            asset for asset in asset_ids if clustered.values[asset] != read[asset]
-        ]
+        differ = [asset for asset in asset_ids if stated[asset] != read[asset]]
         if differ:
             column = self.loss_model.value_column
             where = (
@@ -6081,9 +6087,26 @@ class ParametricPlan:
             raise ValueError(
                 "Clustered weights each cluster's index by the assets' values, and "
                 f"on a plan those are the values its loss model reads: {where}. "
-                f"Its values= differ from them for the assets {differ}: state "
-                "those values in Clustered(..., values=...)"
+                f"Its values= differ from them for the assets {differ}: leave "
+                "values= out, and the plan fills them in, or state those values"
             )
+
+    def _cluster_scope(
+        self, portfolio: AssetPortfolio, asset_ids: Sequence[str]
+    ) -> Clustered | None:
+        """The plan's `Clustered` scope with its values, if it holds one.
+
+        Values left out are those the plan's loss model reads; stated values
+        are kept, as `_check_together` checked that they are those.
+        """
+        clustered = self._clustered
+        if clustered is None or clustered.values is not None:
+            return clustered
+        return Clustered(
+            clustered.assignment,
+            values=self._asset_values(portfolio, asset_ids),
+            joint=clustered.joint,
+        )
 
     @staticmethod
     def _evaluated(block: _Block) -> list[tuple[Split, OutcomeSample]]:
@@ -6334,7 +6357,7 @@ class ParametricPlan:
     ) -> ClusteredDesignResult:
         """One template's design under `Clustered`, once per cluster, labelled `label`.
 
-        `_check_together` checked that the scope's values are the plan's.
+        `scope` is `_cluster_scope`'s: its values are the plan's.
         """
         spec = self.design_spec
         assert spec is not None
@@ -6357,20 +6380,27 @@ class ParametricPlan:
         )
 
     def _joint_entries(
-        self, train: OutcomeSample, covers: Mapping[str, Sequence[Cover]]
+        self,
+        train: OutcomeSample,
+        covers: Mapping[str, Sequence[Cover]],
+        clustered: Clustered | None,
     ) -> tuple[list[Any], list[Any]]:
         """The entries to compare on one block of the joint sample, and the designs.
 
         A resolved cover is one contract per asset. A template is designed under
         each objective on the owner's total under `Joint()`, once per cluster
-        under `Clustered`, and, if the plan holds `Individual()` too, on each
+        under `clustered`, the plan's `Clustered` with its values
+        (`_cluster_scope`), and, if the plan holds `Individual()` too, on each
         asset's own view of the block.
         """
-        positions, designs = self._joint_positions(train, covers)
+        positions, designs = self._joint_positions(train, covers, clustered)
         return [entry for entries in positions for entry in entries], designs
 
     def _joint_positions(
-        self, train: OutcomeSample, covers: Mapping[str, Sequence[Cover]]
+        self,
+        train: OutcomeSample,
+        covers: Mapping[str, Sequence[Cover]],
+        clustered: Clustered | None,
     ) -> tuple[list[list[Any]], list[Any]]:
         """`_joint_entries`, each cover's entries apart, in the order of the covers."""
         assets = train.asset_ids
@@ -6384,7 +6414,6 @@ class ParametricPlan:
                 entries.append(own)
                 continue
             assert self.design_spec is not None
-            clustered = self._clustered
             for objective in self.design_spec.objectives:
                 label = _design_label(stated, objective)
                 if self._holds_joint:
@@ -6444,8 +6473,9 @@ class ParametricPlan:
                 if self.allocation_rule is None
                 else self._asset_values(portfolio, asset_ids)
             )
+            clustered = self._cluster_scope(portfolio, asset_ids)
             for block in self._joint_blocks(built):
-                entries, made = self._joint_entries(block[1], covers)
+                entries, made = self._joint_entries(block[1], covers, clustered)
                 designs += made
                 if not evaluate:
                     continue
@@ -6917,10 +6947,13 @@ class ParametricPlan:
                 else self._asset_values(portfolio, asset_ids)
             )
             blocks = {label: self._joint_blocks(built[label]) for label in labels}
+            clustered = self._cluster_scope(portfolio, asset_ids)
             made: dict[tuple[str, int], list[list[Any]]] = {}
             for label in designed_on:
                 for fold, block in enumerate(blocks[label]):
-                    positions, drawn_up = self._joint_positions(block[1], covers[label])
+                    positions, drawn_up = self._joint_positions(
+                        block[1], covers[label], clustered
+                    )
                     made[(label, fold)] = positions
                     designs += drawn_up
             for fold in range(len(blocks[stated.reference]) if evaluate else 0):

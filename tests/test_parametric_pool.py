@@ -24,6 +24,8 @@ from crc_sdk.parametric import (
     AnnualSeries,
     AsRecorded,
     Budget,
+    Clustered,
+    ClusteredDesignResult,
     ComonotoneIndexWarning,
     Comonotonic,
     Cover,
@@ -55,6 +57,8 @@ from crc_sdk.parametric import (
     ScenarioError,
     StationColumn,
     StepPayout,
+    compare,
+    design_joint,
     evaluate,
     holdout,
     sample_annual,
@@ -1543,6 +1547,66 @@ def test_joint_works_with_a_pool(tmp_path: Path) -> None:
     assert result.joint_sample.provenance.pool is not None
     views = result.samples
     assert _document(views["b"])["runs"][0]["series"]["cell"] is not None
+    text = setup_text(result.metadata)
+    assert "Dependence between the assets: the data's own" in text
+    assert len(_lines(text, "Pool")) == 1
+
+
+@pytest.mark.parametrize("joint", [True, False], ids=["joint", "separate"])
+def test_clustered_works_with_a_pool_as_joint_does(tmp_path: Path, joint: bool) -> None:
+    # One cluster of both sites, weighted by the asset column's values, which
+    # the plan fills in: its design on the joined pool is the function route's.
+    assets = _assets().set_column(3, "value_eur", pa.array([3e6, 1e6], pa.float64()))
+    plan = (
+        _planned(assets=assets)
+        .basis_risk(ImpactNoise(0.3, upper=1.0))
+        .covers(STEP)
+        .objective(MSE(), budget=Budget(ratio=0.8))
+        .split(Holdout(0.75))
+        .scopes(Clustered({"a": "region", "b": "region"}, joint=joint))
+        .metrics(OPTIONS)
+    )
+    pooled = plan.joint_sample()
+    assert pooled.asset_ids == ("a", "b")
+    assert len(pooled) == 60
+    assert pooled.provenance.pool is not None
+    assert pooled.provenance.to_document()["dependence"] == {"kind": "data"}
+    result = plan.write_parquet(tmp_path / "p.parquet")
+    assert result.joint_sample is not None
+    assert result.joint_sample.content_hash == pooled.content_hash
+    train, test = holdout(pooled, 0.75)
+    scope = Clustered(
+        {"a": "region", "b": "region"}, values={"a": 3e6, "b": 1e6}, joint=joint
+    )
+    made = design_joint([STEP], train, MSE(), budget=Budget(ratio=0.8), scope=scope)
+    (planned,) = result.designs
+    assert isinstance(planned, ClusteredDesignResult)
+    assert planned.design_sample.content_hash == train.content_hash
+    assert planned.design_id == made.design_id
+    assert planned.parameters == made.parameters
+    region = planned.covers["region"].cluster_index
+    assert region is not None and dict(region.weights) == {"a": 0.75, "b": 0.25}
+    by_hand = pa.concat_tables(
+        [
+            compare(
+                [made], train, split="in_sample", design_sample=train, options=OPTIONS
+            ),
+            compare(
+                [made],
+                test,
+                split="out_of_sample",
+                design_sample=train,
+                options=OPTIONS,
+            ),
+        ]
+    )
+    columns = [name for name in by_hand.column_names if name != "cover_label"]
+    assert (
+        result.table.select(columns).to_pylist() == by_hand.select(columns).to_pylist()
+    )
+    levels = result.table.column("level").to_pylist()
+    assert set(levels) == ({"total"} if joint else {"cluster", "total"})
+    assert set(result.table.column("scope").to_pylist()) == {"cluster"}
     text = setup_text(result.metadata)
     assert "Dependence between the assets: the data's own" in text
     assert len(_lines(text, "Pool")) == 1

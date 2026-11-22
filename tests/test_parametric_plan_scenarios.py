@@ -523,14 +523,21 @@ def _together(joint: bool) -> Clustered:
     return Clustered(TOGETHER, values=PLAN_VALUES, joint=joint)
 
 
+# The plan's scope states its values, or leaves them out for the plan to fill in.
+STATED_OR_NOT = pytest.mark.parametrize(
+    "values", [PLAN_VALUES, None], ids=["stated", "left-out"]
+)
+
+
+@STATED_OR_NOT
 @pytest.mark.parametrize("joint", [True, False], ids=["joint", "separate"])
 def test_cluster_designs_on_curves_give_the_function_routes_rows(
-    curves: Path, tmp_path: Path, joint: bool
+    curves: Path, tmp_path: Path, joint: bool, values: dict[str, float] | None
 ) -> None:
     scope = _together(joint)
     plan = (
         _curve_plan(curves)
-        .scopes(scope)
+        .scopes(Clustered(TOGETHER, values=values, joint=joint))
         .dependence(Independent())
         .split(Holdout(0.5))
         .scenarios(ScenarioSet(reference="2030s", labels=WINDOWS))
@@ -595,13 +602,14 @@ def test_cluster_designs_on_curves_give_the_function_routes_rows(
     assert {row["scope"] for row in result.allocated.to_pylist()} == {"cluster"}
 
 
+@STATED_OR_NOT
 def test_cluster_designs_on_years_give_the_function_routes_rows(
-    tmp_path: Path,
+    tmp_path: Path, values: dict[str, float] | None
 ) -> None:
     scope = _together(False)
     plan = (
         _annual_plan()
-        .scopes(scope)
+        .scopes(Clustered(TOGETHER, values=values, joint=False))
         .split(KFold(3))
         .scenarios(ScenarioSet([_future()], reference="historical"))
         .allocation("loss")
