@@ -323,8 +323,8 @@ INDEX_VALUES_METHOD = "index_values"
 REFINE_TOLERANCE = 1e-4
 """The default smallest step of a refinement, as a share of a parameter's bounds."""
 
-REFINE_MAX_POINTS = 1_000
-"""The default most points a refinement evaluates."""
+REFINE_MAX_POINTS = 10_000
+"""The default most points a refinement evaluates, by either method."""
 
 StrictInt = Annotated[int, Strict()]
 StrictBool = Annotated[bool, Strict()]
@@ -354,12 +354,14 @@ class DesignOptions(_DefinitionModel):
       those of step or binary components; by a compass search otherwise
       (see the module docstring).
       `refine_tolerance` is the compass search's smallest step, as a share of
-      each parameter's bounds (`upper - lower`), and `refine_max_points` the
-      most points either evaluates. Both apply only with `refine=True`.
+      each parameter's bounds (`upper - lower`; 1e-4 by default), and
+      `refine_max_points` the most points either evaluates (10,000 by
+      default). Both apply only with `refine=True`.
 
     Raises `CoverDefinitionError` (a `ValueError`) for invalid values, and
-    for `refine_tolerance` or `refine_max_points` changed without
-    `refine=True`.
+    for `refine_tolerance` or `refine_max_points` stated without
+    `refine=True` at a value other than its default, which would change
+    nothing.
     """
 
     max_grid_points: StrictInt = 10_000
@@ -406,7 +408,12 @@ class DesignOptions(_DefinitionModel):
             or self.refine_max_points != REFINE_MAX_POINTS
         ):
             raise CoverDefinitionError(
-                "refine_tolerance and refine_max_points apply only with refine=True"
+                "refine_tolerance and refine_max_points apply only with refine=True: "
+                "state refine=True, or leave them at their defaults "
+                f"(refine_tolerance={REFINE_TOLERANCE!r}, "
+                f"refine_max_points={REFINE_MAX_POINTS!r}); got "
+                f"refine_tolerance={self.refine_tolerance!r}, "
+                f"refine_max_points={self.refine_max_points!r}"
             )
         return self
 

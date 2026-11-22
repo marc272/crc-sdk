@@ -28,6 +28,7 @@ from crc_sdk.parametric import (
     CompositeIndex,
     CostOfCapitalLoad,
     Cover,
+    CoverDefinitionError,
     DesignError,
     DesignOptions,
     DesignResult,
@@ -157,7 +158,9 @@ def test_the_option_is_off_and_leaves_the_options_document_as_it_was() -> None:
         "refine_max_points": REFINE_MAX_POINTS,
         "refine_tolerance": REFINE_TOLERANCE,
     }
-    assert (REFINE_TOLERANCE, REFINE_MAX_POINTS) == (1e-4, 1_000)
+    assert (REFINE_TOLERANCE, REFINE_MAX_POINTS) == (1e-4, 10_000)
+    assert DesignOptions().refine_max_points == 10_000
+    assert DesignOptions().refine_tolerance == 1e-4
 
 
 @pytest.mark.parametrize(
@@ -176,6 +179,73 @@ def test_the_option_is_off_and_leaves_the_options_document_as_it_was() -> None:
 def test_invalid_refinement_options_raise(bad: dict[str, Any]) -> None:
     with pytest.raises(ValueError):
         DesignOptions(**bad)
+
+
+def test_a_setting_without_the_option_raises_unless_it_is_its_default() -> None:
+    # Without refine=True the settings change nothing, so a value other than
+    # the default raises rather than being ignored; 1,000, the cap's default
+    # before it became 10,000, is such a value.
+    for settings in ({"refine_max_points": 1_000}, {"refine_tolerance": 1e-3}):
+        with pytest.raises(CoverDefinitionError) as raised:
+            DesignOptions(**settings)
+        message = str(raised.value)
+        assert "apply only with refine=True" in message
+        assert "refine_tolerance=0.0001, refine_max_points=10000" in message
+        name, value = next(iter(settings.items()))
+        assert "; got refine_tolerance=" in message
+        assert f"{name}={value!r}" in message
+    # The defaults, stated or not, give the same options and document.
+    stated = DesignOptions(refine_tolerance=1e-4, refine_max_points=10_000)
+    assert stated == DesignOptions()
+    assert stated.to_document() == DesignOptions().to_document()
+    # With refine=True any valid cap is accepted and enters the document.
+    capped = DesignOptions(refine=True, refine_max_points=1_000)
+    assert capped.to_document()["refine_max_points"] == 1_000
+    assert REFINE.to_document()["refine_max_points"] == 10_000
+
+
+def test_a_stated_cap_keeps_its_design_and_its_design_id() -> None:
+    # The refined ids with refine_max_points=1_000 stated are those of
+    # DesignOptions(refine=True) when 1,000 was the default; the default's
+    # ids differ, since the cap enters the options document, while these
+    # searches, which end well before either cap, find the same designs.
+    step_sample = _sample(STEP_INDEX, STEP_LOSS)
+    for cover, sample, former_id, default_id in (
+        (
+            _step(),
+            step_sample,
+            "sha256:1a355f86636dcd786e648f940136ece06897e8e978c4b077f6bfbf1676ee8748",
+            "sha256:a88779cedd55eb1d29a9f2271cfdfcb4ed6b5508db007ea6adcbfc9737f59377",
+        ),
+        (
+            _linear(),
+            SAMPLE,
+            "sha256:c3cfb137615976b0c33fd9ac98b7dbd42503d039263a93ecccb5ce32ba1707fe",
+            "sha256:2d617dfa6bae07f2dbe4e7517c9fe1ce07243f2b099508f5b67bf5a98b83b4c7",
+        ),
+    ):
+        former = design(
+            cover,
+            sample,
+            MSE(),
+            options=DesignOptions(refine=True, refine_max_points=1_000),
+        )
+        default = design(cover, sample, MSE(), options=REFINE)
+        stated = design(
+            cover,
+            sample,
+            MSE(),
+            options=DesignOptions(refine=True, refine_max_points=10_000),
+        )
+        assert former.design_id == former_id
+        assert default.design_id == stated.design_id == default_id
+        assert former.refinement is not None and default.refinement is not None
+        assert former.refinement["max_points"] == 1_000
+        assert default.refinement["max_points"] == 10_000
+        assert former.parameters == default.parameters
+        assert former.objective_value == default.objective_value
+        assert former.refinement["points"] == default.refinement["points"]
+        assert former.refinement["stopped"] == default.refinement["stopped"]
 
 
 def test_without_the_option_a_grid_design_is_not_refined() -> None:
@@ -737,7 +807,7 @@ def test_the_setup_text_states_the_refinement() -> None:
     assert ", a gain of " in line
     assert (
         f"after {record['points']} points (smallest step 0.0001 of each "
-        "parameter's bounds, at most 1,000 points)" in line
+        "parameter's bounds, at most 10,000 points)" in line
     )
     assert "cap" not in line
 
@@ -1118,7 +1188,7 @@ def test_the_setup_text_states_the_index_value_search() -> None:
     assert (
         ", a gain of 250, after 8 points in 4 passes (each threshold over the "
         "index values between its grid neighbours: breakpoints[0] from 0 to 8; "
-        "at most 1,000 points); unique optimum: yes; ties: 0." in line
+        "at most 10,000 points); unique optimum: yes; ties: 0." in line
     )
 
 
