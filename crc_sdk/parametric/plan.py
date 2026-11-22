@@ -16,8 +16,8 @@ ParametricPlan.for_annual_extremes(source, assets, impact=, unit=, provenance=)
   .pricing(pricing)                     # optional: one pricing for every premium
   .split(FreshDraws(n, seed=) | Holdout(0.7) | KFold(5))   # optional
   .metrics(MetricOptions(...))          # optional: levels and thresholds
-  .scopes(Individual() | Joint())       # optional: asset by asset, or on the total
-  .dependence(Comonotonic() | ...)      # with Joint() on curves: required
+  .scopes(Individual() | Joint() | Clustered(...))  # optional: asset, total, cluster
+  .dependence(Comonotonic() | ...)      # with Joint() or Clustered on curves: required
   .allocation("value" | "loss")         # optional: a joint design's allocated rows
   .scenarios(ScenarioSet(...))          # optional: several scenarios, out of sample
   .hazard(name, source, ...)            # optional: another hazard at each asset
@@ -25,7 +25,7 @@ ParametricPlan.for_annual_extremes(source, assets, impact=, unit=, provenance=)
   .package(covers, label=...)           # optional: separate contracts as one row
   .explain()                            # the setup, no I/O
   .samples()                            # execution: one sample per asset
-  .joint_sample()                       # execution: Joint() only
+  .joint_sample()                       # execution: Joint() or Clustered only
   .scenario_samples()                   # execution: every scenario's samples
   .designs()                            # execution: the designed covers
   .payout_breakdown()                   # execution: each entry's payout in parts
@@ -145,11 +145,22 @@ Under `Joint()` a cover must be written for no asset, because each cover applies
 to every asset; different terms per asset go through `design_joint`. A resolved
 cover is evaluated as a set, one contract per asset. `.samples()` returns each
 asset's view of the sample and `.joint_sample()` the sample itself. `.scopes`
-may hold both scopes: each asset is then also designed on its own view, and the
-`scope` column keeps the rows of each scope apart. `.allocation(rule)` adds a
+may hold several scopes: each asset is then also designed on its own view, and
+the `scope` column keeps the rows of each scope apart. `.allocation(rule)` adds a
 joint design's allocated rows, with the values the plan's loss model read, in a
 table and a file of their own (`allocate`), so they never sit beside the rows
 of covers that stand on their own. `docs/parametric.md` describes the rows.
+
+`Clustered(assignment, values=..., joint=...)` designs on the same sample of all
+the assets, as `Joint()` does, and under the same rules: each template once per
+objective with `design_joint` under that scope, one cover per cluster on the
+value-weighted mean of its assets' indices, with the rows `compare` gives it.
+Its weights are the values the plan's loss model reads (the asset column
+`value_column`, or 1 for a damage ratio), so its `values` must be those, and
+execution raises otherwise; its assignment must hold exactly the plan's assets.
+Its allocated rows share each cluster's payout over that cluster's assets.
+`.index(...)` is refused beside it: a cluster's cover pays on one index
+definition over its assets, so it can't name each asset's station or point.
 
 **Scenarios.** `.scenarios(ScenarioSet(...))` reads several scenarios: on fitted
 curves each selected (pathway, horizon), or a window of horizons under
@@ -160,11 +171,11 @@ of `ScenarioSet` run on them. Every template is designed on each scenario's
 design block (`design_on="each"`) or the reference's (`"reference"`), and every
 cover and design is evaluated on every scenario's evaluation block with
 `compare_scenarios`, one fold and asset at a time, or once for all the assets
-under `Joint()`, so the rows are out of sample only and `.split(...)` is
-required. Under `.allocation(rule)` a joint design's allocated rows on every
-scenario's block go to their own file (`allocate_scenarios`), and
-`.payout_breakdown()` gives each scenario's breakdown
-(`payout_breakdown_scenarios`). A request that selects several horizons or
+under `Joint()` or `Clustered`, so the rows are out of sample only and
+`.split(...)` is required. Under `.allocation(rule)` a joint or cluster design's
+allocated rows on every scenario's block go to their own file
+(`allocate_scenarios`), and `.payout_breakdown()` gives each scenario's
+breakdown (`payout_breakdown_scenarios`). A request that selects several horizons or
 pathways needs `.scenarios(...)`: without it `explain()` and every execution
 point raise `ValueError`.
 
@@ -182,7 +193,7 @@ loss, and a cover on one index on its own hazard's loss (`sample.component`).
 `.package(covers, label=...)` makes separate contracts, named by their labels,
 one row of the comparison (`CoverPackage`); with a budget, `shares=` splits it
 between them (`split_budget`). Every row's metrics are on the combined loss.
-`Joint()`, `pool=` and `.index(...)` raise on such a plan.
+`Joint()`, `Clustered`, `pool=` and `.index(...)` raise on such a plan.
 
 **Output.** `write_parquet(path)` writes one comparison table, as `compare`
 builds it, through a temporary sibling and `os.replace`. Its metadata under
@@ -198,8 +209,8 @@ are never written; the metadata holds a SHA-256 of the (asset id, value)
 pairs. Under `.allocation(rule)`, a joint design's allocated rows go to a
 second file beside the first, `<stem>.allocated<suffix>`, with metadata of the
 same form. The returned `ParametricResult` holds the samples, the fresh draws
-and the designs and, under `Joint()`, the sample of all the assets and any
-allocated rows.
+and the designs and, under `Joint()` or `Clustered`, the sample of all the assets
+and any allocated rows.
 """
 
 from __future__ import annotations
@@ -276,7 +287,14 @@ from crc_sdk.parametric.index import (
     Tail,
     _component_name,
 )
-from crc_sdk.parametric.joint import Individual, Joint, JointDesignResult, design_joint
+from crc_sdk.parametric.joint import (
+    Clustered,
+    ClusteredDesignResult,
+    Individual,
+    Joint,
+    JointDesignResult,
+    design_joint,
+)
 from crc_sdk.parametric.loss import LossModel
 from crc_sdk.parametric.metadata import (
     _ACROSS_YEARS,
@@ -374,6 +392,13 @@ _HAZARDS_REFUSE_JOINT = (
     "holds one asset, and several assets with several hazards would need a "
     "dependence over both axes, which no model states; design each asset on its "
     "own, with Individual()"
+)
+_HAZARDS_REFUSE_CLUSTERED = _HAZARDS_REFUSE_JOINT.replace("Joint()", "Clustered(...)")
+_INDEX_REFUSES_CLUSTERED = (
+    "Clustered(...) is refused on a plan with .index(...): a cluster's cover pays "
+    "on the weighted mean of one IndexDefinition over its assets, so it can't "
+    "name the station or point each asset's index series is read at, as a cover "
+    "bound under .index(...) does"
 )
 _HAZARDS_REFUSE_POOL = (
     "pool= is refused on a plan with .hazard(...): a pool across hazards would "
@@ -834,23 +859,25 @@ class ParametricResult:
     - `samples`: one `OutcomeSample` per asset, in asset order (all years
       or draws, before any split; with `LinearTrend` and a holdout or k-fold,
       fitted on all the years, while the rows come from one sample per fold).
-      Under `Joint()`, each asset's view of `joint_sample`;
+      Under `Joint()` or `Clustered`, each asset's view of `joint_sample`;
     - `designs`: every `DesignResult`, in asset, fold, cover and objective
       order. Under `Joint()`, every `JointDesignResult`, in fold, cover and
-      objective order, each followed by its template's per-asset
-      `DesignResult`s when the plan also holds `Individual()`;
+      objective order, each followed by its template's `ClusteredDesignResult`
+      under `Clustered` and per-asset `DesignResult`s when the plan also holds
+      `Individual()`; under `Clustered` alone, every `ClusteredDesignResult` in
+      that order;
     - `fresh_samples`: with `FreshDraws`, one `OutcomeSample` per asset, in
       asset order: the fresh draws the out-of-sample rows are evaluated on.
-      `None` without fresh draws. Under `Joint()`, each asset's view of
-      `fresh_joint_sample`;
-    - `joint_sample`: under `Joint()`, the sample of all the assets, with all
-      its years or draws, before any split; otherwise `None`;
-    - `fresh_joint_sample`: under `Joint()` with `FreshDraws`, the fresh draws
-      of all the assets, whose `content_hash` is the `sample_hash` of the
-      out-of-sample rows; otherwise `None`;
-    - `allocated`: under `.allocation(...)`, the joint designs' allocated rows
-      as written, in a table of their own with its metadata, as `allocate`
-      builds them; otherwise `None`;
+      `None` without fresh draws. Under `Joint()` or `Clustered`, each asset's
+      view of `fresh_joint_sample`;
+    - `joint_sample`: under `Joint()` or `Clustered`, the sample of all the
+      assets, with all its years or draws, before any split; otherwise `None`;
+    - `fresh_joint_sample`: under `Joint()` or `Clustered` with `FreshDraws`,
+      the fresh draws of all the assets, whose `content_hash` is the
+      `sample_hash` of the out-of-sample rows; otherwise `None`;
+    - `allocated`: under `.allocation(...)`, the joint or cluster designs'
+      allocated rows as written, in a table of their own with its metadata,
+      as `allocate` builds them; otherwise `None`;
     - `allocated_output`: the file of `allocated`, `<stem>.allocated<suffix>`
       beside `output`; otherwise `None`;
     - `scenario_samples`: with `.scenarios(...)`, every scenario's samples, by
@@ -866,8 +893,8 @@ class ParametricResult:
     table: Any
     metadata: EvaluationMetadata
     samples: Mapping[str, OutcomeSample]
-    # `DesignResult`, or `JointDesignResult` under `Joint()`: it depends on the
-    # plan's scopes, so existing callers of a plan of one scope keep their types.
+    # `DesignResult`, `JointDesignResult` or `ClusteredDesignResult`: it depends on
+    # the plan's scopes, so existing callers of a plan of one scope keep their types.
     designs: tuple[Any, ...]
     fresh_samples: Mapping[str, OutcomeSample] | None = None
     joint_sample: OutcomeSample | None = None
@@ -968,8 +995,9 @@ class _Samples:
     """What execution builds before any design: the samples and the source.
 
     `folds` holds each asset's sample of each fold, when each fold has a sample
-    of its own. Under `Joint()`, `joint` and `fresh_joint` are the samples of
-    all the assets, and `samples` and `fresh` each asset's view of them. A pool
+    of its own. Under `Joint()` or `Clustered`, `joint` and `fresh_joint` are the
+    samples of all the assets, and `samples` and `fresh` each asset's view of
+    them. A pool
     read from a sequence of sources has each run's record in `run_records`,
     by model and member. A plan with several hazards has each component's
     record in `component_records`, by name, and `record` is the first's.
@@ -992,12 +1020,33 @@ class _Samples:
 # -- helpers -----------------------------------------------------------------
 
 
-def _require_several_assets(asset_ids: Sequence[str]) -> None:
+def _require_several_assets(asset_ids: Sequence[str], scope: str = "Joint()") -> None:
     if len(asset_ids) < 2:
         raise ValueError(
-            "Joint() designs several assets together, but the plan holds "
+            f"{scope} designs several assets together, but the plan holds "
             f"{list(asset_ids)}; use Individual() for one asset"
         )
+
+
+def _check_assigned(scope: Clustered, asset_ids: Sequence[str]) -> None:
+    """Raise `SampleError` unless `scope` assigns exactly the plan's assets."""
+    left_out = [asset for asset in asset_ids if asset not in scope.assignment]
+    unknown = [asset for asset in scope.assignment if asset not in asset_ids]
+    if not left_out and not unknown:
+        return
+    empty = [
+        cluster
+        for cluster, members in scope.members.items()
+        if all(asset in unknown for asset in members)
+    ]
+    message = (
+        "Clustered assigns every asset of the plan to one cluster, but the "
+        f"assignment leaves out {left_out} and names {unknown}, which the plan's "
+        f"assets {list(asset_ids)} don't hold"
+    )
+    if empty:
+        message += f"; so the clusters {empty} hold no asset of the plan"
+    raise SampleError(message)
 
 
 def _copula_split_error(rule: Holdout | KFold) -> SampleError:
@@ -1435,6 +1484,21 @@ def _bound(
     )
 
 
+def _relabelled(cover: Cover, label: str) -> Cover:
+    """A cluster's `cover` with `label`; its index and asset stay the cluster's."""
+    if cover.label == label:
+        return cover
+    index = cover.cluster_index
+    assert index is not None
+    return Cover(
+        index,
+        cover.payout,
+        payout_unit=cover.payout_unit,
+        asset_id=cover.asset_id,
+        label=label,
+    )
+
+
 def _cover_label(cover: Cover) -> str:
     """A cover's `cover_label` in a comparison: its label, or its hash's start."""
     if cover.label is not None:
@@ -1776,7 +1840,7 @@ class ParametricPlan:
     index_read: _SeriesRead | None = None
     trend: Trend = field(default_factory=AsRecorded)
     scenario: str = "baseline"
-    scope_list: tuple[Individual | Joint, ...] = (Individual(),)
+    scope_list: tuple[Individual | Joint | Clustered, ...] = (Individual(),)
     dependence_model: Dependence | DependenceModel | None = None
     allocation_rule: Allocation | None = None
     pool: ModelPool | None = None
@@ -2196,8 +2260,9 @@ class ParametricPlan:
         checked against its `unit`, and a cover may also name the location
         that the index is read at (`AtStation` or `AtPoint`, the kind that
         `.index`'s `location` resolves to), which is checked at execution.
-        Under `Joint()` a cover must be written for no asset, as it applies to
-        every asset. With `.hazard(...)`, a cover may pay on a `CompositeIndex`,
+        Under `Joint()` and `Clustered` a cover must be written for no asset, as
+        it applies to every asset or cluster. With `.hazard(...)`, a cover may
+        pay on a `CompositeIndex`,
         and each cover's index is checked against the components it reads, by
         name, unit and tail, at `explain()` and at every execution point, so
         only its payout unit is checked here. Replaces any covers set before.
@@ -2344,6 +2409,8 @@ class ParametricPlan:
             raise ValueError(refusal)
         if self.hazard_list:
             raise ValueError(_HAZARDS_REFUSE_INDEX)
+        if self._clustered is not None:
+            raise ValueError(_INDEX_REFUSES_CLUSTERED)
         _source_kind(source)
         if not isinstance(location, (NearestCell, StationColumn)):
             raise TypeError(
@@ -2495,8 +2562,8 @@ class ParametricPlan:
         or fresh draws on per-year values, `ValueError` for fresh draws with
         the plan's seed, and `SampleError` for `Holdout` or `KFold` with
         `.dependence(EmpiricalCopula(...))`, which only fresh draws can test.
-        On fitted curves under `Joint()` or `.hazard(...)`, whose rows read
-        every column the dependence model placed, `Holdout` and `KFold` take
+        On fitted curves under `Joint()`, `Clustered` or `.hazard(...)`, whose
+        rows read every column the dependence model placed, `Holdout` and `KFold` take
         `Independent()` only: under any other model `explain()` and every
         execution point raise `LeakageError`, naming `FreshDraws`.
         """
@@ -2531,33 +2598,47 @@ class ParametricPlan:
             )
         return dataclasses.replace(self, metric_options=options)
 
-    def scopes(self, *scopes: Individual | Joint) -> ParametricPlan:
-        """State how the assets are designed: `Individual()` and/or `Joint()`.
+    def scopes(self, *scopes: Individual | Joint | Clustered) -> ParametricPlan:
+        """State how the assets are designed: `Individual()`, `Joint()`, `Clustered`.
 
         `Individual()`, the default, designs and evaluates each asset on its
         own sample. `Joint()` designs each template once per objective for one
         objective and one budget on the asset owner's total (`design_joint`),
         one cover per asset, on one sample of all the assets, and every
-        evaluation gets a row at the level of that total. A plan may hold both:
-        the `scope` column keeps the rows of each scope apart.
+        evaluation gets a row at the level of that total.
+        `Clustered(assignment, values=..., joint=...)` designs each template
+        once per objective with `design_joint` under that scope, one cover per
+        cluster on the value-weighted mean of its assets' indices, on the same
+        sample of all the assets: under `joint=True` one objective and one
+        budget on the total, under `joint=False` one design problem per
+        cluster, each with its own budget. Its `values` must be those the
+        plan's loss model reads (the asset column `value_column`, or 1 for a
+        damage ratio), so that the weights are the plan's values; execution
+        raises otherwise. A plan may hold several scopes, each once: the
+        `scope` column keeps the rows of each scope apart.
 
-        `Joint()` needs at least two assets; on fitted curves it also needs
-        `.dependence(...)`, and with `Holdout` or `KFold` that model must be
-        `Independent()` (`LeakageError` otherwise, naming `FreshDraws`); and
-        each cover must be written for no asset, as it applies to every asset.
-        Those are checked by `explain()` and at every execution point, since
-        builders may come in any order. Replaces any scopes stated before.
+        `Joint()` and `Clustered` need at least two assets; on fitted curves
+        they also need `.dependence(...)`, and with `Holdout` or `KFold` that
+        model must be `Independent()` (`LeakageError` otherwise, naming
+        `FreshDraws`); and each cover must be written for no asset, as it
+        applies to every asset or cluster. `Clustered`'s assignment must hold
+        exactly the plan's assets. Those are checked by `explain()` and at every
+        execution point, since builders may come in any order. Replaces any
+        scopes stated before.
 
-        Raises `TypeError` for another type, and `ValueError` for no scope, a
-        scope given twice, or `Joint()` on fewer than two assets (when the
-        asset table is in memory; otherwise at execution).
+        Raises `TypeError` for another type; `ValueError` for no scope, a
+        scope given twice, `Joint()` or `Clustered` on fewer than two assets
+        (when the asset table is in memory; otherwise at execution), either
+        beside `.hazard(...)`, and `Clustered` beside `.index(...)`; and
+        `SampleError` for an assignment that leaves out an asset of the plan or
+        names one it doesn't hold (when the asset table is in memory).
         """
         if not scopes:
             raise ValueError("scopes needs at least one scope")
         for scope in scopes:
-            if not isinstance(scope, (Individual, Joint)):
+            if not isinstance(scope, (Individual, Joint, Clustered)):
                 raise TypeError(
-                    "scopes must be Individual() or Joint(), got "
+                    "scopes must be Individual(), Joint() or Clustered(...), got "
                     f"{type(scope).__name__}"
                 )
         kinds = [scope.to_document()["kind"] for scope in scopes]
@@ -2565,23 +2646,29 @@ class ParametricPlan:
         if repeated:
             raise ValueError(f"scope {repeated[0]!r} is given twice")
         plan = dataclasses.replace(self, scope_list=tuple(scopes))
-        if plan._holds_joint and self.hazard_list:
-            raise ValueError(_HAZARDS_REFUSE_JOINT)
+        if plan._together and self.hazard_list:
+            raise ValueError(plan._hazards_refusal())
+        clustered = plan._clustered
+        if clustered is not None and self.index_read is not None:
+            raise ValueError(_INDEX_REFUSES_CLUSTERED)
         ids = self._known_asset_ids()
-        if ids is not None and plan._holds_joint:
-            _require_several_assets(ids)
+        if ids is not None and plan._together:
+            _require_several_assets(ids, plan._together_name())
+            if clustered is not None:
+                _check_assigned(clustered, ids)
         return plan
 
     def dependence(self, model: Dependence | DependenceModel) -> ParametricPlan:
         """State the dependence between curve draws: of the assets, or the hazards.
 
-        For plans on fitted curves, where it is required with `Joint()` and with
-        `.hazard(...)`: a fitted curve says nothing about how two places, or two
+        For plans on fitted curves, where it is required with `Joint()`,
+        `Clustered` and `.hazard(...)`: a fitted curve says nothing about how
+        two places, or two
         hazards, move together, so `Independent()`, `Comonotonic()`,
         `EmpiricalCopula(reference)`, `GaussianCopula(correlation)` or a
         `DependenceModel` of your own is an assumption the plan states, in its
-        metadata and its setup text. Under `Joint()` the draws are those of
-        `sample_curves`, with the plan's generators, the columns being the
+        metadata and its setup text. Under `Joint()` and `Clustered` the draws
+        are those of `sample_curves`, with the plan's generators, the columns being the
         assets; with `.hazard(...)` those of `sample_curve_hazards`, the columns
         being the hazards, and an `EmpiricalCopula`'s reference holds exactly the
         plan's components. Without either nothing puts draws side by side, so
@@ -2629,7 +2716,9 @@ class ParametricPlan:
         those the plan's loss model reads (the asset column `value_column`, or
         1 for a damage ratio); only their hash is written. It applies to joint
         designs only, so `explain()` and every execution point raise without
-        `Joint()`. Replaces any allocation stated before.
+        `Joint()` or `Clustered`. Under `Clustered` each cluster's payout is
+        shared over that cluster's own assets, by the same rules. Replaces any
+        allocation stated before.
 
         Raises `ValueError` for another rule.
         """
@@ -2837,23 +2926,25 @@ class ParametricPlan:
         template on a component with no impact raises: design it on the
         function route. State `.hazard(...)` before `.covers(...)`: the covers'
         units and tails are then checked against the components by `explain()`
-        and at every execution point. `Joint()`, `pool=` and `.index(...)` raise
-        on a plan with `.hazard(...)`. `explain()` lists the components without
-        I/O, and `.samples()` returns one sample of several hazards per asset.
+        and at every execution point. `Joint()`, `Clustered`, `pool=` and
+        `.index(...)` raise on a plan with `.hazard(...)`. `explain()` lists
+        the components without I/O, and `.samples()` returns one sample of
+        several hazards per asset.
 
         Raises `TypeError` for arguments of the wrong type; `ValueError` for an
         invalid or repeated name, a keyword the route doesn't take, a missing
         `unit`, `tail` or `provenance`, a request for other assets or that
         selects several hazards, and for a plan that pools model-years, holds
-        `Joint()` or reads its index elsewhere; and `SampleError` for a unit the
+        `Joint()` or `Clustered`, or reads its index elsewhere; and
+        `SampleError` for a unit the
         impact is not calibrated for, a missing asset column or an impact that
         needs an H3 cell the plan doesn't give.
         """
         name = _component_name(name, ValueError)
         if self.pool is not None:
             raise ValueError(_HAZARDS_REFUSE_POOL)
-        if self._holds_joint:
-            raise ValueError(_HAZARDS_REFUSE_JOINT)
+        if self._together:
+            raise ValueError(self._hazards_refusal())
         if self.index_read is not None:
             raise ValueError(_HAZARDS_REFUSE_INDEX)
         taken = [each.name for each in self.hazard_list]
@@ -3425,7 +3516,7 @@ class ParametricPlan:
         planned = self._planned_scenarios()
         draws = self.draws
         rule = self.split_rule
-        moved = self._holds_joint or bool(self.hazard_list)
+        moved = self._together or bool(self.hazard_list)
         model = self.dependence_model if moved else None
         step = len(model.reference) if isinstance(model, EmpiricalCopula) else 1
         for each in planned:
@@ -3556,8 +3647,8 @@ class ParametricPlan:
                         "hazard per asset; state the others with .hazard(...)"
                     )
             return
-        if self._holds_joint:
-            raise ValueError(_HAZARDS_REFUSE_JOINT)
+        if self._together:
+            raise ValueError(self._hazards_refusal())
         if self.pool is not None:
             raise ValueError(_HAZARDS_REFUSE_POOL)
         if self.index_read is not None:
@@ -3791,7 +3882,37 @@ class ParametricPlan:
 
     @property
     def _holds_joint(self) -> bool:
+        """Whether the plan holds `Joint()`."""
         return any(isinstance(scope, Joint) for scope in self.scope_list)
+
+    @property
+    def _clustered(self) -> Clustered | None:
+        """The plan's `Clustered` scope, if it holds one."""
+        for scope in self.scope_list:
+            if isinstance(scope, Clustered):
+                return scope
+        return None
+
+    @property
+    def _together(self) -> bool:
+        """Whether the plan designs assets together, on one sample of all of them.
+
+        Under `Joint()` or `Clustered`: either builds the sample of all the
+        assets, and its designs read several assets.
+        """
+        return self._holds_joint or self._clustered is not None
+
+    def _together_name(self) -> str:
+        """The scopes that design assets together, as a message names them."""
+        names = [
+            *(["Joint()"] if self._holds_joint else []),
+            *(["Clustered(...)"] if self._clustered is not None else []),
+        ]
+        return " and ".join(names) or "Joint()"
+
+    def _hazards_refusal(self) -> str:
+        """The refusal of `.hazard(...)` beside a scope that designs assets together."""
+        return _HAZARDS_REFUSE_JOINT if self._holds_joint else _HAZARDS_REFUSE_CLUSTERED
 
     @property
     def _holds_individual(self) -> bool:
@@ -3800,24 +3921,32 @@ class ParametricPlan:
     def _check_scopes(self) -> None:
         """Check what no single builder can, as the builders come in any order."""
         model = self.dependence_model
-        if not self._holds_joint:
+        if not self._together:
             if model is not None and not self.hazard_list:
                 raise ValueError(
                     ".dependence(...) says how the assets are put side by side, "
-                    "and only Joint() does that; state .scopes(Joint()), or the "
-                    "hazards it puts side by side with .hazard(...)"
+                    "and only Joint() or Clustered(...) does that; state "
+                    ".scopes(Joint()), or the hazards it puts side by side with "
+                    ".hazard(...)"
                 )
             if self.allocation_rule is not None:
                 raise ValueError(
                     ".allocation(...) shares out a joint design's total payout; "
-                    "state .scopes(Joint())"
+                    "state .scopes(Joint()) or .scopes(Clustered(...))"
                 )
             return
+        clustered = self._clustered
+        if clustered is not None:
+            if self.index_read is not None:
+                raise ValueError(_INDEX_REFUSES_CLUSTERED)
+            ids = self._known_asset_ids()
+            if ids is not None:
+                _check_assigned(clustered, ids)
         if model is None and self._on_curves:
             raise ValueError(
-                "Joint() on fitted curves needs a stated dependence between the "
-                "assets, because a fitted curve says nothing about how two places "
-                "move together: state .dependence(Independent()), "
+                f"{self._together_name()} on fitted curves needs a stated dependence "
+                "between the assets, because a fitted curve says nothing about how "
+                "two places move together: state .dependence(Independent()), "
                 ".dependence(Comonotonic()) or .dependence(EmpiricalCopula(reference))"
             )
         rule = self.split_rule
@@ -3834,9 +3963,9 @@ class ParametricPlan:
             if cover.asset_id is not None:
                 raise ValueError(
                     f"cover {cover.label or cover.definition_hash!r} is written for "
-                    f"asset {cover.asset_id!r}, but under Joint() each cover applies "
-                    "to every asset; write it for no asset, or give different terms "
-                    "per asset to design_joint"
+                    f"asset {cover.asset_id!r}, but under {self._together_name()} "
+                    "each cover applies to every asset; write it for no asset, or "
+                    "give different terms per asset to design_joint"
                 )
         if isinstance(model, EmpiricalCopula):
             ids = self._known_asset_ids()
@@ -3860,20 +3989,24 @@ class ParametricPlan:
         return model.record(self.draws.n_draws, columns)
 
     def _planned_rows(self) -> dict[str, Any]:
-        """The levels, scopes and allocation of the rows under `Joint()`."""
+        """The levels, scopes and allocation of the rows of the scopes together."""
         designed = any(cover.free_parameters() for cover in self.cover_list)
         fixed = any(not cover.free_parameters() for cover in self.cover_list)
         individual = fixed or (designed and self._holds_individual)
-        joint = designed or not self.cover_list
+        together = designed or not self.cover_list
+        clustered = self._clustered
+        cluster = together and clustered is not None
         rule = self.allocation_rule
         levels = [
             *(["asset"] if individual else []),
+            *(["cluster"] if cluster and clustered and not clustered.joint else []),
             "total",
-            *([f"asset_by_{rule}"] if joint and rule is not None else []),
+            *([f"asset_by_{rule}"] if together and rule is not None else []),
         ]
         scopes = [
             *(["individual"] if individual else []),
-            *(["joint"] if joint else []),
+            *(["joint"] if together and self._holds_joint else []),
+            *(["cluster"] if cluster else []),
         ]
         return {"level": levels, "scope": scopes, "allocation": rule}
 
@@ -3916,7 +4049,7 @@ class ParametricPlan:
             details = {"fresh_draws_seed": rule.seed}
         else:
             folds, method, details = rule.k, "kfold", {"k": rule.k}
-        rows = self._planned_rows() if self._holds_joint else {}
+        rows = self._planned_rows() if self._together else {}
         evaluations: list[dict[str, Any]] = []
         for fold in range(folds):
             evaluations.append(
@@ -4117,7 +4250,7 @@ class ParametricPlan:
                 sample["pool"] = self.pool.to_document()
         if self.basis_risk_model is not None:
             sample["basis_risk"] = self.basis_risk_model.to_document()
-        if self._holds_joint:
+        if self._together:
             sample["dependence"] = self._dependence_document()
             if self.dependence_model is not None and self.draws is not None:
                 notes.append(
@@ -4206,7 +4339,7 @@ class ParametricPlan:
         ids = self._known_asset_ids()
         if ids is None:
             return [{**sample, "asset_ids": []}]
-        if self._holds_joint:
+        if self._together:
             return [{**sample, "asset_ids": ids}]
         return [{**sample, "asset_ids": [asset_id]} for asset_id in ids]
 
@@ -4282,7 +4415,7 @@ class ParametricPlan:
                 *([] if read is None else [self._index_description(read)]),
             ],
         }
-        if self._holds_joint:
+        if self._together:
             model = self.dependence_model
             document["scopes"] = [scope.to_document() for scope in self.scope_list]
             document["dependence"] = None if model is None else model.to_document()
@@ -4441,7 +4574,7 @@ class ParametricPlan:
             *(self._design_labels(labels) if templates else []),
             *([None] if given else []),
         ]
-        rows = self._planned_rows() if self._holds_joint else {}
+        rows = self._planned_rows() if self._together else {}
         pricing = self._pricing().to_document()
         rule = self.split_rule
         evaluations: list[dict[str, Any]] = []
@@ -4642,8 +4775,10 @@ class ParametricPlan:
         fitted curves, the dataset's metadata (its units, semantics and
         licence, so `licences` is `None` here); with `cell=`, the cells are
         known only there too, and with `.index(...)` the bound covers.
-        A plan that holds `Joint()` adds `scopes`, `dependence` (`None` on
-        per-year values, whose dependence is the data's own) and `allocation`;
+        A plan that holds `Joint()` or `Clustered` adds `scopes` (a
+        `Clustered`'s document holds its assignment and setting, not its
+        values), `dependence` (`None` on per-year values, whose dependence is
+        the data's own) and `allocation`;
         `setup.samples` then has one sample of all the assets, and each planned
         evaluation its `level`, `scope` and `allocation`. `format="json"` returns a
         dict, `"text"` its JSON text.
@@ -4656,10 +4791,13 @@ class ParametricPlan:
         one entry of `sources` per scenario source, with the labels that read
         it.
 
-        Raises `ValueError` for `Joint()` on fitted curves without
-        `.dependence(...)`, for a dependence or an allocation without
-        `Joint()`, and for a cover written for one asset under `Joint()`;
-        `LeakageError` for `Joint()` on fitted curves with `Holdout` or `KFold`
+        Raises `ValueError` for `Joint()` or `Clustered` on fitted curves
+        without `.dependence(...)`, for a dependence or an allocation without
+        either, for a cover written for one asset under either, and for
+        `Clustered` beside `.index(...)`; `SampleError` for an assignment of
+        `Clustered` that doesn't hold exactly the plan's assets, when they are
+        in memory; `LeakageError` for `Joint()` or `Clustered` on fitted curves
+        with `Holdout` or `KFold`
         under a dependence model other than `Independent()`, naming
         `FreshDraws`;
         for a request that selects several horizons or pathways without
@@ -5371,8 +5509,8 @@ class ParametricPlan:
         basis_risk = self._require_basis_risk()
         portfolio = self._portfolio()
         rows = self._asset_rows(portfolio)
-        if self._holds_joint:
-            _require_several_assets([asset_id for asset_id, _ in rows])
+        if self._together:
+            self._check_together(portfolio, [asset_id for asset_id, _ in rows])
         # Before the source is read, which may take long or download data.
         cells = [self._asset_cell(portfolio, asset_id, row) for asset_id, row in rows]
         pool_runs = None if self.pool is None else self._open_runs()
@@ -5428,7 +5566,7 @@ class ParametricPlan:
                 refitted[asset_id] = self._refitted_samples(
                     asset, samples[asset_id], first_state
                 )
-        joint = OutcomeSample.join(samples.values()) if self._holds_joint else None
+        joint = OutcomeSample.join(samples.values()) if self._together else None
         return _Samples(
             portfolio,
             samples if joint is None else _views(joint),
@@ -5516,8 +5654,8 @@ class ParametricPlan:
         request: PortfolioEvaluation = self.source
         portfolio = self._portfolio()
         rows = self._asset_rows(portfolio)
-        if self._holds_joint:
-            _require_several_assets([asset_id for asset_id, _ in rows])
+        if self._together:
+            self._check_together(portfolio, [asset_id for asset_id, _ in rows])
         metadata = request.dataset.metadata()
         self._check_cover_units(metadata)
         path = Path(request.dataset.provider.source)
@@ -5647,7 +5785,7 @@ class ParametricPlan:
         fresh_samples: dict[str, OutcomeSample] = {}
         joint: OutcomeSample | None = None
         fresh_joint: OutcomeSample | None = None
-        if self._holds_joint:
+        if self._together:
             joint = draw_joint(draws.n_draws, generators)
             samples = _views(joint)
             if isinstance(rule, FreshDraws):
@@ -5914,6 +6052,39 @@ class ParametricPlan:
             values[asset_id] = 1.0 if read is None else read
         return values
 
+    def _check_together(
+        self, portfolio: AssetPortfolio, asset_ids: Sequence[str]
+    ) -> None:
+        """Check the assets of `Joint()` or `Clustered`, before any source is read.
+
+        Both need several assets. `Clustered`'s assignment must hold exactly the
+        plan's assets, and its values must be those the plan's loss model reads,
+        so that each cluster's weights are the plan's values, as on the function
+        route with `values=` those values.
+        """
+        _require_several_assets(asset_ids, self._together_name())
+        clustered = self._clustered
+        if clustered is None:
+            return
+        _check_assigned(clustered, asset_ids)
+        read = self._asset_values(portfolio, asset_ids)
+        differ = [
+            asset for asset in asset_ids if clustered.values[asset] != read[asset]
+        ]
+        if differ:
+            column = self.loss_model.value_column
+            where = (
+                "1 for each asset, as the plan's losses are damage ratios"
+                if column is None
+                else f"the asset column {column!r}"
+            )
+            raise ValueError(
+                "Clustered weights each cluster's index by the assets' values, and "
+                f"on a plan those are the values its loss model reads: {where}. "
+                f"Its values= differ from them for the assets {differ}: state "
+                "those values in Clustered(..., values=...)"
+            )
+
     @staticmethod
     def _evaluated(block: _Block) -> list[tuple[Split, OutcomeSample]]:
         """Where a block's rows are read: its design block, and any held-out one."""
@@ -5956,7 +6127,7 @@ class ParametricPlan:
 
     def _allocated_tables(
         self,
-        designs: Sequence[JointDesignResult],
+        designs: Sequence[JointDesignResult | ClusteredDesignResult],
         block: _Block,
         values: Mapping[str, float] | None,
     ) -> list[Any]:
@@ -6153,14 +6324,47 @@ class ParametricPlan:
             },
         )
 
+    def _cluster_design(
+        self,
+        template: Cover,
+        scope: Clustered,
+        train: OutcomeSample,
+        objective: Objective,
+        label: str,
+    ) -> ClusteredDesignResult:
+        """One template's design under `Clustered`, once per cluster, labelled `label`.
+
+        `_check_together` checked that the scope's values are the plan's.
+        """
+        spec = self.design_spec
+        assert spec is not None
+        result = design_joint(
+            [template] * len(scope.cluster_ids),
+            train,
+            objective,
+            pricing=self._pricing(),
+            budget=spec.budget,
+            limit=spec.limit,
+            options=spec.options,
+            scope=scope,
+        )
+        return dataclasses.replace(
+            result,
+            covers={
+                cluster: _relabelled(cover, label)
+                for cluster, cover in result.covers.items()
+            },
+        )
+
     def _joint_entries(
         self, train: OutcomeSample, covers: Mapping[str, Sequence[Cover]]
     ) -> tuple[list[Any], list[Any]]:
         """The entries to compare on one block of the joint sample, and the designs.
 
         A resolved cover is one contract per asset. A template is designed under
-        each objective on the owner's total and, if the plan holds
-        `Individual()` too, on each asset's own view of the block.
+        each objective on the owner's total under `Joint()`, once per cluster
+        under `Clustered`, and, if the plan holds `Individual()` too, on each
+        asset's own view of the block.
         """
         positions, designs = self._joint_positions(train, covers)
         return [entry for entries in positions for entry in entries], designs
@@ -6180,11 +6384,19 @@ class ParametricPlan:
                 entries.append(own)
                 continue
             assert self.design_spec is not None
+            clustered = self._clustered
             for objective in self.design_spec.objectives:
                 label = _design_label(stated, objective)
-                joint = self._joint_design(own, train, objective, label)
-                designs.append(joint)
-                entries.append(joint)
+                if self._holds_joint:
+                    joint = self._joint_design(own, train, objective, label)
+                    designs.append(joint)
+                    entries.append(joint)
+                if clustered is not None:
+                    by_cluster = self._cluster_design(
+                        stated, clustered, train, objective, label
+                    )
+                    designs.append(by_cluster)
+                    entries.append(by_cluster)
                 if self._holds_individual:
                     each = {
                         asset_id: self._individual_design(
@@ -6237,12 +6449,17 @@ class ParametricPlan:
                 designs += made
                 if not evaluate:
                     continue
-                joint = [each for each in made if isinstance(each, JointDesignResult)]
+                joint = [
+                    each
+                    for each in made
+                    if isinstance(each, (JointDesignResult, ClusteredDesignResult))
+                ]
                 if values is not None and not joint:
                     raise EvaluationError(
                         ".allocation(...) shares out a joint design's total payout, "
                         "but no entry is a joint design: the plan's covers are all "
-                        "resolved, and Joint() evaluates each as a set of contracts"
+                        f"resolved, and {self._together_name()} evaluates each as a "
+                        "set of contracts"
                     )
                 tables += self._block_tables(entries, block)
                 allocated += self._allocated_tables(joint, block, values)
@@ -6417,8 +6634,8 @@ class ParametricPlan:
         portfolio = self._portfolio()
         rows = self._asset_rows(portfolio)
         asset_ids = [asset_id for asset_id, _ in rows]
-        if self._holds_joint:
-            _require_several_assets(asset_ids)
+        if self._together:
+            self._check_together(portfolio, asset_ids)
         own = self._read_curves(
             dataclasses.replace(request, portfolio=portfolio), asset_ids
         )
@@ -6541,8 +6758,8 @@ class ParametricPlan:
         """Every scenario's samples, the reference first, after the set's refusals.
 
         The refusals of a `ScenarioSet` run on each asset's samples, or on the
-        samples of all the assets under `Joint()`, through the function the set
-        runs at construction. On per-year values one asset at a time, the assets
+        samples of all the assets under `Joint()` or `Clustered`, through the
+        function the set runs at construction. On per-year values one asset at a time, the assets
         must read each scenario at one horizon, which the merge of their tables
         requires (`_check_scenario_horizons`), before anything is designed.
         """
@@ -6561,7 +6778,7 @@ class ParametricPlan:
                 for each in self._planned_scenarios()
             }
         groups: list[list[OutcomeSample]]
-        if self._holds_joint:
+        if self._together:
             groups = [[]]
             for each in built.values():
                 assert each.joint is not None
@@ -6576,7 +6793,7 @@ class ParametricPlan:
             _check_scenarios(
                 group, reference=stated.reference, mixed_products=stated.mixed_products
             )
-        if not self._on_curves and not self._holds_joint:
+        if not self._on_curves and not self._together:
             _check_scenario_horizons(built)
         return built
 
@@ -6647,12 +6864,17 @@ class ParametricPlan:
         rule = self.allocation_rule
         if rule is None or values is None:
             return []
-        joint = [entry for entry in entries if isinstance(entry, JointDesignResult)]
+        joint = [
+            entry
+            for entry in entries
+            if isinstance(entry, (JointDesignResult, ClusteredDesignResult))
+        ]
         if not joint:
             raise EvaluationError(
                 ".allocation(...) shares out a joint design's total payout, "
                 "but no entry is a joint design: the plan's covers are all "
-                "resolved, and Joint() evaluates each as a set of contracts"
+                f"resolved, and {self._together_name()} evaluates each as a set of "
+                "contracts"
             )
         return [
             allocate_scenarios(
@@ -6687,7 +6909,7 @@ class ParametricPlan:
         tables: list[Any] = []
         allocated: list[Any] = []
         used: set[str] = set()
-        if self._holds_joint:
+        if self._together:
             values = (
                 None
                 if self.allocation_rule is None
@@ -6796,7 +7018,8 @@ class ParametricPlan:
         asset's draws or years, before any split (fresh draws are drawn by
         `write_parquet()` only, which returns them in `fresh_samples`), so a
         `LinearTrend` here is fitted on all the years, and its record says so.
-        Under `Joint()`, each is that asset's view of `joint_sample()`.
+        Under `Joint()` or `Clustered`, each is that asset's view of
+        `joint_sample()`.
         Raises `ValueError` without a basis-risk model or, on fitted curves,
         without `monte_carlo`, and as `explain()` does for the scopes;
         `SampleError` for an asset that cannot be
@@ -6846,6 +7069,8 @@ class ParametricPlan:
     def joint_sample(self) -> OutcomeSample:
         """Execution: the sample of all the assets, side by side, under `Joint()`.
 
+        And under `Clustered`, which designs on the same sample.
+
         Reads the source and the assets. On fitted curves it is what
         `sample_curves` draws under the plan's `.dependence(...)`, and on
         per-year values `OutcomeSample.join` of each asset's sample. It holds
@@ -6853,15 +7078,15 @@ class ParametricPlan:
         fitted on all the years, like `.samples()`, while the rows of a holdout
         or k-fold come from one sample per fold.
 
-        Raises `ValueError` for a plan that does not hold `Joint()`, and as
-        `samples` does; `SampleError` when the assets' years differ, as
+        Raises `ValueError` for a plan that holds neither, and as `samples`
+        does; `SampleError` when the assets' years differ, as
         `OutcomeSample.join` raises, which a stated `years=` resolves. With
         `.scenarios(...)`, it is the reference's.
         """
-        if not self._holds_joint:
+        if not self._together:
             raise ValueError(
-                "joint_sample() puts the assets side by side under Joint(); state "
-                ".scopes(Joint())"
+                "joint_sample() puts the assets side by side under Joint() or "
+                "Clustered(...); state .scopes(Joint())"
             )
         if self.scenario_set is not None:
             reference = self.scenario_set.reference
@@ -6879,9 +7104,12 @@ class ParametricPlan:
         each fold's design block) under each objective. Under `Joint()` the
         designs are `JointDesignResult`s, in fold, cover and objective order,
         each followed by that template's `DesignResult`s, in asset order, when
-        the plan also holds `Individual()`. With `.scenarios(...)`, they are in
-        scenario, asset, fold, cover and objective order (scenario, fold, cover
-        and objective under `Joint()`), on every scenario's design blocks under
+        the plan also holds `Individual()`. Under `Clustered` each template's
+        `ClusteredDesignResult` comes after its `JointDesignResult` and before
+        its `DesignResult`s. With `.scenarios(...)`, they are in scenario,
+        asset, fold, cover and objective order (scenario, fold, cover and
+        objective under `Joint()` or `Clustered`), on every scenario's design
+        blocks under
         `design_on="each"` and on the reference's under `"reference"`. With
         `.package(...)`, a package's contracts are designed where the package
         sits, its first contract's place, under each objective in turn and in
@@ -6918,12 +7146,14 @@ class ParametricPlan:
         records the set under `setup.scenarios`, with `design_on`.
 
         Raises `ValueError` for a plan that holds `Joint()`, whose designs are on
-        the owner's total. Otherwise raises as `write_parquet` does.
+        the owner's total, or `Clustered`, whose covers read several assets.
+        Otherwise raises as `write_parquet` does.
         """
-        if self._holds_joint:
+        if self._together:
+            on = "the owner's total" if self._clustered is None else "several assets"
             raise ValueError(
                 "payout_breakdown() breaks down one asset's covers, designs and "
-                "packages, and Joint() designs on the owner's total; take "
+                f"packages, and {self._together_name()} designs on {on}; take "
                 "payout_breakdown on each asset's own design on the function route"
             )
         run = self._run(evaluate=True, breakdown=True)
@@ -6959,11 +7189,16 @@ class ParametricPlan:
         Under `Joint()` the rows are one `"total"` row per joint design and
         block (`scope="joint"`); a resolved cover has one `"asset"` row per
         asset and a `"total"` row (`scope="individual"`), and so does a
-        template's per-asset design if the plan also holds `Individual()`. Only
-        the rows of a plan that holds `Joint()` include a `"total"` row.
+        template's per-asset design if the plan also holds `Individual()`. Under
+        `Clustered` they are `compare`'s rows of a `ClusteredDesignResult`
+        (`scope="cluster"`): a `"cluster"` row per cluster and the `"total"`
+        row under `joint=False`, the `"total"` row alone under `joint=True`.
+        Only the rows of a plan that holds `Joint()` or `Clustered` include a
+        `"total"` row.
 
-        Under `.allocation(rule)`, each joint design's allocated rows, one per
-        asset and block, are `allocate`'s, and they go in a table of their own,
+        Under `.allocation(rule)`, each joint or cluster design's allocated
+        rows, one per asset and block, are `allocate`'s, and they go in a table
+        of their own,
         never beside an `"asset"` or `"total"` row: the second file
         `<stem>.allocated<suffix>` beside `path` (for `"comparison.parquet"`,
         `"comparison.allocated.parquet"`), written atomically in the same way,
@@ -6972,11 +7207,11 @@ class ParametricPlan:
 
         With `.scenarios(...)`, the rows are `compare_scenarios`' on each fold's
         blocks of every scenario, one asset at a time, or once for all the
-        assets under `Joint()`, all out of sample, in one file. The metadata
-        records the set under `setup.scenarios`, with `design_on`; each
-        dataset or per-year source is in `source_records` once, with the
-        labels of the scenarios that read it under `scenarios`, and each hazard
-        source names its `scenario`. The result's `samples` are the
+        assets under `Joint()` or `Clustered`, all out of sample, in one file.
+        The metadata records the set under `setup.scenarios`, with
+        `design_on`; each dataset or per-year source is in `source_records`
+        once, with the labels of the scenarios that read it under `scenarios`,
+        and each hazard source names its `scenario`. The result's `samples` are the
         reference's, and `scenario_samples` and `scenario_fresh_samples` hold
         every scenario's. Under `.allocation(rule)` the second file holds each
         joint design's allocated rows on every scenario's block, one fold at a
