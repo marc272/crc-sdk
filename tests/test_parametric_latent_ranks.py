@@ -29,7 +29,6 @@ from crc_sdk.parametric import (
     Comonotonic,
     EmpiricalCopula,
     GaussianCopula,
-    HazardNoise,
     Independent,
     LossModel,
     NoBasisRisk,
@@ -63,26 +62,30 @@ N = 40
 
 _BEFORE = {
     "assets gaussian": (
-        "sha256:d1f3456b6c53ce5bc81d0d4ec523bce33d13224a8bb61d20505c57922b5bb4c4"
+        "sha256:3c80d168894645da8b4544bd514947994f3c6a681ce9658b17ce7b91d4f86131"
     ),
     "assets comonotonic": (
-        "sha256:1396597fd47dceef5f07285f7e175f198aaf568d37cf09cc9d557f7860a404d4"
+        "sha256:e12c7b4adc88dae3c24844816737d9b762e9f054d7a2e44f3db335b73819bb3d"
     ),
     "hazards gaussian": (
-        "sha256:19317c143000592bcb0829feb82744e6785b47c2f6cb606efc539760a8f4ed20"
+        "sha256:e38a1b6dca9f0591453a644c58fb0f382ebad1ecd56ce710391e660b74530745"
     ),
     "hazards comonotonic": (
-        "sha256:25c2650b6a7ddc35e95d65c38fed4745ba383c271b72cff12dc71e157c0db216"
+        "sha256:7c2a5928e037562c58bd787cd7282dac8cb12be2bef1f29a432f053e5bf33764"
     ),
 }
-"""What these samples hashed to before samples kept their latent ranks."""
+"""What these samples hashed to before samples kept their latent ranks.
+
+The samples have no basis risk, as `HazardNoise`'s factors can differ in the
+last bit between platforms, and so would the hashes.
+"""
 
 _KEPT = {
     "assets gaussian": (
-        "sha256:2df1508daf63100ba9baa514f350f36adfb363596852b2772c8c0cb74ea85fc0"
+        "sha256:b9ecb65a9939863c724b38165c3d3af310a1a92770f9d6e56279944d202f8439"
     ),
     "hazards gaussian": (
-        "sha256:b17c48129332ae2ab36a3cdcc9a388c3797153ae20965a404c296e8b2f03c04c"
+        "sha256:dfe01d93b9ae08a7d75d4e6180da63df914130cde6f4aed6f8d2cbc67b9f32b4"
     ),
 }
 """What the `GaussianCopula` samples hash to now that they keep them."""
@@ -123,7 +126,7 @@ def _assets(model: Any, n: int = N, curves: Any = None) -> OutcomeSample:
             a: LossModel(RAMP, value=100.0, value_unit="EUR", name=f"loss of {a}")
             for a in ASSETS
         },
-        basis_risk=HazardNoise(0.3),
+        basis_risk=NoBasisRisk(),
     )
 
 
@@ -136,7 +139,7 @@ def _hazards(model: Any, n: int = N) -> OutcomeSample:
         rngs={h: np.random.default_rng(21 + j) for j, h in enumerate(HAZARDS)},
         loss_models={h: LossModel(RAMP, name=f"damage ratio of {h}") for h in HAZARDS},
         combine=CappedSum(1.0),
-        basis_risk=HazardNoise(0.3),
+        basis_risk=NoBasisRisk(),
         asset_id="site",
     )
 
