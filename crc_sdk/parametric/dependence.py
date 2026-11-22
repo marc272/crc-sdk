@@ -19,7 +19,8 @@ models use no random numbers of their own.
 - `EmpiricalCopula(reference)` puts each column's draws in the ranks of a stated
   per-year sample, in blocks of draws per reference year.
 - `GaussianCopula(correlation)` moves each column's draw of rank r to the row
-  where correlated normal scores of the columns' own uniforms have rank r.
+  where correlated normal scores of the columns' own uniforms have rank r. Its
+  sample keeps those ranks, row by row, as its `latent_ranks`.
 - A model of the caller's implements `DependenceModel`.
 
 The same generators give the same draws under every model, and a row's period
@@ -460,6 +461,11 @@ class GaussianCopula:
     raise `LeakageError` at an out-of-sample evaluation, and the same column's
     rows of each cut pass.
 
+    The sample keeps the rank of each row's `y_j` in every column as its
+    `latent_ranks` (`crc_sdk.parametric.OutcomeSample`), which are also the
+    ranks of the row's draws among their columns' uniforms: what dealing the
+    draws again by the model's ranks needs, as `bootstrap_intervals` does.
+
     Raises `SampleError` for any other `correlation`.
     """
 
@@ -544,6 +550,26 @@ class GaussianCopula:
         for j in range(uniforms.shape[1]):
             order[np.argsort(mixed[:, j], kind="stable"), j] = draws[:, j]
         return order
+
+
+def _draw_ranks(uniforms: FloatArray, order: IntArray) -> IntArray:
+    """The rank of each row's draw among its column's draws, by their uniforms.
+
+    `order` is what a model's reorder returned: the draw each row takes, `(n,
+    d)`. Row i of column j holds the draw `order[i, j]`, and its rank is that
+    draw's rank among the column's uniforms, 0 for the smallest. Under
+    `GaussianCopula` a column's draw of rank r goes to the row where the
+    latent normal score `y_j` has rank r, so these are the ranks of `y_j`, row
+    by row: what the sample keeps so that its rows can be dealt again.
+    """
+    n, columns = uniforms.shape
+    rank = np.empty(uniforms.shape, dtype=np.int64)
+    for j in range(columns):
+        rank[np.argsort(uniforms[:, j], kind="stable"), j] = np.arange(
+            n, dtype=np.int64
+        )
+    ranks: IntArray = np.take_along_axis(rank, order, axis=0)
+    return ranks
 
 
 Dependence = Independent | Comonotonic | EmpiricalCopula | GaussianCopula

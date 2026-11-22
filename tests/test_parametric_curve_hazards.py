@@ -6,6 +6,7 @@ nothing here is a finding about a hazard, a dependence model or a cover form.
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import json
 import math
@@ -710,7 +711,12 @@ def test_the_reductions_are_exact_where_the_quantile_rounds_alike() -> None:
 
 @pytest.mark.parametrize(("rho", "model"), [(0.0, Independent()), (1.0, Comonotonic())])
 def test_the_reductions_hold_on_the_sample(rho: float, model: Any) -> None:
-    assert _draws(GaussianCopula(rho)).content_hash == _draws(model).content_hash
+    # Row for row; the copula's sample also keeps its latent ranks, which the
+    # other models' samples don't.
+    copula = _draws(GaussianCopula(rho))
+    assert copula.latent_ranks is not None
+    without = dataclasses.replace(copula, latent_ranks=None)
+    assert without.content_hash == _draws(model).content_hash
 
 
 @pytest.mark.parametrize("rho", [-0.7, -0.3, 0.3, 0.6, 0.9])

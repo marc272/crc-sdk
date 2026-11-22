@@ -40,7 +40,6 @@ from crc_sdk.parametric import (
     EvaluationError,
     EvaluationMetadata,
     Free,
-    GaussianCopula,
     HazardNoise,
     Independent,
     IndexDefinition,
@@ -576,11 +575,32 @@ def test_an_independent_block_draws_nothing_more() -> None:
     assert _intervals_record(table)["unit"] == "year"
 
 
-@pytest.mark.parametrize(
-    "model", [Comonotonic, lambda: GaussianCopula(0.6)], ids=["comonotonic", "gaussian"]
-)
-def test_rows_other_models_moved_keep_todays_method(model: Any) -> None:
-    sample = _assets(model())
+class _Reversed:
+    """A model of the caller's: the second column's draws in reverse rank order."""
+
+    def to_document(self) -> dict[str, Any]:
+        return {"kind": "reversed"}
+
+    def record(self, n_draws: int, columns: Any) -> dict[str, Any]:
+        del n_draws, columns
+        return self.to_document()
+
+    def statement(self, n_draws: int, between: str) -> str:
+        del n_draws
+        return f"the {between} move in opposite directions."
+
+    def reorder(self, uniforms: Any, columns: Any) -> Any:
+        del columns
+        n = uniforms.shape[0]
+        rank = np.argsort(np.argsort(uniforms[:, 0], kind="stable"), kind="stable")
+        second = np.argsort(uniforms[:, 1], kind="stable")[n - 1 - rank]
+        return np.column_stack([np.arange(n), second])
+
+
+def test_rows_a_model_of_the_callers_moved_keep_todays_method() -> None:
+    # Nothing says how its reorder places the draws, so its rows stay flagged
+    # and are resampled by year, with today's draw and nothing more.
+    sample = _assets(_Reversed())
     rng = np.random.default_rng(6)
     table = UNTYPED_INTERVALS(
         [_covers()], sample, split="in_sample", rng=rng, n_bootstrap=5, options=FEW
@@ -590,6 +610,8 @@ def test_rows_other_models_moved_keep_todays_method(model: Any) -> None:
     assert rng.integers(0, 2**62) == copy.integers(0, 2**62)
     record = _intervals_record(table)
     assert record["unit"] == "year"
+    assert record["built_together"] == ["dependence_model"]
+    assert "kept_today" not in record
     assert UNMEASURED_TEXT in _intervals_line(table)
     assert REBUILT_TEXT not in _intervals_line(table)
 
@@ -1308,14 +1330,17 @@ def test_the_setup_text_of_a_held_block_names_re_ranking() -> None:
 
 
 def test_a_comonotonic_held_block_states_both_methods() -> None:
-    # The held hazard is re-ranked; the draws Comonotonic() placed keep their rows.
+    # The total is re-dealt rank by rank and re-ranked; each asset's row is
+    # re-ranked.
     table = _intervals([_covers()], _assets(Comonotonic(), HELD))
     record = _intervals_record(table)
     assert record["unit"] == "as_built"
     assert record["built_together"] == ["comonotonic", "hazard_distribution"]
+    assert "kept_today" not in record
     line = _intervals_line(table)
-    assert RERANKED_TEXT in line
-    assert "On the rows whose draws Comonotonic() placed" in line
+    assert RERANKED_TEXT in line and "again rank by rank" in line
+    assert "On the rows whose draws Comonotonic() placed" not in line
+    assert UNMEASURED_TEXT not in line
 
 
 def test_rows_filtered_to_todays_method_read_as_todays() -> None:

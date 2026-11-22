@@ -35,17 +35,22 @@ error of the draws and says nothing about the curve. Two rows' intervals are not
 a test of a difference between them.
 
 **Rows built together.** Resampling rows treats them as independent draws. The
-rows of an `EmpiricalCopula` block, and of a block built with `HazardNoise(...,
+rows of a block whose columns `EmpiricalCopula`, `Comonotonic()` or
+`GaussianCopula` moved, and of a block built with `HazardNoise(...,
 hold="hazard_distribution")`, are not: each asset's or hazard's draws, or each
-row's hazard at the asset, were assigned by their rank over every row. So on
+row's hazard at the asset, were placed by their rank over every row. So on
 those rows each replicate builds the rows again as the block built them:
 
-- **Re-dealt.** A row that reads two columns or more of an `EmpiricalCopula`
-  block (an asset of several, or a hazard of several): each replicate redraws
-  each column's draws on its own, with replacement, and deals them to the
-  reference years again by the copula's rule. The draws sorted by their index
-  fill the ranks each reference year held in that column, and a year's rows
-  take its draws in the order they were drawn.
+- **Re-dealt.** A row that reads two columns or more of such a block (an
+  asset of several, or a hazard of several): each replicate redraws each
+  column's draws on its own, with replacement, and deals them to the rows
+  again by the model's rule. Under an `EmpiricalCopula` the draws sorted by
+  their index fill the ranks each reference year held in that column, and a
+  year's rows take its draws in the order they were drawn. Under
+  `Comonotonic()` the draws of equal rank in every column share a row, and
+  under `GaussianCopula` each row takes the draw of the rank its latent normal
+  score held in the column, which the sample keeps (`latent_ranks`); copies of
+  one draw are ranked in the order drawn.
 - **Re-ranked.** A row that reads a column built with the held form: each
   replicate resamples by the unit above, and ranks the hazard at the asset
   again over the resampled rows, as the held form ranks it over the rows of a
@@ -69,17 +74,22 @@ combined loss can't be made again (a rule of the caller's, a table's loss, or
 a stated value or a value column on a sample without damages), a one-hazard
 view whose combined loss reads hazards it doesn't hold, a selection of a held
 sample, whose hazards at the asset came from rows it doesn't hold, a record of
-an `EmpiricalCopula` without its draws per reference year, and pooled rows of
-such blocks.
+an `EmpiricalCopula` without its draws per reference year, a `GaussianCopula`
+sample without its latent ranks (written before samples kept them), a
+`Comonotonic()` block whose indices don't rise together (a basis-risk model of
+the caller's moved one), a block that several models moved, and pooled rows of
+an `EmpiricalCopula` or a held block, which come only from folds built by
+hand. Pooled rows of `Comonotonic()` and `GaussianCopula` folds are re-dealt
+within each fold's held-out block, and joined again in fold order.
 `docs/parametric.md` gives a synthetic coverage study. Resampling whole
 reference years is not offered: it made most intervals of a copula block too
 wide.
 
-`Comonotonic()`, `GaussianCopula` and a model of the caller's also place each
-column's draws by their ranks over every row, so a row that reads several of
-their columns is built together too. Those rows keep the unit above, and their
-coverage is unmeasured. The column `built_together` flags all those rows by how
-the block was built, and the setup text says how each was resampled.
+A model of the caller's also places each column's draws by a rule over every
+row, so a row that reads several of its columns is built together too. Nothing
+says how its reorder places the draws, so those rows keep the unit above, and
+their coverage is unmeasured. The column `built_together` flags all those rows
+by how the block was built, and the setup text says how each was resampled.
 
 **Clusters.** Under `Clustered`, a `"cluster"` row reads its cluster's assets,
 whose index its cover averages and whose losses it sums, and so does each of
@@ -537,6 +547,14 @@ class _Read:
 
 
 @dataclass(frozen=True, eq=False)
+class _Fold:
+    """One fold of pooled rows: its held-out block's evaluation and its entries."""
+
+    run: _Run
+    entries: tuple[_AnyEntry, ...]
+
+
+@dataclass(frozen=True, eq=False)
 class _Evaluated:
     """A comparison table and what resampling its rows needs.
 
@@ -544,7 +562,8 @@ class _Evaluated:
     (`_built_together`). On one block, `run` is its evaluation, `entries` its
     entries, and `positions` says for each of `reads` which entry it is a row of
     and where in `_arrays(entry, run)`, so that a rebuilt replicate can read the
-    row again; pooled folds have no `run`.
+    row again. Pooled folds have no `run`: `folds` holds each fold's, and
+    `positions` says the same of each fold's entries.
     """
 
     table: Any
@@ -558,6 +577,7 @@ class _Evaluated:
     run: _Run | None = None
     entries: tuple[_AnyEntry, ...] = ()
     positions: tuple[tuple[int, int], ...] = ()
+    folds: tuple[_Fold, ...] = ()
 
 
 def _no_premium_names(options: MetricOptions) -> frozenset[str]:
@@ -1195,13 +1215,18 @@ def _pooled(
     probability = np.full(n_rows, 1.0 / n_rows, dtype=np.float64)
     sample_hash = _folds_hash(test.content_hash for test in tests)
     collected = _PooledRows([], [], {}, {}, [], [], [])
-    for entry in pooled:
+    positions: list[tuple[int, int]] = []
+    for position, entry in enumerate(pooled):
+        before = len(collected.rows)
         _pool_entry_rows(
             entry,
             runs,
             sample_hash=sample_hash,
             probability=probability,
             collected=collected,
+        )
+        positions.extend(
+            (position, place) for place in range(len(collected.rows) - before)
         )
     _check_keys(collected.rows, KEY_COLUMNS)
     columns = metric_columns(runs[0].options)
@@ -1217,16 +1242,18 @@ def _pooled(
     schema = _schema(columns, metadata, extra=_block_fields(runs[0].options.betas))
     schema = schema.set(schema.get_field_index("fold"), pa.field("fold", pa.int32()))
     year = np.concatenate([_row_years(test) for test in tests])
-    distinct, positions = np.unique(year, return_inverse=True)
+    distinct, of_year = np.unique(year, return_inverse=True)
     return _Evaluated(
         table=pa.Table.from_pylist(collected.rows, schema=schema),
         reads=tuple(collected.reads),
         together=tuple(collected.together),
         probability=probability,
-        year=positions.astype(np.int64),
+        year=of_year.astype(np.int64),
         n_years=int(distinct.size),
         unit="year",
         options=runs[0].options,
+        positions=tuple(positions),
+        folds=tuple(_Fold(run, tuple(per_fold[fold])) for fold, run in enumerate(runs)),
     )
 
 
@@ -1425,6 +1452,12 @@ def _replicates(
 _REDEALT = "empirical_copula"
 """The kind of rows that each replicate deals again by the copula's reference."""
 
+_COMONOTONIC = "comonotonic"
+_GAUSSIAN = "gaussian_copula"
+
+_DEALT = (_REDEALT, _COMONOTONIC, _GAUSSIAN)
+"""The kinds of rows that each replicate deals again, by the model's own rule."""
+
 _ONE_IMPACT = "one_impact"
 """The `combine` kind of a sample whose combined loss is one hazard's own loss."""
 
@@ -1441,11 +1474,16 @@ _Combine = Callable[[Mapping[str, FloatArray], Mapping[str, FloatArray]], FloatA
 
 def _method(kinds: frozenset[str]) -> _Method:
     """How a row of these kinds is resampled: re-dealt, re-ranked, or as today."""
-    if _REDEALT in kinds:
+    if any(kind in kinds for kind in _DEALT):
         return "redeal"
     if _HELD in kinds:
         return "rerank"
     return "today"
+
+
+def _kept_kind(kinds: frozenset[str]) -> str:
+    """The kind a row kept on today's method would have been built again for."""
+    return next((kind for kind in _DEALT if kind in kinds), _HELD)
 
 
 @dataclass(frozen=True, eq=False)
@@ -1473,9 +1511,13 @@ class _Column:
 class _Builder:
     """What rebuilding the rows of one block needs.
 
-    `members` holds, for re-dealing, the block's rows of each member of a
-    window (one member for a curve), in row order, with the reference year of
-    each row. `year_rows` holds the rows of each year, for re-ranking, and
+    `deal` is the model a re-deal follows, the kind of rows it deals, or
+    `None` when no row is re-dealt. For an `EmpiricalCopula`, `members` holds
+    the block's rows of each member of a window (one member for a curve), in
+    row order, with the reference year of each row. For `Comonotonic()` and
+    `GaussianCopula`, `members` holds each member's rows with their positions,
+    and `ranks` each column's rank of each row's draw, by which the draws are
+    dealt again. `year_rows` holds the rows of each year, for re-ranking, and
     `year_row` the one row of each year where every year has one. `combine`
     makes a sample of several hazards' combined loss from its hazards' own
     losses and damages.
@@ -1488,6 +1530,8 @@ class _Builder:
     year_row: IntArray | None
     combine: _Combine | None
     provenance: SampleProvenance
+    deal: str | None = None
+    ranks: tuple[IntArray, ...] = ()
 
     def drawn_rows(self, years: IntArray) -> IntArray:
         """The rows of the years drawn, in the order drawn."""
@@ -1515,10 +1559,10 @@ _VALUE_NOT_FOUND = "value_not_found"
 _HELD_SELECT = "held_select"
 _HELD_LOSS_NOT_ONE = "held_loss_not_one"
 _COPULA_WITHOUT_K = "copula_without_k"
+_GAUSSIAN_WITHOUT_RANKS = "gaussian_without_ranks"
+_INDEX_NOT_COMONOTONE = "index_not_comonotone"
+_SEVERAL_MODELS = "several_models"
 """Why the rows of a block were not built again, as `kept_today` records it."""
-
-_KEPT_KIND: Mapping[_Method, str] = {"redeal": _REDEALT, "rerank": _HELD}
-"""The kind of rows each method builds again, as `kept_today` names it."""
 
 
 def _block_columns(sample: OutcomeSample) -> list[_Column]:
@@ -1781,18 +1825,85 @@ def _reference_years(sample: OutcomeSample) -> tuple[tuple[IntArray, IntArray], 
     return tuple(members)
 
 
+def _window_members(sample: OutcomeSample) -> int:
+    """How many members the sample's window of horizons has: 1 for a curve."""
+    window = sample.provenance.details.get("window")
+    return 1 if window is None else len(window["members"])
+
+
+def _ranked_members(
+    sample: OutcomeSample, columns: Sequence[_Column], deal: str
+) -> tuple[tuple[tuple[IntArray, IntArray], ...], tuple[IntArray, ...]]:
+    """Each member's rows, and each column's rank of each row's draw.
+
+    A model reorders within each member of a window (row `d` reads member `d
+    mod m`). Under `GaussianCopula` the ranks are those the sample keeps, its
+    latent normal scores' ranks. Under `Comonotonic()` the draws of equal rank
+    share a row, so one rank serves every column: the order of the rows by
+    the first column's index, ties by the next column's and then by row, along
+    which every column's index must rise. Raises `_Unbuildable` when the
+    sample doesn't keep the ranks, or when the indices don't rise together,
+    as where a basis-risk model of the caller's moved an index.
+    """
+    m = _window_members(sample)
+    period = sample.period.astype(np.int64)
+    members: list[tuple[IntArray, IntArray]] = []
+    for member in range(m):
+        rows = np.flatnonzero(period % m == member).astype(np.int64)
+        if rows.size:
+            members.append((rows, np.arange(rows.size, dtype=np.int64)))
+    if deal == _GAUSSIAN:
+        kept = sample.latent_ranks
+        if kept is None:
+            raise _Unbuildable(_GAUSSIAN_WITHOUT_RANKS)
+        ranks = tuple(kept[:, j] for j in range(kept.shape[1]))
+        for rows, _ in members:
+            for rank in ranks:
+                if np.unique(rank[rows]).size != rows.size:
+                    # Ties leave a row's place among its column's draws open.
+                    raise _Unbuildable(_GAUSSIAN_WITHOUT_RANKS)
+        return tuple(members), ranks
+    common = np.empty(len(sample), dtype=np.int64)
+    for rows, positions in members:
+        keys = [column.index[rows] for column in reversed(columns)]
+        order = np.lexsort((positions, *keys))
+        for column in columns:
+            if (np.diff(column.index[rows][order]) < 0).any():
+                raise _Unbuildable(_INDEX_NOT_COMONOTONE)
+        common[rows[order]] = positions
+    return tuple(members), (common,) * len(columns)
+
+
+def _deal_of(sample: OutcomeSample) -> str:
+    """The rule a re-deal of `sample`'s rows follows: the kind of its model.
+
+    An `EmpiricalCopula` keeps its own rule wherever it is among the models
+    that moved the columns. `Comonotonic()` and `GaussianCopula` each need to
+    be the one model. Raises `_Unbuildable` for several.
+    """
+    moved = _moved_by(sample)
+    if _REDEALT in moved:
+        return _REDEALT
+    if len(moved) == 1 and next(iter(moved)) in _DEALT:
+        return next(iter(moved))
+    raise _Unbuildable(_SEVERAL_MODELS)
+
+
 @dataclass(frozen=True, eq=False)
 class _Plan:
     """How each row of a call is resampled, and what rebuilding rows needs.
 
     `methods` holds each row's method once the rows that can't be built again
     are taken back to today's. `kept` holds, for each of those rows, the
-    reason. `builder` is `None` when no row is built again.
+    reason. `builder` is `None` when no row of one block is built again.
+    `folds` holds, for pooled rows re-dealt fold by fold, each fold's builder
+    of its held-out block, in fold order; it is empty otherwise.
     """
 
     methods: tuple[_Method, ...]
     kept: Mapping[int, str]
     builder: _Builder | None
+    folds: tuple[_Builder, ...] = ()
 
 
 def _reasons(
@@ -1800,10 +1911,17 @@ def _reasons(
 ) -> tuple[dict[_Method, str], _Builder | None]:
     """Why each method can't build the block's rows again, and what it needs."""
     run = evaluated.run
-    if run is None:
-        # year_block_kfold refuses these samples, so their folds are built by hand.
-        return {"rerank": _POOLED_BY_HAND, "redeal": _POOLED_BY_HAND}, None
-    sample = run.sample
+    assert run is not None
+    return _block_reasons(run.sample, evaluated.year, evaluated.n_years, methods)
+
+
+def _block_reasons(
+    sample: OutcomeSample, year: IntArray, n_years: int, methods: Sequence[_Method]
+) -> tuple[dict[_Method, str], _Builder | None]:
+    """Why each method can't build the rows of `sample` again, and what it needs.
+
+    `year` is each row's year among the block's `n_years`, for re-ranking.
+    """
     if (
         sample.index_components is None
         and len(sample.asset_ids) == 1
@@ -1833,10 +1951,16 @@ def _reasons(
         except _Unbuildable as unbuildable:
             combine_reason = unbuildable.reason
     members: tuple[tuple[IntArray, IntArray], ...] = ()
+    ranks: tuple[IntArray, ...] = ()
+    deal: str | None = None
     copula_reason: str | None = None
     if redeal:
         try:
-            members = _reference_years(sample)
+            deal = _deal_of(sample)
+            if deal == _REDEALT:
+                members = _reference_years(sample)
+            else:
+                members, ranks = _ranked_members(sample, columns, deal)
         except _Unbuildable as unbuildable:
             copula_reason = unbuildable.reason
     reasons: dict[_Method, str] = {}
@@ -1848,8 +1972,7 @@ def _reasons(
     if redeal_reason is not None:
         reasons["redeal"] = redeal_reason
     year_rows = tuple(
-        np.flatnonzero(evaluated.year == year).astype(np.int64)
-        for year in range(evaluated.n_years)
+        np.flatnonzero(year == each).astype(np.int64) for each in range(n_years)
     )
     provenance = sample.provenance
     return reasons, _Builder(
@@ -1873,6 +1996,8 @@ def _reasons(
                 None if sample.index_components is None else {"kind": "as_built"}
             ),
         ),
+        deal=deal if copula_reason is None else None,
+        ranks=ranks,
     )
 
 
@@ -1885,6 +2010,8 @@ def _plan(evaluated: _Evaluated) -> _Plan:
     wanted = [_method(kinds) for kinds in evaluated.together]
     if all(method == "today" for method in wanted):
         return _Plan(tuple(wanted), {}, None)
+    if evaluated.run is None:
+        return _pooled_plan(evaluated, wanted)
     reasons, builder = _reasons(evaluated, wanted)
     kept = {r: reasons[method] for r, method in enumerate(wanted) if method in reasons}
     methods = tuple("today" if r in kept else method for r, method in enumerate(wanted))
@@ -1892,14 +2019,46 @@ def _plan(evaluated: _Evaluated) -> _Plan:
     return _Plan(methods, kept, builder if rebuilt else None)
 
 
+def _pooled_plan(evaluated: _Evaluated, wanted: Sequence[_Method]) -> _Plan:
+    """Each pooled row's method: re-dealt fold by fold, or kept as today.
+
+    A pooled row reads every fold's held-out block, each with its own fold's
+    designs, so a row of several columns that `Comonotonic()` or
+    `GaussianCopula` moved is re-dealt within each block, as a row of that
+    block is, and the blocks' rows are pooled again. `year_block_kfold` refuses
+    blocks of an `EmpiricalCopula` and of a held `HazardNoise`, so pooled rows
+    of them come only from folds built by hand, and keep today's method. A row
+    that one fold can't deal again keeps it too, with that fold's reason.
+    """
+    kept: dict[int, str] = {}
+    for r, (method, kinds) in enumerate(zip(wanted, evaluated.together, strict=True)):
+        if method != "today" and (_REDEALT in kinds or _HELD in kinds):
+            kept[r] = _POOLED_BY_HAND
+    dealt = [
+        r for r, method in enumerate(wanted) if method == "redeal" and r not in kept
+    ]
+    folds: list[_Builder] = []
+    for fold in evaluated.folds if dealt else ():
+        sample = fold.run.sample
+        distinct, year = np.unique(_row_years(sample), return_inverse=True)
+        reasons, builder = _block_reasons(
+            sample, year.astype(np.int64), int(distinct.size), ["redeal"]
+        )
+        if "redeal" in reasons:
+            kept.update(dict.fromkeys(dealt, reasons["redeal"]))
+            folds = []
+            break
+        assert builder is not None
+        folds.append(builder)
+    methods = tuple("today" if r in kept else method for r, method in enumerate(wanted))
+    return _Plan(methods, kept, None, tuple(folds))
+
+
 def _kept_record(
     evaluated: _Evaluated, kept: Mapping[int, str]
 ) -> list[dict[str, str]]:
     """`kept_today`: each kind of rows kept as today, with its reason, once each."""
-    found = {
-        (_KEPT_KIND[_method(evaluated.together[r])], reason)
-        for r, reason in kept.items()
-    }
+    found = {(_kept_kind(evaluated.together[r]), reason) for r, reason in kept.items()}
     order = list(_BUILT_TOGETHER)
     return [
         {"kind": kind, "reason": reason}
@@ -1916,10 +2075,23 @@ def _redeal_draws(
 
     For each column in the block's order, and each member in order, one call
     `rng.integers(0, n_m, size=(B, n_m))` redraws the member's `n_m` draws with
-    replacement. The redrawn draws, sorted by their index (ties in the order
-    drawn), fill the ranks that each reference year's rows held in the column,
-    and a year's rows take its draws in the order they were drawn, as the copula
-    deals them.
+    replacement. They are dealt by the model's rule: an `EmpiricalCopula`'s
+    (`_reference_draws`), or the ranks of `Comonotonic()` and `GaussianCopula`
+    (`_ranked_draws`).
+    """
+    if builder.deal == _REDEALT:
+        return _reference_draws(builder, rng, n_bootstrap)
+    return _ranked_draws(builder, rng, n_bootstrap)
+
+
+def _reference_draws(
+    builder: _Builder, rng: np.random.Generator, n_bootstrap: int
+) -> list[IntArray]:
+    """An `EmpiricalCopula`'s draws dealt again: `(B, n)` source rows per column.
+
+    The redrawn draws, sorted by their index (ties in the order drawn), fill
+    the ranks that each reference year's rows held in the column, and a year's
+    rows take its draws in the order they were drawn, as the copula deals them.
     """
     n = len(builder.sample)
     sources: list[IntArray] = []
@@ -1936,6 +2108,33 @@ def _redeal_draws(
             dealt = np.lexsort((held, np.broadcast_to(years, held.shape)), axis=-1)
             taken = np.take_along_axis(held, dealt, axis=1)
             source[:, rows] = rows[np.take_along_axis(drawn, taken, axis=1)]
+        sources.append(source)
+    return sources
+
+
+def _ranked_draws(
+    builder: _Builder, rng: np.random.Generator, n_bootstrap: int
+) -> list[IntArray]:
+    """Draws dealt again by the model's ranks: `(B, n)` source rows per column.
+
+    The redrawn draws of a column are put in the order of their ranks there,
+    copies of one draw in the order drawn, and each row takes the draw of the
+    rank it held: under `Comonotonic()` the same in every column, so the draws
+    of equal rank share a row, and under `GaussianCopula` that of its latent
+    normal score in the column, which the sample keeps.
+    """
+    n = len(builder.sample)
+    sources: list[IntArray] = []
+    for rank in builder.ranks:
+        source = np.empty((n_bootstrap, n), dtype=np.int64)
+        for rows, positions in builder.members:
+            size = rows.size
+            drawn = rng.integers(0, size, size=(n_bootstrap, size), dtype=np.int64)
+            held = rank[rows]
+            place = np.empty(size, dtype=np.int64)
+            place[np.argsort(held, kind="stable")] = positions
+            ranked = np.argsort(held[drawn], axis=1, kind="stable")
+            source[:, rows] = rows[np.take_along_axis(drawn, ranked[:, place], axis=1)]
         sources.append(source)
     return sources
 
@@ -2103,6 +2302,53 @@ def _rebuilt_replicates(
                 )
 
 
+def _pooled_rebuilt_replicates(
+    evaluated: _Evaluated,
+    plan: _Plan,
+    redealt: Sequence[Sequence[IntArray]],
+    result: FloatArray,
+) -> None:
+    """Fill `result` for the pooled rows re-dealt, replicate by replicate.
+
+    A replicate deals each fold's held-out block again from its own redrawn
+    draws, reads each re-dealt row on every block with that fold's entries,
+    and joins the blocks' rows in fold order, each paying its own fold's
+    contract, as `compare_pooled` joins them.
+    """
+    options = evaluated.options
+    names = [column.name for column in metric_columns(options)]
+    without = _no_premium_names(options)
+    rows = [r for r, method in enumerate(plan.methods) if method == "redeal"]
+    every_row = np.ones(evaluated.probability.shape[0], dtype=np.bool_)
+    for b in range(result.shape[0]):
+        rebuilt = [
+            dataclasses.replace(
+                fold.run,
+                sample=_rebuilt_sample(
+                    builder,
+                    [source[b] for source in sources],
+                    fold.run.sample.probability,
+                ),
+            )
+            for fold, builder, sources in zip(
+                evaluated.folds, plan.folds, redealt, strict=True
+            )
+        ]
+        arrays: list[dict[int, list[_Arrays]]] = [{} for _ in rebuilt]
+        for r in rows:
+            entry, place = evaluated.positions[r]
+            parts: list[_Arrays] = []
+            for fold, run, read in zip(evaluated.folds, rebuilt, arrays, strict=True):
+                if entry not in read:
+                    read[entry] = _arrays(fold.entries[entry], run)
+                parts.append(read[entry][place])
+            read_again = dataclasses.replace(evaluated.reads[r], arrays=_joined(parts))
+            values = _metrics(
+                read_again, every_row, evaluated.probability, options, without
+            )
+            result[b, r] = np.array([values[name] for name in names], dtype=np.float64)
+
+
 def _short_block(column: MetricColumn, n_rows: int) -> bool | None:
     """Whether the column's level reaches the block's worst row; `None` if no level."""
     return _reaches_worst_row(column.parameter, n_rows)
@@ -2154,6 +2400,11 @@ def _interval_table(
             _redeal_draws(builder, rng, n_bootstrap) if "redeal" in methods else []
         )
         _rebuilt_replicates(evaluated, builder, methods, draws, redealt, replicates)
+        unit = "as_built"
+    elif plan.folds:
+        # Each fold's block in fold order, each column and member in order.
+        by_fold = [_redeal_draws(each, rng, n_bootstrap) for each in plan.folds]
+        _pooled_rebuilt_replicates(evaluated, plan, by_fold, replicates)
         unit = "as_built"
     low, high = np.quantile(
         replicates, [(1.0 - ci_level) / 2.0, (1.0 + ci_level) / 2.0], axis=0
@@ -2349,7 +2600,11 @@ def bootstrap_intervals(
     each column of the block in order and each member of a window in order, one
     call `rng.integers(0, n_m, size=(n_bootstrap, n_m))` redraws the member's
     n_m draws, which are dealt to the reference years again by the copula's
-    rule. A row that reads a column built with `HazardNoise(...,
+    rule. A row that reads two columns or more of a block that `Comonotonic()`
+    or `GaussianCopula` moved is re-dealt the same way, with the same layout of
+    the draws, by the model's ranks: the identity of ranks, or the ranks of the
+    latent normal scores the sample keeps; on folds, each fold's held-out block
+    in fold order. A row that reads a column built with `HazardNoise(...,
     hold="hazard_distribution")` is re-ranked over the years drawn by the call
     above. Every other row reads that call as before. `setup.intervals.unit` is
     `"as_built"` when a row was rebuilt, and `"row"` (an `EmpiricalCopula`
@@ -2360,7 +2615,8 @@ def bootstrap_intervals(
     damages, with a stated value or a value column), `"caller_rule"`,
     `"table_loss"`, `"combined_loss_not_reproduced"`, `"value_not_found"`,
     `"combined_view"`, `"held_select"`, `"held_loss_not_one"`,
-    `"copula_without_k"` or `"pooled_by_hand"`. The key is left out when there
+    `"copula_without_k"`, `"gaussian_without_ranks"`, `"index_not_comonotone"`,
+    `"several_models"` or `"pooled_by_hand"`. The key is left out when there
     is none.
 
     The table has `to_long`'s columns and, for each wide row and metric column:
@@ -2392,11 +2648,11 @@ def bootstrap_intervals(
     leaves out uncertainty in the hazard data, the impact function and the
     design, and on a curve block it is the Monte Carlo error of the draws and
     says nothing about the curve. Two rows' intervals are not a test of a
-    difference between them. On the rows with `built_together` true that
-    `Comonotonic()`, `GaussianCopula` or a model of the caller's moved, and on
-    those kept on today's method, an interval can be narrower or wider than the
-    Monte Carlo error of the draws, and the setup text says so; it states the
-    method of the rows rebuilt and the reason of the rows kept.
+    difference between them. On the rows with `built_together` true that a
+    model of the caller's moved, and on those kept on today's method, an
+    interval can be narrower or wider than the Monte Carlo error of the draws,
+    and the setup text says so; it states the method of the rows rebuilt and
+    the reason of the rows kept.
 
     The table holds an `EvaluationMetadata` under the same key as a
     comparison's, with `setup.intervals`, and `write_comparison` writes it.

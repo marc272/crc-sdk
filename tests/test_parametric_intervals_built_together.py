@@ -593,7 +593,8 @@ def test_the_setup_text_states_the_rows_built_together() -> None:
     assert "is not the sampling error of the number" not in line
     assert "deals them to the reference years again" in line
     assert '"Rows built together"' in line
-    kept = _intervals_line(_intervals([_covers()], _assets(Comonotonic())))
+    # Only a model of the caller's keeps today's method, and erratum 34's sentence.
+    kept = _intervals_line(_intervals([_covers()], _assets(Countermonotonic())))
     assert "is not the sampling error of the number" in kept
     held = _intervals_line(_intervals([_cover()], _curve_sample(HELD)))
     assert HELD_TEXT in held

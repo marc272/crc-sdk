@@ -238,6 +238,17 @@ _REBUILT = {
         "column's draws on its own, with replacement, and deals them to the "
         "reference years again by the copula's rule"
     ),
+    "comonotonic": (
+        "where Comonotonic() placed the draws, each resample redraws each "
+        "column's draws on its own, with replacement, and deals them to the rows "
+        "again rank by rank, so the draws of equal rank in every column share a row"
+    ),
+    "gaussian_copula": (
+        "where a GaussianCopula placed the draws, each resample redraws each "
+        "column's draws on its own, with replacement, and deals them to the rows "
+        "again by the ranks of the copula's latent normal scores, which the sample "
+        "keeps"
+    ),
     _RERANKED: (
         "where HazardNoise(..., hold='hazard_distribution') gave the hazard at the "
         "asset, each resample ranks it again over the resampled rows, and each row "
@@ -247,14 +258,18 @@ _REBUILT = {
 """How a call with `unit` `"as_built"` resampled the rows of each kind it rebuilt."""
 
 _PLACED_BY = {
-    "comonotonic": "Comonotonic()",
-    "gaussian_copula": "a GaussianCopula",
     "dependence_model": "a dependence model of the caller's",
 }
-"""What placed the draws of the rows of each kind, which a call resampled as today."""
+"""What placed the draws of the rows of each kind, which a call resampled as today.
+
+The rows of every other kind are built again, or kept on today's method with
+a reason that `kept_today` records.
+"""
 
 _KEPT_ROWS = {
     _REDEALT: "the rows of several columns an EmpiricalCopula dealt",
+    "comonotonic": "the rows of several columns Comonotonic() placed",
+    "gaussian_copula": "the rows of several columns a GaussianCopula placed",
     _RERANKED: "the rows that read a held HazardNoise",
 }
 """The rows of each kind that `kept_today` names, in the setup text."""
@@ -295,6 +310,20 @@ _KEPT_TODAY = {
     "held_loss_not_one": "rows with one hazard at the asset have different losses",
     "copula_without_k": (
         "the record doesn't state the EmpiricalCopula's draws per reference year"
+    ),
+    "gaussian_without_ranks": (
+        "the sample doesn't keep the ranks of the GaussianCopula's latent normal "
+        "scores, one per row in each column, by which it placed the draws, as one "
+        "written before samples kept them"
+    ),
+    "index_not_comonotone": (
+        "the columns' indices don't rise together over the rows, as where a "
+        "basis-risk model of the caller's moved an index, so the ranks "
+        "Comonotonic() aligned can't be read from them"
+    ),
+    "several_models": (
+        "more than one dependence model moved the block's columns, so no one rule "
+        "deals them again"
     ),
 }
 """Why a call kept rows built together on today's method, by `kept_today` reason."""
@@ -3611,7 +3640,11 @@ def _intervals(intervals: Mapping[str, Any]) -> str:
         " Each resample builds those rows again as the block built them: "
         f"{'; and '.join(_REBUILT[kind] for kind in done)}."
     )
-    others = [_PLACED_BY[kind] for kind in kinds if kind in _PLACED_BY]
+    others = [
+        _PLACED_BY[kind]
+        for kind in kinds
+        if kind in _PLACED_BY and kind not in done and kind not in kept_kinds
+    ]
     if others:
         text += (
             f" On the rows whose draws {' or '.join(others)} placed, resampling "
@@ -3623,11 +3656,12 @@ def _intervals(intervals: Mapping[str, Any]) -> str:
         ' crc-sdk\'s docs/parametric.md, "Rows built together", gives a synthetic '
         'coverage study, which measured these methods only on the "total" rows of '
         "two assets under one EmpiricalCopula, of curves and of a window of two "
-        "horizons, and on the rows of two hazards under one, with their losses as "
-        "damage ratios and on a stated value (re-dealt); on held blocks of the "
-        "curves of one asset or two, of per-year values, of a pool and of two "
-        "hazards with damage ratios (re-ranked); and on held EmpiricalCopula blocks "
-        "of two assets and of two hazards (both)."
+        "horizons, on the rows of two hazards under one, with their losses as "
+        'damage ratios and on a stated value, and on the "total" rows of two '
+        "assets under Comonotonic() and under a GaussianCopula (re-dealt); on held "
+        "blocks of the curves of one asset or two, of per-year values, of a pool "
+        "and of two hazards with damage ratios (re-ranked); and on held "
+        "EmpiricalCopula blocks of two assets and of two hazards (both)."
     )
 
 
