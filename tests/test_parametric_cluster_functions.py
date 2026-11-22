@@ -334,12 +334,20 @@ def test_a_pooled_row_reads_every_held_out_year_with_its_folds_design(
     assert "Scope: cluster" in text
 
 
-def test_a_fold_of_another_shape_is_refused() -> None:
+def test_a_fold_of_other_clusters_is_refused() -> None:
     sample = _table_sample()
     folds = year_block_kfold(sample, 3)
     mixed = [_design(fold != 1, train) for fold, (train, _) in enumerate(folds)]
     with pytest.raises(EvaluationError, match="the same rows on every fold"):
         compare_pooled([mixed], folds, options=FEW)
+    # As many clusters, but other ones: their rows differ by cluster_id alone.
+    renamed = {"A": "east", "B": "east", "C": "west"}
+    other = [
+        _design(False, train, renamed if fold == 1 else ASSIGNMENT)
+        for fold, (train, _) in enumerate(folds)
+    ]
+    with pytest.raises(EvaluationError, match="the same rows on every fold"):
+        compare_pooled([other], folds, options=FEW)
 
 
 def test_a_pooled_design_must_be_its_folds() -> None:
