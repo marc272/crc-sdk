@@ -2,13 +2,15 @@
 
 `pool=` with `.scopes(Joint())` or `.scopes(Clustered(...))`: the assets' pools
 are joined by `OutcomeSample.join` on the same (year, model, member) rows, and
-pools whose rows differ are refused. The tests build tables only to check their
-rows and columns, and that the plan gives what the functions give; nothing here
-is a finding about a design. Every number is synthetic.
+pools whose rows differ are refused, naming the model-years. The tests build
+tables only to check their rows and columns, and that the plan gives what the
+functions give; nothing here is a finding about a design. Every number is
+synthetic.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -45,6 +47,7 @@ from crc_sdk.parametric import (
     compare,
     design_joint,
     holdout,
+    sample_annual,
     sample_annual_pool,
 )
 from crc_sdk.types import SourceProvenance
@@ -156,9 +159,12 @@ def _plan(scope: Any, source: Any = None, **options: Any) -> Any:
     )
 
 
-def _pools_by_hand() -> list[OutcomeSample]:
-    """Each asset's pool, built as the plan builds it, with the plan's generators."""
-    table = _table()
+def _pools_by_hand(table: Any = None, *, missing: Any = "raise") -> list[OutcomeSample]:
+    """Each asset's pool, built as the plan builds it, with the plan's generators.
+
+    `table` defaults to `_table()`.
+    """
+    table = _table() if table is None else table
     children = np.random.SeedSequence(SEED).spawn(len(ASSETS))
     pools: list[OutcomeSample] = []
     for (asset, (point, _, value)), child in zip(ASSETS.items(), children):
@@ -184,6 +190,7 @@ def _pools_by_hand() -> list[OutcomeSample]:
                 basis_risk=ImpactNoise(0.3, upper=1.0),
                 asset_id=asset,
                 rng=np.random.default_rng(child),
+                missing=missing,
             )
         )
     return pools
@@ -485,6 +492,33 @@ EXECUTIONS = {
 }
 
 
+def _pool_message(first: str, other: str, *differing: tuple[str, str]) -> str:
+    """The join's whole message for pools whose rows differ, as a `match=`.
+
+    Each of `differing` is an asset and the model-years only it holds.
+    """
+    message = (
+        "join needs pools of the same (year, model, member) rows, because draw "
+        "numbers alone would not line them up, but those of asset "
+        f"{other!r} differ from those of asset {first!r}: "
+        + "; ".join(f"only asset {asset!r} holds {rows}" for asset, rows in differing)
+    )
+    return f"^{re.escape(message)}$"
+
+
+def _both_models(year: int) -> str:
+    """A year of both models, as the join names model-years."""
+    return ", ".join(f"({year}, {model!r}, {MEMBER!r})" for model in sorted(MODELS))
+
+
+# Asset b holds 2020, which asset a lacks, and lacks 2021, which a holds.
+OTHER_YEARS_REFUSED = _pool_message(
+    "a", "b", ("b", _both_models(2020)), ("a", _both_models(2021))
+)
+# Asset b holds 2020, which asset a lacks.
+FEWER_YEARS_REFUSED = _pool_message("a", "b", ("b", _both_models(2020)))
+
+
 @pytest.mark.parametrize("execute", list(EXECUTIONS.values()), ids=list(EXECUTIONS))
 @pytest.mark.parametrize("scope", list(SCOPES.values()), ids=list(SCOPES))
 def test_pools_of_other_model_years_are_refused(
@@ -493,27 +527,111 @@ def test_pools_of_other_model_years_are_refused(
     plan = _plan(scope, _table(OTHER_YEARS), missing="drop_year")
     plan.explain()  # reads nothing, so the rows are not known yet
     path = tmp_path / "refused.parquet"
-    with pytest.raises(
-        SampleError,
-        match=r"join needs pools of the same \(year, model, member\) rows, because "
-        r"draw numbers alone would not line them up, but those of asset 'b' differ "
-        r"from those of asset 'a'",
-    ):
+    with pytest.raises(SampleError, match=OTHER_YEARS_REFUSED):
         execute(plan, path)
     assert not path.exists()
 
 
+@pytest.mark.parametrize("execute", list(EXECUTIONS.values()), ids=list(EXECUTIONS))
 @pytest.mark.parametrize("scope", list(SCOPES.values()), ids=list(SCOPES))
-def test_pools_of_other_lengths_are_refused(tmp_path: Path, scope: Any) -> None:
+def test_pools_of_other_lengths_are_refused(
+    tmp_path: Path, scope: Any, execute: Any
+) -> None:
+    # Their draw numbers differ too, but on a pool those say nothing of the
+    # model-years: the refusal is the pools' own, naming the model-years.
     plan = _plan(scope, _table(FEWER_YEARS), missing="drop_year")
+    plan.explain()
     path = tmp_path / "refused.parquet"
+    with pytest.raises(SampleError, match=FEWER_YEARS_REFUSED):
+        execute(plan, path)
+    assert not path.exists()
+
+
+def test_join_refuses_pools_of_other_lengths_naming_the_model_years() -> None:
+    pools = _pools_by_hand(_table(FEWER_YEARS), missing="drop_year")
+    assert [len(pool) for pool in pools] == [38, 40, 40]
+    with pytest.raises(SampleError, match=FEWER_YEARS_REFUSED):
+        OutcomeSample.join(pools)
+    # The first sample is the one the others are held against.
     with pytest.raises(
-        SampleError,
-        match=r"join needs identical period columns, but asset 'b' differs from "
-        r"asset 'a'",
+        SampleError, match=_pool_message("c", "a", ("c", _both_models(2020)))
     ):
+        OutcomeSample.join(pools[::-1])
+
+
+def test_join_refuses_pools_of_other_model_years_naming_them() -> None:
+    pools = _pools_by_hand(_table(OTHER_YEARS), missing="drop_year")
+    assert [len(pool) for pool in pools] == [38, 38, 38]
+    with pytest.raises(SampleError, match=OTHER_YEARS_REFUSED):
+        OutcomeSample.join(pools)
+
+
+def test_join_names_three_model_years_and_counts_the_rest() -> None:
+    table = _table()
+    short = table.filter(pc.less_equal(table.column("year"), 2024))
+    full, held = _pools_by_hand(table), _pools_by_hand(short)
+    assert (len(full[0]), len(held[1])) == (40, 20)
+    # Asset a alone holds 2025 to 2034 of both models: 20 model-years.
+    named = f"{_both_models(2025)}, (2026, 'model-a', {MEMBER!r}) and 17 more"
+    with pytest.raises(SampleError, match=_pool_message("a", "b", ("a", named))):
+        OutcomeSample.join([full[0], held[1]])
+
+
+# -- samples that are not pools: the period columns' message ---------------------
+
+
+def _one_model(table: Any) -> Any:
+    """model-a's rows of `table`, as a table of one series per cell."""
+    only = table.filter(pc.equal(table.column("model"), "model-a"))
+    return only.drop_columns(["model", "member", "scenario"])
+
+
+def _years_by_hand(table: Any, asset: str, **options: Any) -> OutcomeSample:
+    """One asset's per-year sample of a table of one series per cell."""
+    point, _, value = ASSETS[asset]
+    return sample_annual(
+        AnnualSeries.nearest_cell(
+            table,
+            longitude=point[0],
+            latitude=point[1],
+            unit="mm/day",
+            source=ARCHIVE,
+        ),
+        loss_model=LossModel(RAMP, value=value, value_unit="EUR"),
+        basis_risk=ImpactNoise(0.3, upper=1.0),
+        asset_id=asset,
+        rng=np.random.default_rng(0),
+        **options,
+    )
+
+
+GENERIC_REFUSED = (
+    r"^join needs identical period columns, but asset 'b' differs from asset 'a'$"
+)
+
+
+@pytest.mark.parametrize("scope", list(SCOPES.values()), ids=list(SCOPES))
+def test_years_of_other_lengths_keep_the_period_columns_message(
+    tmp_path: Path, scope: Any
+) -> None:
+    # Without pool=, each period is a calendar year, which the message names.
+    plan = _plan(scope, _one_model(_table(FEWER_YEARS)), pool=None, missing="drop_year")
+    path = tmp_path / "refused.parquet"
+    with pytest.raises(SampleError, match=GENERIC_REFUSED):
         plan.write_parquet(path)
     assert not path.exists()
+
+
+def test_join_keeps_the_period_columns_message_beside_a_sample_not_pooled() -> None:
+    table = _one_model(_table(FEWER_YEARS))
+    years = [_years_by_hand(table, asset, missing="drop_year") for asset in "ab"]
+    assert [len(sample) for sample in years] == [19, 20]
+    with pytest.raises(SampleError, match=GENERIC_REFUSED):
+        OutcomeSample.join(years)
+    # A pool beside a sample that is not one: no model-years to name.
+    pool = _pools_by_hand()[0]
+    with pytest.raises(SampleError, match=GENERIC_REFUSED):
+        OutcomeSample.join([pool, years[1]])
 
 
 @pytest.mark.parametrize("gaps", [OTHER_YEARS, FEWER_YEARS], ids=["other", "fewer"])
