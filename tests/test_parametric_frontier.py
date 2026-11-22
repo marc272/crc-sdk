@@ -488,10 +488,36 @@ def test_without_ranges_unique_is_null_and_the_text_says_not_checked() -> None:
         budgets=[Budget(amount=5.0), Budget(amount=20.0)],
         evaluate_on=SAMPLE,
         split="in_sample",
+        design_options=DesignOptions(ranges=False),
         metric_options=FEW,
     )
     assert table.column("unique").to_pylist() == [None, None]
     assert setup_text(table).count("unique optimum: not checked") == 2
+
+
+def test_every_lp_row_is_ranged_by_default() -> None:
+    budgets = [Budget(amount=5.0), Budget(amount=20.0)]
+    terms: dict[str, Any] = {
+        "budgets": budgets,
+        "evaluate_on": SAMPLE,
+        "split": "in_sample",
+        "metric_options": FEW,
+    }
+    table = design_frontier(_step([Free(), Free()]), SAMPLE, OBJECTIVES[0], **terms)
+    stated = design_frontier(
+        _step([Free(), Free()]),
+        SAMPLE,
+        OBJECTIVES[0],
+        design_options=DesignOptions(ranges=True),
+        **terms,
+    )
+    assert table.column("unique").to_pylist() == [False, True]
+    assert table.column("design_id").to_pylist() == (
+        stated.column("design_id").to_pylist()
+    )
+    text = setup_text(table)
+    assert "unique optimum: not checked" not in text
+    assert "unique optimum: no" in text and "unique optimum: yes" in text
 
 
 @pytest.mark.parametrize(

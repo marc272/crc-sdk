@@ -146,13 +146,13 @@ def test_the_option_is_off_and_leaves_the_options_document_as_it_was() -> None:
         "feasibility_tolerance": 1e-7,
         "fill": "lowest",
         "max_grid_points": 10_000,
-        "ranges": False,
+        "ranges": True,
     }
     assert REFINE.to_document() == {
         "feasibility_tolerance": 1e-7,
         "fill": "lowest",
         "max_grid_points": 10_000,
-        "ranges": False,
+        "ranges": True,
         "refine": True,
         "refine_max_points": REFINE_MAX_POINTS,
         "refine_tolerance": REFINE_TOLERANCE,
@@ -183,11 +183,18 @@ def test_without_the_option_a_grid_design_is_not_refined() -> None:
     assert plain.refinement is None and plain.refinement_profile is None
     assert "refinement" not in plain.to_record()
     assert plain.parameters["attachment"] == 2.5
-    # The id and the solves of this design before the option existed.
     assert plain.design_id == (
-        "sha256:5c62ad607bd73926d6383887cbd07d664a5dde2ff0c6ddb787b01d6584b72ac2"
+        "sha256:3c4c1e3d276cce73b3b2c4a063123ab71f4316d7fb20a90604a57c7b75fd4fd9"
     )
     assert plain.solves == 5
+    # The id and the solves of this design before the option existed, with
+    # the options of the time: the QP route doesn't range, so only the id,
+    # which holds the options, differs.
+    before = design(_linear(), SAMPLE, MSE(), options=DesignOptions(ranges=False))
+    assert before.design_id == (
+        "sha256:5c62ad607bd73926d6383887cbd07d664a5dde2ff0c6ddb787b01d6584b72ac2"
+    )
+    assert before.solves == 5 and before.parameters == plain.parameters
 
 
 def test_the_option_enters_the_design_id() -> None:
@@ -1116,20 +1123,32 @@ def test_the_setup_text_states_the_index_value_search() -> None:
 
 
 def test_without_the_option_step_and_binary_designs_are_unchanged() -> None:
-    # The ids, values and solves of these designs before the option existed.
+    # The ids, values and solves of these designs before the option existed,
+    # with the options of the time (`ranges=False`); with the default options
+    # only the id, which holds them, differs.
     sample = _sample(STEP_INDEX, STEP_LOSS)
-    step = design(_step(), sample, MSE())
-    assert step.refinement is None and step.refinement_profile is None
-    assert step.parameters["breakpoints[0]"] == 5.0 and step.solves == 4
-    assert step.design_id == (
-        "sha256:fc9745dbf4e558b0e936f99fdf6490b7d559c70f1ac20bc95643e6e6fc16efc1"
-    )
-    binary = design(_binary(), _sample(STEP_INDEX, BINARY_LOSS), MSE())
-    assert binary.refinement is None
-    assert binary.parameters["trigger"] == 5.0 and binary.solves == 4
-    assert binary.design_id == (
-        "sha256:4aa0ffc8feada3b3275da1f32c5a6dc691e0ed642f3972f104fa2e19e9d4513d"
-    )
+    binary_sample = _sample(STEP_INDEX, BINARY_LOSS)
+    before = DesignOptions(ranges=False)
+    for options, step_id, binary_id in (
+        (
+            before,
+            "sha256:fc9745dbf4e558b0e936f99fdf6490b7d559c70f1ac20bc95643e6e6fc16efc1",
+            "sha256:4aa0ffc8feada3b3275da1f32c5a6dc691e0ed642f3972f104fa2e19e9d4513d",
+        ),
+        (
+            DesignOptions(),
+            "sha256:97ba51d480da51dc857e3268746fe772e4474ce5fdce03b53006836b81a3db99",
+            "sha256:f4fa1b2e92c018170818aa362dc6bdc486e1e2ffa66932330e645c9d549f408f",
+        ),
+    ):
+        step = design(_step(), sample, MSE(), options=options)
+        assert step.refinement is None and step.refinement_profile is None
+        assert step.parameters["breakpoints[0]"] == 5.0 and step.solves == 4
+        assert step.design_id == step_id
+        binary = design(_binary(), binary_sample, MSE(), options=options)
+        assert binary.refinement is None
+        assert binary.parameters["trigger"] == 5.0 and binary.solves == 4
+        assert binary.design_id == binary_id
 
 
 def test_other_families_keep_the_compass_search() -> None:

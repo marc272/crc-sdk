@@ -925,10 +925,14 @@ def test_a_breakdown_keeps_its_own_frequency_column() -> None:
 def test_the_hashes_do_not_change() -> None:
     # Each value was read from the code as it stood before the two columns. A
     # solved cover's hash is left out: it holds the solver's floating-point amounts.
+    # The design's is that of its options at the time, `ranges=False`; with
+    # DesignOptions(), which ranges by default, the options document differs,
+    # and so does the id.
     block = _design_block()
     assert block.content_hash == HASHES["sample"]
     assert _step_template().definition_hash == HASHES["blank"]
-    result = _designed()
+    assert _designed().design_id == HASHES["design_ranged"]
+    result = _designed(ranges=False)
     assert result.design_id == HASHES["design"]
     row = _one(evaluate(result, block, split="in_sample"))
     assert (row["sample_hash"], row["design_id"]) == (
@@ -944,6 +948,9 @@ HASHES = {
     "sample": "sha256:5eb02d58809c7274d7a6d73cdcd808a11ed482f2139a028e730958d8d422d992",
     "blank": "sha256:6c2decd269621b6a39d8b99466530baa98c6a913f3bdcd67c3b0ecdbb1688fdb",
     "design": "sha256:c18127c17fc29eaeedfa63cd162070aa7af2879b5099c192f5e66b9e3ce32bcd",
+    "design_ranged": (
+        "sha256:02dea3b788a5db73dc791fa060ad4f0dfda17d258a5caecdab536dc7297441e8"
+    ),
     "given": "sha256:e1777894aa14ea78f40882bae40778aeead889ccddf6d537dfc25d1a83789219",
 }
 

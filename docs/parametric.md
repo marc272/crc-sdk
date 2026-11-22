@@ -2865,11 +2865,16 @@ design_years, held_out = holdout(sample, train_fraction=0.7)
 template = Cover(index, StepPayout([60.0, 80.0, 100.0], [Free(), Free(), Free()]),
                  payout_unit="EUR", asset_id="warehouse-a")
 result = design(template, design_years, WeightedCVaR(alpha=0.9, beta=0.95),
-                pricing=CostOfCapitalLoad(0.06, 0.99), budget=Budget(ratio=0.8),
-                options=DesignOptions(ranges=True))
+                pricing=CostOfCapitalLoad(0.06, 0.99), budget=Budget(ratio=0.8))
 result.cover, result.parameters, result.objective_value, result.premium
+result.unique, result.ranges   # the optimal set, ranged by default on the LP route
 evaluate(result, held_out, split="out_of_sample")   # priced at the design premium
 ```
+
+`DesignOptions()` ranges an LP design's optimal set, so `result.unique` says
+whether the designed amounts are the only optimal ones;
+`options=DesignOptions(ranges=False)` skips that ([non-unique
+optima](#non-unique-optima)).
 
 The design needs the optional extra `crc-sdk[parametric]` (the HiGHS solver,
 `highspy`) on its linear and quadratic routes; without it they raise
@@ -3121,8 +3126,8 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
     are those of a design made before it existed, and `refinement` is
     `None`.
   - **Ties and non-uniqueness.** Where the refinement ends, the amounts are
-    solved again with the uniqueness report, so `unique`, `ranges` (with
-    `ranges=True`) and the QP's eigenvalue rule are those of the amounts at
+    solved again with the uniqueness report, so `unique`, `ranges` (unless
+    `ranges=False`) and the QP's eigenvalue rule are those of the amounts at
     the refined thresholds. `ties` counts the grid's candidates within the tie
     tolerance of the refined objective, which is 0 after any move, since each
     move gains more than that tolerance; when the refinement doesn't move,
@@ -3250,16 +3255,16 @@ rather than presenting one solver's answer as the design.
   the largest, and raises without a bound above. Both keep the design exactly
   optimal, but out of sample a year can fall into such a band, and then the
   rule sets its payout.
-- **The LP route.** With `DesignOptions(ranges=True)` every identified amount
-  is ranged over the near-optimal designs, those within ε · max(1, |optimum|)
-  of the optimum in scaled units, at ε = 1e-9 and ε = 1e-11: four range ends
-  per amount, each the optimum of an LP, at HiGHS feasibility tolerances of
-  1e-10. An amount is pinned when its narrow range is at most half its wide
-  one, or narrower than 1e-7 of the scale; `unique` is true when every
-  identified amount is pinned, and
-  `DesignResult.ranges` gives the wide ranges in payout units. At a unique
-  vertex a range shrinks with ε; on a set of optimal designs it keeps the set's
-  width. Without `ranges=True`, `unique` is `None` on the LP route.
+- **The LP route.** By default (`DesignOptions()`, whose `ranges` is true),
+  every identified amount is ranged over the near-optimal designs, those within
+  ε · max(1, |optimum|) of the optimum in scaled units, at ε = 1e-9 and
+  ε = 1e-11: four range ends per amount, each the optimum of an LP, at HiGHS
+  feasibility tolerances of 1e-10. An amount is pinned when its narrow range is
+  at most half its wide one, or narrower than 1e-7 of the scale; `unique` is
+  true when every identified amount is pinned, and `DesignResult.ranges` gives
+  the wide ranges in payout units. At a unique vertex a range shrinks with ε; on
+  a set of optimal designs it keeps the set's width. With
+  `DesignOptions(ranges=False)`, `unique` is `None` on the LP route.
 - **How a range end is solved.** Its LP is as large as the design's, with
   columns and rows for every draw, but only the draws whose payout crosses
   their loss (or the CVaR's threshold) within the near-optimal set change
@@ -3275,20 +3280,29 @@ rather than presenting one solver's answer as the design.
   draws whose piece broke get their own columns and rows, for this end and
   every later one, and the LP is solved again. An end whose smaller LP is not
   solved to optimality, or that takes 100 of them, is solved on the full LP,
-  on one HiGHS instance that starts from the design LP's basis. The design
-  record counts every solve. `design_joint` ranges the same way.
-- **What ranging costs.** Four range ends per identified amount, each a small
-  LP that grows with the draws near a kink rather than with all of them, paid
-  again for every design (every objective, fold and budget). On one synthetic
-  setup (one asset, 20,000 draws, a piecewise linear cover with five free
-  levels, weighted CVaR with α = 0.9 and β = 0.9, pure premium, a budget and a
-  limit, on one laptop), the design took 1.39 s without ranges and 1.43 s
-  with them, where solving every range end on the full LP took 30 s. Ranging is
-  off by default: an LP design's rows then have `unique` null, the setup text
-  says "unique optimum: not checked", and `DesignResult.ranges` is `None`;
-  state `DesignOptions(ranges=True)` when you need the report, and read a
-  design whose `unique` is null as one member of a set that may hold others.
-  The QP route reports `unique` either way.
+  on one HiGHS instance that starts from the design LP's basis. The design LP
+  itself is solved at HiGHS's default tolerances of 1e-7, so its optimum can
+  lie below the LP's optimum at 1e-10 by more than ε, and a near-optimal set is
+  then empty at 1e-10. When an end's full LP is infeasible, the full LP's
+  optimum at 1e-10 is solved for, and if it lies above the design's, every end
+  is ranged again from it; otherwise, or if a set is still empty, the design
+  raises `InfeasibleDesignError`. The design record counts every solve.
+  `design_joint` ranges the same way.
+- **What ranging costs, and turning it off.** Four range ends per identified
+  amount, each a small LP that grows with the draws near a kink rather than
+  with all of them, paid again for every design (every objective, fold and
+  budget). On one synthetic setup (one asset, 20,000 draws, a piecewise linear
+  cover with five free levels, weighted CVaR with α = 0.9 and β = 0.9, pure
+  premium, a budget and a limit, on one laptop), the design took 1.39 s
+  without ranges and 1.43 s with them, where solving every range end on the
+  full LP took 30 s. So ranging is on by default, and every LP design states
+  whether its amounts are unique. `DesignOptions(ranges=False)` turns it off:
+  an LP design's rows then have `unique` null, the setup text says "unique
+  optimum: not checked", and `DesignResult.ranges` is `None`; read such a
+  design as one member of a set that may hold others. The options enter the
+  `design_id`, so a design made with `ranges=False` has another id than the
+  same design made with `DesignOptions()`, on every route. The QP route reports
+  `unique` either way, and a grid evaluated in numpy never ranges.
 - **The QP route.** `unique` is true when H = Bᵀ diag(p) B, over the identified
   amounts, is positive definite (smallest eigenvalue above 1e-10 of the
   largest).
@@ -3365,9 +3379,10 @@ sample.
   neighbouring budgets where a row isn't unique.
 - **Non-uniqueness and degenerate tails are reported on each row**: `unique`,
   `ties`, `degenerate_tail` and `unidentified_share`, as on any design's row.
-  `DesignOptions(ranges=True)` applies to every row, at four more LPs per amount and
-  per budget; without it `unique` is null on the LP route and the setup text says
-  "not checked" ([non-unique optima](#non-unique-optima)).
+  `DesignOptions()` ranges every LP row, at four more LPs per amount and per
+  budget; with `design_options=DesignOptions(ranges=False)` `unique` is null on the
+  LP route and the setup text says "not checked" ([non-unique
+  optima](#non-unique-optima)).
 - **The table names no best budget.** It has no rank, no best flag, no marginal
   column and no ordering by a metric. A difference between two rows describes that
   pair of budgets, on the block stated.
@@ -3428,8 +3443,8 @@ L_d = Σ_j L_{d,j} and the total payout π_d = Σ_j π_{d,j}.
 - **The solver's split between the assets is often not identified.** The covers
   enter the objective through their sum, so several splits of one total payout
   can be optimal. Unless `unique` is true, a design's per-asset amounts are one
-  member of an optimal set, and `DesignOptions(ranges=True)` reports their
-  ranges on the LP route ([non-unique optima](#non-unique-optima)).
+  member of an optimal set, and on the LP route `DesignOptions()` reports their
+  ranges, unless `ranges=False` ([non-unique optima](#non-unique-optima)).
 
 `JointDesignResult` holds the record of a design, with these differences:
 `covers` (asset id to resolved `Cover`) replaces `cover`, `template_hashes`
