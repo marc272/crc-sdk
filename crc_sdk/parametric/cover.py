@@ -18,8 +18,10 @@ from crc_sdk.parametric.errors import (
     UnresolvedParameterError,
 )
 from crc_sdk.parametric.index import (
+    ClusterIndex,
     CompositeIndex,
     IndexDefinition,
+    _cluster_words,
     _index_words,
     _unit_words,
 )
@@ -36,6 +38,7 @@ from crc_sdk.parametric.payouts import (
 )
 
 __all__ = [
+    "CLUSTER_COVER_SCHEMA_VERSION",
     "COMPOSITE_COVER_SCHEMA_VERSION",
     "COVER_SCHEMA_VERSION",
     "COVER_SEMANTICS_VERSION",
@@ -47,6 +50,15 @@ COVER_SCHEMA_VERSION = "1.0"
 
 COMPOSITE_COVER_SCHEMA_VERSION = "1.1"
 """The `schema_version` of the document of a cover on a `CompositeIndex`."""
+
+CLUSTER_COVER_SCHEMA_VERSION = "1.2"
+"""The `schema_version` of the document of a cover on a `ClusterIndex`."""
+
+_SCHEMA_VERSIONS = (
+    COVER_SCHEMA_VERSION,
+    COMPOSITE_COVER_SCHEMA_VERSION,
+    CLUSTER_COVER_SCHEMA_VERSION,
+)
 
 COVER_SEMANTICS_VERSION = "crc-parametric-cover/1"
 """The `semantics_version` of cover documents."""
@@ -87,7 +99,7 @@ def _reject_constant(name: str) -> NoReturn:
 
 
 def _check_payout_reads(
-    payout: PayoutFunction, index: IndexDefinition | CompositeIndex
+    payout: PayoutFunction, index: IndexDefinition | CompositeIndex | ClusterIndex
 ) -> None:
     """Raise `CoverDefinitionError` unless `payout` reads what `index` holds."""
     if isinstance(index, CompositeIndex):
@@ -130,7 +142,13 @@ class Cover:
     The payout's `index_names` must then equal its names and its `tail` be the
     tuple of its tails, in order, and the cover document writes
     `COMPOSITE_COVER_SCHEMA_VERSION`, so that a reader of the one-index
-    document refuses it.
+    document refuses it. Or it may be a `ClusterIndex`, the weighted mean of
+    one index over a cluster's assets, for the cover of a cluster, which
+    `design_joint` makes under `Clustered`. Its payout reads one index, as on
+    an `IndexDefinition`; `asset_id` then names the cluster, the document
+    writes `CLUSTER_COVER_SCHEMA_VERSION`, and `cluster_index` holds the
+    index, as `index` and `index_definition` read one asset's index and raise
+    on it.
 
     A cover with `Free` parameters is a template: it has a document and a
     hash, but `payout_values` raises until `with_values` (or a design)
@@ -160,17 +178,17 @@ class Cover:
 
     def __init__(
         self,
-        index: IndexDefinition | CompositeIndex,
+        index: IndexDefinition | CompositeIndex | ClusterIndex,
         payout: PayoutFunction,
         *,
         payout_unit: str,
         asset_id: str | None = None,
         label: str | None = None,
     ) -> None:
-        if not isinstance(index, IndexDefinition | CompositeIndex):
+        if not isinstance(index, IndexDefinition | CompositeIndex | ClusterIndex):
             raise CoverDefinitionError(
-                "index must be an IndexDefinition or a CompositeIndex, got "
-                f"{type(index).__name__}"
+                "index must be an IndexDefinition or a CompositeIndex, or a "
+                f"ClusterIndex for a cluster's cover, got {type(index).__name__}"
             )
         if not isinstance(payout, PayoutFunction):
             raise CoverDefinitionError(
@@ -195,6 +213,8 @@ class Cover:
             "schema_version": (
                 COMPOSITE_COVER_SCHEMA_VERSION
                 if isinstance(index, CompositeIndex)
+                else CLUSTER_COVER_SCHEMA_VERSION
+                if isinstance(index, ClusterIndex)
                 else COVER_SCHEMA_VERSION
             ),
             "semantics_version": COVER_SEMANTICS_VERSION,
@@ -223,19 +243,38 @@ class Cover:
         """The index of a cover on one index.
 
         Raises `CoverDefinitionError` on a cover with a `CompositeIndex`,
-        which has no one index: read `index_definition`.
+        which has no one index: read `index_definition`; and on a cluster's
+        cover, as `index_definition` does.
         """
-        if isinstance(self._index, CompositeIndex):
+        index = self.index_definition
+        if isinstance(index, CompositeIndex):
             raise CoverDefinitionError(
-                f"this cover pays on the components {list(self._index.names)}, not "
+                f"this cover pays on the components {list(index.names)}, not "
                 "on one index: read cover.index_definition, its CompositeIndex"
+            )
+        return index
+
+    @property
+    def index_definition(self) -> IndexDefinition | CompositeIndex:
+        """What the cover pays on: an `IndexDefinition` or a `CompositeIndex`.
+
+        Raises `CoverDefinitionError` on a cluster's cover, whose index is read
+        at several assets: read `cluster_index`. So a cluster's cover never
+        passes for a cover of one asset's index.
+        """
+        if isinstance(self._index, ClusterIndex):
+            raise CoverDefinitionError(
+                "this cover pays on the weighted mean of the index of the assets "
+                f"{list(self._index.members)}, not on one asset's index: read "
+                "cover.cluster_index, and evaluate it through its "
+                "ClusteredDesignResult"
             )
         return self._index
 
     @property
-    def index_definition(self) -> IndexDefinition | CompositeIndex:
-        """What the cover pays on: an `IndexDefinition` or a `CompositeIndex`."""
-        return self._index
+    def cluster_index(self) -> ClusterIndex | None:
+        """The `ClusterIndex` of a cluster's cover; `None` on any other cover."""
+        return self._index if isinstance(self._index, ClusterIndex) else None
 
     @property
     def payout(self) -> PayoutFunction:
@@ -334,10 +373,13 @@ class Cover:
 
         - `Label`, when the cover has one: a display name, not a term;
         - `Asset`: the asset the cover is written for, or that it names none;
+          on a `ClusterIndex`, `Cluster`: the cluster it is written for, or
+          that it names none;
         - `Index`: the hazard, its unit, where it is read, its severe side,
           the aggregation and the source, saying plainly when the terms state
           no aggregation or source; on a `CompositeIndex`, one indented line
-          per component, in order;
+          per component, in order; on a `ClusterIndex`, its members and their
+          weights first;
         - `Payout per year`: the payout unit and the family, with its `kind`,
           then one indented line per band, knot or cell, from nothing to the
           most severe, in index and payout units. A value equal to a threshold
@@ -368,11 +410,16 @@ class Cover:
             if self._label is None
             else [f"Label: {self._label} (a display name, not part of the terms)"]
         )
-        lines.append(
-            f"Asset: {'not named' if self._asset_id is None else self._asset_id}"
-        )
+        named = "not named" if self._asset_id is None else self._asset_id
+        if isinstance(index, ClusterIndex):
+            lines.append(f"Cluster: {named}")
+        else:
+            lines.append(f"Asset: {named}")
         axes: dict[str, _Axis]
-        if isinstance(index, CompositeIndex):
+        if isinstance(index, ClusterIndex):
+            lines.append(f"Index: {_cluster_words(index)}")
+            axes = {"index": (index.hazard_name, index.unit)}
+        elif isinstance(index, CompositeIndex):
             lines.append(f"Index: {len(index.names)} components, in this order")
             lines += [
                 f"  - {name}: {_index_words(component)}"
@@ -426,8 +473,9 @@ class Cover:
         """Read a cover document, as `to_document` returns it.
 
         The payout's `kind` is looked up among the registered payout
-        classes. A document of `COVER_SCHEMA_VERSION` holds one index, and one
-        of `COMPOSITE_COVER_SCHEMA_VERSION` a `CompositeIndex`. Raises
+        classes. A document of `COVER_SCHEMA_VERSION` holds one index, one
+        of `COMPOSITE_COVER_SCHEMA_VERSION` a `CompositeIndex` and one of
+        `CLUSTER_COVER_SCHEMA_VERSION` a `ClusterIndex`. Raises
         `UnknownPayoutKindError` for an unregistered kind, and
         `CoverDefinitionError` for missing or unknown keys, another schema or
         semantics version, or invalid terms.
@@ -443,7 +491,7 @@ class Cover:
                 f"missing: {missing}; unknown: {unknown}"
             )
         version = document["schema_version"]
-        if version not in (COVER_SCHEMA_VERSION, COMPOSITE_COVER_SCHEMA_VERSION):
+        if version not in _SCHEMA_VERSIONS:
             raise CoverDefinitionError(
                 f"unsupported cover schema_version {document['schema_version']!r}"
             )
@@ -455,12 +503,15 @@ class Cover:
         if not isinstance(payout_document, Mapping):
             raise CoverDefinitionError("a payout document must be an object")
         payout = _payout_reader(payout_document.get("kind"))(payout_document)
+        index: IndexDefinition | CompositeIndex | ClusterIndex
+        if version == COMPOSITE_COVER_SCHEMA_VERSION:
+            index = CompositeIndex.from_document(document["index"])
+        elif version == CLUSTER_COVER_SCHEMA_VERSION:
+            index = ClusterIndex.from_document(document["index"])
+        else:
+            index = IndexDefinition.from_document(document["index"])
         return cls(
-            (
-                CompositeIndex.from_document(document["index"])
-                if version == COMPOSITE_COVER_SCHEMA_VERSION
-                else IndexDefinition.from_document(document["index"])
-            ),
+            index,
             payout,
             payout_unit=document["payout_unit"],
             asset_id=document["asset_id"],
