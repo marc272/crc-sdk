@@ -6759,9 +6759,10 @@ class ParametricPlan:
 
         The refusals of a `ScenarioSet` run on each asset's samples, or on the
         samples of all the assets under `Joint()` or `Clustered`, through the
-        function the set runs at construction. On per-year values one asset at a time, the assets
-        must read each scenario at one horizon, which the merge of their tables
-        requires (`_check_scenario_horizons`), before anything is designed.
+        function the set runs at construction. On per-year values one asset at
+        a time, the assets must read each scenario at one horizon, which the
+        merge of their tables requires (`_check_scenario_horizons`), before
+        anything is designed.
         """
         self._check_hazard_plan()
         self._check_scopes()
