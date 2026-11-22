@@ -362,12 +362,13 @@ MOVED = [
 def test_every_model_that_moves_draws_flags_the_total(model: Any, kind: str) -> None:
     # Each column's draws are placed by their ranks over every row, so a row of
     # several columns doesn't hold independent draws; one column's draws are
-    # the same whatever their order. Only the EmpiricalCopula was measured.
+    # the same whatever their order. The coverage study measured the built-in
+    # models' rows, and a model of the caller's stays unmeasured.
     table = _intervals([_covers()], _assets(model()))
     assert [flag for *_, flag in _flags(table)] == [False, False, True]
     assert _record(table) == [kind]
     unmeasured = "where interval coverage is unmeasured" in _intervals_line(table)
-    assert unmeasured is (kind != "empirical_copula")
+    assert unmeasured is (kind == "dependence_model")
 
 
 @pytest.mark.parametrize("model", [_copula, Comonotonic], ids=["copula", "comonotonic"])
