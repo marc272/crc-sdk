@@ -188,7 +188,11 @@ def _design_record(**changes: Any) -> dict[str, Any]:
 
 def _with_designs(*records: dict[str, Any]) -> EvaluationMetadata:
     base = _metadata(evaluate(COVER, _sample(), split="in_sample"))
-    return base.model_copy(update={"designs": records})
+    # A fixed stamp: each call would otherwise read the wall clock, and two
+    # stamps a second apart make equal metadata compare unequal.
+    return base.model_copy(
+        update={"designs": records, "created_at": "2026-01-01T00:00:00+00:00"}
+    )
 
 
 def test_merge_keeps_the_first_of_two_records_differing_in_solve_time() -> None:
