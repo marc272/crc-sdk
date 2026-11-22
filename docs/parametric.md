@@ -2348,11 +2348,11 @@ between the two.
 | Column | Type | Meaning |
 | --- | --- | --- |
 | `cover_label` | string | The cover's label, or the first 12 hex digits of its hash. On `"total"` and allocated rows, the covers' label if they all share one, else the first 12 hex digits of `cover_hash` |
-| `cover_hash` | string | `Cover.definition_hash`. On `"total"` and allocated rows, the hash of the set of covers, one per asset |
+| `cover_hash` | string | `Cover.definition_hash`. On `"total"` and allocated rows, the hash of the set of covers, one per asset or, under `Clustered`, one per cluster |
 | `design_id` | string, nullable | The design's id; null for a cover given as is, and on the `"total"` row of a set of covers |
-| `asset_id` | string, nullable | The asset; null exactly on `"total"` rows |
-| `level` | string | `"asset"`: an asset's own cover. `"total"`: the sum over the assets of one owner, draw by draw. `"asset_by_value"`, `"asset_by_loss"`: an asset's share of a joint design's total payout, under the rule in the name, in [a table of their own](#allocated-rows-in-a-table-of-their-own). `"package"`: the sum of one asset's separate contracts (`CoverPackage`), draw by draw, against the combined loss, with the sum of their premiums; `cover_hash` is the package's hash and `design_id` is null |
-| `scope` | string | `"individual"`, each cover standing on its own, or `"joint"`, one objective and one budget on the owner's total |
+| `asset_id` | string, nullable | The asset; null on `"total"` and `"cluster"` rows, and only there |
+| `level` | string | `"asset"`: an asset's own cover. `"total"`: the sum over the assets of one owner, draw by draw. `"asset_by_value"`, `"asset_by_loss"`: an asset's share of a joint design's total payout, or under `Clustered` of its cluster's payout, under the rule in the name, in [a table of their own](#allocated-rows-in-a-table-of-their-own). `"package"`: the sum of one asset's separate contracts (`CoverPackage`), draw by draw, against the combined loss, with the sum of their premiums; `cover_hash` is the package's hash and `design_id` is null. `"cluster"`: a cluster's own cover under `Clustered(..., joint=False)`, against the sum of its assets' losses ([clusters](#clusters-of-assets)) |
+| `scope` | string | `"individual"`, each cover standing on its own, `"joint"`, one objective and one budget on the owner's total, or `"cluster"`, one cover per cluster of the owner's assets (`Clustered`) |
 | `scenario` | string | The sample's scenario, `"baseline"` by default |
 | `design_scenario` | string, nullable | The `scenario` of the design's own design sample. Null for a cover given as is, and on a `"total"` or `"package"` row whose designs don't share one |
 | `pathway`, `horizon`, `product` | string, int32, string; nullable | What the sample's source records state, never its label, and null where they state none: the canonical row's `pathway` and `horizon` and the dataset's provider; for a window of horizons, the members' pathway and the centre of their horizons; for per-year rows, the pathway of the series or the pool, the centre `(first + last) // 2` of its years, and the provider of its source; for a table, its source's `pathway` and `provider`. On a sample of several hazards `product` holds every provider, joined by `+` |
@@ -2363,8 +2363,9 @@ between the two.
 | `premium_basis` | string, nullable | `"stated"`, `"design"`, `"evaluation"` or, in `compare_scenarios`, `"reference"`; null exactly on allocated rows |
 | `unique`, `ties`, `degenerate_tail` | bool, int32, string; nullable | The design's non-uniqueness report; null for a cover given as is |
 | `components` | string, nullable | What the row's cover reads of a sample with index components, joined by `+`; null on a sample of one hazard |
-| `design_budget` | float64, nullable | The design's budget bound in payout units. On a `"package"` row, or the `"total"` row of a set of covers, the sum of the covers' bounds, null if any has none. Null for a cover given as is |
-| `copula_reference_years` | int32, nullable | m, the reference's rows, on a row that reads a sum over the columns an `EmpiricalCopula` reordered: the `"total"` and allocated rows of a sample of several assets, and every row of a sample of several hazards. Null on any other row: an `"asset"` row of a sample of several assets, other dependence models and per-year samples |
+| `design_budget` | float64, nullable | The design's budget bound in payout units. On a `"package"` row, or the `"total"` row of a set of covers or of a design under `Clustered(..., joint=False)`, the sum of the covers' bounds, null if any has none. Null for a cover given as is |
+| `cluster_id` | string, nullable | The cluster's id on a `"cluster"` row; null on every other row, and in a table written before the column |
+| `copula_reference_years` | int32, nullable | m, the reference's rows, on a row that reads a sum over the columns an `EmpiricalCopula` reordered: the `"total"` and allocated rows of a sample of several assets, a `"cluster"` row of two assets or more and its assets' allocated rows, and every row of a sample of several hazards. Null on any other row: an `"asset"` row of a sample of several assets, other dependence models and per-year samples |
 | `copula_block_tail_b<β>` | bool, nullable | One per β of `MetricOptions.betas`, labelled as the metrics are, and null where `copula_reference_years` is: true when (1 − β)·m ≤ 1, with the tolerance of `degenerate_tail` (1e-9), so that the tail at β holds at most one reference year's block, inside which the columns are independent by assumption; else false |
 | `short_block_b<β>`, `short_block_rp<T>` | bool, nullable | One per β of `MetricOptions.betas` and per T of `return_periods`, labelled as the metrics are: true when the level reaches the block's worst row, (1 − β)·n ≤ 1 or T > n with n the row's `n_rows` ([short blocks](#short-blocks)); else false. Null only in a table written before them |
 | one column per metric | float64, nullable | As defined above; null where undefined |
@@ -3402,9 +3403,10 @@ different values of `split` or `fold`, because a file can't repeat a row key.
 
 A risk owner with several sites may ask for one objective on the total: what
 the owner loses and is paid across the sites in the same year. A joint design
-states that objective. It is a method, and this page describes what it does
-and what it optimises. It makes no statement about how a joint design does
-against covers designed asset by asset.
+states that objective, and a design of [clusters](#clusters-of-assets) pays one
+cover per group of sites. Each is a method, and this page describes what it
+does and what it optimises. It makes no statement about how a joint or cluster
+design does against covers designed asset by asset, or against each other.
 
 ### What a joint design optimises
 
@@ -3606,6 +3608,108 @@ columns.
   that holds across the whole call, whichever scenario each entry was designed
   on. It is the way to pool allocated rows over
   folds or give them intervals.
+
+### Clusters of assets
+
+An owner may group the sites into clusters, a region each for example, and buy
+one cover per cluster, on an index of the cluster. `Clustered(assignment, *,
+values, joint=True)` is that scope of `design_joint`. It is a method: this
+section says what it does and what it optimises, and makes no statement about
+how a cluster design does against covers designed asset by asset or jointly, in
+either direction.
+
+```python
+from crc_sdk.parametric import ClusterIndex, Clustered, ClusteredDesignResult
+
+book_sites = [("warehouse-a", 6.96, 50.94, 2e6), ("warehouse-b", 7.10, 51.10, 1.5e6),
+              ("depot-c", 7.15, 50.90, 1e6)]
+book_values = {asset: value for asset, _, _, value in book_sites}
+book = OutcomeSample.join(
+    sample_annual(
+        AnnualSeries.nearest_cell(annual, longitude=lon, latitude=lat,
+                                  unit="mm/day", source=provenance),
+        loss_model=LossModel(PiecewiseLinearImpact([40.0, 120.0], [0.0, 0.5]),
+                             value=value, value_unit="EUR"),
+        basis_risk=ImpactNoise(0.3, upper=1.0),
+        asset_id=asset,
+        rng=np.random.default_rng(child),
+    )
+    for (asset, lon, lat, value), child in zip(
+        book_sites, np.random.SeedSequence(7).spawn(len(book_sites)))
+)
+book_years, book_held_out = holdout(book, train_fraction=0.7)
+regions = Clustered({"warehouse-a": "north", "warehouse-b": "north",
+                     "depot-c": "south"},
+                    values=book_values, joint=True)
+cluster_design = design_joint([step, step], book_years,    # one template per cluster
+                              WeightedCVaR(alpha=0.9, beta=0.9),
+                              budget=Budget(ratio=0.8), scope=regions)
+assert isinstance(cluster_design, ClusteredDesignResult)
+north = cluster_design.covers["north"].cluster_index       # a ClusterIndex
+print(dict(north.weights))      # each site's value over the cluster's: 4/7 and 3/7
+cluster_table = compare([cluster_design], book_held_out, split="out_of_sample")
+cluster_shares = allocate([cluster_design], book_held_out, split="out_of_sample",
+                          allocation="value", values=book_values)
+```
+
+- **The assignment is stated.** `assignment` maps every asset of the sample to
+  a cluster id of your choice. The clusters come in the order the assignment
+  first names them (`regions.cluster_ids`), and each cluster's assets in the
+  order it names them. The module clusters nothing itself: which sites belong
+  together is the caller's choice, and an asset of the sample left out, an
+  assigned asset the sample doesn't hold, or a cluster left with none raises
+  `SampleError`.
+- **The index.** Each cluster's cover pays on the value-weighted mean of its
+  assets' indices, ξ_{d,c} = Σ_{i∈c} w_i x_{d,i} with w_i = v_i / Σ_{k∈c} v_k,
+  where `values=` gives each asset's value v_i in the loss unit. A cluster's
+  loss is the sum of its assets' losses in each draw. So a cluster's cover pays
+  on a trigger that none of its assets has alone, and a one-asset cluster's
+  index is its asset's. The resolved cover is written for the cluster: its
+  `asset_id` is the cluster id, and its index is a `ClusterIndex`, which names
+  the members and their weights, so the cover document and its hash hold them
+  (`schema_version` `"1.2"`). `cover.cluster_index` returns it, and
+  `cover.index` and `cover.index_definition` raise on such a cover, as it reads
+  several assets.
+- **What it optimises.** With `joint=True`, the thesis's setting, there is one
+  design problem over every cluster: the objective, the premium and the budget
+  are on the owner's total, L_d = Σ_c L_{d,c} and π_d = Σ_c π_{d,c}, as under
+  `Joint()` with the clusters as the covers. With `joint=False` there is one
+  design problem per cluster, on its own loss and payout, each with its own
+  objective, premium and budget: `Budget(ratio=κ)` means a premium of at most
+  κ·E[L_c] for cluster c. Both settings have the same clusters and the same
+  index.
+- **The rules of a joint design hold.** One template per cluster, in
+  `regions.cluster_ids` order, each on the `IndexDefinition` its assets read
+  and written for no asset or for its cluster; fixed thresholds only, payouts
+  linear in their amounts, `limit=` per cover. Under `joint=True` the split
+  between the clusters' covers is often not identified: unless `unique` is
+  true, the per-cluster amounts are one member of an optimal set.
+- **The result.** `ClusteredDesignResult` holds the record of a
+  `JointDesignResult`, keyed by cluster: `covers`, `parameters`,
+  `unidentified`, `zeroed` and `ranges`. Its `premium` is on the total: the
+  design premium of one contract under `joint=True`, and the sum of the
+  clusters' premiums under `joint=False`, each cluster being its own contract.
+  Under `joint=False`, `clusters` maps each cluster to its `ClusterDesign`: its
+  objective value, premium, budget and uniqueness report.
+
+| Setting | Rows of `evaluate` and `compare`, all `scope="cluster"` |
+| --- | --- |
+| `joint=True` | One `"total"` row, with the design premium. No row per cluster: the split of the total payout across the clusters' covers is the solver's choice, as for a joint design |
+| `joint=False` | One `"cluster"` row per cluster, with `cluster_id` and its own design premium, its cover's payout against the cluster's loss; then the `"total"` row, whose premium is the sum of the clusters' |
+
+- **Allocated rows.** `allocate`, and `allocation=` on `evaluate` and
+  `compare`, share each cluster's payout over that cluster's own assets, in
+  both settings, by value or by loss within the cluster: a cluster's cover
+  pays on its cluster's index, so its payout belongs to its cluster. They hold
+  no premium, as for a joint design, and the rows of a cluster's assets add up
+  to its payout. `values=` is required, as for any allocation.
+- **The setup text** states the clusters, their assets, the setting and how
+  the total's premium is made.
+- **Not yet.** `compare_pooled`, `bootstrap_intervals`, `compare_scenarios`,
+  `allocate_scenarios` and `payout_breakdown` don't take a cluster design yet,
+  and raise `EvaluationError`; nor does the plan's `.scopes(...)`. A cluster's
+  cover on its own is refused by `evaluate`, `compare` and `design`: evaluate
+  it through its `ClusteredDesignResult`.
 
 ## Several hazards at one asset
 
@@ -4279,14 +4383,20 @@ rank and no best flag.
 
 ## What this version does not do
 
-- **Clusters of assets, free thresholds in a joint design.** A joint design
-  covers all the assets of its sample, as one scope, with fixed thresholds
-  only. A `Limit` is each cover's own: a limit on the owner's total isn't
+- **Clustering, free thresholds in a joint design.** A design under
+  `Clustered` takes a stated assignment: the module groups no assets itself. A
+  joint or cluster design covers all the assets of its sample, with fixed
+  thresholds only. A `Limit` is each cover's own: a limit on the owner's total isn't
   offered. By default, each asset is designed and evaluated on its own sample
   and a plan builds one sample per asset, so it assumes no dependence between
   them.
 - **Different terms per asset on the plan.** Under `Joint()` a plan applies each
   cover to every asset. `design_joint` takes one template per asset.
+- **Clusters on the plan, in pooled folds, intervals and scenarios.** A design
+  under `Clustered` is made with `design_joint` and read by `evaluate`, `compare`
+  and `allocate`; the plan, `compare_pooled`, `bootstrap_intervals`,
+  `compare_scenarios`, `allocate_scenarios` and `payout_breakdown` don't take it
+  yet.
 - **Several hazards beside `Joint()`, pools or an index read elsewhere, on the
   plan.** A plan with `.hazard(...)` refuses `Joint()`, `pool=` and
   `.index(...)`, and `.payout_breakdown()` isn't offered with `Joint()`.

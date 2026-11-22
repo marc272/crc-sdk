@@ -1,11 +1,13 @@
 """What a parametric cover pays on: the index definition and its location.
 
 `IndexDefinition` is one index. `CompositeIndex` names several, for a cover
-that pays on several hazards at once.
+that pays on several hazards at once. `ClusterIndex` is the weighted mean of
+one index over several assets, for the cover of a cluster of assets.
 """
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -25,6 +27,7 @@ __all__ = [
     "AtCell",
     "AtPoint",
     "AtStation",
+    "ClusterIndex",
     "CompositeIndex",
     "IndexDefinition",
     "Location",
@@ -406,3 +409,180 @@ class CompositeIndex:
 
     def __reduce__(self) -> tuple[Any, tuple[dict[str, IndexDefinition]]]:
         return (type(self), (dict(self.components),))
+
+
+_CLUSTER_KEYS = frozenset({"index", "kind", "members"})
+_CLUSTER_MEMBER_KEYS = frozenset({"asset_id", "weight"})
+_ASSET_ID = re.compile(r"^\S(?:[\s\S]*\S)?$")
+
+_WEIGHTS_TOLERANCE = 1e-9
+"""How far a cluster's weights may sum from 1."""
+
+
+def _asset_name(value: Any, what: str) -> str:
+    """A valid asset id; raise `CoverDefinitionError` otherwise."""
+    if not isinstance(value, str) or not _ASSET_ID.fullmatch(value):
+        raise CoverDefinitionError(
+            f"{what} must be a non-empty string without surrounding whitespace, "
+            f"got {value!r}"
+        )
+    return value
+
+
+def _weight(asset: str, value: Any) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float, np.integer, np.floating))
+        or not math.isfinite(float(value))
+        or float(value) < 0.0
+    ):
+        raise CoverDefinitionError(
+            f"the weight of asset {asset!r} must be a finite number >= 0, got {value!r}"
+        )
+    return float(value) + 0.0
+
+
+@dataclass(frozen=True, eq=False)
+class ClusterIndex:
+    """The weighted mean of one index over several assets: a cluster's index.
+
+    `index` is the `IndexDefinition` that each member asset reads, and
+    `weights` maps each member's asset id to its weight, in order: one member
+    or more, each weight a finite number >= 0, summing to 1 within 1e-9. On a
+    draw d the cluster's index is the weighted mean of its members' values,
+    xi_d = sum_i w_i x_{d,i}, with x_{d,i} the index of `index` at asset i in
+    that draw. `Clustered` builds one per cluster, with each member's value
+    over the cluster's summed value as its weight, so a cluster's cover pays on
+    a trigger that none of its assets has alone. A one-member cluster's index
+    is its asset's.
+
+    The members and their weights are part of the terms, so the cover document
+    and its hash hold them; their order is the order of the sum.
+
+    Two cluster indices are equal when they hold the same index and the same
+    members and weights in the same order. Raises `CoverDefinitionError` for
+    an `index` that is not an `IndexDefinition`, no member, an invalid asset
+    id, or weights that are negative, not finite or don't sum to 1.
+    """
+
+    index: IndexDefinition
+    weights: Mapping[str, float]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.index, IndexDefinition):
+            raise CoverDefinitionError(
+                "a ClusterIndex's index must be the IndexDefinition its members "
+                f"read, got {type(self.index).__name__}"
+            )
+        weights = self.weights
+        if isinstance(weights, (str, bytes)) or not isinstance(weights, Mapping):
+            raise CoverDefinitionError(
+                "weights must map each member's asset id to its weight, got "
+                f"{type(weights).__name__}"
+            )
+        if not weights:
+            raise CoverDefinitionError("a ClusterIndex has one member or more")
+        checked = {
+            _asset_name(asset, "a member's asset id"): _weight(asset, value)
+            for asset, value in weights.items()
+        }
+        total = math.fsum(checked.values())
+        if abs(total - 1.0) > _WEIGHTS_TOLERANCE:
+            raise CoverDefinitionError(
+                f"a ClusterIndex's weights must sum to 1, got {total!r}"
+            )
+        object.__setattr__(self, "weights", MappingProxyType(checked))
+
+    @property
+    def members(self) -> tuple[str, ...]:
+        """The member assets, in order."""
+        return tuple(self.weights)
+
+    @property
+    def tail(self) -> Tail:
+        """The severe side, the members' index's."""
+        return self.index.tail
+
+    @property
+    def unit(self) -> str:
+        """The unit, the members' index's."""
+        return self.index.unit
+
+    @property
+    def hazard_name(self) -> str:
+        """The hazard, the members' index's."""
+        return self.index.hazard_name
+
+    def to_document(self) -> dict[str, Any]:
+        """Return the definition as plain JSON types, as the cover stores it.
+
+        The members are a list, because canonical JSON sorts the keys of an
+        object and their order is the order of the sum.
+        """
+        return {
+            "index": self.index.to_document(),
+            "kind": "cluster",
+            "members": [
+                {"asset_id": asset, "weight": weight}
+                for asset, weight in self.weights.items()
+            ],
+        }
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any]) -> Self:
+        """Read a definition written by `to_document`.
+
+        Raises `CoverDefinitionError` for another `kind`, unknown or missing
+        keys, or a member that repeats.
+        """
+        if not isinstance(document, Mapping) or set(document) != _CLUSTER_KEYS:
+            raise CoverDefinitionError(
+                f"a ClusterIndex document has the keys {sorted(_CLUSTER_KEYS)}"
+            )
+        if document["kind"] != "cluster":
+            raise CoverDefinitionError(
+                f"expected an index of kind 'cluster', got {document['kind']!r}"
+            )
+        entries = document["members"]
+        if isinstance(entries, (str, bytes, Mapping)) or not isinstance(
+            entries, Sequence
+        ):
+            raise CoverDefinitionError("a ClusterIndex document's members is a list")
+        weights: dict[str, float] = {}
+        for entry in entries:
+            if not isinstance(entry, Mapping) or set(entry) != _CLUSTER_MEMBER_KEYS:
+                raise CoverDefinitionError(
+                    "each member of a ClusterIndex document has the keys "
+                    f"{sorted(_CLUSTER_MEMBER_KEYS)}"
+                )
+            asset = _asset_name(entry["asset_id"], "a member's asset id")
+            if asset in weights:
+                raise CoverDefinitionError(
+                    f"a ClusterIndex document repeats the member {asset!r}"
+                )
+            weights[asset] = entry["weight"]
+        return cls(IndexDefinition.from_document(document["index"]), weights)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ClusterIndex):
+            return NotImplemented
+        return self.index == other.index and tuple(self.weights.items()) == tuple(
+            other.weights.items()
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.index, tuple(self.weights.items())))
+
+    def __reduce__(self) -> tuple[Any, tuple[IndexDefinition, dict[str, float]]]:
+        return (type(self), (self.index, dict(self.weights)))
+
+
+def _cluster_words(index: ClusterIndex) -> str:
+    """A cluster index in words: its members with their weights, then the index."""
+    members = ", ".join(
+        f"{asset} (weight {_number(weight)})" for asset, weight in index.weights.items()
+    )
+    return (
+        f"the weighted mean over the assets {members} of each one's index: "
+        f"{_index_words(index.index)}"
+    )

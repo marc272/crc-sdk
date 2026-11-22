@@ -44,7 +44,8 @@ with sorted keys. It holds:
   one-line definition;
 - `covers`: every cover's label, hash and full document, the hash of every
   set of covers a `"total"` or allocated row names, with the asset ids and
-  cover hashes it is made of, and the hash of every package a `"package"` row
+  cover hashes it is made of (`kind` `"cluster_set"` and the cluster ids for a
+  design under `Clustered`), and the hash of every package a `"package"` row
   names, with the component names and cover hashes it is made of;
 - `designs`: the record of every design evaluated, with the label of its
   cover as evaluated (`cover_label`), and for a pooled row an entry of `kind`
@@ -67,10 +68,11 @@ or without an evaluation's `level`, `scope` and `allocation` or a sample's
 without `trend` has none recorded, which on per-year values reads as the years
 as recorded, and a sample without `pool` is no pool. A comparison without the
 metric column `payout_frequency` or `unidentified_share` reads as null there, as
-does one without the column `design_scenario`, `pathway`, `horizon`, `product` or
-`n_rows`, or without the rank-block columns `copula_reference_years` and
-`copula_block_tail_b<beta>` or the short-block flags `short_block_b<beta>` and
-`short_block_rp<T>`, and a document without `intervals` has no intervals.
+does one without the column `design_scenario`, `pathway`, `horizon`, `product`,
+`n_rows` or `cluster_id`, or without the rank-block columns
+`copula_reference_years` and `copula_block_tail_b<beta>` or the short-block flags
+`short_block_b<beta>` and `short_block_rp<T>`, and a document without
+`intervals` has no intervals.
 
 The module claims no licence of its own for a comparison: it is derived data
 under its inputs' terms, which `licences` lists.
@@ -140,6 +142,7 @@ IDENTITY_COLUMNS = (
     "degenerate_tail",
     "components",
     "design_budget",
+    "cluster_id",
 )
 """The columns of a comparison table before its metric columns.
 
@@ -160,6 +163,7 @@ _ADDED_IDENTITY_COLUMNS = (
     "scope",
     "components",
     "design_budget",
+    "cluster_id",
     *_ADDED_SCENARIO_COLUMNS,
 )
 """The identity columns that a table written earlier doesn't have."""
@@ -312,8 +316,12 @@ _BLOCK_TAIL_PREFIX = "copula_block_tail_b"
 _BLOCK_TAIL_TOLERANCE = 1e-9
 """The rounding allowance of the rank-block flag, the one of `degenerate_tail`."""
 
-_SUMMED_LEVELS = frozenset({"total", "asset_by_value", "asset_by_loss"})
-"""The levels whose rows read a sum over a sample's reordered columns."""
+_SUMMED_LEVELS = frozenset({"total", "asset_by_value", "asset_by_loss", "cluster"})
+"""The levels whose rows read a sum over a sample's reordered columns.
+
+A `"cluster"` row reads its cluster's assets; a row of a cluster of one asset
+reads one column, so `evaluate` gives it the flags of an `"asset"` row.
+"""
 
 _SHORT_BLOCK_BETA_PREFIX = "short_block_b"
 """The start of a short-block flag's name at a beta; the metrics' label follows."""
@@ -2883,14 +2891,67 @@ def _unidentified(record: Mapping[str, Any], where: str) -> list[str]:
     ]
 
 
+def _cluster_members(record: Mapping[str, Any], where: str) -> dict[str, list[str]]:
+    """Each cluster's assets, in the order of the clusters and of their assets.
+
+    A design's record lists them (`cluster_ids`, `members`), as JSON keeps the
+    order of a list; without them, the scope's assignment gives them.
+    """
+    listed = _list(record, "cluster_ids", where)
+    named = _get(record, "members", Mapping, where) or {}
+    if listed and named:
+        return {
+            str(cluster): [
+                str(asset) for asset in _list(named, cluster, f"{where}.members")
+            ]
+            for cluster in listed
+        }
+    scope = _get(record, "scope", Mapping, where) or {}
+    assignment = _get(scope, "assignment", Mapping, f"{where}.scope") or {}
+    members: dict[str, list[str]] = {}
+    for asset, cluster in assignment.items():
+        members.setdefault(str(cluster), []).append(str(asset))
+    return members
+
+
+def _clusters_words(members: Mapping[str, Sequence[str]]) -> str:
+    """`C1 of A1 and A2, C2 of A3`."""
+    return ", ".join(
+        f"{cluster} of {_join(list(assets))}" for cluster, assets in members.items()
+    )
+
+
+def _cluster_scope_words(record: Mapping[str, Any], where: str) -> str:
+    """A design's scope under `Clustered`, in words: the clusters and the setting."""
+    members = _cluster_members(record, where)
+    scope = _get(record, "scope", Mapping, where) or {}
+    together = _get(scope, "joint", bool, f"{where}.scope") is not False
+    setting = (
+        "designed together, with one objective, one budget and one premium on "
+        "the owner's total"
+        if together
+        else "designed cluster by cluster, each with its own objective, budget and "
+        "premium on its own loss and payout"
+    )
+    return (
+        f"scope: cluster, one cover per cluster ({_clusters_words(members)}) on "
+        f"the value-weighted mean of its assets' indices, against the sum of their "
+        f"losses, {setting}"
+    )
+
+
 def _design_terms(record: Mapping[str, Any], unit: str, where: str) -> list[str]:
     """What a design is made under: its scope if joint, objective, pricing, terms."""
     objective = _get(record, "objective", Mapping, where) or {}
     scope = _get(record, "scope", Mapping, where) or {}
-    joint = scope.get("kind") == "joint"
-    on_total = " on the total" if joint else ""
+    clustered = scope.get("kind") == "clustered"
+    by_cluster = clustered and scope.get("joint") is False
+    joint = scope.get("kind") == "joint" or (clustered and not by_cluster)
+    on_total = " on the total" if joint else " on each cluster" if by_cluster else ""
     parts: list[str] = []
-    if joint:
+    if clustered:
+        parts.append(_cluster_scope_words(record, where))
+    elif joint:
         assets = [str(asset) for asset in _list(record, "asset_ids", where)]
         parts.append(
             "scope: joint, one objective, one budget and one premium on the total "
@@ -2903,7 +2964,13 @@ def _design_terms(record: Mapping[str, Any], unit: str, where: str) -> list[str]
     budget = _get(record, "budget", Mapping, where) or {}
     if budget.get("ratio") is not None:
         ratio = _number(budget["ratio"], f"{where}.budget.ratio")
-        expected = "E[L] of the total" if joint else "E[L]"
+        expected = (
+            "E[L] of the total"
+            if joint
+            else "E[L] of each cluster"
+            if by_cluster
+            else "E[L]"
+        )
         parts.append(
             f"budget: premium at most {ratio} x {expected} of the design sample"
         )
@@ -2914,7 +2981,7 @@ def _design_terms(record: Mapping[str, Any], unit: str, where: str) -> list[str]
         parts.append("no budget")
     limit = _get(record, "limit", Mapping, where) or {}
     if limit.get("amount") is not None:
-        each = " on each cover" if joint else ""
+        each = " on each cover" if joint or by_cluster else ""
         parts.append(
             f"limit: {_number(limit['amount'], f'{where}.limit')} {unit}{each}"
         )
@@ -2943,6 +3010,30 @@ def _designed_on(
     return None
 
 
+def _cluster_lines(clusters: Mapping[str, Any], unit: str, where: str) -> list[str]:
+    """A design's clusters under `Clustered(..., joint=False)`, in words."""
+    premiums: list[str] = []
+    open_set: list[str] = []
+    for cluster, own in clusters.items():
+        place = f"{where}.{cluster}"
+        if not isinstance(own, Mapping):
+            raise EvaluationError(f"{place} must be an object")
+        premium = _number(own.get("premium"), f"{place}.premium")
+        premiums.append(f"{cluster} {premium} {unit}")
+        if _get(own, "unique", bool, place) is not True:
+            open_set.append(str(cluster))
+    parts = [
+        f"design premiums: {', '.join(premiums)}, one per cluster, whose sum is the "
+        "total's premium"
+    ]
+    if open_set:
+        parts.append(
+            f"the amounts of the clusters {_join(open_set)} are one member of an "
+            "optimal set"
+        )
+    return parts
+
+
 def _design(
     record: Mapping[str, Any],
     labels: Mapping[str, str | None],
@@ -2954,13 +3045,17 @@ def _design(
     label = labels.get(str(record["design_id"]))
     objective = _get(record, "objective", Mapping, where) or {}
     scope = _get(record, "scope", Mapping, where) or {}
-    joint = scope.get("kind") == "joint"
+    clustered = scope.get("kind") == "clustered"
+    per_cluster = _get(record, "clusters", Mapping, where) if clustered else None
+    joint = scope.get("kind") == "joint" or (clustered and per_cluster is None)
     on_total = " on the total" if joint else ""
     parts = _design_terms(record, unit, where)
     designed_on = _designed_on(record, samples, where)
     if designed_on is not None:
         parts.append(designed_on)
-    if record.get("premium") is not None:
+    if per_cluster is not None:
+        parts += _cluster_lines(per_cluster, unit, f"{where}.clusters")
+    elif record.get("premium") is not None:
         premium = _number(record["premium"], f"{where}.premium")
         parts.append(f"design premium: {premium} {unit}{on_total}")
     if record.get("route") is not None:
@@ -2974,7 +3069,8 @@ def _design(
     ties = _get(record, "ties", int, where)
     parts.append("ties: not counted" if ties is None else f"ties: {ties}")
     if joint and unique is not True:
-        parts.append("the amounts of each asset are one member of an optimal set")
+        each = "cluster's cover" if clustered else "asset"
+        parts.append(f"the amounts of each {each} are one member of an optimal set")
     unidentified = _unidentified(record, where)
     if unidentified:
         parts.append(
@@ -2982,7 +3078,18 @@ def _design(
             f"{record.get('fill') or 'lowest'} value allowed"
         )
     flag = _get(record, "degenerate_tail", str, where)
-    if flag == "expected_uncovered":
+    if per_cluster is not None:
+        flags = {
+            str(cluster): _get(own, "degenerate_tail", str, f"{where}.clusters")
+            for cluster, own in per_cluster.items()
+            if isinstance(own, Mapping)
+        }
+        flagged = [f"{cluster} ({kind})" for cluster, kind in flags.items() if kind]
+        if flagged:
+            parts.append(f"degenerate tail of the clusters: {_join(flagged)}")
+        elif objective.get("kind") == "weighted_cvar":
+            parts.append("tail: not degenerate in any cluster")
+    elif flag == "expected_uncovered":
         parts.append(
             "degenerate tail: beta is at most the probability of a zero loss, so "
             "the objective is a multiple of E[U]"
@@ -3216,10 +3323,40 @@ def _named(
     return [str(value) for value in _list(evaluation, key, where)]
 
 
+def _clustered_records(
+    designs: Sequence[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    """The records of the designs under `Clustered`, in order."""
+    return [
+        record
+        for record in designs
+        if isinstance(record.get("scope"), Mapping)
+        and record["scope"].get("kind") == "clustered"
+    ]
+
+
+def _is_together(record: Mapping[str, Any]) -> bool:
+    """Whether a design under `Clustered` is one problem on the total."""
+    return bool(record["scope"].get("joint") is not False)
+
+
+def _cluster_setting(records: Sequence[Mapping[str, Any]]) -> str:
+    """How the designs under `Clustered` were made: together, apart or both."""
+    settings = {_is_together(record) for record in records}
+    if settings == {True}:
+        return (
+            "designed together, with one objective and one budget on the owner's total"
+        )
+    if settings == {False}:
+        return "designed cluster by cluster, each with its own objective and budget"
+    return "designed together or cluster by cluster, as each design's line states"
+
+
 def _levels_of(
     evaluations: Sequence[Mapping[str, Any]],
     samples: Mapping[str, Mapping[str, Any]],
     assets: Sequence[str],
+    designs: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[list[str], list[str], str | None]:
     """The rows' levels, their scopes, and the words for levels beyond assets."""
     levels = _first_seen(
@@ -3246,9 +3383,28 @@ def _levels_of(
         summed = None if sample is None else sample.get("asset_ids")
         sums.append(_join([str(asset) for asset in summed or assets]) or "its assets")
     each = _join(assets) or "the assets not stated"
+    clustered = _clustered_records(designs)
+    members: dict[str, list[str]] = {}
+    for i, record in enumerate(clustered):
+        for cluster, own in _cluster_members(record, f"designs[{i}]").items():
+            members.setdefault(cluster, own)
+    shared = (
+        "the joint design's total payout"
+        if "cluster" not in scopes
+        else "its cluster's payout"
+        if "joint" not in scopes
+        else "the joint design's total payout, or under Clustered its cluster's payout"
+    )
     words: list[str] = []
     for level in levels:
-        if level == "asset":
+        if level == "cluster":
+            named = _clusters_words(members) or "the clusters not stated"
+            words.append(
+                f"cluster, one row per cluster ({named}): its own cover's payout, on "
+                "the value-weighted mean of its assets' indices, against the sum of "
+                "their losses, each cluster its own design problem and contract"
+            )
+        elif level == "asset":
             words.append(f"asset, one row per asset ({each})")
         elif level == "total":
             words.append(
@@ -3262,8 +3418,8 @@ def _levels_of(
             )
         elif level in _ALLOCATED_LEVELS:
             words.append(
-                f"{level}, one row per asset ({each}): its share of the joint "
-                f"design's total payout {_ALLOCATED_LEVELS[level]}, an accounting "
+                f"{level}, one row per asset ({each}): its share of {shared} "
+                f"{_ALLOCATED_LEVELS[level]}, an accounting "
                 "rule and not the payout of the asset's cover, with no premium or "
                 "net-loss values"
             )
@@ -3272,6 +3428,12 @@ def _levels_of(
     text = "; ".join(words)
     if scopes == ["joint"]:
         text += ". Scope: joint, one objective and one budget on the owner's total"
+    elif scopes == ["cluster"]:
+        text += (
+            ". Scope: cluster, one cover per cluster of the owner's assets, on the "
+            "value-weighted mean of its assets' indices, "
+            f"{_cluster_setting(clustered)}"
+        )
     elif scopes == ["individual"]:
         text += ". Scope: individual, each cover standing on its own"
     else:
@@ -3557,7 +3719,7 @@ def _rank_block_designs(
     return [
         record
         for record in designs
-        if (record.get("scope") or {}).get("kind") == "joint"
+        if (record.get("scope") or {}).get("kind") in ("joint", "clustered")
         and str(record.get("sample_hash")) in made_on
     ]
 
@@ -4364,7 +4526,7 @@ def setup_text(
     assets, scenarios, units = map(_first_seen, (assets, scenarios, units))
     unit = units[0] if len(units) == 1 else "loss units"
 
-    levels, scopes, described = _levels_of(evaluations, by_hash, assets)
+    levels, scopes, described = _levels_of(evaluations, by_hash, assets, designs)
     if described is not None:
         level = described
     elif not assets:
@@ -4484,6 +4646,18 @@ def setup_text(
         )
     if "joint" in scopes:
         priced += " A joint design's premium is that of one contract on the total."
+    clustered = _clustered_records(designs)
+    if any(_is_together(record) for record in clustered):
+        priced += (
+            " A design under Clustered(joint=True) has the premium of one contract "
+            "on the total."
+        )
+    if not all(_is_together(record) for record in clustered):
+        priced += (
+            " Under Clustered(joint=False) each cluster row holds its cluster's "
+            "design premium, and the total row the sum of the clusters' premiums, "
+            "one per contract, unless a total premium is stated."
+        )
     if "package" in levels:
         priced += (
             " The package row holds the sum of its contracts' premiums, one per "
@@ -4503,9 +4677,16 @@ def setup_text(
         for kind in _list(evaluation, "part_kinds", f"setup.evaluations[{i}]")
     ]
     if levels and set(levels) <= set(_ALLOCATED_LEVELS):
+        priced_payout = (
+            "a joint design's total payout"
+            if "cluster" not in scopes
+            else "a cluster's payout"
+            if "joint" not in scopes
+            else "a joint design's total payout or a cluster's payout"
+        )
         lines.append(
             "Pricing: allocated rows hold no premium and no net-loss values, as a "
-            "pricing prices a joint design's total payout and not a part of it; a "
+            f"pricing prices {priced_payout} and not a part of it; a "
             "design's line states its pricing."
         )
     elif not part_kinds:

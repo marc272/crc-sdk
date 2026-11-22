@@ -4,7 +4,8 @@ The cases in `cases/` are golden fixtures for the metrics
 (`tests/test_parametric_parity.py`), the designs
 (`tests/test_parametric_design.py`), the joint designs
 (`tests/test_parametric_joint.py`), the totals of joint designs
-(`tests/test_parametric_evaluate_joint.py`) and the plan on fitted curves
+(`tests/test_parametric_evaluate_joint.py`), the cluster designs and their rows
+(`tests/test_parametric_cluster.py`) and the plan on fitted curves
 (`tests/test_parametric_plan_parity.py`) of `crc_sdk.parametric`, and
 `tests/test_parametric_fixtures_readme.py` checks this README against them.
 Each case is one JSON document: an outcome sample, a cover, a pricing and the
@@ -15,7 +16,7 @@ imports the code that generated them.
 
 Copied byte for byte from
 [marc272/parametric-insurance-design](https://github.com/marc272/parametric-insurance-design),
-`parity/crc/cases/`, all at commit `101326a`. That repository's
+`parity/crc/cases/`, all at commit `5f3a841`. That repository's
 `parity/crc/README.md` describes the format, the comparison tolerances and how
 the cases were generated; its script `parity/scripts/export_crc_fixtures.py`
 regenerates them. Do not edit the cases here: regenerate them there and copy
@@ -24,7 +25,7 @@ the copies stay byte-identical. A case's `generator.commit` names the commit
 of the code that generated it, which can be older than the commit it was copied
 at.
 
-The 76 cases copied (about 998 kB):
+The 100 cases copied (about 2.1 MB):
 
 - 20 evaluation cases of fixed covers (`*-fixed-*`): 16 whose expected values
   are closed forms, computed in exact rational arithmetic, and 4 step covers
@@ -64,7 +65,22 @@ The 76 cases copied (about 998 kB):
   expected loss, on the sums over the assets of the loss and of the payout of
   each draw. A case's `cover` is the list of templates in `asset_ids` order,
   and its `expected.parameters` and `expected.unidentified` are keyed by asset
-  id.
+  id;
+- 24 cluster design cases
+  (`step-{mse,eu,wcvar-b0_9}-{pure,coc}-cluster-{joint,separate}-{synthetic,thesis}`):
+  step covers on two clusters of the three assets, each cluster's cover on the
+  value-weighted mean of its assets' indices against the sum of their losses,
+  designed by the reference implementation with a budget of 0.8 times the
+  expected loss: under `cluster-joint` one design problem on the owner's total,
+  and under `cluster-separate` one per cluster, each with its own budget. A
+  case's `clusters` states the assignment, the members, the asset values, the
+  weights, the cluster index and the setting; its `cover` is the list of
+  templates in `clusters.cluster_ids` order, each written for no asset on the
+  members' index; and its `expected` holds the total's row, a block per cluster
+  and the allocated rows under both rules, each cluster's payout shared over its
+  own assets. Under `cluster-separate` the total's premium is the sum of the
+  clusters' premiums. The source README's "Cluster cases" says where these
+  cases follow the owner's decisions rather than the reference implementation.
 
 Every case carries the fields `metric_options` and `expected.profile`.
 `metric_options` is null, for the default metric options, except in the two
@@ -90,6 +106,18 @@ evaluated on its `evaluation_sample` with the design premium:
   design years; with the design sample's lineage they would raise
   `LeakageError`.
 
+The cluster test reads every case of `kind` `"design"` and `scope`
+`"cluster"` in `cases/`. It designs one cover per cluster with `design_joint`
+under `Clustered`, judges each design problem (the whole design under
+`cluster-joint`, each cluster under `cluster-separate`) by its objective value,
+its parameters by its `compare_parameters`, its premium and `unique`, and then
+the rows of `evaluate`: the total row, each cluster's row under
+`cluster-separate`, and the allocated rows under both rules. A non-unique
+case's rows are those of the templates resolved with `expected.parameters`,
+with the case's premiums. Under `cluster-joint` the module shows no row per
+cluster, so each cluster block is checked on that cluster's cover evaluated on
+its own index and loss.
+
 The joint design test reads every case of `kind` `"design"` and `scope`
 `"joint"` in `cases/`. It designs one cover per asset with `design_joint` and
 judges the objective value, the parameters by the case's `compare_parameters`,
@@ -111,22 +139,26 @@ or `-fresh`, or `-options`):
 - **`synthetic`, `synthetic52` and `handmade`: CC0-1.0**
   ([public domain dedication](https://creativecommons.org/publicdomain/zero/1.0/)).
   These are the cases whose ids end in `-synthetic` or `-synthetic-holdout`
-  (26 cases), in `-synthetic52`, `-synthetic52-kfold5-fold<i>`,
+  (38 cases), in `-synthetic52`, `-synthetic52-kfold5-fold<i>`,
   `-synthetic52-fresh` or `-synthetic52-options` (13) and in `-handmade` or
   `-handmade-options` (15). They hold no third-party data: draws of a seeded synthetic generator, the fresh draws of the
-  `-fresh` cases included, and values chosen by hand.
+  `-fresh` cases included, and values chosen by hand, the asset values of the
+  cluster cases included.
 - **`thesis`: CC-BY-4.0**
   ([Creative Commons Attribution 4.0](https://creativecommons.org/licenses/by/4.0/)).
-  These are the cases whose ids end in `-thesis` or `-thesis-holdout` (22
+  These are the cases whose ids end in `-thesis` or `-thesis-holdout` (34
   cases: `step-fixed-*-thesis`, `step-*-individual-thesis`,
-  `step-*-joint-thesis` and `step-*-thesis-holdout`). Their draws are taken from the source
+  `step-*-joint-thesis`, `step-*-cluster-*-thesis` and `step-*-thesis-holdout`).
+  Their draws are taken from the source
   repository's parity fixture `parity/tests/data/thesis_eventset/`, which is
-  derived from the IRIS event set. A copy of them keeps this attribution:
+  derived from the IRIS event set, and the cluster cases also the three
+  assets' values (its `locations.value`). A copy of them keeps this
+  attribution:
   - the draws: Marc Prinzing, parametric-insurance-design,
     `parity/tests/data/thesis_eventset/`,
     <https://github.com/marc272/parametric-insurance-design>, CC BY 4.0.
     Changes: a subsample of 160 years and 3 assets, described in the source's
-    `parity/crc/README.md` ("Data sets");
+    `parity/crc/README.md` ("Data sets"), with the 3 assets' values;
   - the hazard data: Sparks, N. and Toumi, R. (2024). The Imperial College
     Storm Model (IRIS) Dataset. Scientific Data 11, 424,
     <https://doi.org/10.1038/s41597-024-03250-y>; dataset
