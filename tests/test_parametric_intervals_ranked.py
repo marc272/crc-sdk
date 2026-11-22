@@ -373,6 +373,46 @@ def test_a_replicate_that_draws_each_draw_once_is_the_block(model: Any) -> None:
         assert (source == np.arange(40)).all()
 
 
+def _hurdle(curve_kind: str = "hurdle") -> dict[str, Any]:
+    """A curve row whose draws below 0.4 are its atom, 50 mm/day: they tie."""
+    return {
+        **_horizon(2045, 60.0),
+        "curve_kind": curve_kind,
+        "curve_atom_probability": 0.4 if curve_kind == "hurdle" else None,
+        "curve_atom_location": 50.0 if curve_kind == "hurdle" else None,
+    }
+
+
+@pytest.mark.parametrize(
+    "model", [Comonotonic, lambda: GaussianCopula(RHO)], ids=["comonotonic", "gaussian"]
+)
+def test_at_an_atom_the_re_deal_keeps_the_places_the_model_gave(model: Any) -> None:
+    # Site a's draws tie at the atom, each with its own loss (HazardNoise moves
+    # each draw's hazard at the asset). The model placed them by their uniforms:
+    # under GaussianCopula the sample keeps those ranks, which its index doesn't
+    # give, and under Comonotonic() site b's index orders them. A replicate that
+    # draws each draw once in order still rebuilds the block row for row.
+    sample = _assets(
+        model(), n=40, curves={"site-a": _hurdle(), "site-b": _hurdle("fitted")}
+    )
+    tied = sample.index[:, 0] == 50.0
+    assert tied.sum() > 10 and np.unique(sample.loss[tied, 0]).size > 10
+    if sample.latent_ranks is not None:
+        assert np.array_equal(sample.latent_ranks, _latent_ranks(SEEDS, RHO, 40))
+        by_index = np.argsort(np.argsort(sample.index[:, 0], kind="stable"))
+        assert not np.array_equal(by_index, sample.latent_ranks[:, 0])
+    builder = _plan(_evaluated([_covers()], sample)).builder
+    assert builder is not None
+
+    class _InOrder:
+        def integers(self, low: int, high: int, size: Any, dtype: Any) -> np.ndarray:
+            return np.tile(np.arange(high, dtype=dtype), (size[0], 1))
+
+    for source in _redeal_draws(builder, _InOrder(), 1):  # type: ignore[arg-type]
+        assert (source == np.arange(40)).all()
+    assert _record(_intervals([_covers()], sample))["unit"] == "as_built"
+
+
 def _evaluated(entries: list[Any], sample: OutcomeSample, **kw: Any) -> Any:
     arguments: dict[str, Any] = {
         "split": "in_sample",
