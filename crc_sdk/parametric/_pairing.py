@@ -2,8 +2,10 @@
 
 `design`, `design_joint`, `evaluate`, `compare`, `payout_breakdown` and the
 functions built on them call `_check_reads` wherever a cover meets a sample.
-It checks what `_check_cover_index` checks (the index unit, and on a sample of
-several hazards each component's name, unit and tail), and then the hazard.
+It checks what `_check_cover_index` checks (the index unit; on a component's
+view, `sample.component(name)` and its blocks, the component's tail; and on a
+sample of several hazards each component's name, unit and tail), and then the
+hazard.
 
 **The hazard.** A cover's `IndexDefinition.hazard_name` must be the name the
 sample records for the series its index reads, compared exactly: crc-sdk has no
