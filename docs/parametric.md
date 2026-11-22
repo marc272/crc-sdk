@@ -2595,7 +2595,7 @@ difference between them.
   the replications.
 
   A second run, on the same setup and with 300 rows a block, measured the rows
-  the first left out, each resampled as the module resamples it: two assets
+  the first left out, each resampled as the module then resampled it: two assets
   under `Comonotonic()`, `GaussianCopula(0.8)` and `GaussianCopula(-0.8)`; held
   blocks of the two assets under `Independent()`, of 300 years of one asset's
   per-year values drawn from its curve, of a pool of three independent runs of
@@ -2672,6 +2672,34 @@ difference between them.
 
   On those rows `correlation` held the true value in 0.906 to 0.951 of the
   replications.
+
+  A fourth run, on the setup of the second and with its generators, measured
+  the `"total"` rows of the two assets under `Comonotonic()`,
+  `GaussianCopula(0.8)` and `GaussianCopula(-0.8)` as they are resampled now,
+  re-dealt by the model's ranks, beside the second run's numbers for the same
+  rows resampled by year. Each asset's own row is resampled by year in both
+  runs and gave the same 1,000 intervals in each, and so the same shares as in
+  the second run's table. Each share of the fourth run has a Monte Carlo error
+  of at most 0.011.
+
+  | Block | Rows | Columns | By year (second run) | Re-dealt (fourth run) |
+  | --- | --- | --- | --- | --- |
+  | `Comonotonic()`, two assets | the `"total"` row | the means, the counts | 0.913 to 0.975 | 0.885 to 0.915 |
+  | The same | the `"total"` row | `rmse` | 0.910 | 0.917 |
+  | The same | the `"total"` row | the tail columns | 0.890 to 0.954 | 0.946 to 0.975 |
+  | The same | the `"total"` row | `false_positive_rate` | 0.588 | 0.999 |
+  | `GaussianCopula(0.8)`, two assets | the `"total"` row | the means, the counts | 0.892 to 0.960 | 0.866 to 0.908 |
+  | The same | the `"total"` row | `rmse` | 0.895 | 0.905 |
+  | The same | the `"total"` row | the tail columns | 0.878 to 0.946 | 0.946 to 0.969 |
+  | The same | the `"total"` row | `false_positive_rate` | 0.807 | 1.000 |
+  | `GaussianCopula(-0.8)`, two assets | the `"total"` row | the means, the counts | 0.774 to 0.894 | 0.879 to 0.914 |
+  | The same | the `"total"` row | `rmse` | 0.885 | 0.914 |
+  | The same | the `"total"` row | the tail columns | 0.854 to 0.902 | 0.959 to 0.984 |
+
+  Under `GaussianCopula(-0.8)` `false_positive_rate` was undefined in more than
+  100 replications in both runs. On the re-dealt rows `correlation` held the
+  true value in 0.912 to 0.920 of the replications, and in 0.898 to 0.922 by
+  year.
 
   On the same setup, with these rows resampled as independent rows as before,
   an earlier run of the study found the copula's `"total"` rows at 0.55 to
