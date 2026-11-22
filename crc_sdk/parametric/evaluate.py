@@ -6,7 +6,8 @@
   covers as rows and metrics as columns, the layout of crc-sdk's portfolio
   output.
 - `allocate(designs, sample, *, split, allocation, values, ...)` returns a joint
-  design's allocated rows, in a table of their own.
+  design's allocated rows, or those of a design under `Clustered`, in a table of
+  their own.
 - `write_comparison(table, path)` writes a comparison table to one Parquet
   file atomically, with its metadata under `crc.parametric.evaluation`.
 - `to_long(table)` gives the tidy form, one row per cover and metric.
@@ -27,6 +28,18 @@ against the sum of their payouts, draw by draw; the `scope` column says
 - A joint design gets one `"total"` row, with the premium of one contract on
   the total. It gets no `"asset"` row, because the split of the total payout
   across the assets is the solver's choice and is often not identified.
+
+**Clusters.** A design under `Clustered` (a `ClusteredDesignResult`) has one
+cover per cluster of the sample's assets, on the cluster's `ClusterIndex`; its
+rows have `scope` `"cluster"`. Under `joint=False` each cluster is its own
+design problem and contract, so it gets a `"cluster"` row, with the cluster's
+id in `cluster_id` and its own premium, and the `"total"` row holds the sum of
+the clusters' premiums. Under `joint=True` it gets the `"total"` row alone, with
+the premium of one contract on the total, as a joint design does. Its allocated
+rows share each cluster's payout over that cluster's own assets, under the same
+rules. `compare_pooled`, `bootstrap_intervals`, `compare_scenarios`,
+`allocate_scenarios` and `payout_breakdown` don't take such a design yet, and a
+cluster's cover is refused on its own, as it reads several assets.
 
 Per-asset rows of a joint design exist only under a stated rule, with
 `values=` giving every asset's value: `level="asset_by_value"` shares the total
@@ -153,7 +166,14 @@ from crc_sdk.parametric.errors import (
     UnresolvedParameterError,
 )
 from crc_sdk.parametric.index import CompositeIndex, _component_name
-from crc_sdk.parametric.joint import JointDesignResult, covers_hash
+from crc_sdk.parametric.joint import (
+    ClusteredDesignResult,
+    JointDesignResult,
+    _cluster_index_values,
+    _cluster_loss,
+    _cluster_of,
+    covers_hash,
+)
 from crc_sdk.parametric.metadata import (
     _ADDED_METRIC_COLUMNS,
     _ADDED_SCENARIO_COLUMNS,
@@ -342,6 +362,14 @@ class _JointEntry:
 
 
 @dataclass(frozen=True)
+class _ClusteredEntry:
+    """A design under `Clustered`: one total, one cover per cluster."""
+
+    design: ClusteredDesignResult
+    record: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class _Run:
     """What every row of one evaluation shares."""
 
@@ -444,8 +472,20 @@ def _design_record(design: DesignedCover) -> dict[str, Any]:
     return record
 
 
+def _check_not_cluster(cover: Cover) -> None:
+    """Raise `EvaluationError` for a cluster's cover, which reads several assets."""
+    index = cover.cluster_index
+    if index is not None:
+        raise EvaluationError(
+            f"the cover of cluster {cover.asset_id!r} pays on the weighted mean of "
+            f"the index of the assets {list(index.members)}: evaluate it with the "
+            "other clusters' covers, through its ClusteredDesignResult"
+        )
+
+
 def _item(entry: Any) -> _Item:
     if isinstance(entry, Cover):
+        _check_not_cluster(entry)
         return _Item(entry, None, None)
     if isinstance(entry, DesignedCover):
         cover = entry.cover
@@ -453,6 +493,7 @@ def _item(entry: Any) -> _Item:
             raise TypeError(
                 f"a design's cover must be a Cover, got {type(cover).__name__}"
             )
+        _check_not_cluster(cover)
         return _Item(cover, entry, _design_record(entry))
     raise TypeError(f"expected a Cover or a designed cover, got {type(entry).__name__}")
 
@@ -664,13 +705,39 @@ class CoverPackage:
         return all(item.design is not None for item in self._items.values())
 
 
-EvaluationEntry = Cover | DesignedCover | JointDesignResult | CoverSet | CoverPackage
+EvaluationEntry = (
+    Cover
+    | DesignedCover
+    | JointDesignResult
+    | ClusteredDesignResult
+    | CoverSet
+    | CoverPackage
+)
 """What `evaluate` and `compare` take: see their docstrings."""
 
 _Entry = _Item | _CoverSet | _JointEntry | CoverPackage
+"""An entry of the functions that take no design under `Clustered` yet."""
+
+_AnyEntry = _Entry | _ClusteredEntry
+"""An entry of `evaluate`, `compare` and `allocate`."""
+
+_CLUSTERED_ONLY_IN = "evaluate, compare and allocate"
+"""The functions that take a `ClusteredDesignResult` so far."""
 
 
 def _entry(entry: Any) -> _Entry:
+    """Read one entry, and refuse a `ClusteredDesignResult`.
+
+    `evaluate`, `compare` and `allocate` take one, through `_any_entry`. The
+    functions built on them that don't yet, such as `compare_pooled`,
+    `bootstrap_intervals` and `compare_scenarios`, read their entries here, so
+    they raise `EvaluationError` rather than misread its covers.
+    """
+    if isinstance(entry, ClusteredDesignResult):
+        raise EvaluationError(
+            "a design under Clustered (a ClusteredDesignResult) is read by "
+            f"{_CLUSTERED_ONLY_IN} only, so far: evaluate it there"
+        )
     if isinstance(entry, CoverPackage):
         return entry
     if isinstance(entry, JointDesignResult):
@@ -680,12 +747,27 @@ def _entry(entry: Any) -> _Entry:
     return _item(entry)
 
 
-def _entries(covers: Any) -> list[_Entry]:
+def _any_entry(entry: Any) -> _AnyEntry:
+    """Read one entry of `evaluate` or `compare`, a design under `Clustered` too."""
+    if isinstance(entry, ClusteredDesignResult):
+        return _ClusteredEntry(entry, entry.to_record())
+    return _entry(entry)
+
+
+def _checked_covers(covers: Any) -> Sequence[Any]:
     if isinstance(covers, (str, bytes, Cover)) or not isinstance(covers, Sequence):
         raise TypeError("covers must be a sequence of covers or designs")
     if not covers:
         raise EvaluationError("compare needs at least one cover")
-    return [_entry(entry) for entry in covers]
+    return covers
+
+
+def _entries(covers: Any) -> list[_Entry]:
+    return [_entry(entry) for entry in _checked_covers(covers)]
+
+
+def _any_entries(covers: Any) -> list[_AnyEntry]:
+    return [_any_entry(entry) for entry in _checked_covers(covers)]
 
 
 def _allocation(allocation: Any) -> Allocation | None:
@@ -894,8 +976,34 @@ def _check_joint(
     _check_own_sample(design.design_sample, given)
 
 
+def _check_clustered(
+    entry: _ClusteredEntry, sample: OutcomeSample, given: OutcomeSample | None
+) -> None:
+    design = entry.design
+    if set(design.asset_ids) != set(sample.asset_ids):
+        raise SampleError(
+            f"the design under Clustered is for the assets {list(design.asset_ids)}, "
+            f"but the sample holds {list(sample.asset_ids)}"
+        )
+    if sample.index_components is not None:
+        raise SampleError(
+            "a cluster's cover reads one index at each of its assets, but this "
+            f"sample holds the index components {list(sample.index_components)}"
+        )
+    for cluster, cover in design.covers.items():
+        if cover.payout_unit != sample.loss_unit:
+            raise SampleError(
+                f"the cover of cluster {cluster!r} pays in {cover.payout_unit!r}, "
+                f"but the sample's loss is in {sample.loss_unit!r}"
+            )
+        index = _cluster_of(cover)
+        for asset in index.members:
+            _check_reads(index.index, sample, asset)
+    _check_own_sample(design.design_sample, given)
+
+
 def _check_entry(
-    entry: _Entry, sample: OutcomeSample, given: OutcomeSample | None
+    entry: _AnyEntry, sample: OutcomeSample, given: OutcomeSample | None
 ) -> None:
     if isinstance(entry, _Item):
         _check_item(entry, sample, given)
@@ -903,6 +1011,8 @@ def _check_entry(
         _check_set(entry, sample, given)
     elif isinstance(entry, CoverPackage):
         _check_package(entry, sample, given)
+    elif isinstance(entry, _ClusteredEntry):
+        _check_clustered(entry, sample, given)
     else:
         _check_joint(entry, sample, given)
 
@@ -949,7 +1059,7 @@ def _check_split(
 
 
 def _design_pairs(
-    entry: _Entry,
+    entry: _AnyEntry,
     sample: OutcomeSample,
     split: Split,
     given: OutcomeSample | None,
@@ -976,7 +1086,7 @@ def _design_pairs(
     own: OutcomeSample | None = None
     if isinstance(entry, _Item) and entry.design is not None:
         own = entry.design.design_sample
-    elif isinstance(entry, _JointEntry):
+    elif isinstance(entry, (_JointEntry, _ClusteredEntry)):
         own = entry.design.design_sample
     known = _check_split(own, sample, split, given)
     return [] if known is None else [(known, sample)]
@@ -1065,7 +1175,7 @@ def _identity(
     *,
     label: str,
     cover_hash: str,
-    design: DesignedCover | JointDesignResult | None,
+    design: DesignedCover | JointDesignResult | ClusteredDesignResult | None,
     asset_id: str | None,
     level: str,
     scope: str,
@@ -1073,11 +1183,13 @@ def _identity(
     components: str | None = None,
     budget: float | None = None,
     design_scenario: str | None = None,
+    cluster_id: str | None = None,
 ) -> dict[str, Any]:
     """The columns of a row before its metrics.
 
     `design_scenario` is for a row with no design of its own, the sum of
     separate contracts; a row with a design takes its design sample's label.
+    `cluster_id` names the cluster of a `"cluster"` row.
     """
     return {
         "cover_label": label,
@@ -1103,6 +1215,7 @@ def _identity(
         "degenerate_tail": None if design is None else design.degenerate_tail,
         "components": components,
         "design_budget": budget,
+        "cluster_id": cluster_id,
     }
 
 
@@ -1523,6 +1636,190 @@ def _joint_rows(entry: _JointEntry, run: _Run) -> list[dict[str, Any]]:
     return [total, *_allocated_rows(entry, run, paid)]
 
 
+@dataclass(frozen=True, eq=False)
+class _ClusterPayouts:
+    """A design's covers under `Clustered` on a sample, cluster by cluster."""
+
+    label: str
+    loss: Mapping[str, FloatArray]
+    payout: Mapping[str, FloatArray]
+    filled: Mapping[str, BoolArray | None]
+    total: FloatArray
+    total_filled: BoolArray | None
+
+
+def _cluster_payouts(entry: _ClusteredEntry, sample: OutcomeSample) -> _ClusterPayouts:
+    """Each cluster's loss, payout and reads of filled amounts, and their totals."""
+    design = entry.design
+    loss: dict[str, FloatArray] = {}
+    payout: dict[str, FloatArray] = {}
+    filled: dict[str, BoolArray | None] = {}
+    total = np.zeros(len(sample), dtype=np.float64)
+    for cluster, cover in design.covers.items():
+        index = _cluster_of(cover)
+        values = _cluster_index_values(index, sample)
+        loss[cluster] = _cluster_loss(index, sample)
+        payout[cluster] = cover.payout_values(values)
+        names = _filled_amounts(entry.record, cluster)
+        filled[cluster] = None if names is None else _reads_filled(cover, names, values)
+        total += payout[cluster]
+    return _ClusterPayouts(
+        label=_set_label(design.covers, design.covers_hash),
+        loss=loss,
+        payout=payout,
+        filled=filled,
+        total=total,
+        total_filled=_union_reads(filled.values()),
+    )
+
+
+def _cluster_share(
+    rule: Allocation,
+    paid: _ClusterPayouts,
+    cluster: str,
+    members: Sequence[str],
+    sample: OutcomeSample,
+    values: Mapping[str, float],
+    asset: str,
+) -> FloatArray:
+    """An asset's share of its cluster's payout, draw by draw, under `rule`.
+
+    The shares run over the cluster's own assets: by value, or by the asset's
+    loss over the cluster's in each draw, and by value where the cluster has
+    no loss.
+    """
+    payout = paid.payout[cluster]
+    share = values[asset] / math.fsum(values[member] for member in members)
+    if rule == "value":
+        return payout * share
+    loss = paid.loss[cluster]
+    shares = np.divide(
+        sample.loss[:, sample.asset_ids.index(asset)],
+        loss,
+        out=np.full(len(sample), share, dtype=np.float64),
+        where=loss > 0.0,
+    )
+    return payout * shares
+
+
+def _cluster_allocated_rows(
+    entry: _ClusteredEntry, run: _Run, paid: _ClusterPayouts | None = None
+) -> list[dict[str, Any]]:
+    """A design's allocated rows under `Clustered`: each cluster's payout shared."""
+    rule, values = run.allocation, run.values
+    assert rule is not None and values is not None
+    design = entry.design
+    sample = run.sample
+    paid = _cluster_payouts(entry, sample) if paid is None else paid
+    without = [
+        column.name
+        for column in metric_columns(run.options)
+        if column.metric in _NO_PREMIUM_METRICS
+    ]
+    members = design.members
+    cluster_of = {asset: cluster for cluster, own in members.items() for asset in own}
+    rows: list[dict[str, Any]] = []
+    for asset in sample.asset_ids:
+        cluster = cluster_of[asset]
+        row = _identity(
+            run,
+            label=paid.label,
+            cover_hash=design.covers_hash,
+            design=design,
+            asset_id=asset,
+            level=_ALLOCATED_LEVEL[rule],
+            scope="cluster",
+            basis=None,
+        )
+        row.update(
+            metric_values(
+                sample.loss[:, sample.asset_ids.index(asset)],
+                _cluster_share(
+                    rule, paid, cluster, members[cluster], sample, values, asset
+                ),
+                sample.probability,
+                premium=0.0,
+                options=run.options,
+                unidentified=paid.filled[cluster],
+            )
+        )
+        row.update(dict.fromkeys(without))
+        rows.append(row)
+    return rows
+
+
+def _clustered_rows(entry: _ClusteredEntry, run: _Run) -> list[dict[str, Any]]:
+    """The rows of a design under `Clustered`.
+
+    Under `joint=False` one `"cluster"` row per cluster, each its own design
+    problem and contract, with its own premium; then the total, whose premium
+    is the sum of theirs. Under `joint=True` the total, with the design
+    premium, and no row per cluster, as a joint design's split isn't
+    identified per cover. Then the allocated rows, if a rule is set.
+    """
+    design = entry.design
+    sample = run.sample
+    paid = _cluster_payouts(entry, sample)
+    rows: list[dict[str, Any]] = []
+    for cluster, own in (design.clusters or {}).items():
+        cover = design.covers[cluster]
+        row = _identity(
+            run,
+            label=_label(cover),
+            cover_hash=cover.definition_hash,
+            design=design,
+            asset_id=None,
+            level="cluster",
+            scope="cluster",
+            basis="design",
+            budget=own.budget_bound,
+            cluster_id=cluster,
+        )
+        row["unique"] = own.unique
+        row["degenerate_tail"] = own.degenerate_tail
+        row.update(
+            metric_values(
+                paid.loss[cluster],
+                paid.payout[cluster],
+                sample.probability,
+                premium=own.premium,
+                options=run.options,
+                unidentified=paid.filled[cluster],
+            )
+        )
+        rows.append(row)
+    basis: PremiumBasis
+    if run.premium is not None:
+        basis, used = "stated", run.premium
+    else:
+        basis, used = "design", float(design.premium) + 0.0
+    total = _identity(
+        run,
+        label=paid.label,
+        cover_hash=design.covers_hash,
+        design=design,
+        asset_id=None,
+        level="total",
+        scope="cluster",
+        basis=basis,
+        budget=design.budget_bound,
+    )
+    total.update(
+        metric_values(
+            sample.loss.sum(axis=1),
+            paid.total,
+            sample.probability,
+            premium=used,
+            options=run.options,
+            unidentified=paid.total_filled,
+        )
+    )
+    rows.append(total)
+    if run.allocation is not None:
+        rows += _cluster_allocated_rows(entry, run, paid)
+    return rows
+
+
 def _package_label(entry: CoverPackage) -> str:
     if entry.label is not None:
         return entry.label
@@ -1583,13 +1880,15 @@ def _package_rows(entry: CoverPackage, run: _Run) -> list[dict[str, Any]]:
     return [*rows, package]
 
 
-def _entry_rows(entry: _Entry, run: _Run) -> list[dict[str, Any]]:
+def _entry_rows(entry: _AnyEntry, run: _Run) -> list[dict[str, Any]]:
     if isinstance(entry, _Item):
         return [_asset_row(entry, run.sample.asset_ids[0], run, premium=run.premium)]
     if isinstance(entry, _CoverSet):
         return _set_rows(entry, run)
     if isinstance(entry, CoverPackage):
         return _package_rows(entry, run)
+    if isinstance(entry, _ClusteredEntry):
+        return _clustered_rows(entry, run)
     return _joint_rows(entry, run)
 
 
@@ -1657,11 +1956,27 @@ def _short_blocks(options: MetricOptions, n_rows: int) -> dict[str, bool]:
     }
 
 
-def _rows(entry: _Entry, run: _Run) -> list[dict[str, Any]]:
+def _block_level(entry: _AnyEntry, row: Mapping[str, Any]) -> str:
+    """The level whose rank-block columns a row takes.
+
+    Under `Clustered`, a `"cluster"` or allocated row of a cluster of one asset
+    reads that asset's column alone, so it takes an `"asset"` row's.
+    """
+    level: str = row["level"]
+    if not isinstance(entry, _ClusteredEntry) or level == "total":
+        return level
+    members = entry.design.members
+    cluster = row["cluster_id"]
+    if cluster is None:
+        cluster = next(name for name, own in members.items() if row["asset_id"] in own)
+    return "asset" if len(members[cluster]) == 1 else level
+
+
+def _rows(entry: _AnyEntry, run: _Run) -> list[dict[str, Any]]:
     """The rows of one entry, with their rank-block and short-block columns."""
     flags = _short_blocks(run.options, len(run.sample))
     return [
-        {**row, **_block_values(run, row["level"]), **flags}
+        {**row, **_block_values(run, _block_level(entry, row)), **flags}
         for row in _entry_rows(entry, run)
     ]
 
@@ -1702,6 +2017,7 @@ def _schema(
         pa.field("degenerate_tail", pa.string()),
         pa.field("components", pa.string()),
         pa.field("design_budget", pa.float64()),
+        pa.field("cluster_id", pa.string()),
     ]
     # One short-block flag per level of the metric columns, after `extra`; a
     # payout breakdown's columns have no level, so it has none.
@@ -1819,18 +2135,38 @@ def _package_entry(entry: CoverPackage) -> CoverEntry:
     )
 
 
-def _cover_entries(entry: _Entry) -> list[CoverEntry]:
+def _cluster_set_entry(design: ClusteredDesignResult) -> CoverEntry:
+    """The entry of a design's covers under `Clustered`, by cluster id."""
+    return CoverEntry(
+        label=_shared_label(design.covers),
+        hash=design.covers_hash,
+        document={
+            "kind": "cluster_set",
+            "covers": {
+                cluster: cover.definition_hash
+                for cluster, cover in design.covers.items()
+            },
+        },
+    )
+
+
+def _cover_entries(entry: _AnyEntry) -> list[CoverEntry]:
     if isinstance(entry, _Item):
         return [_cover_entry(entry.cover)]
     if isinstance(entry, CoverPackage):
         return [*map(_cover_entry, entry.covers.values()), _package_entry(entry)]
+    if isinstance(entry, _ClusteredEntry):
+        return [
+            *map(_cover_entry, entry.design.covers.values()),
+            _cluster_set_entry(entry.design),
+        ]
     covers = entry.covers if isinstance(entry, _CoverSet) else entry.design.covers
     return [*map(_cover_entry, covers.values()), _set_entry(covers)]
 
 
-def _records(entry: _Entry) -> list[dict[str, Any]]:
+def _records(entry: _AnyEntry) -> list[dict[str, Any]]:
     """The design records of an entry, each with the label as evaluated."""
-    if isinstance(entry, _JointEntry):
+    if isinstance(entry, (_JointEntry, _ClusteredEntry)):
         return [{**entry.record, "cover_label": _shared_label(entry.design.covers)}]
     items: list[_Item]
     if isinstance(entry, _CoverSet):
@@ -1849,7 +2185,7 @@ def _records(entry: _Entry) -> list[dict[str, Any]]:
 
 
 def _metadata(
-    entries: Sequence[_Entry],
+    entries: Sequence[_AnyEntry],
     sample: OutcomeSample,
     *,
     evaluation: dict[str, Any],
@@ -1924,14 +2260,17 @@ def _metadata(
     )
 
 
-def _check_allocated(entries: Sequence[_Entry]) -> None:
+def _check_allocated(entries: Sequence[_AnyEntry]) -> None:
     """Raise unless every entry of an allocation is a joint design.
 
     So a table that holds allocated rows holds no row of a cover that stands
-    on its own beside them.
+    on its own beside them. A design under `Clustered` counts as joint here,
+    in both settings: its per-asset rows need a rule too.
     """
     others = [
-        i for i, entry in enumerate(entries) if not isinstance(entry, _JointEntry)
+        i
+        for i, entry in enumerate(entries)
+        if not isinstance(entry, (_JointEntry, _ClusteredEntry))
     ]
     if len(others) == len(entries):
         raise EvaluationError(
@@ -1948,8 +2287,27 @@ def _check_allocated(entries: Sequence[_Entry]) -> None:
         )
 
 
+def _check_cluster_values(
+    entries: Sequence[_AnyEntry], values: Mapping[str, float]
+) -> None:
+    """Raise `EvaluationError` for a cluster whose values are all zero.
+
+    Under `Clustered` an allocation shares each cluster's payout over its own
+    assets, so each cluster needs a value to share it by.
+    """
+    for entry in entries:
+        if not isinstance(entry, _ClusteredEntry):
+            continue
+        for cluster, members in entry.design.members.items():
+            if not math.fsum(values[asset] for asset in members) > 0.0:
+                raise EvaluationError(
+                    f"values= are all zero on cluster {cluster!r}'s assets "
+                    f"{list(members)}, so they share none of its payout"
+                )
+
+
 def _prepared(
-    entries: Sequence[_Entry],
+    entries: Sequence[_AnyEntry],
     sample: OutcomeSample,
     *,
     split: Any,
@@ -1978,6 +2336,8 @@ def _prepared(
     checked_values = _values(values, rule, sample)
     if rule is not None:
         _check_allocated(entries)
+        assert checked_values is not None
+        _check_cluster_values(entries, checked_values)
     if given is not None:
         if len(sample.asset_ids) == 1:
             _require_one_asset(given, "evaluate and compare")
@@ -2073,7 +2433,7 @@ def _package_record(
 def _describe_rows(
     evaluation: dict[str, Any],
     run: _Run,
-    entries: Sequence[_Entry],
+    entries: Sequence[_AnyEntry],
     by_entry: Sequence[Sequence[Mapping[str, Any]]],
 ) -> None:
     """Add to `evaluation` what the setup text says of the rows of `entries`."""
@@ -2093,7 +2453,7 @@ def _describe_rows(
 
 
 def _table(
-    entries: Sequence[_Entry],
+    entries: Sequence[_AnyEntry],
     sample: OutcomeSample,
     *,
     split: Any,
@@ -2283,7 +2643,10 @@ def evaluate(
     covers or all designs, each designed on that asset's own sample). The rows
     are then those of the module docstring: a mapping gives one `"asset"` row per
     asset and one `"total"` row, and a joint design one `"total"` row and, under
-    `allocation`, one allocated row per asset. On a sample with index components,
+    `allocation`, one allocated row per asset. A `ClusteredDesignResult` gives,
+    under `joint=False`, one `"cluster"` row per cluster and the `"total"` row,
+    and under `joint=True` the `"total"` row; under `allocation`, each cluster's
+    payout is shared over its own assets. On a sample with index components,
     `cover` may be a `CoverPackage`, which gives one `"asset"` row per contract
     and one `"package"` row. `split` is `"in_sample"` (on the
     design sample) or `"out_of_sample"` (on a sample that shares no period
@@ -2315,7 +2678,8 @@ def evaluate(
     `design_id`, `asset_id`, `level`, `scope`, `scenario`, `design_scenario`,
     `pathway`, `horizon`, `product`, `split`, `fold`, `sample_hash`, `n_rows`,
     `premium_basis`, `unique`, `ties`, `degenerate_tail`, `components`,
-    `design_budget`), then the rank-block columns (`copula_reference_years`,
+    `design_budget`, `cluster_id`), then the rank-block columns
+    (`copula_reference_years`,
     `copula_block_tail_b<beta>`) and the short-block flags
     (`short_block_b<beta>`, `short_block_rp<T>`, one per level of `options`;
     see the module docstring), and one float64 column per metric, null where
@@ -2333,8 +2697,10 @@ def evaluate(
     the probability that the cover pays, and `unidentified_share` the
     probability of the draws whose payout reads an amount that the design's
     fill rule set (see the module docstring).
-    `asset_id` is null on `"total"` rows. `premium_basis`, `premium` and the
-    net-loss columns are null on allocated rows. On `"total"` and allocated
+    `asset_id` is null on `"total"` and `"cluster"` rows, and `cluster_id` names
+    the cluster of a `"cluster"` row and is null on every other row.
+    `premium_basis`, `premium` and the net-loss columns are null on allocated
+    rows. On `"total"` and allocated
     rows, `cover_hash` is the hash of the set of covers and `cover_label` their
     shared label, or else the first 12 hex digits of that hash; on a
     `"package"` row, `cover_hash` is the `package_hash` and `cover_label` the
@@ -2357,7 +2723,7 @@ def evaluate(
     allocation, and `TypeError` for arguments of the wrong type.
     """
     return _table(
-        _entries([cover]),
+        _any_entries([cover]),
         sample,
         split=split,
         fold=fold,
@@ -2405,7 +2771,7 @@ def compare(
     Raises as `evaluate` does, and `EvaluationError` for an empty `covers`.
     """
     return _table(
-        _entries(covers),
+        _any_entries(covers),
         sample,
         split=split,
         fold=fold,
@@ -2418,24 +2784,51 @@ def compare(
     )
 
 
-def _joint_entries(designs: Any) -> list[_JointEntry]:
-    """The joint designs of `allocate`; raise for anything else."""
+def _checked_designs(designs: Any) -> Sequence[Any]:
     if isinstance(designs, (str, bytes, Mapping)) or not isinstance(designs, Sequence):
         raise TypeError("designs must be a sequence of JointDesignResult")
     if not designs:
         raise EvaluationError("allocate needs at least one joint design")
-    for i, design in enumerate(designs):
-        if not isinstance(design, JointDesignResult):
-            raise TypeError(
-                "allocate shares out a joint design's total payout, so designs must "
-                f"hold JointDesignResult objects, got {type(design).__name__} at "
-                f"position {i}; compare evaluates covers and sets of covers"
-            )
-    return [_JointEntry(design, design.to_record()) for design in designs]
+    return designs
+
+
+def _joint_entry(design: Any, position: int, also: str = "") -> _JointEntry:
+    """A joint design of `allocate`; `also` names the other kinds it takes."""
+    if isinstance(design, ClusteredDesignResult):
+        raise EvaluationError(
+            "a design under Clustered (a ClusteredDesignResult) is read by "
+            f"{_CLUSTERED_ONLY_IN} only, so far: allocate it there"
+        )
+    if not isinstance(design, JointDesignResult):
+        raise TypeError(
+            "allocate shares out a joint design's total payout, so designs must "
+            f"hold {also}JointDesignResult objects, got {type(design).__name__} at "
+            f"position {position}; compare evaluates covers and sets of covers"
+        )
+    return _JointEntry(design, design.to_record())
+
+
+def _joint_entries(designs: Any) -> list[_JointEntry]:
+    """The joint designs of `allocate_scenarios`; raise for anything else."""
+    return [
+        _joint_entry(design, i) for i, design in enumerate(_checked_designs(designs))
+    ]
+
+
+def _allocated_entries(designs: Any) -> list[_JointEntry | _ClusteredEntry]:
+    """The designs of `allocate`, under `Joint()` or `Clustered`; raise otherwise."""
+    return [
+        (
+            _ClusteredEntry(design, design.to_record())
+            if isinstance(design, ClusteredDesignResult)
+            else _joint_entry(design, i, "ClusteredDesignResult or ")
+        )
+        for i, design in enumerate(_checked_designs(designs))
+    ]
 
 
 def allocate(
-    designs: Sequence[JointDesignResult],
+    designs: Sequence[JointDesignResult | ClusteredDesignResult],
     sample: OutcomeSample,
     *,
     split: Split,
@@ -2453,7 +2846,9 @@ def allocate(
     `compare` gives each joint design. `compare` holds the owner's total, which
     is what a joint design optimises.
 
-    `designs` are `JointDesignResult`s on `sample`, a sample of their assets.
+    `designs` are `JointDesignResult`s on `sample`, a sample of their assets,
+    or `ClusteredDesignResult`s, whose rows share each cluster's payout over
+    that cluster's own assets, the sums running over the cluster.
     `allocation` is the rule, with no default, because how to share out a
     total is an accounting choice: `"value"` shares each draw's total payout in
     proportion to the assets' `values`, and `"loss"` in proportion to their
@@ -2478,7 +2873,7 @@ def allocate(
     `TypeError` for an entry that is not a `JointDesignResult` and for
     arguments of the wrong type.
     """
-    entries = _joint_entries(designs)
+    entries = _allocated_entries(designs)
     if allocation is None:
         raise EvaluationError(
             f"allocate needs a rule: allocation= one of {get_args(Allocation)}"
@@ -2498,8 +2893,12 @@ def allocate(
     flags = _short_blocks(run.options, len(run.sample))
     by_entry = [
         [
-            {**row, **_block_values(run, row["level"]), **flags}
-            for row in _allocated_rows(entry, run)
+            {**row, **_block_values(run, _block_level(entry, row)), **flags}
+            for row in (
+                _cluster_allocated_rows(entry, run)
+                if isinstance(entry, _ClusteredEntry)
+                else _allocated_rows(entry, run)
+            )
         ]
         for entry in entries
     ]
