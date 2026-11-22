@@ -32,7 +32,9 @@ objective (`MSE`, `ExpectedUncovered`, `WeightedCVaR` or a `UserObjective`)
 under a `Budget` and a `Limit`; its LP and QP routes need the optional extra
 `crc-sdk[parametric]`. `design_joint` designs one cover per asset of a
 sample of several assets, for one objective and one budget on the asset
-owner's total. `evaluate` and `compare` assess covers and designs,
+owner's total; under `Clustered` it designs one cover per cluster of the assets,
+on a `ClusterIndex`, the value-weighted mean of the cluster's indices, either
+on the total or cluster by cluster. `evaluate` and `compare` assess covers and designs,
 `allocate` shares a joint design's total payout out over its assets in a table
 of its own, and `payout_breakdown` splits each one's expected payout into its
 parts. A
@@ -120,11 +122,15 @@ from crc_sdk.parametric.index import (
     AtCell,
     AtPoint,
     AtStation,
+    ClusterIndex,
     CompositeIndex,
     IndexDefinition,
 )
 from crc_sdk.parametric.intervals import bootstrap_intervals, compare_pooled
 from crc_sdk.parametric.joint import (
+    ClusterDesign,
+    Clustered,
+    ClusteredDesignResult,
     Individual,
     Joint,
     JointDesignResult,
@@ -209,6 +215,10 @@ __all__ = [
     "BinaryPayout",
     "Budget",
     "CappedSum",
+    "ClusterDesign",
+    "ClusterIndex",
+    "Clustered",
+    "ClusteredDesignResult",
     "CombineRule",
     "ComonotoneIndexWarning",
     "Comonotonic",

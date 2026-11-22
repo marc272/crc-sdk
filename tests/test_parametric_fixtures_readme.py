@@ -138,7 +138,7 @@ def test_the_licence_section_counts_every_case(
         ]
         assert len({number for number, _ in hits}) == 1, (case_id, hits, LICENCE_HINT)
         number = hits[0][0]
-        scope = re.search(r"-(?:individual|joint)-([^-]+)", case_id)
+        scope = re.search(r"-(?:individual|joint|separate)-([^-]+)", case_id)
         assert scope is not None, case_id
         assert _data_set(groups[number].suffixes[0]) == scope.group(1), (
             case_id,
