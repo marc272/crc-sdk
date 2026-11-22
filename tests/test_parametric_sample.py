@@ -1036,7 +1036,7 @@ def test_the_repr_of_a_component_prints_no_arrays() -> None:
     bare = IndexComponent(values, unit="mm/day", tail="upper")
     assert repr(bare) == (
         "IndexComponent(shape=(10, 1), unit='mm/day', tail='upper', hazard=None, "
-        "own_loss=None)"
+        "own_loss=None, damage=None)"
     )
     full = IndexComponent(
         values,
@@ -1044,10 +1044,11 @@ def test_the_repr_of_a_component_prints_no_arrays() -> None:
         tail="lower",
         hazard=np.full(10, 3.0),
         own_loss=np.ones(10),
+        damage=np.full(10, 0.01),
     )
     assert repr(full) == (
         "IndexComponent(shape=(10, 1), unit='degC', tail='lower', hazard=..., "
-        "own_loss=...)"
+        "own_loss=..., damage=...)"
     )
     assert "array" not in repr(full) and "10.0" not in repr(full)
 

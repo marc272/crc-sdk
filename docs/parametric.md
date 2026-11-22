@@ -2482,7 +2482,7 @@ difference between them.
   | A row that reads | Each replicate |
   | --- | --- |
   | Two columns or more of an `EmpiricalCopula` block: the `"total"` row of a set of covers, every row of a joint design, and on a sample of several hazards a row whose index and combined loss read two hazards or more | **Re-deals the draws.** It redraws each column's draws on its own, with replacement, and deals them to the reference years again by the copula's rule: the redrawn draws, sorted by their index, fill the ranks that each reference year's rows held in that column, and a year's rows take its draws in the order they were drawn. On a window of horizons, within each member |
-  | A column built with `HazardNoise(..., hold="hazard_distribution")` | **Re-ranks the hazard at the asset.** It resamples by the unit above, and ranks the hazard at the asset again over the resampled rows, as the held form ranks it over the rows of a call. Each row takes the loss of its new hazard at the asset, which the block's own rows give |
+  | A column built with `HazardNoise(..., hold="hazard_distribution")` | **Re-ranks the hazard at the asset.** It resamples by the unit above, and ranks the hazard at the asset again over the resampled rows, as the held form ranks it over the rows of a call. Each row takes the loss of its new hazard at the asset, and on a sample of several hazards its damage, which the block's own rows give |
   | Two columns or more of a block that `Comonotonic()`, `GaussianCopula` or a model of your own moved, and no held column | Resamples by the unit above. The study below measured these intervals under `Comonotonic()` and `GaussianCopula`; under a model of your own their coverage is unmeasured |
   | Anything else, which `built_together` leaves unflagged: an asset's own row, one asset's view, a hazard's view on its own loss, and every row under `Independent()` with the default `hold` | Resamples by the unit above, with the same draws and numbers as before |
 
@@ -2495,12 +2495,19 @@ difference between them.
   at a curve's atom, are ranked by row, where the copula ranked them by their
   uniforms.
 
-  Across hazards each replicate makes the combined loss again from the hazards'
-  own losses, by the sample's rule. The rule's result is multiplied by the
-  value, which a sample's record never holds, so two kinds of sample can be
-  rebuilt: one with a single impact, whose combined loss is that hazard's own
-  loss, and one under `CappedSum` or `CompoundDamage` whose loss models give the
-  damage ratio, with no value.
+  Across hazards each replicate makes the combined loss again by the sample's
+  rule, as the sampler made it. A sample with a single impact takes that
+  hazard's own loss. Under `CappedSum` or `CompoundDamage` the rule takes the
+  hazards' damages, which the sample keeps ([a sample of several
+  hazards](#a-sample-of-several-hazards)), and its result is multiplied by the
+  asset's value. A record never holds the value, so it is read from the block:
+  the one number whose product with each hazard's damage is that hazard's own
+  loss, exactly as the loss model multiplied them, and the rule must give the
+  block's own combined loss again. A replicate's rows carry their damages with
+  their own losses, and a re-ranked row those of its new hazard at the asset.
+  On damage ratios, with no value, this gives the numbers it gave from the own
+  losses before samples kept the damages. A sample without damages, as one
+  written before, is rebuilt under a built-in rule only on damage ratios.
 
   A row built together that can't be built again keeps the resampling of the
   unit above, with the draws and numbers it had before, and the record says so:
@@ -2509,20 +2516,21 @@ difference between them.
 
   | Rows | `reason` |
   | --- | --- |
-  | On a sample of several hazards, rows whose combined loss is a built-in rule's result times a stated value or a value column, which a record never holds | `"combined_loss_needs_value"` |
+  | On a sample of several hazards without damages, as one written before samples kept them, rows whose combined loss is a built-in rule's result times a stated value or a value column, which a record never holds | `"combined_loss_needs_value"` |
   | The same, with a rule of your own, or a combined loss a table states | `"caller_rule"`, `"table_loss"` |
   | A view `component(name, loss="combined")` whose loss reads hazards it doesn't hold | `"combined_view"` |
   | A selection of a held sample, which holds hazards at the asset from rows it lacks | `"held_select"` |
   | A sample that records an `EmpiricalCopula` without its draws per reference year | `"copula_without_k"` |
   | Pooled rows of these blocks, from folds built by hand, as `year_block_kfold` refuses such samples | `"pooled_by_hand"` |
 
-  Two more reasons guard against a sample whose rows contradict its record:
+  Three more reasons guard against a sample whose rows contradict its record:
   `"combined_loss_not_reproduced"`, when the recorded rule doesn't give the
-  sample's combined loss again, and `"held_loss_not_one"`, when rows with one
-  hazard at the asset have different losses. `kept_today` is left out when no
-  row was kept. Resampling whole reference years is not offered: on a copula
-  block it made most intervals too wide, up to about four times the Monte Carlo
-  error.
+  sample's combined loss again, `"value_not_found"`, when no one value gives
+  each hazard's own loss as its damage times that value, and
+  `"held_loss_not_one"`, when rows with one hazard at the asset have different
+  losses. `kept_today` is left out when no row was kept. Resampling whole
+  reference years is not offered: on a copula block it made most intervals too
+  wide, up to about four times the Monte Carlo error.
 
   A synthetic study measured how often 90% intervals held the true value:
   Gumbel curves, linear covers given as is and priced again on each replicate
@@ -2546,9 +2554,9 @@ difference between them.
   | The same | the `"total"` row | re-dealt | the means, `payout_frequency`, `false_negative_rate`, `rmse` | 0.885 to 0.912 |
   | The same | the `"total"` row | re-dealt | the tail columns | 0.938 to 0.991 |
   | The same | the `"total"` row | re-dealt | `false_positive_rate`, under +0.8 | 0.995 |
-  | `EmpiricalCopula` of two hazards, `CompoundDamage()` | the package row and its covers' rows | re-dealt | the means, `payout_frequency`, `false_negative_rate`, `rmse` | 0.884 to 0.919 |
+  | `EmpiricalCopula` of two hazards, damage ratios, `CompoundDamage()` | the package row and its covers' rows | re-dealt | the means, `payout_frequency`, `false_negative_rate`, `rmse` | 0.884 to 0.919 |
   | The same | the same | re-dealt | the tail columns, and `false_positive_rate` under +0.8 | 0.890 to 0.994 |
-  | `EmpiricalCopula` of two hazards, `CappedSum(1.0)` | the package row and its covers' rows | re-dealt | the means, `payout_frequency`, `false_negative_rate`, `rmse` | 0.886 to 0.926 |
+  | `EmpiricalCopula` of two hazards, damage ratios, `CappedSum(1.0)` | the package row and its covers' rows | re-dealt | the means, `payout_frequency`, `false_negative_rate`, `rmse` | 0.886 to 0.926 |
   | The same | the same | re-dealt | the tail columns, and `false_positive_rate` under +0.8 | 0.890 to 1.000; `var_loss` and `cvar_loss` 1.000, as the combined loss's tail is at the cap |
   | `HazardNoise(sigma, hold="hazard_distribution")`, sigma 0.3 and 1 | the asset's row | re-ranked | every column | 0.863 to 0.928 |
 
@@ -2567,7 +2575,9 @@ difference between them.
   hazards with damage ratios and `CompoundDamage()`, under `Independent()` and
   under the `EmpiricalCopula` at +0.8; the two hazards under each
   `EmpiricalCopula` with a stated value of 100 EUR, under `CappedSum(1.0)` and
-  `CompoundDamage()`, which keep the unit above (`"combined_loss_needs_value"`);
+  `CompoundDamage()`, which kept the unit above (`"combined_loss_needs_value"`)
+  until samples kept each hazard's damage, and which a sample without damages
+  still keeps;
   and the pooled rows of the five folds of a held block of one asset, or of two
   under `Independent()`, cut by hand, which keep the unit above
   (`"pooled_by_hand"`). Every held block had sigma 0.3. "The counts" are
@@ -2598,7 +2608,7 @@ difference between them.
   | Held, two hazards under `Independent()` | the package row and its covers' rows | re-ranked | every column | 0.883 to 0.936 |
   | Held `EmpiricalCopula` of two hazards, +0.8 | the package row and its covers' rows | re-dealt and re-ranked | the means, the counts, `rmse` | 0.897 to 0.933 |
   | The same | the same | re-dealt and re-ranked | the tail columns | 0.913 to 0.952 |
-  | `EmpiricalCopula` of two hazards, a stated value | the package row, +0.8 | by row | the means, the counts | 0.746 to 0.982 |
+  | `EmpiricalCopula` of two hazards, a stated value, without damages | the package row, +0.8 | by row | the means, the counts | 0.746 to 0.982 |
   | The same | the package row, -0.8 | by row | the means, the counts | 0.549 to 0.894 |
   | The same | the covers' rows | by row | the means, the counts | 0.842 to 0.929; `expected_loss`, which reads the combined loss, 0.928 and 0.929 under +0.8, 0.842 and 0.858 under -0.8 |
   | The same | every row | by row | `rmse`, the tail columns | 0.847 to 1.000; `var_loss` and `cvar_loss` 0.973 to 1.000 |
@@ -2614,6 +2624,23 @@ difference between them.
   block were not measured: the leakage checks refuse folds cut by hand from one
   such block (`LeakageError`), so of the pooled rows only those of held blocks
   can be made.
+
+  A third run, on the setup of the first and with generators of its own,
+  measured the two hazards under each `EmpiricalCopula` with a stated value of
+  100 EUR as they are resampled now that the samples keep each hazard's damage:
+  re-dealt, with each replicate's combined loss made again from the damages
+  times the value. The package's covers had the first run's limits times the
+  value, 60 EUR. Each share has a Monte Carlo error of at most 0.011.
+
+  | Block | Rows | Resampled | Columns | Share that held the true value |
+  | --- | --- | --- | --- | --- |
+  | `EmpiricalCopula` of two hazards, a stated value, `CompoundDamage()` | the package row and its covers' rows | re-dealt | the means, `payout_frequency`, `false_negative_rate`, `rmse` | 0.879 to 0.926 |
+  | The same | the same | re-dealt | the tail columns, and `false_positive_rate` under +0.8 | 0.895 to 0.997 |
+  | `EmpiricalCopula` of two hazards, a stated value, `CappedSum(1.0)` | the package row and its covers' rows | re-dealt | the means, `payout_frequency`, `false_negative_rate`, `rmse` | 0.880 to 0.916 |
+  | The same | the same | re-dealt | the tail columns, and `false_positive_rate` under +0.8 | 0.886 to 1.000; `var_loss` and `cvar_loss` 1.000, as the combined loss's tail is at the cap |
+
+  On those rows `correlation` held the true value in 0.906 to 0.951 of the
+  replications.
 
   On the same setup, with these rows resampled as independent rows as before,
   an earlier run of the study found the copula's `"total"` rows at 0.55 to
@@ -3866,13 +3893,19 @@ setup text calls it one.
 ### A sample of several hazards
 
 - **Components.** `sample.index_components` maps each component's name to an
-  `IndexComponent(values, *, unit, tail, hazard=None, own_loss=None)`, two or
-  more, in order, and is `None` on a sample of one hazard. `values` is the
-  component's index, `(n, 1)`; `hazard` is the value its loss model read, when
-  it differs from the index; `own_loss` is the loss of that hazard alone, in the
-  sample's loss unit, and `None` for a component with no impact. Its repr prints
-  no arrays: the shape of `values`, the unit, the tail, and `hazard` and
-  `own_loss` as `...` when held and `None` when not.
+  `IndexComponent(values, *, unit, tail, hazard=None, own_loss=None,
+  damage=None)`, two or more, in order, and is `None` on a sample of one hazard.
+  `values` is the component's index, `(n, 1)`; `hazard` is the value its loss
+  model read, when it differs from the index; `own_loss` is the loss of that
+  hazard alone, in the sample's loss unit, and `None` for a component with no
+  impact. `damage` is that hazard's impact before the rule for the combined
+  loss, usually a damage ratio: what the rule takes, so `own_loss` is it times
+  the value ([the combined loss](#the-combined-loss)). The samplers below keep
+  it on every component with an impact; a table of yours doesn't state it, so
+  there it is `None`, and a sample keeps it on every component with an own loss
+  or on none. Its repr prints no arrays: the shape of `values`, the unit, the
+  tail, and `hazard`, `own_loss` and `damage` as `...` when held and `None` when
+  not.
 - **The primary.** The first component is the sample's `index`, `index_unit` and
   `hazard`, so code that reads one index reads it. `loss` is the combined loss.
 - **Names** are non-empty, without surrounding whitespace and without `.`, `+`,
@@ -3904,7 +3937,15 @@ setup text calls it one.
 - **Hashes and tables.** With components, `content_hash` covers each one's name,
   unit, tail, values, hazard and own loss, and `to_table` adds the columns
   `index[<name>]`, `hazard[<name>]` and `own_loss[<name>]`, with
-  `schema_version` `"1.1"`. A sample of one hazard hashes and writes as before.
+  `schema_version` `"1.1"`. Components that keep their damage add it to the
+  hash and a `damage[<name>]` column, null on a component with no impact, with
+  `schema_version` `"1.2"`, so a reader that knows only `"1.1"` refuses the
+  table rather than dropping the damages. A sample without damages, such as a
+  table of yours, or one written before samples kept them, hashes and writes as
+  `"1.1"`, so such a table reads back with its hash, without damages. A sample of
+  one hazard hashes and writes as before. The damage makes the asset's value
+  readable from the arrays, as a component's own loss against its damage; the
+  sample is your own data.
 
 | Source | Function | The dependence between the hazards |
 | --- | --- | --- |
@@ -3927,12 +3968,12 @@ setup text calls it one.
 - **Fitted curves.** Each component is what `sample_curve` draws with that
   component's own generator, and the dependence model then reorders the rows,
   as across assets ([several assets](#several-assets-from-fitted-curves)): a
-  row's index, hazard and own loss stay together and no value changes. Two
-  components with the same generator state raise `SampleError`. A window of
+  row's index, hazard, own loss and damage stay together and no value changes.
+  Two components with the same generator state raise `SampleError`. A window of
   horizons takes the same horizons of one pathway for every component.
 - **A component with no impact.** A component left out of `loss_models` is read
-  as an index and has no loss: it needs no rule and has no own loss. A sample
-  with no impact at all raises, as it has no loss.
+  as an index and has no loss: it needs no rule and has no own loss or damage. A
+  sample with no impact at all raises, as it has no loss.
 - **A table of yours.** `index_unit` maps component names to units; a component
   it leaves out, or all of them with `index_unit=None`, takes the unit its
   column states ([outcome samples](#outcome-samples)).
@@ -3953,7 +3994,9 @@ components have an impact, with no default, and refused with fewer.
   hazard at the asset, after the basis-risk model; its own loss is that impact
   times the value; the rule takes the impacts, and the combined loss is the
   rule's result times the value. So the loss models must have one value, one
-  `value_unit` and one `value_column`.
+  `value_unit` and one `value_column`. The sample keeps each impact as its
+  component's `damage`, so the combined loss can be made again from the rows,
+  as [intervals](#pooled-folds-and-intervals) do.
 - **`CompoundDamage()`** raises `SampleError` for an impact outside [0, 1], which
   `ImpactNoise` without `upper=1.0` can make.
 - **A rule of your own** implements `CombineRule`: `to_document()`, plain JSON
@@ -4426,9 +4469,10 @@ rank and no best flag.
 - **Intervals on every row built together.** `bootstrap_intervals` builds the
   rows of an `EmpiricalCopula` block and of a held `HazardNoise` block again on
   each replicate, but not those it can't build again: on a sample of several
-  hazards whose loss models state a value or whose rule is your own, on a view
-  whose combined loss reads hazards it doesn't hold, on a selection of a held
-  sample, and on pooled folds of these blocks. Those keep the resampling they
+  hazards whose rule is your own or whose combined loss a table states, or that
+  keeps no damages and whose loss models state a value, on a view whose
+  combined loss reads hazards it doesn't hold, on a selection of a held sample,
+  and on pooled folds of these blocks. Those keep the resampling they
   had, and `setup.intervals.kept_today` says why. It resamples the rows of a
   block that `Comonotonic()`, `GaussianCopula` or a model of your own moved as
   independent rows, and flags them with `built_together`.

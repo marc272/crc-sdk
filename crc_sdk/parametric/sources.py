@@ -61,7 +61,8 @@ components. A row's values are the same year's, so the dependence between the
 hazards is the data's own and is recorded as `{"kind": "data"}`. The rows are the
 same years and not the same events: two annual maxima of one year may come from
 different events. Two impacts or more need a stated rule for the combined loss
-(`crc_sdk.parametric.combine`).
+(`crc_sdk.parametric.combine`). Each component keeps its impact, the damage
+before that rule, beside its own loss, as `sample_curve_hazards` does.
 
 **Pooled model-years** (`ModelRun`, `sample_annual_pool`). One climate model
 gives few years for a tail, so the years of several models can be pooled for
@@ -1557,15 +1558,17 @@ def sample_curve_hazards(
     **The draws.** Each component is what `sample_curve` makes with that
     component's generator: the uniforms first, then the basis-risk model. The
     model then puts that component's rows in another order, by the ranks of the
-    uniforms: a row's hazard, index and own loss stay together, no value changes
-    and no further random number is used. So each component holds the rows of
-    `sample_curve`, and under `Independent()` `sample.component(name)` has its
-    `content_hash` for the same generator. `period` is the row number, 0 to
-    `n_draws - 1`, and each row has probability `1/n_draws`.
+    uniforms: a row's hazard, index, own loss and damage stay together, no
+    value changes and no further random number is used. So each component holds
+    the rows of `sample_curve`, and under `Independent()`
+    `sample.component(name)` has its `content_hash` for the same generator.
+    `period` is the row number, 0 to `n_draws - 1`, and each row has
+    probability `1/n_draws`.
 
     **The loss.** A component's impact comes from its `LossModel`, on its
     hazard at the asset, after the basis-risk model, and its `own_loss` is that
-    impact times the value. After the reorder, `combine` takes the impacts of
+    impact times the value; the component keeps the impact as its `damage`,
+    which moves with its row. After the reorder, `combine` takes the impacts of
     each row, and the sample's `loss` is its result times the value. It is
     required when two or more components have an impact, and refused with
     fewer. A component left out of `loss_models` has no impact: it needs no
@@ -1672,6 +1675,7 @@ def sample_curve_hazards(
             tail=datasets[name].return_period_tail,
             hazard=None if np.array_equal(index, hazard) else hazard,
             own_loss=None if each.loss is None else each.loss[rows],
+            damage=None if each.impact is None else each.impact[rows],
         )
     loss = _combined_loss(models, combine, rule_record, impacts)
     first = next(iter(components.values()))
@@ -2817,15 +2821,16 @@ def sample_annual_hazards(
 
     **The loss.** A component's impact comes from its `LossModel`, on its
     hazard at the asset, after the basis-risk model, and its `own_loss` is that
-    impact times the value. `combine` takes the impacts, and the sample's
-    `loss` is its result times the value: `CappedSum(cap)`, `CompoundDamage()`
-    or a `CombineRule` of the caller's. It is required when two or more components
-    have an impact, and refused with fewer. A component left out of
-    `loss_models` has no impact: it needs no rule, has no `own_loss`, and only
-    a basis-risk model with `apply_hazard` acts on it or draws for it, so the
-    others' draws don't depend on which of them has an impact. With one impact
-    the sample's loss is that component's own, and `combine` records that. The
-    loss models must have one value, one `value_unit` and one `value_column`.
+    impact times the value; the component keeps the impact as its `damage`.
+    `combine` takes the impacts, and the sample's `loss` is its result times
+    the value: `CappedSum(cap)`, `CompoundDamage()` or a `CombineRule` of the
+    caller's. It is required when two or more components have an impact, and
+    refused with fewer. A component left out of `loss_models` has no impact: it
+    needs no rule, has no `own_loss`, and only a basis-risk model with
+    `apply_hazard` acts on it or draws for it, so the others' draws don't
+    depend on which of them has an impact. With one impact the sample's loss is
+    that component's own, and `combine` records that. The loss models must have
+    one value, one `value_unit` and one `value_column`.
 
     A year without a value in any series raises, unless `missing="drop_year"`
     drops it from all of them and lists it in the provenance. `scenario` is
@@ -2978,6 +2983,7 @@ def _annual_hazard_rows(
             tail=inputs.tails[name],
             hazard=None if np.array_equal(new_index, at_asset) else at_asset,
             own_loss=own_loss,
+            damage=impacts.get(name),
         )
     one_model = inputs.models[inputs.impacted[0]]
     loss = _combined_loss(inputs.models, combine, rule_record, impacts)
