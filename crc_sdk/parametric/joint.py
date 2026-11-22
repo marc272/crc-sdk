@@ -7,11 +7,11 @@ returns a `JointDesignResult`: the resolved covers and the design's record.
 
 **What it optimises.** On each draw `d`, `L_d = sum_j L_{d,j}` is the owner's
 total loss and `pi_d = sum_j pi_{d,j}` the total payout. The objective (`MSE`,
-`ExpectedUncovered` or `WeightedCVaR`) and the premium (`PurePremium` or
-`CostOfCapitalLoad`) are taken on `L_d` and `pi_d`. `Budget(ratio=k)` means
-premium <= `k * E[L]` on the total, and `Budget(amount=B)` means premium <= `B`
-on the total. Each asset keeps its own cover, on its own index, and each cover
-pays by its own terms.
+`ExpectedUncovered` or `WeightedCVaR`) and the premium (`PurePremium`,
+`CostOfCapitalLoad` or `ExpectedPayoutMultiple`) are taken on `L_d` and `pi_d`.
+`Budget(ratio=k)` means premium <= `k * E[L]` on the total, and
+`Budget(amount=B)` means premium <= `B` on the total. Each asset keeps its own
+cover, on its own index, and each cover pays by its own terms.
 
 **How it is solved.** The LP or QP of `design`, on the block basis
 `[B_1 | ... | B_m]` with the amounts in asset order, the covers' constraints
@@ -32,10 +32,11 @@ choice.
 **Non-unique optima.** The covers enter the objective only through their sum,
 so several splits of the same total payout across the assets can be optimal,
 and the amounts of one asset are often not identified on their own. The report
-of `design` applies on the block basis: `fill` per asset,
-`DesignOptions(ranges=True)` for every identified amount of every asset on the
-LP route, and the eigenvalue rule on the QP route. Unless `unique` is true, the
-per-asset amounts are one member of an optimal set.
+of `design` applies on the block basis: `fill` per asset, the ranges of every
+identified amount of every asset on the LP route, which `DesignOptions()` takes
+by default and `DesignOptions(ranges=False)` skips, leaving `unique` null there,
+and the eigenvalue rule on the QP route. Unless `unique` is true, the per-asset
+amounts are one member of an optimal set.
 
 **Clusters.** Under `scope=Clustered(assignment, values=..., joint=...)`,
 `design_joint` takes one template per cluster of the owner's assets, and each

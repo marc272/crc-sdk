@@ -15,15 +15,20 @@ There are two ways to use the module:
   .select(...).impact(...)`, draws simulated years from each asset's fitted
   hazard curve, and chains the steps to a written comparison. It is a lazy
   crc-sdk plan: builders and `explain()` do no I/O, and the data is read only
-  at the execution points `samples()`, `designs()` and `write_parquet()`. The
-  same plan also runs on per-year values, such as ERA5's annual extremes
-  ([next step](#next-step-per-year-values)), and on several scenarios at once,
-  such as windows of horizons ([scenarios on the plan](#scenarios-on-the-plan)).
+  at its execution points, such as `samples()`, `designs()` and
+  `write_parquet()`. The same plan also runs on per-year values, such as
+  ERA5's annual extremes ([next step](#next-step-per-year-values)); on several
+  scenarios at once, such as windows of horizons ([scenarios on the
+  plan](#scenarios-on-the-plan)); on several hazards at each asset ([several
+  hazards on the plan](#several-hazards-on-the-plan)); and on several assets
+  designed together, on the owner's total or in clusters ([joint
+  design](#joint-design-over-several-assets)).
 - **The functions.** Every step is also a function on numpy arrays and Arrow
   tables that does no I/O (`sample_curve`, `sample_annual`, `design`,
   `compare`, ...), for your own tables, fitted curves and chains. Only
-  `write_comparison` writes a file. Covers on several hazards are on this
-  route only ([several hazards](#several-hazards-at-one-asset)).
+  `write_comparison` writes a file. Pooled folds, intervals and the budget
+  frontier are on this route only ([what this version does not
+  do](#what-this-version-does-not-do)).
 
 ## Concepts
 
@@ -40,7 +45,7 @@ There are two ways to use the module:
 | Objective | `MSE`, `ExpectedUncovered`, `WeightedCVaR`, `UserObjective` | What a design minimises |
 | Pricing and constraints | `PurePremium`, `CostOfCapitalLoad`, `ExpectedPayoutMultiple`, `Budget`, `Limit` | The premium of a payout ([pricing](#pricing-and-the-premium-used)), and what a design must respect |
 | Design | `design`, `DesignResult` | A template's resolved cover and its design record |
-| Scope | `Individual()`, `Joint()` | Whether each asset's cover is designed on its own or several together, for one objective on the owner's total ([joint design](#joint-design-over-several-assets)) |
+| Scope | `Individual()`, `Joint()`, `Clustered` | Whether each asset's cover is designed on its own, several together for one objective on the owner's total ([joint design](#joint-design-over-several-assets)), or one cover per cluster of the assets that you state, on the value-weighted mean of its assets' indices ([clusters](#clusters-of-assets)) |
 | Comparison | `compare`, a `pyarrow.Table` | Covers as rows, metrics as columns, in and out of sample |
 | Scenarios | `ScenarioSet`, `AnnualScenario`, `CurveScenario`, `compare_scenarios`, `to_drift` | Every cover or design on every scenario's block, such as windows of horizons, in one table, and each row's difference from a reference scenario ([scenarios on the plan](#scenarios-on-the-plan)) |
 | Pooled folds and intervals | `compare_pooled`, `bootstrap_intervals` | Metrics computed once over all the held-out years of a k-fold split, and how much a number moves with the years drawn ([pooled folds and intervals](#pooled-folds-and-intervals)) |
@@ -308,7 +313,7 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
 | `.metrics(options)` | The `MetricOptions` of every row |
 | `.scopes(*scopes)` | `Individual()`, the default, designs each asset on its own; `Joint()` designs each template on the owner's total ([joint design](#joint-design-over-several-assets)); `Clustered(assignment, joint=...)` one cover per cluster of the assets, weighted by the values the plan's loss model reads ([clusters on the plan](#clusters-on-the-plan)) |
 | `.dependence(model)` | Fitted curves only, and required there with `Joint()`, `Clustered` and `.hazard(...)`: how the assets', or the hazards', draws are put side by side (`Independent()`, `Comonotonic()`, `EmpiricalCopula(reference)`, `GaussianCopula(correlation)` or a `DependenceModel` of your own). A plan on per-year values raises: its dependence is the data's own |
-| `.allocation(rule)` | With `Joint()`: adds a joint design's allocated rows, under `"value"` or `"loss"`, in a table and a file of their own ([allocated rows](#allocated-rows-in-a-table-of-their-own)) |
+| `.allocation(rule)` | With `Joint()` or `Clustered`: adds a joint or cluster design's allocated rows, under `"value"` or `"loss"`, in a table and a file of their own ([allocated rows](#allocated-rows-in-a-table-of-their-own)) |
 | `.scenarios(set, *, design_on, premiums)` | Several scenarios, such as windows of horizons, each cover and design evaluated on every scenario's block, out of sample ([scenarios on the plan](#scenarios-on-the-plan)) |
 | `.hazard(name, source, ...)`, `.combine(rule)`, `.package(covers, *, label, shares)` | Several hazards at each asset, the rule of their combined loss, and separate contracts as one row ([several hazards on the plan](#several-hazards-on-the-plan)) |
 
@@ -371,9 +376,9 @@ model. Fresh draws spawn their children from `SeedSequence(FreshDraws.seed)`
 in the same way. On per-year values only the basis-risk model draws, so
 `HazardNoise` and `ImpactNoise` need a seed there, at every sigma. Each
 sample's provenance records its
-generator's state before each draw. With `Joint()` on fitted curves,
-`sample_curves` takes those same children, one per asset, and its dependence
-model reorders the rows without any further random number.
+generator's state before each draw. With `Joint()` or `Clustered` on fitted
+curves, `sample_curves` takes those same children, one per asset, and its
+dependence model reorders the rows without any further random number.
 
 ### Explain, execute, write
 
@@ -834,9 +839,10 @@ run. `provenance` states the archive's licence and attribution once; each run's
 own columns are recorded with it. `.samples()` returns one pooled sample per
 asset. `cell=` is allowed, as the cell belongs to the asset, not to a run.
 
-**Under `Joint()`** the assets' pools are joined by `OutcomeSample.join`, which
-needs the same (year, model, member) rows under one pathway, because draw
-numbers alone would not line them up. The dependence is the data's own, the rows
+**Under `Joint()`**, and under `Clustered` as under `Joint()`, the assets'
+pools are joined by `OutcomeSample.join`, which needs the same (year, model,
+member) rows under one pathway, because draw numbers alone would not line them
+up. The dependence is the data's own, the rows
 being the same model-years. With `LinearTrend` and a split the plan joins per
 fold.
 
@@ -1107,7 +1113,8 @@ row is one draw or year of every hazard in each scenario:
   objective on every scenario's design block, so that how a fixed cover drifts
   and a design per scenario are slices of one table. `"reference"` designs on the
   reference's design block only. `.designs()` is in scenario, asset, fold, cover
-  and objective order (scenario, fold, cover and objective under `Joint()`).
+  and objective order (scenario, fold, cover and objective under `Joint()` or
+  `Clustered`).
 - **`.split(...)` is required**, because the rows are out of sample only. One
   rule makes each scenario's blocks: `FreshDraws` designs on the plan's draws
   and evaluates on fresh ones (curves); `Holdout` and `KFold` cut each
@@ -1127,16 +1134,19 @@ row is one draw or year of every hazard in each scenario:
   `"other_scenario"`.
 - **Joint designs.** Under `Joint()` each scenario has one sample of all the
   assets per block, and a joint design gets one `"total"` row per scenario, as in
-  [the rows of a joint design](#the-rows-of-a-joint-design).
+  [the rows of a joint design](#the-rows-of-a-joint-design). Under `Clustered`
+  each scenario has that sample too, and a cluster design gets the rows of
+  [clusters](#clusters-of-assets) per scenario.
 
 ### Allocated rows and breakdowns
 
-- **Allocated rows.** Under `Joint()` and `.allocation(rule)`, each joint design's
-  allocated rows on every scenario's block go to the second file,
+- **Allocated rows.** Under `Joint()` or `Clustered` and `.allocation(rule)`,
+  each design's allocated rows on every scenario's block go to the second file,
   `<stem>.allocated<suffix>`, as on a plan without scenarios ([allocated
   rows](#allocated-rows-in-a-table-of-their-own)), and the main file keeps the
-  `"total"` rows. An allocated row shares the design's total payout on that block
-  out over the assets, under the stated rule: an accounting statement about the
+  design's own rows. An allocated row shares the design's total payout on that
+  block out over the assets, or under `Clustered` each cluster's payout over its
+  own assets, under the stated rule: an accounting statement about the
   total, not the payout of an asset's cover, with no premium,
   `premium_repriced` or net-loss values. `scenario` and `design_scenario` say
   where the row is evaluated and where the design was made, and the file's
@@ -1148,7 +1158,7 @@ row is one draw or year of every hazard in each scenario:
   `design_scenario`; the parts of one entry add up to its expected payout on
   that block, and nothing is written. The rows are
   `payout_breakdown_scenarios`' on each fold's blocks. It isn't offered under
-  `Joint()`, whose designs are on the owner's total.
+  `Joint()`, whose designs are on the owner's total, or under `Clustered`.
 
 On the function route they take a `ScenarioSet` of built samples, as
 `compare_scenarios` does, and every row is out of sample:
@@ -1437,8 +1447,9 @@ Before execution, `setup_text(plan.explain(format="json"))` gives the same
 lines, and says what only execution knows (the years of each block, the leakage
 check, the dataset's own metadata) is not known yet. In place of the design
 records it has one `Design` line per objective and scope the plan states: the
-templates, the objective, the pricing, the budget and the limit, and under
-`Joint()` the scope and the assets of the total, with the design premium, the
+templates, the objective, the pricing, the budget and the limit, under
+`Joint()` the scope and the assets of the total, and under `Clustered` the
+clusters and their assets and the setting, with the design premium, the
 route and the non-uniqueness report not known yet. Without templates nothing is
 designed, so there is no such line. Its `Source` line names what the plan
 states: on fitted curves the canonical dataset's path and the hazards, horizons
@@ -1606,6 +1617,10 @@ Hash: sha256:d6d4fb6ee74366eb0fe226b0dcecf07f992c23e4d5051953a9b0c9ffef9cf1e5, o
   contracts](#separate-contracts-coverpackage-and-split_budget)). A
   `ScenarioSet` holds samples and no terms: a cover keeps its terms in every
   scenario.
+- **Clusters.** A cluster's cover, designed under
+  [`Clustered`](#clusters-of-assets), has a `Cluster` line in place of the
+  `Asset` line, and its `Index` line names the cluster's assets with their
+  weights.
 
 ## User-defined payouts
 
@@ -1821,6 +1836,22 @@ Parquet key `crc.parametric.sample`, and `OutcomeSample.from_written_table(table
 reads it back, in memory or from `pyarrow.parquet.read_table`, with its
 provenance and lineage; a table whose rows no longer match the recorded
 content hash raises `SampleError`.
+
+The long table has one row per period and asset, sorted by period and asset
+id, with the columns `scenario`, `period`, `asset_id`, `probability`, `index`,
+`loss` and `hazard` (null where the hazard is the index). The record's
+`schema_version` says what else the sample holds:
+
+| `schema_version` | The sample | Its columns beside those |
+| --- | --- | --- |
+| `"1.0"` | one hazard | none |
+| `"1.1"` | index components ([a sample of several hazards](#a-sample-of-several-hazards)) | `index[<name>]`, `hazard[<name>]` and `own_loss[<name>]`, per component |
+| `"1.2"` | index components that keep their damage | `damage[<name>]` too |
+| `"1.3"` | a `GaussianCopula` sample, which keeps `OutcomeSample.latent_ranks` ([the record](#several-assets-from-fitted-curves)) | `latent_rank`, int64, after `hazard` on several assets; on several hazards `latent_rank[<name>]`, after each component's other columns |
+
+A reader that knows only the earlier versions refuses a later one rather than
+dropping its columns, and `from_written_table` reads all four. A sample
+without damages or latent ranks writes and hashes as before they existed.
 
 ### Basis-risk models
 
@@ -2121,12 +2152,12 @@ synthetic setup, nothing more.
   its reorder treats the rows. Under every model the out-of-sample test is a
   fresh sample: new generators, the same model.
 
-On a plan,
+On a plan under `Joint()` or `Clustered`,
 `.dependence(model)` states it and `.joint_sample()` returns the sample; the
-plan takes `Independent()`, `Comonotonic()` and `EmpiricalCopula(reference)`.
-The same models, `GaussianCopula` and a model of your own included, put the
-hazards of one asset side by side in `sample_curve_hazards` ([several
-hazards](#several-hazards-at-one-asset)).
+plan takes every model above, `GaussianCopula` and a model of your own
+included. The same models put the hazards of one asset side by side in
+`sample_curve_hazards` ([several hazards](#several-hazards-at-one-asset)), and
+on a plan with `.hazard(...)`.
 
 ## Evaluate and compare covers
 
@@ -2775,6 +2806,29 @@ difference between them.
   blocks' rows at 0.78 to 0.99. These numbers describe this synthetic setup,
   nothing more.
 
+  **What no run measured.** These rows built together are in none of the five
+  runs, so no number on this page describes their coverage:
+
+  - held blocks of `Comonotonic()` other than the fifth run's two assets, and
+    every held `GaussianCopula` block, which are re-dealt and re-ranked;
+  - `Comonotonic()` and `GaussianCopula` blocks across hazards and on a window
+    of horizons, re-dealt by the model's ranks, and the rows of a cluster under
+    either model;
+  - blocks of three columns or more under `Comonotonic()` or `GaussianCopula`:
+    the runs gave them two;
+  - pooled rows re-dealt fold by fold whose folds' covers differ: in the fifth
+    run every fold held the same covers;
+  - draws tied in their index, as at a hurdle curve's atom or a tabulated curve
+    clamped at its knots, which the re-deal of an `EmpiricalCopula` or a
+    `Comonotonic()` block orders by the block's rows, as above, where the model
+    ordered them by their uniforms; and a reference with tied years;
+  - the rows kept on the unit above with the reason `"index_moved"`, an
+    `EmpiricalCopula` block whose index a basis-risk model of yours moved, and
+    with `"index_not_comonotone"`, a `Comonotonic()` block whose indices don't
+    rise together;
+  - every row under a model of your own; and under `Clustered`, allocated rows
+    by loss, and clusters of more than two assets or with unequal weights.
+
   The column `built_together` flags the rows built together. It follows how the
   block was built, not the method or a measured coverage:
 
@@ -2805,10 +2859,11 @@ difference between them.
     rows as the unit above resampled them before, its fourth run as they are
     re-dealt, and its fifth run their `"total"` rows pooled over the folds of
     `year_block_kfold`, re-dealt fold by fold, and those of a held block of two
-    assets under `Comonotonic()`, re-dealt and re-ranked. Across hazards, on a
-    window of horizons, with three columns or more and on a held
-    `GaussianCopula` block their coverage is unmeasured. A model of your own is
-    flagged too, and the coverage of its intervals is unmeasured.
+    assets under `Comonotonic()`, re-dealt and re-ranked. Their other rows,
+    across hazards, on a window of horizons, with three columns or more and on
+    held blocks beyond that one, are among those no run measured, above. A
+    model of your own is flagged too, and the coverage of its intervals is
+    unmeasured.
     `Independent()` keeps every column in draw order. It was measured, and
     isn't flagged.
 
@@ -3008,7 +3063,7 @@ design's rows are the owner's total, per scenario, as in
 [the rows of a joint design](#the-rows-of-a-joint-design). On the plan,
 [`.scenarios(...)`](#scenarios-on-the-plan) builds every scenario's blocks and
 calls this function, one fold and one asset at a time, or once for all the assets
-under `Joint()`.
+under `Joint()` or `Clustered`.
 
 ## Design a cover
 
@@ -3313,9 +3368,9 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
     amounts included, so no LP or QP solves its amounts: the option raises
     `DesignError`, naming the reason. `design_joint` has no grid route, since
     its thresholds are fixed, so the option raises `DesignError` there too,
-    and on a plan under `Joint()`. A threshold without a finite upper bound
-    raises `DesignError`. The plan and `design_frontier` pass the option to
-    every design they make.
+    and on a plan under `Joint()` or `Clustered`. A threshold without a finite
+    upper bound raises `DesignError`. The plan and `design_frontier` pass the
+    option to every design they make.
   - **What it costs.** Each point it evaluates is one LP or QP, as a grid
     point is, and `solves`, `iterations` and `seconds` count them. A search
     over the index values tries every distinct index value in each window,
@@ -3407,8 +3462,15 @@ the larger of the bound and the scale). Nothing is returned that fails them.
 | `InfeasibleDesignError` | no payout meets the constraints, including a fixed amount or a lower bound above the limit, a budget below the pricing's fixed expense, and a grid without a feasible candidate |
 | `UnboundedDesignError` | the solver reports an unbounded objective; never for `MSE()`, which is at least 0, so a QP reported unbounded raises `DesignError` |
 | `SolverLimitError` | a solve stopped at its iteration or time limit before it found an optimum; its `status` names the limit: `"qp_iteration_limit"`, `"time_limit"`, `"active_set_iteration_limit"` or `"cutting_plane_limit"` |
-| `DesignError` | any other solver status, a failed check, a missing grid, a grid above the cap, E[U] or weighted CVaR without a budget or bounds |
+| `DesignError` | any other solver status, a failed check, a missing grid, a grid above the cap, E[U] or weighted CVaR without a budget or bounds, and a template on a `ClusterIndex`, which `design_joint` designs under `Clustered` |
+| `DesignError`, from the refinement | `DesignOptions(refine=True)` where nothing can be refined: on a grid evaluated in numpy (a `UserObjective`, or a payout not linear in its amounts), for a free threshold without a finite upper bound, and in `design_joint`, whose thresholds are fixed, alone or at a plan's execution under `Joint()` or `Clustered`. Each is raised before anything is solved, and names its reason |
 | `SolverUnavailableError` | the LP or QP route without `crc-sdk[parametric]` |
+
+`DesignOptions` checks its own values when it is built and raises
+`CoverDefinitionError`: a `max_grid_points` or `refine_max_points` below 1, a
+`feasibility_tolerance` or `refine_tolerance` outside (0, 1), and
+`refine_tolerance` or `refine_max_points` stated at a value other than its
+default without `refine=True`, since it would change nothing.
 
 The design errors are `RuntimeError`s and carry `asset_id`, `status` and
 `solver_message`. Free amounts below 1e-9 of the scale are set to 0 and listed
@@ -3508,8 +3570,13 @@ SHA-256 of the canonical JSON of the template hash, the objective, the pricing,
 the budget, the limit, the options and the design sample's `content_hash`
 (the solver and the time are in the record, not in the id); the
 `objective_value`, the design `premium`, `expected_loss`, `budget_bound` and
-`budget_use`; the `route`; the solver's identity, status and work; the
-non-uniqueness report and the degenerate-tail flags; and the `design_sample`.
+`budget_use`; the `route`; the solver's identity, status and work, with
+`solved_by` and `fallbacks` ([solver settings](#routes)); the non-uniqueness
+report (`unidentified`, `zeroed`, `ranges`, `unique`, `ties`) and the
+degenerate-tail flags; on the grid route the grid's `profile`; with
+`DesignOptions(refine=True)`, the refinement's record, `refinement`, and its
+points, `refinement_profile` ([a local refinement after the grid](#routes)),
+both `None` without a refinement; and the `design_sample`.
 `result.cover.terms_text()` states the designed terms in words ([the terms in
 words](#the-terms-in-words)), and the record says how they were chosen.
 
@@ -3561,9 +3628,11 @@ sample.
 - **Non-uniqueness and degenerate tails are reported on each row**: `unique`,
   `ties`, `degenerate_tail` and `unidentified_share`, as on any design's row.
   `DesignOptions()` ranges every LP row, at four more LPs per amount and per
-  budget; with `design_options=DesignOptions(ranges=False)` `unique` is null on the
-  LP route and the setup text says "not checked" ([non-unique
-  optima](#non-unique-optima)).
+  budget. Each is a small LP that grows with the draws near a kink rather than
+  with all of them, so ranging adds little to a row's design: on the synthetic
+  setup of [non-unique optima](#non-unique-optima), 1.43 s with ranges against
+  1.39 s without. With `design_options=DesignOptions(ranges=False)` `unique` is
+  null on the LP route and the setup text says "not checked".
 - **The table names no best budget.** It has no rank, no best flag, no marginal
   column and no ordering by a metric. A difference between two rows describes that
   pair of budgets, on the block stated.
@@ -3925,7 +3994,8 @@ cluster_shares = allocate([cluster_design], book_held_out, split="out_of_sample"
   settings, with its allocated rows by value: on an `EmpiricalCopula` block
   (re-dealt) and on a held block (re-ranked). The rows of a cluster under
   `Comonotonic()`, `GaussianCopula` or a model of your own, allocated rows by
-  loss, and clusters of more than two assets are unmeasured.
+  loss, and clusters of more than two assets or with unequal weights are
+  unmeasured.
 - **What is refused.** `payout_breakdown` and `payout_breakdown_scenarios`
   raise `EvaluationError` for a cluster design, as for a joint design: a
   breakdown parts one asset's payout over its hazards, and a cluster's cover
@@ -4395,9 +4465,19 @@ own loss.
 | --- | --- |
 | `SumOf` of components linear in their amounts, thresholds fixed | one LP or QP on the side-by-side basis [B_1 \| … \| B_K] |
 | `StepGrid`, thresholds fixed | one LP or QP, on the one-hot basis of the cells |
-| `SumOf` or `StepGrid` with free thresholds on grids | the grid over the threshold candidates, with the LP or QP at each point, under `max_grid_points` |
+| `SumOf` or `StepGrid` with free thresholds on grids, or a `MaxOf` with a free scale over components with them | the grid over the threshold candidates, with the LP or QP at each point, under `max_grid_points`; with `DesignOptions(refine=True)`, then the refinement below |
 | `MaxOf` with a free scale over fixed components | one LP or QP in one amount, the scale |
 | `MaxOf` with a fixed scale, a `SumOf` with a component that isn't linear in its amounts, a family of your own without `LinearInAmounts`, or a `UserObjective` | the numpy grid over every free parameter, under `max_grid_points` |
+
+`DesignOptions(refine=True)` refines the grid's best point as on one index
+([a local refinement after the grid](#routes)). A `StepGrid`, and a `SumOf`
+or `MaxOf` whose free thresholds are those of step and binary components, is a
+payout built from steps: its free thresholds are refined over the design
+sample's index values, each threshold on its own component's values. A
+template with any other free threshold, such as a linear component's
+attachment in a `SumOf`, takes the compass search for all of them. A template
+on the numpy grid can't be refined, and the option raises `DesignError` there,
+as on one index.
 
 [Non-unique optima](#non-unique-optima) applies: a grid cell or a band that no
 design year reaches is in `unidentified`, and the fill rule runs on the order of
@@ -4705,7 +4785,8 @@ rank and no best flag.
   and a plan builds one sample per asset, so it assumes no dependence between
   them.
 - **Different terms per asset on the plan.** Under `Joint()` a plan applies each
-  cover to every asset. `design_joint` takes one template per asset.
+  cover to every asset, and under `Clustered` to every cluster. `design_joint`
+  takes one template per asset, or per cluster.
 - **A breakdown of a cluster design, and clusters beside an index read
   elsewhere.** `payout_breakdown` and `.payout_breakdown()` part one asset's
   payout over its hazards, so they refuse a cluster design, and a plan refuses
@@ -4721,6 +4802,12 @@ rank and no best flag.
   scaled by another is not built in (a family of your own can be registered).
 - **A design robust over scenarios.** A design is made on one scenario's block
   at a time, and none minimises the worst case over the scenarios.
+- **A global search over thresholds, and unique thresholds.** The grid searches
+  the stated grid. A refinement after it ends where no single threshold
+  improves within its window, over the index values, or at a local optimum of
+  the compass search's last step: neither is a global optimum. Whether the
+  refined thresholds are the only optimal ones is not checked, and `unique`
+  speaks of the amounts at them ([routes](#routes)).
 - **Several members of one model in a pool.** A model appears once, whatever
   its member. **An index read elsewhere on a pool**, even from the same run at
   another cell, is refused.
@@ -4738,14 +4825,22 @@ rank and no best flag.
   fold; `compare_pooled` and `bootstrap_intervals` are functions. An interval on
   the difference between two rows is not offered.
 - **Intervals on every row built together.** `bootstrap_intervals` builds the
-  rows of an `EmpiricalCopula` block and of a held `HazardNoise` block again on
-  each replicate, but not those it can't build again: on a sample of several
-  hazards whose rule is your own or whose combined loss a table states, or that
-  keeps no damages and whose loss models state a value, on a view whose
-  combined loss reads hazards it doesn't hold, on a selection of a held sample,
-  on a `GaussianCopula` sample written without its latent ranks, and on pooled
-  folds of `EmpiricalCopula` and held blocks. Those keep the resampling they
-  had, and `setup.intervals.kept_today` says why. It builds the rows of
-  `Comonotonic()` and `GaussianCopula` blocks again too, but resamples the rows
-  of a block that a model of your own moved as independent rows, and flags them
-  with `built_together`.
+  rows of `EmpiricalCopula`, `Comonotonic()` and `GaussianCopula` blocks and of
+  held `HazardNoise` blocks again on each replicate, but not those it can't
+  build again: on a sample of several hazards whose rule is your own or whose
+  combined loss a table states, or that keeps no damages and whose loss models
+  state a value, on a view whose combined loss reads hazards it doesn't hold,
+  on a selection of a held sample, on a `GaussianCopula` sample written
+  without its latent ranks, on an `EmpiricalCopula` or `Comonotonic()` block
+  whose index a basis-risk model of yours moved (`"index_moved"`,
+  `"index_not_comonotone"`), and on pooled folds of `EmpiricalCopula` and held
+  blocks. Those keep the resampling they had, and `setup.intervals.kept_today`
+  says why. It resamples the rows of a block that a model of your own moved as
+  independent rows, and flags them with `built_together`.
+- **A measured coverage for every interval.** The coverage study measured
+  some kinds of rows built together, on its synthetic setup, and no run
+  measured others ([what no run measured](#pooled-folds-and-intervals)). Among
+  them: held blocks of `Comonotonic()` beyond two assets, and every held
+  `GaussianCopula` block; these two models across hazards, on a window of
+  horizons and with three columns or more; draws tied in their index, as at a
+  curve's atom; and the rows kept with `"index_moved"`.

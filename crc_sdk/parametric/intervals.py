@@ -83,7 +83,8 @@ the caller's moved one), a block that several models moved, and pooled rows of
 an `EmpiricalCopula` or a held block, which come only from folds built by
 hand. Pooled rows of `Comonotonic()` and `GaussianCopula` folds are re-dealt
 within each fold's held-out block, and joined again in fold order.
-`docs/parametric.md` gives a synthetic coverage study. Resampling whole
+`docs/parametric.md` gives a synthetic coverage study of these methods, and
+lists the rows built together that it didn't measure. Resampling whole
 reference years is not offered: it made most intervals of a copula block too
 wide.
 

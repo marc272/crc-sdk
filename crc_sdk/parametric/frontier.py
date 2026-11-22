@@ -18,8 +18,9 @@ payout units.
 **Each row is solved on its own**, so it doesn't depend on the other budgets or on
 their order. Amounts may jump between neighbouring budgets where a row isn't
 unique. Each row says so in its own `unique`, `ties`, `degenerate_tail` and
-`unidentified_share`. With `DesignOptions(ranges=True)` every row is ranged, at four
-more LPs per amount; without it `unique` is null on the LP route.
+`unidentified_share`. Ranging is the default: under `DesignOptions()` every LP row
+is ranged, at four more small LPs per amount, and with `DesignOptions(ranges=False)`
+`unique` is null on the LP route.
 
 **Nothing is ranked.** The table has no rank, no best flag, no marginal column and
 no ordering by a metric. On the design sample the objective doesn't rise with the
@@ -179,9 +180,9 @@ def design_frontier(
     premium is the design premium. Each row is solved on its own and doesn't depend
     on the other budgets or on their order. Amounts may jump between neighbouring
     budgets where a row isn't unique, and each row's `unique`, `ties`,
-    `degenerate_tail` and `unidentified_share` say so. With
-    `DesignOptions(ranges=True)` every row is ranged, and without it `unique` is
-    null on the LP route.
+    `degenerate_tail` and `unidentified_share` say so. Ranging is the default:
+    under `DesignOptions()` every LP row is ranged, and with
+    `DesignOptions(ranges=False)` `unique` is null on the LP route.
 
     The table has `compare`'s columns, in `compare`'s order, and, between the
     identity columns and the metric columns, `budget_ratio` and `budget_amount`
