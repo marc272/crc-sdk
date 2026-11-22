@@ -811,7 +811,8 @@ def test_the_setup_text_names_the_re_deal(model: Any, text: str) -> None:
     assert UNMEASURED_TEXT not in line
     assert (
         'and on the "total" rows of two assets under Comonotonic() and under a '
-        "GaussianCopula (re-dealt)"
+        "GaussianCopula, on one block and pooled over the folds of year_block_kfold "
+        "(re-dealt)"
     ) in line
 
 

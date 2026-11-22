@@ -2702,6 +2702,73 @@ difference between them.
   true value in 0.912 to 0.920 of the replications, and in 0.898 to 0.922 by
   year.
 
+  A fifth run, on the setup of the second and with generators of its own,
+  measured the rows of a design under `Clustered`, and rows of `Comonotonic()`
+  and `GaussianCopula` blocks that the fourth left out, each resampled as the
+  module resamples it now. The cluster design had three assets: the two above,
+  and a third with the first's curve and draws of its own. The first two were
+  one cluster and the third another, each asset with a value of 100 EUR, so the
+  cluster of two paid on the mean of its assets' indices. For each block and
+  setting of `joint`, one design was made once, on 3,000 rows of the same model
+  drawn apart, with `ExpectedUncovered()` and `Budget(ratio=0.8)`, from
+  `LinearPayout(57.5, 95, Free())` on the cluster of two and `LinearPayout(55,
+  90, Free())` on the third asset's, and every block evaluated it out of
+  sample, with its allocated rows by value. A design's premium is a fixed
+  price, so it wasn't priced again on a replicate. The blocks were each
+  `EmpiricalCopula` above, whose reference gave the third asset normal scores
+  of its own, independent of the others', and a held block of the three assets
+  under `Independent()`. The run also measured a held block of the two assets
+  under `Comonotonic()`, with the covers above given as is, and the pooled rows
+  of the five folds of `year_block_kfold` under `Comonotonic()`,
+  `GaussianCopula(0.8)` and `GaussianCopula(-0.8)`. The leakage checks refuse
+  covers given as is on such folds, so each fold held one design per asset,
+  made on its design block's view of that asset from the covers above with
+  their limit bounded to 60: each fold's covers were those covers, and each
+  year paid its own fold's premium, the pure premium on that fold's design
+  block. A pooled row's true value read each fold's designs and premium on a
+  fifth of the large blocks' rows. Each share has a Monte Carlo error of at
+  most 0.014.
+
+  | Block | Rows | Resampled | Columns | Share that held the true value |
+  | --- | --- | --- | --- | --- |
+  | `EmpiricalCopula` at +0.8, three assets, the design under `Clustered`, both settings | the row of the cluster of two, the `"total"` row, and the allocated rows of the cluster's two assets | re-dealt | the means, `false_negative_rate` | 0.871 to 0.961 |
+  | The same | the same | re-dealt | `payout_frequency` | 0.995 to 0.996 on the cluster's rows, 0.946 to 0.955 on the `"total"` row, a bound within 1e-12 of the true value counted as holding it (below) |
+  | `EmpiricalCopula` at -0.8, the same | the same | re-dealt | the means, the counts | 0.881 to 0.924 |
+  | `EmpiricalCopula` at +0.8 and -0.8, the same | the same | re-dealt | `rmse` | 0.849 to 0.964 |
+  | The same | the same | re-dealt | the tail columns | 0.870 to 0.997 |
+  | The same | the row of the cluster of two at +0.8, and the allocated rows of the cluster's two assets | re-dealt | `false_positive_rate` | 0.928 to 0.969 |
+  | The same | the third asset's cluster row and allocated row | by row | every column | 0.866 to 0.927 |
+  | Held, three assets under `Independent()`, the same design, both settings | every row | re-ranked | every column | 0.857 to 0.934 |
+  | Held, two assets under `Comonotonic()` | an asset's own row | re-ranked | every column | 0.859 to 0.932 |
+  | The same | the `"total"` row | re-dealt and re-ranked | the means, the counts, `rmse` | 0.883 to 0.926 |
+  | The same | the `"total"` row | re-dealt and re-ranked | the tail columns | 0.931 to 0.982 |
+  | `Comonotonic()`, `GaussianCopula(0.8)` and `GaussianCopula(-0.8)`, two assets, pooled over five folds | an asset's own row | by year | every column | 0.858 to 0.921 |
+  | `Comonotonic()`, pooled | the `"total"` row | re-dealt fold by fold | the means, `rmse` | 0.893 to 0.917 |
+  | The same | the `"total"` row | re-dealt fold by fold | the counts | 0.724 to 0.759 |
+  | `GaussianCopula(0.8)` and `GaussianCopula(-0.8)`, pooled | the `"total"` row | re-dealt fold by fold | the means, the counts, `rmse` | 0.858 to 0.910 |
+  | The three models, pooled | the `"total"` row | re-dealt fold by fold | the tail columns | 0.934 to 0.977 |
+  | `Comonotonic()` and `GaussianCopula(0.8)`, pooled | the `"total"` row | re-dealt fold by fold | `false_positive_rate` | 0.999 |
+
+  Under the `EmpiricalCopula` at +0.8, the payout frequency of the cluster of
+  two was a whole number of reference years: on the large blocks every draw of
+  a reference year paid or none did, so its true value was 10 years of 30, 1/3,
+  on the cluster's rows and 21 of 30, 0.7, on the `"total"` row. The number
+  itself was 1/3 in 789 to 817 of the 1,000 blocks, and 0.7 in 392. A bound
+  then equals the true value up to rounding, so the table counts a bound within
+  1e-12 of it as holding it; compared exactly, the shares are 0.000 on the
+  cluster's rows and 0.747 to 0.752 on the `"total"` row. A column undefined
+  in more than 100 replications is left out, as `false_positive_rate` is on
+  the cluster design's `"total"` rows, on the row of the cluster of two at -0.8
+  and on the held block, on the second asset's allocated row on the held block,
+  and on the second asset's own row and the `"total"` row of the held
+  `Comonotonic()` block and the pooled `"total"` row of `GaussianCopula(-0.8)`.
+  `correlation` held the true value in 0.902 to 0.982 of the replications on
+  the re-dealt cluster rows, 0.882 to 0.901 on the held ones, 0.918 on the held
+  `Comonotonic()` `"total"` row and 0.909 to 0.935 on the pooled `"total"`
+  rows. Rows of a cluster under `Comonotonic()`, `GaussianCopula` or a model of
+  your own, allocated rows by loss, and clusters of more than two assets were
+  not measured.
+
   On the same setup, with these rows resampled as independent rows as before,
   an earlier run of the study found the copula's `"total"` rows at 0.55 to
   0.97, lowest for `payout_frequency` and `false_negative_rate`, and the held
@@ -2735,10 +2802,15 @@ difference between them.
     exchangeable, not independent ([cuts of one
     sample](#several-assets-from-fitted-curves)). They are flagged by
     construction, and re-dealt; the study's second run measured their `"total"`
-    rows as the unit above resampled them before, and its fourth run as they
-    are re-dealt. A model of your own is flagged too, and the coverage of its
-    intervals is unmeasured. `Independent()` keeps every column in draw order.
-    It was measured, and isn't flagged.
+    rows as the unit above resampled them before, its fourth run as they are
+    re-dealt, and its fifth run their `"total"` rows pooled over the folds of
+    `year_block_kfold`, re-dealt fold by fold, and those of a held block of two
+    assets under `Comonotonic()`, re-dealt and re-ranked. Across hazards, on a
+    window of horizons, with three columns or more and on a held
+    `GaussianCopula` block their coverage is unmeasured. A model of your own is
+    flagged too, and the coverage of its intervals is unmeasured.
+    `Independent()` keeps every column in draw order. It was measured, and
+    isn't flagged.
 
   When a row is flagged, the setup text's `Intervals` line says how its rows
   were built and how they were resampled: for rows re-dealt or re-ranked, the
@@ -3847,9 +3919,13 @@ cluster_shares = allocate([cluster_design], book_held_out, split="out_of_sample"
   re-ranked, under `Comonotonic()` and `GaussianCopula` they are re-dealt by
   the model's ranks, and under a model of your own they keep the unit above,
   flagged. The rows of a one-asset cluster read one
-  column, as an asset's own row does. The coverage study of [those
-  intervals](#pooled-folds-and-intervals) measured no row of a cluster, so
-  their coverage is unmeasured.
+  column, as an asset's own row does. The fifth run of the coverage study of
+  [those intervals](#pooled-folds-and-intervals) measured the rows of one
+  design of three assets, a cluster of two and one of one, under both
+  settings, with its allocated rows by value: on an `EmpiricalCopula` block
+  (re-dealt) and on a held block (re-ranked). The rows of a cluster under
+  `Comonotonic()`, `GaussianCopula` or a model of your own, allocated rows by
+  loss, and clusters of more than two assets are unmeasured.
 - **What is refused.** `payout_breakdown` and `payout_breakdown_scenarios`
   raise `EvaluationError` for a cluster design, as for a joint design: a
   breakdown parts one asset's payout over its hazards, and a cluster's cover

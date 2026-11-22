@@ -1488,6 +1488,9 @@ def test_the_setup_text_names_the_method_of_re_dealt_rows() -> None:
     assert "of a window of two horizons" in line
     assert "of per-year values, of a pool" in line
     assert "held EmpiricalCopula blocks of two assets and of two hazards" in line
+    assert "a design under Clustered with a cluster of two assets under one" in line
+    assert "the same design under Clustered on a held block (re-ranked)" in line
+    assert "a held Comonotonic() block of two assets (both)" in line
 
 
 def test_the_setup_text_of_a_held_block_names_re_ranking() -> None:

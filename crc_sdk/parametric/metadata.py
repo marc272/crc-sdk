@@ -3661,12 +3661,16 @@ def _intervals(intervals: Mapping[str, Any]) -> str:
         ' crc-sdk\'s docs/parametric.md, "Rows built together", gives a synthetic '
         'coverage study, which measured these methods only on the "total" rows of '
         "two assets under one EmpiricalCopula, of curves and of a window of two "
-        "horizons, on the rows of two hazards under one, with their losses as "
-        'damage ratios and on a stated value, and on the "total" rows of two '
-        "assets under Comonotonic() and under a GaussianCopula (re-dealt); on held "
-        "blocks of the curves of one asset or two, of per-year values, of a pool "
-        "and of two hazards with damage ratios (re-ranked); and on held "
-        "EmpiricalCopula blocks of two assets and of two hazards (both)."
+        "horizons, on the rows of a design under Clustered with a cluster of two "
+        "assets under one, on the rows of two hazards under one, with their losses "
+        'as damage ratios and on a stated value, and on the "total" rows of two '
+        "assets under Comonotonic() and under a GaussianCopula, on one block and "
+        "pooled over the folds of year_block_kfold (re-dealt); on held blocks of "
+        "the curves of one asset or two, of per-year values, of a pool and of two "
+        "hazards with damage ratios, and on the rows of the same design under "
+        "Clustered on a held block (re-ranked); and on held EmpiricalCopula blocks "
+        "of two assets and of two hazards and on a held Comonotonic() block of two "
+        "assets (both)."
     )
 
 
