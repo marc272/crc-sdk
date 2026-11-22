@@ -875,8 +875,16 @@ def test_join_keeps_the_pool_and_states_the_data_s_dependence() -> None:
 
 
 def test_join_needs_the_same_rows() -> None:
+    # Pools of other lengths get the pools' message, which names the model-years.
     two = _pool([_run(model) for model in MODELS[:2]], asset_id="site-b")
-    with pytest.raises(SampleError, match="identical period"):
+    with pytest.raises(
+        SampleError,
+        match=r"same \(year, model, member\) rows, because draw numbers alone would "
+        r"not line them up, but those of asset 'site-b' differ from those of asset "
+        r"'site-a': only asset 'site-a' holds \(2015, 'NorESM2-LM', 'r1i1p1f1'\), "
+        r"\(2016, 'NorESM2-LM', 'r1i1p1f1'\), \(2017, 'NorESM2-LM', 'r1i1p1f1'\) and "
+        r"27 more$",
+    ):
         OutcomeSample.join([_pool([_run(m) for m in MODELS]), two])
     other = _pool([_run("X"), _run(MODELS[1]), _run(MODELS[2])], asset_id="site-b")
     with pytest.raises(SampleError, match=r"same \(year, model, member\)"):

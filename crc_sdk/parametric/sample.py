@@ -1643,6 +1643,13 @@ class OutcomeSample:
         for name in ("period", "probability"):
             for part in parts[1:]:
                 if not np.array_equal(getattr(part, name), getattr(first, name)):
+                    if (
+                        first.provenance.pool is not None
+                        and part.provenance.pool is not None
+                    ):
+                        # A pool's periods are draw numbers, which say nothing of
+                        # the model-years: the pools' own check names those.
+                        _check_same_pool((first, part))
                     raise SampleError(
                         f"join needs identical {name} columns, but asset "
                         f"{part.asset_ids[0]!r} differs from asset {ids[0]!r}"
@@ -3174,11 +3181,46 @@ def _pool_row_ids(pool: Mapping[str, Any]) -> list[tuple[int, str, str]]:
     ]
 
 
+_ROWS_NAMED = 3
+"""How many model-years a refused join names on each side before it counts the rest."""
+
+
+def _named_rows(rows: Sequence[tuple[int, str, str]]) -> str:
+    """The first `_ROWS_NAMED` of `rows` as (year, model, member), then a count."""
+    named = ", ".join(
+        f"({year}, {model!r}, {member!r})" for year, model, member in rows[:_ROWS_NAMED]
+    )
+    rest = len(rows) - _ROWS_NAMED
+    return named if rest <= 0 else f"{named} and {rest} more"
+
+
+def _differing_rows(
+    asset: str,
+    rows: Sequence[tuple[int, str, str]],
+    other: str,
+    other_rows: Sequence[tuple[int, str, str]],
+) -> str:
+    """The model-years only one of two pools holds, as a clause of the error.
+
+    Empty when both hold the same model-years in another order or number.
+    """
+    clauses = [
+        f"only asset {name!r} holds {_named_rows(only)}"
+        for name, only in (
+            (asset, sorted(set(rows) - set(other_rows))),
+            (other, sorted(set(other_rows) - set(rows))),
+        )
+        if only
+    ]
+    return "" if not clauses else ": " + "; ".join(clauses)
+
+
 def _check_same_pool(parts: Sequence[OutcomeSample]) -> None:
     """Raise `SampleError` unless the parts of a join hold the same model-years.
 
     Their draw numbers alone would not line them up, the reason `join` refuses
-    Monte Carlo samples.
+    Monte Carlo samples. Pools of other rows are refused naming the model-years
+    that only one of them holds, whether or not their lengths differ.
     """
     first = parts[0]
     stated = first.provenance.pool
@@ -3198,12 +3240,16 @@ def _check_same_pool(parts: Sequence[OutcomeSample]) -> None:
                 f"{part.asset_ids[0]!r} is under {own['pathway']!r} and asset "
                 f"{first.asset_ids[0]!r} under {stated['pathway']!r}"
             )
-        if _pool_row_ids(own) != _pool_row_ids(stated):
+        own_rows, stated_rows = _pool_row_ids(own), _pool_row_ids(stated)
+        if own_rows != stated_rows:
             raise SampleError(
                 f"join needs pools of the same (year, model, member) rows, because "
                 f"draw numbers alone would not line them up, but those of asset "
                 f"{part.asset_ids[0]!r} differ from those of asset "
                 f"{first.asset_ids[0]!r}"
+                + _differing_rows(
+                    part.asset_ids[0], own_rows, first.asset_ids[0], stated_rows
+                )
             )
 
 
