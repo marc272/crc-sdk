@@ -2542,6 +2542,7 @@ difference between them.
   | A view `component(name, loss="combined")` whose loss reads hazards it doesn't hold | `"combined_view"` |
   | A selection of a held sample, which holds hazards at the asset from rows it lacks | `"held_select"` |
   | A sample that records an `EmpiricalCopula` without its draws per reference year | `"copula_without_k"` |
+  | An `EmpiricalCopula` block whose record says a basis-risk model of yours changed an index: the re-deal reads each draw's rank from the index, and the copula ranked the draws by their uniforms, which the sample doesn't keep. No built-in model changes the index | `"index_moved"` |
   | A `GaussianCopula` sample without its latent ranks, as one written before samples kept them, or whose ranks tie within a column | `"gaussian_without_ranks"` |
   | A `Comonotonic()` block whose columns' indices don't rise together over the rows, as where a basis-risk model of yours moved an index | `"index_not_comonotone"` |
   | A block whose columns more than one dependence model moved, which only a provenance made by hand records | `"several_models"` |

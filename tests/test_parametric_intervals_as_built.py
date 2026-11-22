@@ -41,6 +41,7 @@ from crc_sdk.parametric import (
     EvaluationMetadata,
     Free,
     HazardNoise,
+    ImpactNoise,
     Independent,
     IndexDefinition,
     LinearPayout,
@@ -390,8 +391,85 @@ def _expected_rerank(index: np.ndarray, hazard: np.ndarray) -> np.ndarray:
 # -- re-dealing across assets --------------------------------------------------
 
 
-def test_a_copula_total_is_re_dealt_by_the_reference() -> None:
-    sample = _assets(_copula())
+class _MovedIndex:
+    """A basis-risk model of the caller's that moves the index, not the hazard."""
+
+    name = "moved index"
+
+    def to_document(self) -> dict[str, Any]:
+        return {"kind": "moved_index"}
+
+    def apply(self, index: Any, hazard: Any, impact: Any, rng: Any) -> Any:
+        del hazard
+        return index + rng.normal(0.0, 20.0, index.shape), impact
+
+
+class _HalfImpact:
+    """A basis-risk model of the caller's that halves the impact, not the index."""
+
+    name = "half impact"
+
+    def to_document(self) -> dict[str, Any]:
+        return {"kind": "half_impact"}
+
+    def apply(self, index: Any, hazard: Any, impact: Any, rng: Any) -> Any:
+        del hazard, rng
+        return index, 0.5 * impact
+
+
+def _indices(sample: OutcomeSample) -> list[np.ndarray]:
+    """Each column's index: an asset's, or a hazard's."""
+    components = sample.index_components
+    if components is None:
+        return [sample.index[:, j] for j in range(len(sample.asset_ids))]
+    return [component.values[:, 0] for component in components.values()]
+
+
+def _row_uniforms(sample: OutcomeSample, copula: EmpiricalCopula) -> np.ndarray:
+    """Each row's uniform in each column, the copula's order, rebuilt apart.
+
+    Each column's uniforms come from the generator state its record keeps,
+    and the copula's reorder of them puts each in its row.
+    """
+    components = sample.index_components
+    names, key = (
+        (sample.asset_ids, "asset_id")
+        if components is None
+        else (tuple(components), "component")
+    )
+    records = sample.provenance.rng
+    steps = [
+        next(
+            i
+            for i, record in enumerate(records)
+            if record["step"] == "hazard" and record.get(key) == name
+        )
+        for name in names
+    ]
+    uniforms = np.column_stack(
+        [sample.provenance.generator(step).random(len(sample)) for step in steps]
+    )
+    order = copula.reorder(uniforms, names)
+    return np.column_stack([uniforms[order[:, j], j] for j in range(len(names))])
+
+
+def _in_the_copulas_order(sample: OutcomeSample, copula: EmpiricalCopula) -> bool:
+    """Whether every column's index rises along the copula's order of its draws."""
+    uniforms = _row_uniforms(sample, copula)
+    return all(
+        (np.diff(index[np.argsort(uniforms[:, j], kind="stable")]) >= 0).all()
+        for j, index in enumerate(_indices(sample))
+    )
+
+
+@pytest.mark.parametrize(
+    "basis_risk",
+    [None, _HalfImpact()],
+    ids=["hazard_noise", "callers_model_keeps_the_index"],
+)
+def test_a_copula_total_is_re_dealt_by_the_reference(basis_risk: Any) -> None:
+    # A model of the caller's that leaves the index is re-dealt as a built-in one.
+    sample = _assets(_copula(), basis_risk)
     rng = np.random.default_rng(8)
     copy = np.random.default_rng(8)
     table = UNTYPED_INTERVALS(
@@ -1220,6 +1298,95 @@ def test_a_copula_record_without_its_draws_per_year_keeps_todays_method() -> Non
         _without_k(_assets(_copula())),
         [{"kind": "empirical_copula", "reason": "copula_without_k"}],
     )
+
+
+def _index_changed(sample: OutcomeSample) -> set[bool]:
+    """What each column's basis-risk summary records as `index_changed`."""
+    own = sample.provenance.parts or sample.provenance.components
+    assert own is not None
+    return {
+        bool(each["details"]["basis_risk"]["index_changed"]) for each in own.values()
+    }
+
+
+@pytest.mark.parametrize(
+    "model",
+    [NoBasisRisk(), HazardNoise(0.3), HELD, ImpactNoise(0.3, upper=1.0), _HalfImpact()],
+    ids=[
+        "no_basis_risk",
+        "hazard_noise",
+        "held",
+        "impact_noise",
+        "callers_keeps_index",
+    ],
+)
+@pytest.mark.parametrize("columns", ["assets", "hazards"])
+def test_a_model_that_keeps_the_index_keeps_the_copulas_order(
+    model: Any, columns: str
+) -> None:
+    # The copula ranked each column's draws by their uniforms, the curve's
+    # draw rises with its uniform, and these models return the index they
+    # were given: the index orders the draws as the copula dealt them, so the
+    # re-deal reads its ranks from it.
+    if columns == "assets":
+        copula, sample = _copula(4), _assets(_copula(4), model, n=12)
+        entries: list[Any] = [_covers()]
+    else:
+        copula, sample = (
+            EmpiricalCopula(_reference(HAZARDS)),
+            _hazards(basis_risk=model),
+        )
+        entries = [_package()]
+    assert _in_the_copulas_order(sample, copula)
+    assert _index_changed(sample) == {False}
+    record = _intervals_record(_intervals(entries, sample))
+    assert record["unit"] == "as_built"
+    assert "kept_today" not in record
+
+
+def _moved(
+    shape: str,
+) -> tuple[list[Any], OutcomeSample, OutcomeSample, EmpiricalCopula]:
+    """The entries, the block, the sample it came from and the copula."""
+    if shape == "hazards":
+        copula = EmpiricalCopula(_reference(HAZARDS))
+        sample = _hazards(basis_risk=_MovedIndex())
+        return [_package()], sample, sample, copula
+    if shape == "one_row_per_year":
+        sample = _assets(_copula(N), _MovedIndex())
+        return [_covers()], sample, sample, _copula(N)
+    sample = _assets(_copula(4), _MovedIndex(), n=12)
+    if shape == "selection":
+        return [_covers()], sample.select(sample.period[2:10]), sample, _copula(4)
+    if shape == "read_back":
+        written = OutcomeSample.from_written_table(sample.to_table())
+        return [_covers()], written, sample, _copula(4)
+    return [_covers()], sample, sample, _copula(4)
+
+
+@pytest.mark.parametrize(
+    "shape", ["assets", "one_row_per_year", "hazards", "selection", "read_back"]
+)
+def test_a_copula_block_whose_index_a_callers_model_moved_keeps_todays_method(
+    shape: str,
+) -> None:
+    # The model moved each draw's index, and the copula dealt the draws by
+    # their uniforms: sorting by the index no longer gives that order. With one
+    # row per reference year any order of a column's rows could be a deal of
+    # some reference, so only the record, which the sampler wrote, says so; a
+    # selection and a table keep it.
+    entries, block, sample, copula = _moved(shape)
+    assert not _in_the_copulas_order(sample, copula)
+    assert _index_changed(block) == {True}
+    table = _kept(
+        entries, block, [{"kind": "empirical_copula", "reason": "index_moved"}]
+    )
+    line = _intervals_line(table)
+    assert UNMEASURED_TEXT in line and REBUILT_TEXT not in line
+    assert (
+        "the rows of several columns an EmpiricalCopula dealt, as the record says "
+        "a basis-risk model of the caller's changed an index"
+    ) in line
 
 
 def test_rows_kept_beside_rows_rebuilt_are_stated_apart() -> None:

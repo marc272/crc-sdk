@@ -311,6 +311,11 @@ _KEPT_TODAY = {
     "copula_without_k": (
         "the record doesn't state the EmpiricalCopula's draws per reference year"
     ),
+    "index_moved": (
+        "the record says a basis-risk model of the caller's changed an index, so "
+        "the index may not order the draws as the copula dealt them, by the ranks "
+        "of their uniforms, which the sample doesn't keep"
+    ),
     "gaussian_without_ranks": (
         "the sample doesn't keep the ranks of the GaussianCopula's latent normal "
         "scores, one per row in each column, by which it placed the draws, as one "
