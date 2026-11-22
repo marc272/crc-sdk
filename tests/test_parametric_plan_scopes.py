@@ -6,6 +6,8 @@ gives what the functions give; nothing here is a finding about a design.
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
@@ -27,6 +29,8 @@ from crc_sdk.parametric import (
     AtPoint,
     AtStation,
     Budget,
+    Clustered,
+    ClusteredDesignResult,
     ComonotoneIndexWarning,
     Comonotonic,
     Cover,
@@ -1536,3 +1540,279 @@ def test_the_plan_s_setup_text_collapses_its_notes_on_real_output(
     assert "scope: joint" in design
     # The rows of a table state the same setup as the metadata.
     assert setup_text(result.table) == text
+
+
+# -- Clustered ---------------------------------------------------------------------
+
+REGIONS = {"warehouse-a": "north", "depot-b": "north", "store-c": "south"}
+
+
+def _regions(joint: bool = True, **changes: Any) -> Clustered:
+    """The plan's three sites in two clusters, weighted by the plan's own values."""
+    return Clustered(
+        changes.get("assignment", REGIONS),
+        values=changes.get("values", VALUES),
+        joint=joint,
+    )
+
+
+@pytest.mark.parametrize("joint", [True, False], ids=["joint", "separate"])
+def test_a_cluster_plan_on_per_year_values_equals_the_function_route(
+    tmp_path: Path, joint: bool
+) -> None:
+    source = _grid()
+    budget = Budget(ratio=0.8)
+    scope = _regions(joint)
+    plan = (
+        _designed_per_year(_per_year(source))
+        .covers(_step(), _linear())
+        .objective(MSE(), ExpectedUncovered(), budget=budget)
+        .split(Holdout(0.7))
+        .scopes(scope)
+        .allocation("value")
+    )
+    result = plan.write_parquet(tmp_path / "out.parquet")
+    joined = _joined(source)
+    assert result.joint_sample is not None
+    assert result.joint_sample.content_hash == joined.content_hash
+    train, test = holdout(joined, 0.7)
+    # One template per cluster, on the index its assets read, as on the plan.
+    made: list[Any] = [
+        design_joint([_step(), _step()], train, objective, budget=budget, scope=scope)
+        for objective in (MSE(), ExpectedUncovered())
+    ]
+    entries = [*made, {asset: _linear(asset) for asset in ALL}]
+    by_hand = pa.concat_tables(
+        [
+            compare(
+                entries, train, split="in_sample", design_sample=train, options=OPTIONS
+            ),
+            compare(
+                entries,
+                test,
+                split="out_of_sample",
+                design_sample=train,
+                options=OPTIONS,
+            ),
+        ]
+    )
+    assert _comparable(result.table).equals(_comparable(by_hand))
+    for planned, expected in zip(result.designs, made, strict=True):
+        assert isinstance(planned, ClusteredDesignResult)
+        assert planned.design_id == expected.design_id
+        assert planned.covers_hash == expected.covers_hash
+        assert planned.parameters == expected.parameters
+        assert planned.cluster_ids == ("north", "south")
+    blocks: list[tuple[Any, OutcomeSample]] = [
+        ("in_sample", train),
+        ("out_of_sample", test),
+    ]
+    allocated = pa.concat_tables(
+        [
+            allocate(
+                made,
+                sample,
+                split=split,
+                allocation="value",
+                values=VALUES,
+                options=OPTIONS,
+            )
+            for split, sample in blocks
+        ]
+    )
+    assert result.allocated is not None
+    assert _comparable(result.allocated).equals(_comparable(allocated))
+    rows = result.table.to_pylist()
+    designed = [row for row in rows if row["design_id"] is not None]
+    assert {row["scope"] for row in designed} == {"cluster"}
+    expected_levels = {"total"} if joint else {"cluster", "total"}
+    assert {row["level"] for row in designed} == expected_levels
+    assert designed[0]["cover_label"] == "step (mse)"
+    covers = result.designs[0].covers
+    assert {cover.label for cover in covers.values()} == {"step (mse)"}
+    text = setup_text(result.metadata)
+    assert "one cover per cluster (north of warehouse-a and depot-b, south of" in text
+
+
+def test_a_cluster_plan_designs_each_fold_of_the_sample_of_all_its_assets() -> None:
+    plan = _designed_per_year(_per_year()).split(KFold(3)).scopes(_regions(False))
+    designs = plan.designs()
+    joined = _joined(_grid())
+    folds = year_block_kfold(joined, 3)
+    assert [type(d) for d in designs] == [ClusteredDesignResult] * 3
+    for planned, (train, _) in zip(designs, folds, strict=True):
+        assert planned.design_sample.content_hash == train.content_hash
+        made = design_joint(
+            [_step(), _step()],
+            train,
+            MSE(),
+            budget=Budget(ratio=0.8),
+            scope=_regions(False),
+        )
+        assert planned.design_id == made.design_id
+        assert planned.parameters == made.parameters
+
+
+def test_a_cluster_plan_on_curves_equals_the_function_route(dataset: Path) -> None:
+    budget = Budget(ratio=0.8)
+    scope = _regions(False)
+    plan = (
+        _designed_on_curves(dataset)
+        .split(FreshDraws(300, seed=7))
+        .scopes(scope)
+        .dependence(Comonotonic())
+    )
+    result = plan.write_parquet(dataset.parent / "out.parquet")
+    drawn = _drawn(dataset, Comonotonic())
+    fresh = _drawn(dataset, Comonotonic(), seed=7, n_draws=300)
+    assert result.joint_sample is not None and result.fresh_joint_sample is not None
+    assert result.joint_sample.content_hash == drawn.content_hash
+    assert result.fresh_joint_sample.content_hash == fresh.content_hash
+    made = design_joint([_step(), _step()], drawn, MSE(), budget=budget, scope=scope)
+    planned = result.designs[0]
+    assert isinstance(planned, ClusteredDesignResult)
+    assert planned.design_id == made.design_id
+    by_hand = pa.concat_tables(
+        [
+            compare(
+                [made], drawn, split="in_sample", design_sample=drawn, options=OPTIONS
+            ),
+            compare([made], fresh, split="out_of_sample", options=OPTIONS),
+        ]
+    )
+    assert _comparable(result.table).equals(_comparable(by_hand))
+    assert result.joint_sample.provenance.dependence == Comonotonic().to_document()
+
+
+def test_the_values_of_a_cluster_plan_are_its_loss_models() -> None:
+    # The weights are the values the plan's loss model reads: stated values that
+    # differ raise before the source is read.
+    other = {**VALUES, "store-c": 1.5e6}
+    plan = _designed_per_year(_per_year()).scopes(_regions(values=other))
+    for run in (plan.samples, plan.joint_sample, plan.designs):
+        with pytest.raises(
+            ValueError, match=r"differ from them for the assets \['store-c'\]"
+        ):
+            run()
+    # On damage ratios, the plan's values are 1 for each asset.
+    ratios = _per_year(value_column=None, value_unit="1").basis_risk(NoBasisRisk())
+    with pytest.raises(ValueError, match="1 for each asset, as the plan's losses are"):
+        ratios.scopes(_regions()).joint_sample()
+    ones = ratios.scopes(_regions(values=dict.fromkeys(ALL, 1.0)))
+    assert ones.joint_sample().asset_ids == ALL
+
+
+def test_a_cluster_plan_checks_its_assignment(tmp_path: Path) -> None:
+    left_out = {"warehouse-a": "north", "depot-b": "north"}
+    some = {asset: VALUES[asset] for asset in left_out}
+    other = {**REGIONS, "office-d": "east"}
+    with pytest.raises(SampleError, match=r"leaves out \['store-c'\]"):
+        _per_year().scopes(_regions(assignment=left_out, values=some))
+    with pytest.raises(SampleError, match=r"names \['office-d'\].*clusters \['east'\]"):
+        _per_year().scopes(
+            _regions(assignment=other, values={**VALUES, "office-d": 1.0})
+        )
+    # With the assets in a file, at execution, before the source is read.
+    path = tmp_path / "assets.parquet"
+    pq.write_table(_asset_table(), path)
+    plan = (
+        _per_year(assets=path)
+        .basis_risk(NoBasisRisk())
+        .scopes(_regions(assignment=left_out, values=some))
+    )
+    plan.explain()
+    with pytest.raises(SampleError, match=r"leaves out \['store-c'\]"):
+        plan.joint_sample()
+
+
+def test_a_cluster_plan_refuses_what_a_joint_plan_refuses(dataset: Path) -> None:
+    one = _asset_table(ALL[:1])
+    with pytest.raises(ValueError, match=r"Clustered\(\.\.\.\) designs several assets"):
+        _per_year(assets=one).scopes(
+            Clustered({"warehouse-a": "a"}, values={"warehouse-a": 1.0})
+        )
+    curves = (
+        _on_curves(dataset)
+        .monte_carlo(400, seed=42)
+        .basis_risk(ImpactNoise(0.3))
+        .covers(_step())
+        .scopes(_regions())
+    )
+    with pytest.raises(ValueError, match=r"Clustered\(\.\.\.\) on fitted curves needs"):
+        curves.explain()
+    with pytest.raises(LeakageError, match="FreshDraws"):
+        curves.dependence(Comonotonic()).split(Holdout(0.5)).explain()
+    written = _designed_per_year(_per_year()).covers(_step("depot-b"))
+    with pytest.raises(ValueError, match=r"under Clustered\(\.\.\.\) each cover"):
+        written.scopes(_regions()).explain()
+    with pytest.raises(ValueError, match=r"Clustered\(\.\.\.\) designs on several"):
+        _designed_per_year(_per_year()).scopes(_regions()).payout_breakdown()
+    with pytest.raises(TypeError, match=r"Clustered\(\.\.\.\)"):
+        _per_year().scopes(UNTYPED_PLAN)
+    with pytest.raises(ValueError, match="'clustered' is given twice"):
+        _per_year().scopes(_regions(), _regions(False))
+
+
+def test_a_cluster_plan_refuses_an_index_read_elsewhere() -> None:
+    index: dict[str, Any] = {
+        "location": StationColumn("station_id"),
+        "unit": "mm/day",
+        "provenance": STATIONS,
+    }
+    with pytest.raises(ValueError, match=r"Clustered\(\.\.\.\) is refused on a plan"):
+        _per_year().index(_stations(), **index).scopes(_regions())
+    with pytest.raises(ValueError, match=r"Clustered\(\.\.\.\) is refused on a plan"):
+        _per_year().scopes(_regions()).index(_stations(), **index)
+    stated = dataclasses.replace(
+        _per_year().index(_stations(), **index), scope_list=(_regions(),)
+    )
+    with pytest.raises(ValueError, match=r"Clustered\(\.\.\.\) is refused on a plan"):
+        stated.explain()
+
+
+def test_explain_states_a_cluster_scope_without_its_values() -> None:
+    plan = (
+        _designed_per_year(_per_year())
+        .covers(_step(), _linear())
+        .split(Holdout(0.7))
+        .scopes(_regions(False))
+        .allocation("loss")
+    )
+    document: Any = plan.explain(format="json")
+    assert document["scopes"] == [_regions(False).to_document()]
+    assert document["allocation"] == "loss"
+    assert [s["asset_ids"] for s in document["setup"]["samples"]] == [list(ALL)]
+    evaluation = document["setup"]["evaluations"][0]
+    assert evaluation["level"] == ["asset", "cluster", "total", "asset_by_loss"]
+    assert evaluation["scope"] == ["individual", "cluster"]
+    # The values weight the clusters' indices, and are never written.
+    assert "3000000" not in json.dumps(document)
+    text = setup_text(document)
+    assert "scope: cluster, one cover per cluster (north of warehouse-a and" in text
+    assert "designed cluster by cluster" in text
+
+
+def test_a_plan_may_hold_every_scope(tmp_path: Path) -> None:
+    plan = (
+        _designed_per_year(_per_year())
+        .split(Holdout(0.7))
+        .scopes(Individual(), Joint(), _regions(False))
+    )
+    result = plan.write_parquet(tmp_path / "out.parquet")
+    kinds = [type(d) for d in result.designs]
+    assert kinds == [
+        JointDesignResult,
+        ClusteredDesignResult,
+        DesignResult,
+        DesignResult,
+        DesignResult,
+    ]
+    in_sample = [row for row in result.table.to_pylist() if row["split"] == "in_sample"]
+    assert [(row["scope"], row["level"], row["cluster_id"]) for row in in_sample] == [
+        ("joint", "total", None),
+        ("cluster", "cluster", "north"),
+        ("cluster", "cluster", "south"),
+        ("cluster", "total", None),
+        *([("individual", "asset", None)] * 3),
+        ("individual", "total", None),
+    ]

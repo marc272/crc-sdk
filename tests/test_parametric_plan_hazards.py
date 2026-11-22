@@ -26,6 +26,7 @@ from crc_sdk.parametric import (
     AnnualSeries,
     Budget,
     CappedSum,
+    Clustered,
     ComonotoneIndexWarning,
     CompositeIndex,
     CompoundDamage,
@@ -867,6 +868,28 @@ def test_joint_pool_and_index_are_refused_with_several_hazards(
     stated = dataclass_replace(curves, scope_list=(Joint(),))
     with pytest.raises(ValueError, match=r"Joint\(\) is refused"):
         stated.explain()
+
+
+def test_clustered_is_refused_with_several_hazards_as_joint_is(
+    datasets: dict[str, Path],
+) -> None:
+    scope = Clustered(
+        {"warehouse-a": "both", "depot-b": "both"},
+        values={"warehouse-a": 2e6, "depot-b": 3e6},
+    )
+    hazards = _two_hazards(_annual_plan()).basis_risk(NOISE).covers(_rain())
+    with pytest.raises(ValueError, match=r"Clustered\(\.\.\.\) is refused"):
+        hazards.scopes(scope)
+    with pytest.raises(ValueError, match=r"Clustered\(\.\.\.\) is refused"):
+        _annual_plan().scopes(scope).hazard("rx1day", tail="upper")
+    curves = _curve_plan(datasets).dependence(Independent())
+    with pytest.raises(ValueError, match=r"Clustered\(\.\.\.\) is refused"):
+        curves.scopes(scope)
+    stated = dataclass_replace(curves, scope_list=(scope,))
+    with pytest.raises(ValueError, match=r"Clustered\(\.\.\.\) is refused"):
+        stated.explain()
+    with pytest.raises(ValueError, match=r"Clustered\(\.\.\.\) is refused"):
+        dataclass_replace(hazards, scope_list=(scope,)).samples()
 
 
 def dataclass_replace(plan: Any, **fields: Any) -> Any:

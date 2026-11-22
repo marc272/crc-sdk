@@ -25,6 +25,8 @@ from crc_sdk.parametric import (
     AnnualScenario,
     AnnualSeries,
     Budget,
+    Clustered,
+    ClusteredDesignResult,
     ComonotoneIndexWarning,
     Cover,
     CurveScenario,
@@ -55,6 +57,7 @@ from crc_sdk.parametric import (
     ScenarioSet,
     StationColumn,
     StepPayout,
+    allocate,
     allocate_scenarios,
     compare_scenarios,
     design,
@@ -509,6 +512,172 @@ def test_joint_designs_on_curves_give_the_function_routes_rows(
     )
     assert result.table.to_pylist() == table.to_pylist()
     assert {row["level"] for row in result.table.to_pylist()} == {"asset", "total"}
+
+
+# One cluster of both sites, weighted by the plan's values (`_assets()`).
+TOGETHER = {"warehouse-a": "both", "depot-b": "both"}
+PLAN_VALUES = {"warehouse-a": 2e6, "depot-b": 3e6}
+
+
+def _together(joint: bool) -> Clustered:
+    return Clustered(TOGETHER, values=PLAN_VALUES, joint=joint)
+
+
+@pytest.mark.parametrize("joint", [True, False], ids=["joint", "separate"])
+def test_cluster_designs_on_curves_give_the_function_routes_rows(
+    curves: Path, tmp_path: Path, joint: bool
+) -> None:
+    scope = _together(joint)
+    plan = (
+        _curve_plan(curves)
+        .scopes(scope)
+        .dependence(Independent())
+        .split(Holdout(0.5))
+        .scenarios(ScenarioSet(reference="2030s", labels=WINDOWS))
+        .allocation("value")
+    )
+    result = plan.write_parquet(tmp_path / "clusters.parquet")
+    rows = _rows(curves)
+    metadata = HazardDataset.local(curves).metadata()
+    assert result.scenario_samples is not None
+    blocks: dict[str, tuple[OutcomeSample, OutcomeSample]] = {}
+    for label, horizons in (("2030s", EARLY), ("2050s", MIDDLE)):
+        children = np.random.SeedSequence(42).spawn(2)
+        joint_sample = sample_curves(
+            {asset_id: [rows[(asset_id, h)] for h in horizons] for asset_id in POINTS},
+            dependence=Independent(),
+            metadata=dict.fromkeys(POINTS, metadata),
+            n_draws=600,
+            rngs={
+                asset_id: np.random.default_rng(child)
+                for asset_id, child in zip(POINTS, children, strict=True)
+            },
+            loss_models={asset_id: _loss(asset_id) for asset_id in POINTS},
+            basis_risk=ImpactNoise(0.3),
+            scenario=label,
+        )
+        for asset_id in POINTS:
+            assert (
+                joint_sample.asset(asset_id).content_hash
+                == result.scenario_samples[label][asset_id].content_hash
+            )
+        blocks[label] = holdout(joint_sample, 0.5)
+    # Cluster designs, in scenario, fold, cover and objective order.
+    assert [type(d) for d in result.designs] == [ClusteredDesignResult] * 2
+    assert [d.design_sample.scenario for d in result.designs] == ["2030s", "2050s"]
+    for planned in result.designs:
+        train = blocks[planned.design_sample.scenario][0]
+        by_hand = design_joint(
+            [_step()], train, MSE(), budget=Budget(ratio=0.8), scope=scope
+        )
+        assert planned.design_id == by_hand.design_id
+        assert planned.parameters == by_hand.parameters
+    linear = {asset_id: _linear(asset_id) for asset_id in POINTS}
+    evaluated = ScenarioSet([blocks[label][1] for label in WINDOWS], reference="2030s")
+    table = compare_scenarios(
+        [*result.designs, linear],
+        evaluated,
+        design_sample=blocks["2030s"][0],
+        options=OPTIONS,
+    )
+    assert result.table.to_pylist() == table.to_pylist()
+    levels = {row["level"] for row in result.table.to_pylist()}
+    assert levels == ({"asset", "total"} if joint else {"asset", "cluster", "total"})
+    allocated = allocate_scenarios(
+        list(result.designs),
+        evaluated,
+        allocation="value",
+        values=PLAN_VALUES,
+        options=OPTIONS,
+    )
+    assert result.allocated is not None
+    assert result.allocated.to_pylist() == allocated.to_pylist()
+    assert {row["scope"] for row in result.allocated.to_pylist()} == {"cluster"}
+
+
+def test_cluster_designs_on_years_give_the_function_routes_rows(
+    tmp_path: Path,
+) -> None:
+    scope = _together(False)
+    plan = (
+        _annual_plan()
+        .scopes(scope)
+        .split(KFold(3))
+        .scenarios(ScenarioSet([_future()], reference="historical"))
+        .allocation("loss")
+    )
+    result = plan.write_parquet(tmp_path / "clusters.parquet")
+    assert result.scenario_samples is not None
+    joined = {
+        label: OutcomeSample.join(result.scenario_samples[label].values())
+        for label in ("historical", "ssp585")
+    }
+    folds = {label: year_block_kfold(joined[label], 3) for label in joined}
+    assert [
+        (d.design_sample.scenario, d.design_sample.content_hash) for d in result.designs
+    ] == [
+        (label, folds[label][fold][0].content_hash)
+        for label in ("historical", "ssp585")
+        for fold in range(3)
+    ]
+    for planned in result.designs:
+        made = design_joint(
+            [_step()],
+            planned.design_sample,
+            ExpectedUncovered(),
+            budget=Budget(ratio=0.8),
+            scope=scope,
+        )
+        assert planned.design_id == made.design_id
+    linear = {asset_id: _linear(asset_id) for asset_id in POINTS}
+    expected: list[dict[str, Any]] = []
+    shares: list[dict[str, Any]] = []
+    for fold in range(3):
+        designs = [
+            d
+            for d in result.designs
+            if d.design_sample.content_hash
+            in {folds[label][fold][0].content_hash for label in folds}
+        ]
+        evaluated = ScenarioSet(
+            [folds[label][fold][1] for label in ("historical", "ssp585")],
+            reference="historical",
+        )
+        expected += compare_scenarios(
+            [*designs, linear],
+            evaluated,
+            fold=fold,
+            design_sample=folds["historical"][fold][0],
+            options=OPTIONS,
+        ).to_pylist()
+        shares += allocate_scenarios(
+            designs,
+            evaluated,
+            allocation="loss",
+            values=PLAN_VALUES,
+            fold=fold,
+            options=OPTIONS,
+        ).to_pylist()
+    assert result.table.to_pylist() == expected
+    assert result.allocated is not None
+    assert result.allocated.to_pylist() == shares
+    # On one scenario's block alone, the allocated rows are allocate's.
+    block = folds["historical"][0][1]
+    alone = allocate(
+        [result.designs[0]],
+        block,
+        split="out_of_sample",
+        allocation="loss",
+        values=PLAN_VALUES,
+        options=OPTIONS,
+    ).to_pylist()
+    on_block = [
+        {key: value for key, value in row.items() if key != "premium_repriced"}
+        for row in shares
+        if row["sample_hash"] == block.content_hash
+        and row["design_id"] == result.designs[0].design_id
+    ]
+    assert on_block == alone
 
 
 def _drawn_joint(path: Path) -> dict[tuple[str, int], dict[str, Any]]:

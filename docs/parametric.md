@@ -236,10 +236,11 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
   .pricing(pricing)                           # optional: one pricing for every premium
   .split(FreshDraws(n_draws, seed=...) | Holdout(train_fraction) | KFold(k))
   .metrics(MetricOptions(...))                # optional
-  .scopes(Individual() | Joint())             # optional; default Individual()
+  .scopes(Individual() | Joint() | Clustered(...))   # optional; default Individual()
   .dependence(Independent() | Comonotonic() | EmpiricalCopula(reference)
               | GaussianCopula(correlation) | a DependenceModel of yours)
                                               # fitted curves; required with Joint()
+                                              # and Clustered
                                               # and with .hazard(...)
   .allocation("value" | "loss")               # optional: allocated rows, own file
   .scenarios(ScenarioSet(...), *, design_on="each", premiums=None)
@@ -305,8 +306,8 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
 | `.pricing(pricing)` | The plan's pricing, `PurePremium()`, `CostOfCapitalLoad(rate, q)` or `ExpectedPayoutMultiple(multiple, expense)` ([pricing](#pricing-and-the-premium-used)), for a plan of resolved covers that has no `.objective(...)` |
 | `.split(rule)` | `FreshDraws(n_draws, seed=...)` (fitted curves), `Holdout(train_fraction)` or `KFold(k)`, below |
 | `.metrics(options)` | The `MetricOptions` of every row |
-| `.scopes(*scopes)` | `Individual()`, the default, designs each asset on its own; `Joint()` designs each template on the owner's total ([joint design](#joint-design-over-several-assets)) |
-| `.dependence(model)` | Fitted curves only, and required there with `Joint()` and with `.hazard(...)`: how the assets', or the hazards', draws are put side by side (`Independent()`, `Comonotonic()`, `EmpiricalCopula(reference)`, `GaussianCopula(correlation)` or a `DependenceModel` of your own). A plan on per-year values raises: its dependence is the data's own |
+| `.scopes(*scopes)` | `Individual()`, the default, designs each asset on its own; `Joint()` designs each template on the owner's total ([joint design](#joint-design-over-several-assets)); `Clustered(assignment, values=..., joint=...)` one cover per cluster of the assets, its values those the plan's loss model reads ([clusters on the plan](#clusters-on-the-plan)) |
+| `.dependence(model)` | Fitted curves only, and required there with `Joint()`, `Clustered` and `.hazard(...)`: how the assets', or the hazards', draws are put side by side (`Independent()`, `Comonotonic()`, `EmpiricalCopula(reference)`, `GaussianCopula(correlation)` or a `DependenceModel` of your own). A plan on per-year values raises: its dependence is the data's own |
 | `.allocation(rule)` | With `Joint()`: adds a joint design's allocated rows, under `"value"` or `"loss"`, in a table and a file of their own ([allocated rows](#allocated-rows-in-a-table-of-their-own)) |
 | `.scenarios(set, *, design_on, premiums)` | Several scenarios, such as windows of horizons, each cover and design evaluated on every scenario's block, out of sample ([scenarios on the plan](#scenarios-on-the-plan)) |
 | `.hazard(name, source, ...)`, `.combine(rule)`, `.package(covers, *, label, shares)` | Several hazards at each asset, the rule of their combined loss, and separate contracts as one row ([several hazards on the plan](#several-hazards-on-the-plan)) |
@@ -388,11 +389,11 @@ semantics the caller states and the fresh draws; the dataset's own metadata
 
 | Execution point | Returns |
 | --- | --- |
-| `.samples()` | One `OutcomeSample` per asset, all draws or years, in asset order; with `Joint()`, each asset's view of `.joint_sample()` |
-| `.joint_sample()` | With `Joint()` only: the `OutcomeSample` of all the assets, all draws or years |
-| `.designs()` | Every `DesignResult`, in asset, fold, cover and objective order; with `Joint()`, every `JointDesignResult`, in fold, cover and objective order; with `.scenarios(...)`, by scenario first |
+| `.samples()` | One `OutcomeSample` per asset, all draws or years, in asset order; with `Joint()` or `Clustered`, each asset's view of `.joint_sample()` |
+| `.joint_sample()` | With `Joint()` or `Clustered` only: the `OutcomeSample` of all the assets, all draws or years |
+| `.designs()` | Every `DesignResult`, in asset, fold, cover and objective order; with `Joint()` or `Clustered`, every `JointDesignResult` or `ClusteredDesignResult`, in fold, cover and objective order; with `.scenarios(...)`, by scenario first |
 | `.scenario_samples()` | With `.scenarios(...)` only: every scenario's samples, by label and then by asset |
-| `.payout_breakdown()` | Each entry's expected payout in its parts, on every block, as `payout_breakdown` gives it, or with `.scenarios(...)` as `payout_breakdown_scenarios` gives it; nothing is written. Not with `Joint()` |
+| `.payout_breakdown()` | Each entry's expected payout in its parts, on every block, as `payout_breakdown` gives it, or with `.scenarios(...)` as `payout_breakdown_scenarios` gives it; nothing is written. Not with `Joint()` or `Clustered` |
 | `.write_parquet(path)` | A `ParametricResult`: `output`, `table`, `metadata`, `samples`, `designs`, `fresh_samples`, `joint_sample`, `fresh_joint_sample`, `allocated`, `allocated_output`, `scenario_samples`, `scenario_fresh_samples` and `row_count` |
 
 `write_parquet` writes the rows of every asset, split and fold to one local
@@ -418,8 +419,9 @@ sample per asset with all its draws or years, and, with `FreshDraws`,
 `content_hash` is the `sample_hash` of the out-of-sample rows (`None` without
 fresh draws). With `LinearTrend` and a holdout or k-fold split, `samples` are
 fitted on all the years, and the rows come from one sample per fold. With
-`Joint()`, `joint_sample` and `fresh_joint_sample` hold the samples of all the
-assets, and `samples` and `fresh_samples` each asset's view of them.
+`Joint()` or `Clustered`, `joint_sample` and `fresh_joint_sample` hold the
+samples of all the assets, and `samples` and `fresh_samples` each asset's view
+of them.
 
 ## Next step: per-year values
 
@@ -2481,10 +2483,10 @@ difference between them.
 
   | A row that reads | Each replicate |
   | --- | --- |
-  | Two columns or more of an `EmpiricalCopula` block: the `"total"` row of a set of covers, every row of a joint design, and on a sample of several hazards a row whose index and combined loss read two hazards or more | **Re-deals the draws.** It redraws each column's draws on its own, with replacement, and deals them to the reference years again by the copula's rule: the redrawn draws, sorted by their index, fill the ranks that each reference year's rows held in that column, and a year's rows take its draws in the order they were drawn. On a window of horizons, within each member |
+  | Two columns or more of an `EmpiricalCopula` block: the `"total"` row of a set of covers, every row of a joint design, under `Clustered` the `"total"` row and the rows of a cluster of two assets or more, and on a sample of several hazards a row whose index and combined loss read two hazards or more | **Re-deals the draws.** It redraws each column's draws on its own, with replacement, and deals them to the reference years again by the copula's rule: the redrawn draws, sorted by their index, fill the ranks that each reference year's rows held in that column, and a year's rows take its draws in the order they were drawn. On a window of horizons, within each member |
   | A column built with `HazardNoise(..., hold="hazard_distribution")` | **Re-ranks the hazard at the asset.** It resamples by the unit above, and ranks the hazard at the asset again over the resampled rows, as the held form ranks it over the rows of a call. Each row takes the loss of its new hazard at the asset, and on a sample of several hazards its damage, which the block's own rows give |
   | Two columns or more of a block that `Comonotonic()`, `GaussianCopula` or a model of your own moved, and no held column | Resamples by the unit above. The study below measured these intervals under `Comonotonic()` and `GaussianCopula`; under a model of your own their coverage is unmeasured |
-  | Anything else, which `built_together` leaves unflagged: an asset's own row, one asset's view, a hazard's view on its own loss, and every row under `Independent()` with the default `hold` | Resamples by the unit above, with the same draws and numbers as before |
+  | Anything else, which `built_together` leaves unflagged: an asset's own row, one asset's view, a hazard's view on its own loss, the rows of a one-asset cluster, and every row under `Independent()` with the default `hold` | Resamples by the unit above, with the same draws and numbers as before |
 
   A row of both kinds, on a held `EmpiricalCopula` block, is re-dealt and
   re-ranked. A rebuilt replicate holds the rows rebuilt, not reweighted: a row
@@ -3747,11 +3749,97 @@ cluster_shares = allocate([cluster_design], book_held_out, split="out_of_sample"
   to its payout. `values=` is required, as for any allocation.
 - **The setup text** states the clusters, their assets, the setting and how
   the total's premium is made.
-- **Not yet.** `compare_pooled`, `bootstrap_intervals`, `compare_scenarios`,
-  `allocate_scenarios` and `payout_breakdown` don't take a cluster design yet,
-  and raise `EvaluationError`; nor does the plan's `.scopes(...)`. A cluster's
-  cover on its own is refused by `evaluate`, `compare` and `design`: evaluate
-  it through its `ClusteredDesignResult`.
+- **Pooled folds, intervals and scenarios.** `compare_pooled` takes one
+  `ClusteredDesignResult` per fold, and `bootstrap_intervals` one on a block
+  or one per fold, with the rows `compare` gives; `allocation=` adds the
+  allocated rows there too. `compare_scenarios` and `allocate_scenarios` take
+  cluster designs made on the set's scenarios. On a scenario's block
+  `premium_repriced` reprices each contract on that block: a `"cluster"` row's
+  cover, and on the `"total"` row the sum of the clusters' under `joint=False`
+  and the total payout under `joint=True`.
+- **Rows built together.** A `"cluster"` row reads its cluster's assets, whose
+  index its cover averages and whose losses it sums, and so does each of those
+  assets' allocated rows; the `"total"` row reads every asset. So in
+  [intervals](#pooled-folds-and-intervals), on an `EmpiricalCopula` block the
+  rows of a cluster of two assets or more are re-dealt as a `"total"` row is,
+  on a held `HazardNoise` block every row that reads a held column is
+  re-ranked, and under `Comonotonic()`, `GaussianCopula` or a model of your own
+  they keep the unit above, flagged. The rows of a one-asset cluster read one
+  column, as an asset's own row does. The coverage study of [those
+  intervals](#pooled-folds-and-intervals) measured no row of a cluster, so
+  their coverage is unmeasured.
+- **What is refused.** `payout_breakdown` and `payout_breakdown_scenarios`
+  raise `EvaluationError` for a cluster design, as for a joint design: a
+  breakdown parts one asset's payout over its hazards, and a cluster's cover
+  pays on one index over several assets. A cluster's cover on its own is
+  refused by `evaluate` and `compare`, which name its `ClusteredDesignResult`,
+  and a template on a `ClusterIndex` by `design`, whose `DesignError` names
+  `design_joint` under `Clustered`.
+
+#### Clusters on the plan
+
+`.scopes(Clustered(assignment, values=..., joint=...))` runs the same design
+from a plan, as `.scopes(Joint())` does: each template is designed once per
+objective and block under that scope, one cover per cluster, on the sample of
+all the assets. Here the three sites above, from the same per-year table and
+the same seed, so the plan's sample and design are the function route's:
+
+```python
+from crc_sdk.parametric import Clustered
+
+book_assets = pa.table({
+    "asset_id": [asset for asset, _, _, _ in book_sites],
+    "longitude": [lon for _, lon, _, _ in book_sites],
+    "latitude": [lat for _, _, lat, _ in book_sites],
+    "value_eur": [value for _, _, _, value in book_sites],
+})
+cluster_plan = (
+    ParametricPlan.for_annual_extremes(
+        annual, book_assets,
+        impact=PiecewiseLinearImpact([40.0, 120.0], [0.0, 0.5]),   # damage ratio
+        unit="mm/day", value_column="value_eur", value_unit="EUR",
+        provenance=provenance, seed=7,
+    )
+    .basis_risk(ImpactNoise(0.3, upper=1.0))
+    .covers(step)                              # one cover per cluster
+    .objective(WeightedCVaR(alpha=0.9, beta=0.9), budget=Budget(ratio=0.8))
+    .split(Holdout(0.7))
+    .scopes(Clustered(regions.assignment, values=book_values, joint=True))
+)
+print(setup_text(cluster_plan.explain(format="json")))   # the setup; no I/O
+cluster_result = cluster_plan.write_parquet("cluster-comparison.parquet")
+assert cluster_result.designs[0].design_id == cluster_design.design_id
+```
+
+- **The values are the plan's.** A cluster's weights are the values the plan's
+  loss model reads: the asset column `value_column`, or 1 for each asset when
+  the losses are damage ratios. So `values=` must be those, and execution
+  raises `ValueError` otherwise, before the source is read, naming the assets
+  whose values differ. Only their hash is written, and `explain()` states the
+  assignment and the setting, not the values.
+- **The assignment** must hold exactly the plan's assets: `.scopes(...)` raises
+  `SampleError` when the asset table is in memory, and execution otherwise.
+- **As under `Joint()`:** at least two assets; on fitted curves
+  `.dependence(...)`, and with `Holdout` or `KFold` `Independent()` only;
+  each cover written for no asset, as it applies to every cluster; a resolved
+  cover evaluated as one contract per asset (`scope` `"individual"`); under
+  `LinearTrend` the assets joined fold by fold; `.joint_sample()` for the
+  sample; `.allocation(rule)` for the allocated rows, each cluster's payout
+  shared over its own assets, in their own file; and `.scenarios(...)`, with
+  `compare_scenarios` and `allocate_scenarios` once per fold for all the
+  assets. `.payout_breakdown()` and `.hazard(...)` are refused, as beside
+  `Joint()`.
+- **`.index(...)` is refused** beside `Clustered`: under `.index(...)` each
+  asset's cover is bound to the station or point its index series is read at,
+  and a cluster's cover pays on one `IndexDefinition` over its assets, which
+  can't name each one's.
+- **`.scopes`** may hold `Individual()`, `Joint()` and `Clustered(...)`, each
+  once, and the `scope` column keeps the rows of each scope apart. This page
+  runs `Clustered` alone.
+
+`cluster_result.designs` holds one `ClusteredDesignResult` per template,
+objective and block, and `setup_text(cluster_result.metadata)` states the
+clusters, their assets, the setting and how the total's premium is made.
 
 ## Several hazards at one asset
 
@@ -4387,9 +4475,10 @@ form does better.
   is no default. A template in no package takes the budget as stated, which on
   its own hazard's loss is a share of that loss. Without a budget, or for a
   package of resolved covers, `shares` raises.
-- **Refused.** `Joint()`, `pool=` and `.index(...)` raise `ValueError` on a plan
-  with `.hazard(...)`, at the builder and at `explain()` and every execution
-  point: a sample of several hazards holds one asset, a pool across hazards
+- **Refused.** `Joint()`, `Clustered`, `pool=` and `.index(...)` raise
+  `ValueError` on a plan with `.hazard(...)`, at the builder and at `explain()`
+  and every execution point: a sample of several hazards holds one asset, a
+  pool across hazards
   would need the same model-years of every hazard, and an index read elsewhere
   has no form per component yet. `.combine(...)` with fewer than two impacts,
   and a missing rule with two or more, raise `SampleError`.
@@ -4402,7 +4491,7 @@ form does better.
   checksum. `.payout_breakdown()` returns `payout_breakdown`'s table of the same
   entries on every block, or with `.scenarios(...)` each scenario's breakdown
   ([allocated rows and breakdowns](#allocated-rows-and-breakdowns)), and isn't
-  offered with `Joint()`.
+  offered with `Joint()` or `Clustered`.
 
 **Scenarios.** `.scenarios(...)` takes a plan with several hazards too
 ([scenarios on the plan](#several-hazards-in-scenarios)): an `AnnualScenario`
@@ -4450,14 +4539,14 @@ rank and no best flag.
   them.
 - **Different terms per asset on the plan.** Under `Joint()` a plan applies each
   cover to every asset. `design_joint` takes one template per asset.
-- **Clusters on the plan, in pooled folds, intervals and scenarios.** A design
-  under `Clustered` is made with `design_joint` and read by `evaluate`, `compare`
-  and `allocate`; the plan, `compare_pooled`, `bootstrap_intervals`,
-  `compare_scenarios`, `allocate_scenarios` and `payout_breakdown` don't take it
-  yet.
-- **Several hazards beside `Joint()`, pools or an index read elsewhere, on the
-  plan.** A plan with `.hazard(...)` refuses `Joint()`, `pool=` and
-  `.index(...)`, and `.payout_breakdown()` isn't offered with `Joint()`.
+- **A breakdown of a cluster design, and clusters beside an index read
+  elsewhere.** `payout_breakdown` and `.payout_breakdown()` part one asset's
+  payout over its hazards, so they refuse a cluster design, and a plan refuses
+  `Clustered` beside `.index(...)`.
+- **Several hazards beside `Joint()`, `Clustered`, pools or an index read
+  elsewhere, on the plan.** A plan with `.hazard(...)` refuses `Joint()`,
+  `Clustered`, `pool=` and `.index(...)`, and `.payout_breakdown()` isn't
+  offered with `Joint()` or `Clustered`.
 - **Several hazards beyond one asset and two axes.** A sample with index
   components holds one asset, so several assets with several hazards, and a
   joint design over them, are not offered. A `StepGrid` spans two components,

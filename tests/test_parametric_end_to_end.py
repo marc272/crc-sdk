@@ -325,7 +325,7 @@ def test_the_docs_joint_design_runs_as_written(
     quick_start = _python_blocks("### From a fitted curve, with the plan")
     per_year = _python_blocks("## Next step: per-year values")
     joint = _python_blocks("## Joint design over several assets")
-    assert len(joint) == 3
+    assert len(joint) == 4
     monkeypatch.chdir(tmp_path)
     namespace: dict[str, Any] = {}
     with warnings.catch_warnings():
@@ -388,6 +388,22 @@ def test_the_docs_joint_design_runs_as_written(
     )
     text = setup_text(table)
     assert "north of warehouse-a and warehouse-b, south of depot-c" in text
+
+    # The same clusters on the plan: its sample and design are the function
+    # route's, and its rows are the cluster design's, in and out of sample.
+    cluster_result = namespace["cluster_result"]
+    assert (tmp_path / "cluster-comparison.parquet").is_file()
+    assert cluster_result.joint_sample.content_hash == namespace["book"].content_hash
+    (on_plan,) = cluster_result.designs
+    assert on_plan.design_id == clustered.design_id
+    assert cluster_result.table.column("level").to_pylist() == ["total", "total"]
+    assert set(cluster_result.table.column("scope").to_pylist()) == {"cluster"}
+    held_out = cluster_result.table.filter(
+        pc.equal(cluster_result.table["split"], "out_of_sample")
+    )
+    assert table.select(columns).equals(held_out.select(columns))
+    assert "Scope: cluster" in setup_text(cluster_result.metadata)
+    assert "scope: cluster, one cover per cluster" in printed
 
 
 def test_the_docs_comparison_table_lists_every_identity_column() -> None:

@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import math
 import pickle
-import warnings
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +24,6 @@ from crc_sdk.parametric import (
     Clustered,
     ClusteredDesignResult,
     ClusterIndex,
-    ComonotoneIndexWarning,
     CompositeIndex,
     Cover,
     CoverDefinitionError,
@@ -42,16 +40,13 @@ from crc_sdk.parametric import (
     OutcomeSample,
     SampleError,
     SampleProvenance,
-    ScenarioSet,
     StepPayout,
     UserObjective,
     WeightedCVaR,
     allocate,
     allocate_scenarios,
-    bootstrap_intervals,
     compare,
     compare_pooled,
-    compare_scenarios,
     design,
     design_joint,
     evaluate,
@@ -60,7 +55,6 @@ from crc_sdk.parametric import (
     setup_text,
     to_long,
     write_comparison,
-    year_block_kfold,
 )
 from crc_sdk.parametric.constraints import Budget, Limit
 from crc_sdk.parametric.cover import CLUSTER_COVER_SCHEMA_VERSION
@@ -336,7 +330,7 @@ def test_evaluate_and_design_refuse_a_clusters_cover_on_its_own() -> None:
         StepPayout([33.0], [Free()]),
         payout_unit="EUR",
     )
-    with pytest.raises(CoverDefinitionError, match="cluster_index"):
+    with pytest.raises(DesignError, match="design_joint"):
         design(template, one, MSE())
 
 
@@ -775,53 +769,12 @@ def test_rank_blocks_flag_the_rows_that_read_several_assets() -> None:
     }
 
 
-def test_the_functions_not_built_for_clusters_yet_refuse_a_cluster_design() -> None:
+def test_a_payout_breakdown_refuses_a_cluster_design() -> None:
+    # The functions built on compare take one, and test_parametric_cluster_functions
+    # checks their rows. A breakdown parts one asset's payout over its hazards.
     sample = _sample(30)
-    result = _design(sample=sample)
-    message = "read by evaluate, compare and allocate only"
-    folds = year_block_kfold(sample, 3)
-    per_fold = [_design(sample=train) for train, _ in folds]
-    with pytest.raises(EvaluationError, match=message):
-        UNTYPED_POOLED([per_fold], folds)
-    with pytest.raises(EvaluationError, match=message):
-        bootstrap_intervals(
-            [result],
-            sample,
-            split="in_sample",
-            rng=np.random.default_rng(1),
-            n_bootstrap=5,
-        )
-    with pytest.raises(EvaluationError, match=message):
-        payout_breakdown([result], sample, split="in_sample")
-    data = _sample(30)
-    table = pa.table(
-        {
-            "year": np.repeat(data.period, 3),
-            "asset": np.tile(data.asset_ids, len(data)),
-            "wind": data.index.ravel(),
-            "loss": data.loss.ravel(),
-        }
-    )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ComonotoneIndexWarning)
-        labelled = OutcomeSample.from_table(
-            table,
-            period="year",
-            asset_id="asset",
-            index="wind",
-            loss="loss",
-            index_unit="m/s",
-            loss_unit="EUR",
-            source="synthetic book",
-            scenario="today",
-            hazard_name="wind",
-        )
-    scenarios = ScenarioSet([labelled], reference="today")
-    result = _design(sample=labelled)
-    with pytest.raises(EvaluationError, match=message):
-        compare_scenarios([result], scenarios)
-    with pytest.raises(EvaluationError, match=message):
-        UNTYPED_SCENARIOS([result], scenarios, allocation="value", values=VALUES)
+    with pytest.raises(EvaluationError, match="parts one asset's payout"):
+        payout_breakdown([_design(sample=sample)], sample, split="in_sample")
 
 
 def test_a_cluster_design_is_read_in_its_loss_unit_only() -> None:

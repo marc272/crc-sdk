@@ -20,8 +20,9 @@ where a row is evaluated and `design_scenario` where it was designed.
 `to_drift(table, reference=)` adds each row's difference and ratio against the
 row of the same cover or design on a reference scenario. Neither ranks anything:
 a row is a measurement of a stated setup, and `setup_text` states it.
-`allocate_scenarios` gives a joint design's allocated rows on every scenario's
-block in a table of their own, as `allocate` does on one block, and
+`allocate_scenarios` gives a joint design's allocated rows, or those of a design
+under `Clustered`, on every scenario's block in a table of their own, as
+`allocate` does on one block, and
 `payout_breakdown_scenarios` each entry's payout in its parts on every block, as
 `payout_breakdown` does on one.
 
@@ -53,20 +54,24 @@ from crc_sdk.parametric.evaluate import (
     Allocation,
     CoverPackage,
     EvaluationEntry,
+    _allocated_entries,
     _allocated_rows,
     _allocation,
+    _any_entries,
+    _AnyEntry,
     _block_fields,
+    _block_level,
     _block_values,
     _breakdown_rows,
     _check_allocated,
     _check_keys,
+    _cluster_allocated_rows,
+    _ClusteredEntry,
     _CoverSet,
     _describe_rows,
     _entries,
-    _Entry,
     _fold,
     _Item,
-    _joint_entries,
     _JointEntry,
     _metadata,
     _options,
@@ -99,7 +104,7 @@ from crc_sdk.parametric.intervals import (
     _no_premium_names,
     _short_block,
 )
-from crc_sdk.parametric.joint import JointDesignResult
+from crc_sdk.parametric.joint import ClusteredDesignResult, JointDesignResult
 from crc_sdk.parametric.metadata import (
     EVALUATION_METADATA_KEY,
     KEY_COLUMNS,
@@ -1060,12 +1065,23 @@ def _check_bound_cover(cover: Cover, sample: OutcomeSample) -> None:
     member of a window.
     A sample that holds several assets is read at the cover's, or at each if it
     names none, and a sample of several hazards at each component the cover
-    reads. What the cover can't read at all is `_check_cover_index`'s error.
+    reads. A cluster's cover is read at each of its assets, on the index they
+    read. What the cover can't read at all is `_check_cover_index`'s error.
     """
-    index = cover.index_definition
-    _check_cover_index(index, sample)
     document = sample.provenance.to_document()
     label = sample.scenario
+    cluster = cover.cluster_index
+    if cluster is not None:
+        _check_cover_index(cluster.index, sample)
+        parts = document.get("parts")
+        for asset in cluster.members:
+            leaf = document if not parts else parts.get(asset, document)
+            _check_location(
+                cover, label, f"asset {asset!r}", cluster.index.location, leaf
+            )
+        return
+    index = cover.index_definition
+    _check_cover_index(index, sample)
     if sample.index_components is not None:
         wanted = (
             dict(index.components)
@@ -1840,9 +1856,9 @@ class ScenarioSet:
 # -- one table -------------------------------------------------------------------
 
 
-def _design_label_of(entry: _Entry) -> list[str]:
+def _design_label_of(entry: _AnyEntry) -> list[str]:
     """The labels of the design samples of `entry`; empty for covers given as is."""
-    if isinstance(entry, _JointEntry):
+    if isinstance(entry, (_JointEntry, _ClusteredEntry)):
         return [entry.design.design_sample.scenario]
     if isinstance(entry, _Item):
         return [] if entry.design is None else [entry.design.design_sample.scenario]
@@ -1856,7 +1872,7 @@ def _design_label_of(entry: _Entry) -> list[str]:
     ]
 
 
-def _checked_design_label(entry: _Entry, labels: Sequence[str]) -> str | None:
+def _checked_design_label(entry: _AnyEntry, labels: Sequence[str]) -> str | None:
     """The scenario `entry` was designed on, or `None` for covers given as is.
 
     `ScenarioError` for a design sample whose label isn't one of the set's, and
@@ -1898,7 +1914,7 @@ def _checked_design_block(
     return given
 
 
-def _covers_of(entry: _Entry) -> tuple[Cover, ...]:
+def _covers_of(entry: _AnyEntry) -> tuple[Cover, ...]:
     """What each cover of `entry` reads, for the bound-location check."""
     if isinstance(entry, _Item):
         return (entry.cover,)
@@ -1925,7 +1941,7 @@ def _repriced(
 class _Terms:
     """What every block of `compare_scenarios` shares."""
 
-    entries: tuple[_Entry, ...]
+    entries: tuple[_AnyEntry, ...]
     design_labels: tuple[str | None, ...]
     reference: str
     given: OutcomeSample | None
@@ -2009,7 +2025,9 @@ def _groups(terms: _Terms, sample: OutcomeSample, *, priced: bool) -> list[_Grou
     groups: list[_Group] = []
     for label, chosen in positions.items():
         drawn_up = [terms.entries[i] for i in chosen]
-        joint = any(isinstance(entry, _JointEntry) for entry in drawn_up)
+        joint = any(
+            isinstance(entry, (_JointEntry, _ClusteredEntry)) for entry in drawn_up
+        )
         run, evaluation, designs = _prepared(
             drawn_up,
             sample,
@@ -2108,15 +2126,19 @@ def _allocated_block(terms: _Terms, sample: OutcomeSample) -> _BlockRows:
     for group in groups:
         for i in group.chosen:
             entry = terms.entries[i]
-            assert isinstance(entry, _JointEntry)
+            assert isinstance(entry, (_JointEntry, _ClusteredEntry))
             by_entry[i] = [
                 {
                     **row,
-                    **_block_values(group.run, row["level"]),
+                    **_block_values(group.run, _block_level(entry, row)),
                     **flags,
                     "premium_repriced": None,
                 }
-                for row in _allocated_rows(entry, group.run)
+                for row in (
+                    _cluster_allocated_rows(entry, group.run)
+                    if isinstance(entry, _ClusteredEntry)
+                    else _allocated_rows(entry, group.run)
+                )
             ]
         entries = [terms.entries[i] for i in group.chosen]
         _describe_rows(
@@ -2138,7 +2160,10 @@ def _breakdown_block(terms: _Terms, sample: OutcomeSample) -> _BlockRows:
     items: list[EvaluationMetadata] = []
     for group in groups:
         for i in group.chosen:
-            by_entry[i] = _breakdown_rows(terms.entries[i], group.run)
+            entry = terms.entries[i]
+            # `_entries` refused a design under Clustered when it read them.
+            assert not isinstance(entry, _ClusteredEntry)
+            by_entry[i] = _breakdown_rows(entry, group.run)
         rows = [row for i in group.chosen for row in by_entry[i]]
         evaluation = group.evaluation
         evaluation["pricing"] = None
@@ -2313,7 +2338,10 @@ def compare_scenarios(
     on the block evaluated (`"reference"`). `premium_repriced` is what a renewal on
     this block would cost: `pricing` on this block's payouts, the sum of the
     contracts' on a set's `"total"` row or a package's row, on the total payout on a
-    joint design's `"total"` row. Under `PurePremium` it equals `expected_payout`.
+    joint design's `"total"` row. Under `Clustered`, a `"cluster"` row's is its
+    cover's, and the `"total"` row's is the sum of the clusters' under
+    `joint=False`, each cluster being its own contract, and on the total payout
+    under `joint=True`. Under `PurePremium` it equals `expected_payout`.
     Allocated rows have neither.
 
     A budget is the design's: `Budget(ratio=k)` is a share of each design block's
@@ -2331,7 +2359,9 @@ def compare_scenarios(
     `fold` is the fold of a k-fold split, one at a time: concatenate folds with
     `pyarrow.concat_tables` and pass `EvaluationMetadata.merge` of their metadata to
     `write_comparison`. `allocation` and `values` are `compare`'s, and `allocation`
-    takes joint designs only, across the whole call: any other entry raises
+    takes joint designs only, a design under `Clustered` among them, whose rows
+    share each cluster's payout over its own assets, across the whole call: any
+    other entry raises
     `EvaluationError`, as in `compare`, whichever scenario each entry was designed
     on, so allocated rows never share a table with the rows of covers that stand on
     their own. `allocate_scenarios` gives them alone, without the totals.
@@ -2347,7 +2377,7 @@ def compare_scenarios(
     """
     scenarios = _scenario_set(scenarios)
     labels = scenarios.labels
-    entries = tuple(_entries(covers))
+    entries = tuple(_any_entries(covers))
     design_labels = tuple(_checked_design_label(entry, labels) for entry in entries)
     reference = scenarios.reference
     given = _checked_design_block(design_sample, design_labels, reference)
@@ -2424,7 +2454,7 @@ def _table_across(
 
 
 def allocate_scenarios(
-    designs: Sequence[JointDesignResult],
+    designs: Sequence[JointDesignResult | ClusteredDesignResult],
     scenarios: ScenarioSet,
     *,
     allocation: Allocation,
@@ -2443,8 +2473,10 @@ def allocate_scenarios(
     sit beside an `"asset"` or a `"total"` row. `compare_scenarios` holds the
     owner's total, which is what a joint design optimises.
 
-    `designs` are `JointDesignResult`s on the set's samples, each designed on one
-    of its scenarios, whose label is the row's `design_scenario`. `allocation`
+    `designs` are `JointDesignResult`s on the set's samples, or
+    `ClusteredDesignResult`s, whose rows share each cluster's payout over that
+    cluster's own assets, each designed on one of its scenarios, whose label is
+    the row's `design_scenario`. `allocation`
     is the rule, with no default: `"value"` shares each draw's total payout in
     proportion to the assets' `values`, and `"loss"` in proportion to their
     losses in that draw, and to their values in a draw without loss. `values`
@@ -2462,13 +2494,14 @@ def allocate_scenarios(
     and `setup_text` states them; `write_comparison` writes the table.
 
     Raises `TypeError` for a `scenarios` that isn't a `ScenarioSet` of built
-    samples, for an entry that isn't a `JointDesignResult` and for arguments of
-    the wrong type; `ScenarioError` for a design sample labelled outside the set;
-    and as `allocate` and `compare_scenarios` do.
+    samples, for an entry that isn't a `JointDesignResult` or a
+    `ClusteredDesignResult` and for arguments of the wrong type; `ScenarioError`
+    for a design sample labelled outside the set; and as `allocate` and
+    `compare_scenarios` do.
     """
     checked = _scenario_set(scenarios)
     labels = checked.labels
-    entries = tuple(_joint_entries(designs))
+    entries = tuple(_allocated_entries(designs))
     if allocation is None:
         raise EvaluationError(
             "allocate_scenarios needs a rule: allocation= one of "
@@ -2532,7 +2565,9 @@ def payout_breakdown_scenarios(
     `write_comparison` writes it.
 
     Raises `TypeError` for a `scenarios` that isn't a `ScenarioSet` of built
-    samples and for arguments of the wrong type; `SampleError` for a set whose
+    samples and for arguments of the wrong type; `EvaluationError` for a
+    design under `Clustered`, which reads several assets, as `payout_breakdown`
+    does; `SampleError` for a set whose
     samples hold several assets, and without the `design_sample` a cover given
     as is needs; `ScenarioError` for a design sample labelled outside the set, for
     a `design_sample=` not labelled as the reference, and for a cover bound to a

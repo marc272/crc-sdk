@@ -81,6 +81,13 @@ their columns is built together too. Those rows keep the unit above, and their
 coverage is unmeasured. The column `built_together` flags all those rows by how
 the block was built, and the setup text says how each was resampled.
 
+**Clusters.** Under `Clustered`, a `"cluster"` row reads its cluster's assets,
+whose index its cover averages and whose losses it sums, and so does each of
+those assets' allocated rows, a share of that cluster's payout; the `"total"`
+row reads every asset. So the rows of a cluster of two assets or more are
+built together as a `"total"` row is, and re-dealt or re-ranked by the same
+rule, and those of a one-asset cluster are an asset's own rows.
+
 Both functions rank nothing. They work in memory and do no I/O. Random numbers
 come only from the `rng` a call states, and its state at entry is recorded, so
 the table can be rebuilt.
@@ -116,14 +123,17 @@ from crc_sdk.parametric.evaluate import (
     EvaluationEntry,
     Split,
     _allocated_payout,
+    _any_entries,
+    _any_entry,
+    _AnyEntry,
     _block_fields,
     _check_keys,
+    _cluster_payouts,
+    _cluster_share,
+    _ClusteredEntry,
     _component_values,
     _component_view,
     _CoverSet,
-    _entries,
-    _Entry,
-    _entry,
     _Item,
     _item_reads,
     _joint_reads,
@@ -147,7 +157,7 @@ from crc_sdk.parametric.evaluate import (
     to_long,
 )
 from crc_sdk.parametric.index import CompositeIndex, IndexDefinition
-from crc_sdk.parametric.joint import JointDesignResult
+from crc_sdk.parametric.joint import ClusteredDesignResult, JointDesignResult
 from crc_sdk.parametric.metadata import (
     _BUILT_TOGETHER,
     EVALUATION_METADATA_KEY,
@@ -190,6 +200,7 @@ PooledEntry = (
     | CoverSet
     | Sequence[DesignedCover]
     | Sequence[JointDesignResult]
+    | Sequence[ClusteredDesignResult]
     | Sequence[CoverSet]
     | Sequence[CoverPackage]
 )
@@ -286,7 +297,57 @@ def _package_arrays(entry: CoverPackage, run: _Run) -> list[_Arrays]:
     return [*parts, package]
 
 
-def _arrays(entry: _Entry, run: _Run) -> list[_Arrays]:
+def _cluster_of_asset(entry: _ClusteredEntry) -> dict[str, str]:
+    """The cluster of each asset of a design under `Clustered`."""
+    return {
+        asset: cluster
+        for cluster, members in entry.design.members.items()
+        for asset in members
+    }
+
+
+def _cluster_arrays(entry: _ClusteredEntry, run: _Run) -> list[_Arrays]:
+    """A design's rows under `Clustered`, draw by draw, in the order of its rows.
+
+    Under `joint=False` each cluster's row, then the total, whose contracts are
+    the clusters' covers; under `joint=True` the total alone, one contract on
+    the total. Then the allocated rows, each asset's share of its cluster's
+    payout.
+    """
+    sample = run.sample
+    design = entry.design
+    paid = _cluster_payouts(entry, sample)
+    arrays = [
+        _Arrays(
+            paid.loss[cluster],
+            paid.payout[cluster],
+            paid.filled[cluster],
+            (paid.payout[cluster],),
+        )
+        for cluster in design.clusters or {}
+    ]
+    contracts = (
+        (paid.total,) if design.clusters is None else tuple(paid.payout.values())
+    )
+    arrays.append(
+        _Arrays(sample.loss.sum(axis=1), paid.total, paid.total_filled, contracts)
+    )
+    if run.allocation is None:
+        return arrays
+    assert run.values is not None
+    members = design.members
+    cluster_of = _cluster_of_asset(entry)
+    for asset in sample.asset_ids:
+        cluster = cluster_of[asset]
+        share = _cluster_share(
+            run.allocation, paid, cluster, members[cluster], sample, run.values, asset
+        )
+        loss = sample.loss[:, sample.asset_ids.index(asset)]
+        arrays.append(_Arrays(loss, share, paid.filled[cluster], (share,)))
+    return arrays
+
+
+def _arrays(entry: _AnyEntry, run: _Run) -> list[_Arrays]:
     """Each row of `entry` draw by draw, in the order of `_rows(entry, run)`."""
     if isinstance(entry, _Item):
         return [_asset_arrays(entry, run.sample.asset_ids[0], run)]
@@ -294,6 +355,8 @@ def _arrays(entry: _Entry, run: _Run) -> list[_Arrays]:
         return _set_arrays(entry, run)
     if isinstance(entry, CoverPackage):
         return _package_arrays(entry, run)
+    if isinstance(entry, _ClusteredEntry):
+        return _cluster_arrays(entry, run)
     return _joint_arrays(entry, run)
 
 
@@ -355,15 +418,36 @@ def _cover_columns(cover: Cover, sample: OutcomeSample, asset: str) -> frozenset
     return _view_columns(sample)
 
 
-def _reads(entry: _Entry, run: _Run) -> list[frozenset[str]]:
+def _cluster_reads(entry: _ClusteredEntry, run: _Run) -> list[frozenset[str]]:
+    """The assets each row of a design under `Clustered` reads.
+
+    A cluster's row reads its own assets, whose index its cover averages and
+    whose losses it sums, and so does each of their allocated rows, a share of
+    that cluster's payout; the `"total"` row reads every asset.
+    """
+    members = {
+        cluster: frozenset(assets) for cluster, assets in entry.design.members.items()
+    }
+    reads = [members[cluster] for cluster in entry.design.clusters or {}]
+    reads.append(frozenset(run.sample.asset_ids))
+    if run.allocation is not None:
+        cluster_of = _cluster_of_asset(entry)
+        reads += [members[cluster_of[asset]] for asset in run.sample.asset_ids]
+    return reads
+
+
+def _reads(entry: _AnyEntry, run: _Run) -> list[frozenset[str]]:
     """The columns each row of `entry` reads, in the order of `_arrays`.
 
     A column is an asset of a sample of several assets, a hazard of a sample
     of several hazards, and the one column of any other sample. A `"total"`
     row reads its parts' columns, and so do a joint design's rows, whose
-    allocated rows share the total payout.
+    allocated rows share the total payout. Under `Clustered` a cluster's rows
+    read that cluster's assets.
     """
     sample = run.sample
+    if isinstance(entry, _ClusteredEntry):
+        return _cluster_reads(entry, run)
     if isinstance(entry, _Item):
         return [_cover_columns(entry.cover, sample, sample.asset_ids[0])]
     if isinstance(entry, _CoverSet):
@@ -417,7 +501,7 @@ def _moved_by(sample: OutcomeSample) -> frozenset[str]:
     )
 
 
-def _built_together(entry: _Entry, run: _Run) -> list[frozenset[str]]:
+def _built_together(entry: _AnyEntry, run: _Run) -> list[frozenset[str]]:
     """How each row of `entry` reads rows built together, in the order of `_arrays`.
 
     The models that moved the block's columns (`_moved_by`), when the row
@@ -472,7 +556,7 @@ class _Evaluated:
     unit: Unit
     options: MetricOptions
     run: _Run | None = None
-    entries: tuple[_Entry, ...] = ()
+    entries: tuple[_AnyEntry, ...] = ()
     positions: tuple[tuple[int, int], ...] = ()
 
 
@@ -530,7 +614,7 @@ def _metrics(
 class _PooledEntry:
     """One entry of `compare_pooled`: what applies on each fold."""
 
-    folds: tuple[_Entry, ...]
+    folds: tuple[_AnyEntry, ...]
     given: bool
 
 
@@ -637,8 +721,8 @@ def _check_equal_probabilities(
                 )
 
 
-def _has_designs(entry: _Entry) -> bool:
-    if isinstance(entry, _JointEntry):
+def _has_designs(entry: _AnyEntry) -> bool:
+    if isinstance(entry, (_JointEntry, _ClusteredEntry)):
         return True
     if isinstance(entry, _Item):
         return entry.design is not None
@@ -649,7 +733,7 @@ def _has_designs(entry: _Entry) -> bool:
 
 def _pooled_entry(entry: Any, k: int) -> _PooledEntry:
     if isinstance(entry, (Cover, Mapping)):
-        checked = _entry(entry)
+        checked = _any_entry(entry)
         if _has_designs(checked):
             raise EvaluationError(
                 "a mapping on its own is a set of covers given as is, which applies "
@@ -658,15 +742,15 @@ def _pooled_entry(entry: Any, k: int) -> _PooledEntry:
         return _PooledEntry((checked,) * k, True)
     if isinstance(entry, (str, bytes)) or not isinstance(entry, Sequence):
         raise TypeError(
-            f"each entry is a sequence of {k} designs, joint designs, mappings of "
-            "designs or packages of designs in fold order, or one resolved Cover or "
-            f"mapping of covers, got {type(entry).__name__}"
+            f"each entry is a sequence of {k} designs, joint designs, designs under "
+            "Clustered, mappings of designs or packages of designs in fold order, or "
+            f"one resolved Cover or mapping of covers, got {type(entry).__name__}"
         )
     if len(entry) != k:
         raise EvaluationError(
             f"an entry needs one item per fold: {k} folds, got {len(entry)} items"
         )
-    per_fold = tuple(_entry(item) for item in entry)
+    per_fold = tuple(_any_entry(item) for item in entry)
     for fold, item in enumerate(per_fold):
         if not _has_designs(item):
             raise EvaluationError(
@@ -690,10 +774,10 @@ def _pooled_entries(entries: Any, k: int) -> list[_PooledEntry]:
 
 
 def _own_design_samples(
-    entry: _Entry, train: OutcomeSample
+    entry: _AnyEntry, train: OutcomeSample
 ) -> list[tuple[OutcomeSample, OutcomeSample]]:
     """Each design sample of `entry`, with the view of `train` it must equal."""
-    if isinstance(entry, _JointEntry):
+    if isinstance(entry, (_JointEntry, _ClusteredEntry)):
         return [(entry.design.design_sample, train)]
     if isinstance(entry, _CoverSet):
         return [
@@ -709,7 +793,7 @@ def _own_design_samples(
     ]
 
 
-def _check_fold_designs(entry: _Entry, train: OutcomeSample, fold: int) -> None:
+def _check_fold_designs(entry: _AnyEntry, train: OutcomeSample, fold: int) -> None:
     for own, view in _own_design_samples(entry, train):
         if own.content_hash != view.content_hash:
             raise EvaluationError(
@@ -803,6 +887,7 @@ def _pooled_identity(
             / sum(sizes)
             + 0.0
         ),
+        "cluster_id": first["cluster_id"],
         **{name: value for name, value in first.items() if _is_block_column(name)},
     }
 
@@ -830,7 +915,14 @@ def _pooled_read(
 
 def _shape(rows: Sequence[Mapping[str, Any]]) -> list[tuple[Any, ...]]:
     return [
-        (row["level"], row["asset_id"], row["scope"], row["components"]) for row in rows
+        (
+            row["level"],
+            row["asset_id"],
+            row["scope"],
+            row["components"],
+            row["cluster_id"],
+        )
+        for row in rows
     ]
 
 
@@ -987,7 +1079,7 @@ def _pool_entry_rows(
 
 
 def _pooled_metadata(
-    per_fold: Sequence[Sequence[_Entry]],
+    per_fold: Sequence[Sequence[_AnyEntry]],
     pairs: Sequence[tuple[OutcomeSample, OutcomeSample]],
     runs: Sequence[_Run],
     *,
@@ -1231,7 +1323,7 @@ def _block(
             "split= is required on one block, as in compare: 'in_sample' or "
             "'out_of_sample'"
         )
-    checked: list[_Entry] = _entries(entries)
+    checked: list[_AnyEntry] = _any_entries(entries)
     arguments: dict[str, Any] = {
         "split": split,
         "fold": fold,
@@ -2168,8 +2260,8 @@ def compare_pooled(
     `entries` is one of:
 
     - a sequence of k of what `compare` takes that hold designs, in fold order:
-      designs, `JointDesignResult`s, mappings of designs or packages of
-      designs, each made on its fold's design block;
+      designs, `JointDesignResult`s, `ClusteredDesignResult`s, mappings of
+      designs or packages of designs, each made on its fold's design block;
     - one resolved `Cover` or mapping of covers, which applies on every fold.
 
     The table has the columns of `compare`, one row per entry at the levels
@@ -2194,7 +2286,10 @@ def compare_pooled(
       `design_budget` is the mean over the rows of each fold's bound (null if
       any has none).
 
-    `allocation` and `values` are those of `compare`. The table's metadata
+    A design under `Clustered` gives, as in `compare`, its `"cluster"` rows
+    under `joint=False`, with `cluster_id`, and its `"total"` row; each pooled
+    row reads every fold's design of that cluster or total. `allocation` and
+    `values` are those of `compare`. The table's metadata
     holds every block, one entry for the pooled rows, and one
     `setup.evaluations` entry with `fold` null and `method` `"kfold_pooled"`;
     `setup_text` states it and `write_comparison` writes it. The table ranks
@@ -2284,8 +2379,9 @@ def bootstrap_intervals(
       block whose columns a dependence model moved (`EmpiricalCopula`,
       `Comonotonic()`, `GaussianCopula` or a model of the caller's), a row that
       reads two of its columns or more (an asset or a hazard each; a `"total"`
-      row, a joint design's rows, and on a sample of several hazards a row
-      whose index and combined loss read two hazards or more), and any row that
+      row, a joint design's rows, under `Clustered` the rows of a cluster of
+      two assets or more, and on a sample of several hazards a row whose index
+      and combined loss read two hazards or more), and any row that
       reads a column built with `HazardNoise(...,
       hold="hazard_distribution")`. A pooled row is flagged when a fold's row
       is. `setup.intervals.built_together` lists how the flagged rows were
