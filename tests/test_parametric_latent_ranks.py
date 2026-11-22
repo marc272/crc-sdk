@@ -62,30 +62,26 @@ N = 40
 
 _BEFORE = {
     "assets gaussian": (
-        "sha256:3c80d168894645da8b4544bd514947994f3c6a681ce9658b17ce7b91d4f86131"
+        "sha256:72f83daa8c6b7eea1187183e53041153e7417b314a3889ff9374874c48061eaa"
     ),
     "assets comonotonic": (
-        "sha256:e12c7b4adc88dae3c24844816737d9b762e9f054d7a2e44f3db335b73819bb3d"
+        "sha256:b69d2eb7c75ec2c8ae0eef1c5e866fa103080c50af68a84f21682b112e7f34b8"
     ),
     "hazards gaussian": (
-        "sha256:e38a1b6dca9f0591453a644c58fb0f382ebad1ecd56ce710391e660b74530745"
+        "sha256:ec23aba3c667d426bd9ea59eae2afb0e48a439fbb0b98336444842253747499a"
     ),
     "hazards comonotonic": (
-        "sha256:7c2a5928e037562c58bd787cd7282dac8cb12be2bef1f29a432f053e5bf33764"
+        "sha256:80350d37d7b61cff4a7dd8be2853b50531f3867a5e85ff4a0045dc54449db7d3"
     ),
 }
-"""What these samples hashed to before samples kept their latent ranks.
-
-The samples have no basis risk, as `HazardNoise`'s factors can differ in the
-last bit between platforms, and so would the hashes.
-"""
+"""What these samples (`_pinned`) hashed to before samples kept their latent ranks."""
 
 _KEPT = {
     "assets gaussian": (
-        "sha256:b9ecb65a9939863c724b38165c3d3af310a1a92770f9d6e56279944d202f8439"
+        "sha256:d51a7effa7e29f918d5e5a4bb1fece1592aea5d5d0d4c9ff97344a49a98f7cd1"
     ),
     "hazards gaussian": (
-        "sha256:dfe01d93b9ae08a7d75d4e6180da63df914130cde6f4aed6f8d2cbc67b9f32b4"
+        "sha256:d2263c282c246369c6f29422d556d437a034ab8327417e911fe1139cb7abe305"
     ),
 }
 """What the `GaussianCopula` samples hash to now that they keep them."""
@@ -141,6 +137,40 @@ def _hazards(model: Any, n: int = N) -> OutcomeSample:
         combine=CappedSum(1.0),
         basis_risk=NoBasisRisk(),
         asset_id="site",
+    )
+
+
+def _pinned(model: Any, *, hazards: bool = False) -> OutcomeSample:
+    """A sample whose pinned hash is the same on every platform.
+
+    The recipe of the module's other pinned curve samples: one Gumbel curve, a
+    loss that only divides, no basis risk. `HazardNoise`'s factors, and other
+    curves and impact functions, can differ in the last bit between platforms.
+    """
+    curve = FittedDistribution.from_parameters("gumbel_r", location=50.0, scale=10.0)
+    loss = LossModel(
+        lambda hazard: hazard / 200.0, value=1000.0, value_unit="EUR", name="ramp"
+    )
+    if hazards:
+        return sample_curve_hazards(
+            dict.fromkeys(HAZARDS, curve),
+            dependence=model,
+            metadata={h: _metadata(UNITS[h]) for h in HAZARDS},
+            n_draws=N,
+            rngs={h: np.random.default_rng(21 + j) for j, h in enumerate(HAZARDS)},
+            loss_models=dict.fromkeys(HAZARDS, loss),
+            combine=CappedSum(1.0),
+            basis_risk=NoBasisRisk(),
+            asset_id="site",
+        )
+    return sample_curves(
+        dict.fromkeys(ASSETS, curve),
+        dependence=model,
+        metadata={a: _metadata() for a in ASSETS},
+        n_draws=N,
+        rngs={a: np.random.default_rng(11 + j) for j, a in enumerate(ASSETS)},
+        loss_models=dict.fromkeys(ASSETS, loss),
+        basis_risk=NoBasisRisk(),
     )
 
 
@@ -325,10 +355,10 @@ def test_a_block_keeps_its_rows_ranks_and_a_view_keeps_none() -> None:
 
 def test_the_gaussian_samples_hashes_change_and_the_others_stay() -> None:
     samples = {
-        "assets gaussian": _assets(GaussianCopula(0.6)),
-        "assets comonotonic": _assets(Comonotonic()),
-        "hazards gaussian": _hazards(GaussianCopula(-0.5)),
-        "hazards comonotonic": _hazards(Comonotonic()),
+        "assets gaussian": _pinned(GaussianCopula(0.6)),
+        "assets comonotonic": _pinned(Comonotonic()),
+        "hazards gaussian": _pinned(GaussianCopula(-0.5), hazards=True),
+        "hazards comonotonic": _pinned(Comonotonic(), hazards=True),
     }
     for name, sample in samples.items():
         if name in _KEPT:
