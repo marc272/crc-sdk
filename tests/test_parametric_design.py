@@ -749,10 +749,106 @@ def test_expected_uncovered_closed_form() -> None:
 
 def test_expected_uncovered_without_ranges_reports_no_uniqueness() -> None:
     result = design(
-        _step([Free(), Free()]), SAMPLE, ExpectedUncovered(), budget=Budget(amount=20.0)
+        _step([Free(), Free()]),
+        SAMPLE,
+        ExpectedUncovered(),
+        budget=Budget(amount=20.0),
+        options=DesignOptions(ranges=False),
     )
     assert result.unique is None and result.ranges is None
     assert result.solver_options["ranging"] is None
+    assert result.solves == 1
+
+
+def test_the_lp_route_ranges_by_default() -> None:
+    assert DesignOptions().ranges is True
+    terms: dict[str, Any] = {"budget": Budget(amount=20.0)}
+    default = design(_step([Free(), Free()]), SAMPLE, ExpectedUncovered(), **terms)
+    stated = design(
+        _step([Free(), Free()]),
+        SAMPLE,
+        ExpectedUncovered(),
+        options=DesignOptions(ranges=True),
+        **terms,
+    )
+    unranged = design(
+        _step([Free(), Free()]),
+        SAMPLE,
+        ExpectedUncovered(),
+        options=DesignOptions(ranges=False),
+        **terms,
+    )
+    assert default.unique is True and default.ranges is not None
+    assert default.solver_options["ranging"] == dict(_solver.RANGING_OPTIONS)
+    assert default.solves == 1 + 4 * 2
+    assert default.design_id == stated.design_id
+    assert default.ranges == stated.ranges
+    # Ranging reports on the design; it doesn't change it. The options enter
+    # the id, so the design without ranges has another.
+    assert default.parameters == unranged.parameters
+    assert default.objective_value == unranged.objective_value
+    assert default.premium == unranged.premium
+    assert default.design_id != unranged.design_id
+    row = evaluate(default, SAMPLE, split="in_sample").to_pylist()[0]
+    assert row["unique"] is True
+
+
+def test_the_qp_route_and_a_grid_in_numpy_do_not_range() -> None:
+    # MSE takes the QP route, whose eigenvalue rule reports unique with or
+    # without ranges; a user objective takes a grid in numpy, which reports
+    # none. Only the options document, and so the id, differs.
+    grid = _step(
+        [Free(upper=40.0, grid=[10.0, 20.0]), Free(upper=40.0, grid=[30.0, 40.0])]
+    )
+    absolute = UserObjective(
+        lambda loss, payout, probability: float(
+            np.sum(probability * np.abs(loss - payout))
+        ),
+        name="mean_absolute_error",
+    )
+    for template, objective, route in (
+        (_step([Free(), Free()]), MSE(), "qp"),
+        (grid, absolute, "grid"),
+    ):
+        default = design(template, SAMPLE, objective)
+        unranged = design(
+            template, SAMPLE, objective, options=DesignOptions(ranges=False)
+        )
+        assert default.amounts == unranged.amounts == route
+        assert default.ranges is None and unranged.ranges is None
+        assert default.solver_options == unranged.solver_options
+        record, other = default.to_record(), unranged.to_record()
+        for each in (record, other):
+            del each["design_id"], each["options"], each["solve"]["seconds"]
+        assert record == other
+        assert default.design_id != unranged.design_id
+    assert design(_step([Free(), Free()]), SAMPLE, MSE()).unique is True
+
+
+def test_a_grid_ranges_the_lp_at_its_chosen_candidate() -> None:
+    # A free first breakpoint on a grid, with the amounts an LP at each point:
+    # the LP is ranged at the chosen point only, and gives the grid's report.
+    sample = _many_draws()
+    template = _step(
+        [Free(upper=40.0), Free(upper=40.0), Free(upper=40.0)],
+        (Free(upper=2.0, grid=[0.8, 1.2]), 2.0, 3.0),
+    )
+    terms: dict[str, Any] = {"budget": Budget(ratio=0.5)}
+    default = design(template, sample, ExpectedUncovered(), **terms)
+    unranged = design(
+        template,
+        sample,
+        ExpectedUncovered(),
+        options=DesignOptions(ranges=False),
+        **terms,
+    )
+    assert default.route == "grid" and default.amounts == "lp"
+    assert default.ties == unranged.ties == 0
+    assert default.unique is True and default.ranges is not None
+    assert default.solves >= unranged.solves + 4 * 3
+    assert unranged.unique is None and unranged.ranges is None
+    assert default.parameters == unranged.parameters
+    assert default.profile == unranged.profile
 
 
 def test_non_unique_lp_optimum_is_reported_with_ranges() -> None:
@@ -1054,6 +1150,162 @@ def test_the_round_limit_leaves_an_end_to_the_full_lp(
     assert len(released) == 4 * 3 and sum(1 for count in released if count) >= 1
     assert got.solves == 1 + 4 * 3 + sum(1 for count in released if count)
     _same_ranges(got, expected, float(sample.loss.max()))
+
+
+def test_an_empty_near_optimal_set_is_ranged_from_the_lps_tight_optimum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The design LP is solved at HiGHS's default tolerances, the ranges at
+    # 1e-10, so the design's optimum can lie below the LP's optimum at 1e-10
+    # by more than a near-optimal tolerance. Here the design LP reports an
+    # optimum 1e-8 too low (within the objective check's 1e-7), so both
+    # near-optimal sets are empty: the LP's optimum at the ranging
+    # tolerances is solved for once, and every end is ranged from it.
+    sample = _many_draws()
+    expected = design(
+        _three_bands(), sample, WeightedCVaR(0.5, 0.9), budget=Budget(ratio=0.5)
+    )
+    solve_lp = _solver.solve_lp
+    optimum = DESIGN_MODULE._FullRanging.optimum
+    tight: list[float] = []
+
+    def low(
+        programme: _solver.Programme,
+        options: Mapping[str, Any] | None = None,
+        *,
+        keep_basis: bool = False,
+    ) -> _solver.Solution:
+        solution = solve_lp(programme, options, keep_basis=keep_basis)
+        if options is None and solution.objective is not None:
+            shift = 1e-8 * max(1.0, abs(solution.objective))
+            return dataclasses.replace(solution, objective=solution.objective - shift)
+        return solution
+
+    def counted(self: Any) -> float:
+        tight.append(optimum(self))
+        return tight[-1]
+
+    monkeypatch.setattr(_solver, "solve_lp", low)
+    monkeypatch.setattr(DESIGN_MODULE._FullRanging, "optimum", counted)
+    got = design(
+        _three_bands(), sample, WeightedCVaR(0.5, 0.9), budget=Budget(ratio=0.5)
+    )
+    assert len(tight) == 1
+    _same_ranges(got, expected, float(sample.loss.max()))
+
+
+@pytest.mark.parametrize("tight", ["not_above", "still_empty"])
+def test_an_empty_near_optimal_set_the_tight_optimum_does_not_explain_raises(
+    monkeypatch: pytest.MonkeyPatch, tight: str
+) -> None:
+    # Every ranging LP is infeasible. When the LP's optimum at the ranging
+    # tolerances is not above the design's, or the near-optimal sets stay
+    # empty from it, the full LP's error is raised.
+    solve_lp = _solver.solve_lp
+
+    def infeasible_ranging(
+        programme: _solver.Programme,
+        options: Mapping[str, Any] | None = None,
+        *,
+        keep_basis: bool = False,
+    ) -> _solver.Solution:
+        if options is _solver.RANGING_OPTIONS:
+            return _solver.Solution("infeasible", None, None, "patched", 0, 0.0)
+        return solve_lp(programme, options, keep_basis=keep_basis)
+
+    def infeasible(
+        self: _solver.LPSession, options: Mapping[str, Any] | None = None
+    ) -> _solver.Solution:
+        return _solver.Solution("infeasible", None, None, "patched session", 0, 0.0)
+
+    references: list[float] = []
+
+    def reference(self: Any) -> float:
+        references.append(-math.inf if tight == "not_above" else math.inf)
+        return references[-1]
+
+    monkeypatch.setattr(_solver, "solve_lp", infeasible_ranging)
+    monkeypatch.setattr(_solver.LPSession, "solve", infeasible)
+    monkeypatch.setattr(DESIGN_MODULE._FullRanging, "optimum", reference)
+    with pytest.raises(InfeasibleDesignError) as raised:
+        design(
+            _step([Free(), Free()]),
+            NON_UNIQUE,
+            ExpectedUncovered(),
+            budget=Budget(amount=5.0),
+        )
+    assert raised.value.status == "infeasible"
+    assert raised.value.solver_message == "patched session"
+    assert len(references) == 1
+
+
+def test_the_tight_optimum_of_an_infeasible_lp_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The LP solved for the tight optimum fails too: its typed error.
+    solve_lp = _solver.solve_lp
+
+    def infeasible_ranging(
+        programme: _solver.Programme,
+        options: Mapping[str, Any] | None = None,
+        *,
+        keep_basis: bool = False,
+    ) -> _solver.Solution:
+        if options is _solver.RANGING_OPTIONS:
+            return _solver.Solution("infeasible", None, None, "patched", 0, 0.0)
+        return solve_lp(programme, options, keep_basis=keep_basis)
+
+    def infeasible(
+        self: _solver.LPSession, options: Mapping[str, Any] | None = None
+    ) -> _solver.Solution:
+        return _solver.Solution("infeasible", None, None, "patched session", 0, 0.0)
+
+    monkeypatch.setattr(_solver, "solve_lp", infeasible_ranging)
+    monkeypatch.setattr(_solver.LPSession, "solve", infeasible)
+    with pytest.raises(InfeasibleDesignError, match="patched session"):
+        design(
+            _step([Free(), Free()]),
+            NON_UNIQUE,
+            ExpectedUncovered(),
+            budget=Budget(amount=5.0),
+        )
+
+
+def test_a_design_whose_lp_optimum_moves_at_the_ranging_tolerances_ranges() -> None:
+    # A synthetic site on which the design LP's optimum, at HiGHS's default
+    # tolerances, lay 1.5e-9 (scaled) below its optimum at 1e-10 on the
+    # machine this was written on, so the wide near-optimal set was empty
+    # there. Whichever optimum the platform's HiGHS reports, the design ranges
+    # and its amounts lie within their ranges.
+    rng = np.random.default_rng(1)
+    n = 60
+    shock = 22.0 + rng.gamma(2.0, 7.0, (n, 1))
+    hazard = shock + rng.normal(0.0, 3.0, (n, 3))
+    index = np.maximum(hazard + rng.normal(0.0, 3.0, (n, 3)), 0.0)[:, 0]
+    excess = np.maximum(hazard[:, 0] - 25.7, 0.0) / 49.0
+    loss = 10.0 * excess**3 / (1.0 + excess**3)
+    sample = _sample(index.tolist(), loss.tolist())
+    template = Cover(
+        INDEX,
+        StepPayout((25.0, 30.0, 36.0, 43.0, 51.0, 60.0), [Free() for _ in range(6)]),
+        payout_unit="EUR",
+        asset_id="A",
+    )
+    result = design(template, sample, ExpectedUncovered(), budget=Budget(ratio=0.5))
+    unranged = design(
+        template,
+        sample,
+        ExpectedUncovered(),
+        budget=Budget(ratio=0.5),
+        options=DesignOptions(ranges=False),
+    )
+    assert result.unique is not None and result.ranges is not None
+    assert result.parameters == unranged.parameters
+    # Within the golden cases' parameter allowance, 1e-6 of the scale.
+    scale = float(loss.max())
+    for name, (low, high) in result.ranges.items():
+        value = result.parameters[name]
+        assert low - 1e-6 * scale <= value <= high + 1e-6 * scale, name
 
 
 def _small_lp(cost: Sequence[float], upper: float | None = None) -> _solver.Programme:
@@ -1867,6 +2119,14 @@ def test_design_options_validation() -> None:
         "feasibility_tolerance": 1e-7,
         "fill": "lowest",
         "max_grid_points": 10_000,
+        "ranges": True,
+    }
+    # The document, and so the design_id, of the options before ranging was
+    # the default.
+    assert DesignOptions(ranges=False).to_document() == {
+        "feasibility_tolerance": 1e-7,
+        "fill": "lowest",
+        "max_grid_points": 10_000,
         "ranges": False,
     }
 
@@ -1970,7 +2230,7 @@ def test_designs_are_deterministic_and_ids_follow_the_inputs() -> None:
             SAMPLE,
             WeightedCVaR(0.9, 0.5),
             budget=Budget(amount=10.0),
-            options=DesignOptions(ranges=True),
+            options=DesignOptions(ranges=False),
         ).design_id,
         design(
             template,
@@ -1982,6 +2242,16 @@ def test_designs_are_deterministic_and_ids_follow_the_inputs() -> None:
         ).design_id,
     }
     assert len(ids) == 5
+    assert (
+        design(
+            template,
+            SAMPLE,
+            WeightedCVaR(0.9, 0.5),
+            budget=Budget(amount=10.0),
+            options=DesignOptions(ranges=True),
+        ).design_id
+        == first.design_id
+    )
     assert all(item.startswith("sha256:") for item in ids)
 
 

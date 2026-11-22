@@ -423,9 +423,19 @@ def test_the_joint_ranges_free_draws_and_match_the_full_lp(
 
 def test_without_ranges_the_lp_route_reports_no_uniqueness() -> None:
     result = design_joint(
-        _pair(), SEPARATE, ExpectedUncovered(), budget=Budget(amount=7.5)
+        _pair(),
+        SEPARATE,
+        ExpectedUncovered(),
+        budget=Budget(amount=7.5),
+        options=DesignOptions(ranges=False),
     )
     assert result.unique is None and result.ranges is None
+    # DesignOptions() ranges by default.
+    default = design_joint(
+        _pair(), SEPARATE, ExpectedUncovered(), budget=Budget(amount=7.5)
+    )
+    assert default.unique is not None and default.ranges is not None
+    assert default.parameters == result.parameters
 
 
 def test_a_loaded_premium_is_priced_on_the_total_payout() -> None:

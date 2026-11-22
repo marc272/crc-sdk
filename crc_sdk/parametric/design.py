@@ -133,20 +133,25 @@ unbounded raises `DesignError`, not `UnboundedDesignError`. Free amounts below
   `unidentified` and set by `DesignOptions.fill`: `"lowest"` (the default)
   takes the smallest value the constraints allow, `"highest"` the largest.
   Both keep the design exactly optimal;
-- on the LP route, `DesignOptions(ranges=True)` ranges every identified
-  amount over the near-optimal designs at two tolerances (1e-9 and 1e-11 of
-  `max(1, |optimum|)`, in scaled units). An amount is pinned when its narrow
-  range is at most half its wide one, or narrower than 1e-7 of the scale;
-  `unique` is true when every identified amount is pinned. Without ranges,
-  `unique` is `None` on the LP route. Each range end is the optimum of an LP
-  over the near-optimal set, solved on a reduced LP: draws with the same
-  basis row and loss are merged, and a draw away from the kinks of its
-  uncovered loss and of the CVaR terms keeps the linear piece it is on at the
-  design's optimum, summed into one row with the others. A fixed piece is
-  below the function, so the reduced LP is a relaxation; when its solution
-  keeps every fixed piece it solves the full LP, and otherwise the draws whose
-  piece broke are freed and it is solved again. After 100 such LPs, or one
-  that is not solved to optimality, the full LP solves that end;
+- on the LP route, `DesignOptions()` ranges every identified amount over the
+  near-optimal designs (`ranges=True`, the default) at two tolerances (1e-9
+  and 1e-11 of `max(1, |optimum|)`, in scaled units). An amount is pinned
+  when its narrow range is at most half its wide one, or narrower than 1e-7
+  of the scale; `unique` is true when every identified amount is pinned.
+  With `ranges=False`, `unique` is `None` on the LP route. Each range end is
+  the optimum of an LP over the near-optimal set, solved on a reduced LP:
+  draws with the same basis row and loss are merged, and a draw away from
+  the kinks of its uncovered loss and of the CVaR terms keeps the linear
+  piece it is on at the design's optimum, summed into one row with the
+  others. A fixed piece is below the function, so the reduced LP is a
+  relaxation; when its solution keeps every fixed piece it solves the full
+  LP, and otherwise the draws whose piece broke are freed and it is solved
+  again. After 100 such LPs, or one that is not solved to optimality, the
+  full LP solves that end. The design LP is solved at HiGHS's default
+  tolerances and the ranges at 1e-10, so its optimum can lie below the LP's
+  optimum at 1e-10 by more than a near-optimal tolerance, and a near-optimal
+  set is then empty there: when an end's full LP is infeasible, the LP's
+  optimum at 1e-10 is solved for, and every end is ranged again from it;
 - on the QP route, `unique` is true when `H = B' diag(p) B` over the
   identified amounts is positive definite (smallest eigenvalue above 1e-10
   of the largest);
@@ -339,7 +344,9 @@ class DesignOptions(_DefinitionModel):
     - `fill`: `"lowest"` or `"highest"`, the value of unidentified amounts.
     - `ranges`: on the LP route, range every identified amount over the
       near-optimal designs and report `unique` (four range ends per amount,
-      each an LP, solved on reduced LPs; see the module docstring).
+      each an LP, solved on reduced LPs; see the module docstring). True by
+      default; with `False`, `unique` is `None` on the LP route. The QP
+      route and a grid evaluated in numpy don't range either way.
     - `refine`: after a grid over free thresholds, refine its best point,
       with the amounts solved exactly at every point it evaluates: over the
       sample's index values for a `StepPayout`, a `BinaryPayout`, a
@@ -358,7 +365,7 @@ class DesignOptions(_DefinitionModel):
     max_grid_points: StrictInt = 10_000
     feasibility_tolerance: FiniteFloat = 1e-7
     fill: Fill = "lowest"
-    ranges: StrictBool = False
+    ranges: StrictBool = True
     refine: StrictBool = False
     refine_tolerance: FiniteFloat = REFINE_TOLERANCE
     refine_max_points: StrictInt = REFINE_MAX_POINTS
@@ -369,7 +376,7 @@ class DesignOptions(_DefinitionModel):
         max_grid_points: int = 10_000,
         feasibility_tolerance: float = 1e-7,
         fill: Fill = "lowest",
-        ranges: bool = False,
+        ranges: bool = True,
         refine: bool = False,
         refine_tolerance: float = REFINE_TOLERANCE,
         refine_max_points: int = REFINE_MAX_POINTS,
@@ -453,7 +460,7 @@ class DesignResult:
       many of its QPs did).
     - The non-uniqueness report: `unidentified` amounts and the `fill` rule
       that set them, `zeroed` amounts, `ranges` (wide ranges in payout
-      units, with `ranges=True` on the LP route), `unique`, `ties`, and the
+      units, on the LP route unless `ranges=False`), `unique`, `ties`, and the
       grid's `profile` (a `pyarrow.Table`: one row per candidate, its values,
       `objective` and `status`) and `grid` counts.
     - The degenerate-tail flags `p_zero_loss`, `tail_outcomes` and
@@ -1375,6 +1382,18 @@ def _release(
     return count
 
 
+class _EmptyNearSet(Exception):
+    """A range end's full LP is infeasible: its near-optimal set is empty.
+
+    `error` is the full LP's `InfeasibleDesignError`, which the design raises
+    when the LP's optimum at the ranging tolerances doesn't explain it.
+    """
+
+    def __init__(self, error: InfeasibleDesignError) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
 class _FullRanging:
     """The range ends that the reduced LPs leave, solved on the full LP.
 
@@ -1397,7 +1416,7 @@ class _FullRanging:
         self._session: _solver.LPSession | None = None
         self._near = 0
 
-    def end(self, column: int, sign: float, upper: float) -> float:
+    def _opened(self) -> _solver.LPSession:
         if self._session is None:
             self._session = _solver.LPSession(
                 self._programme, _solver.RANGING_OPTIONS, basis=self._basis
@@ -1405,13 +1424,30 @@ class _FullRanging:
             self._near = self._session.add_row(
                 self._programme.cost, -math.inf, math.inf
             )
-        self._session.change_row_bounds(self._near, -math.inf, upper)
+        return self._session
+
+    def end(self, column: int, sign: float, upper: float) -> float:
+        """The range end; raise `_EmptyNearSet` when the full LP is infeasible."""
+        session = self._opened()
+        session.change_row_bounds(self._near, -math.inf, upper)
         cost = np.zeros(self._programme.n_columns)
         cost[column] = sign
-        self._session.change_cost(cost)
-        solution = _checked(self._session.solve, self._context, self._solves)
+        session.change_cost(cost)
+        try:
+            solution = _checked(session.solve, self._context, self._solves)
+        except InfeasibleDesignError as error:
+            raise _EmptyNearSet(error) from error
         assert solution.values is not None
         return float(solution.values[column])
+
+    def optimum(self) -> float:
+        """The LP's optimum at the ranging tolerances, without the near row."""
+        session = self._opened()
+        session.change_row_bounds(self._near, -math.inf, math.inf)
+        session.change_cost(self._programme.cost)
+        solution = _checked(session.solve, self._context, self._solves)
+        assert solution.objective is not None
+        return solution.objective
 
 
 def _range_end(
@@ -1455,6 +1491,15 @@ def _ranges(
     solved to optimality, or that takes `RANGING_ROUND_LIMIT` of them, is
     solved on the full LP (`_FullRanging`). Every solve is counted.
 
+    The design LP is solved at HiGHS's default tolerances and the ranges at
+    the tighter ones of `RANGING_OPTIONS`, so the design's optimum can lie
+    below the LP's optimum at those by more than a near-optimal tolerance; a
+    near-optimal set is then empty there. When an end's full LP is
+    infeasible, the LP's optimum at the ranging tolerances is solved for,
+    and if it lies above the design's, every end is ranged again from it,
+    with the pieces as they are. Otherwise, or if an end is still
+    infeasible, the full LP's `InfeasibleDesignError` is raised.
+
     Returns each amount's wide range in scaled units, and whether every one
     is pinned.
     """
@@ -1466,23 +1511,36 @@ def _ranges(
     optimum = solution.objective
     pieces = _pieces(block, solution.values[: block.basis.shape[1]], context)
     full = _FullRanging(solved.programme, solution.basis, context, solves)
-    found: list[dict[int, tuple[float, float]]] = []
-    for tolerance in NEAR_OPTIMAL_TOLERANCES:
-        upper = optimum + tolerance * max(1.0, abs(optimum))
-        found.append(
-            {
-                column: (
-                    _range_end(
-                        pieces, block, context, solves, full, (column, 1.0, upper)
-                    ),
-                    _range_end(
-                        pieces, block, context, solves, full, (column, -1.0, upper)
-                    ),
-                )
-                for column in identified
-            }
-        )
-    wide, narrow = found
+
+    def near_optimal(reference: float) -> list[dict[int, tuple[float, float]]]:
+        found: list[dict[int, tuple[float, float]]] = []
+        for tolerance in NEAR_OPTIMAL_TOLERANCES:
+            upper = reference + tolerance * max(1.0, abs(reference))
+            found.append(
+                {
+                    column: (
+                        _range_end(
+                            pieces, block, context, solves, full, (column, 1.0, upper)
+                        ),
+                        _range_end(
+                            pieces, block, context, solves, full, (column, -1.0, upper)
+                        ),
+                    )
+                    for column in identified
+                }
+            )
+        return found
+
+    try:
+        wide, narrow = near_optimal(optimum)
+    except _EmptyNearSet as empty:
+        tight = full.optimum()
+        if not tight > optimum:
+            raise empty.error from None
+        try:
+            wide, narrow = near_optimal(tight)
+        except _EmptyNearSet as again:
+            raise again.error from None
     pinned = True
     for column in identified:
         width = wide[column][1] - wide[column][0]
@@ -2958,8 +3016,9 @@ def design(
     `Budget(amount=...)`) bounds it; `limit` (`Limit(amount)`) bounds every
     payout. `options` (`DesignOptions`) sets the grid cap, the tolerances,
     the fill rule of unidentified amounts, whether the LP route ranges its
-    optimal set and whether a grid's best point is refined. The routes,
-    checks and reports are described in the module docstring.
+    optimal set (by default it does) and whether a grid's best point is
+    refined. The routes, checks and reports are described in the module
+    docstring.
 
     The expected uncovered loss and the weighted CVaR need a budget or
     bounded amounts; MSE needs neither.
