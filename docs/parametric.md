@@ -2482,7 +2482,7 @@ difference between them.
   | --- | --- |
   | Two columns or more of an `EmpiricalCopula` block: the `"total"` row of a set of covers, every row of a joint design, and on a sample of several hazards a row whose index and combined loss read two hazards or more | **Re-deals the draws.** It redraws each column's draws on its own, with replacement, and deals them to the reference years again by the copula's rule: the redrawn draws, sorted by their index, fill the ranks that each reference year's rows held in that column, and a year's rows take its draws in the order they were drawn. On a window of horizons, within each member |
   | A column built with `HazardNoise(..., hold="hazard_distribution")` | **Re-ranks the hazard at the asset.** It resamples by the unit above, and ranks the hazard at the asset again over the resampled rows, as the held form ranks it over the rows of a call. Each row takes the loss of its new hazard at the asset, and on a sample of several hazards its damage, which the block's own rows give |
-  | Two columns or more of a block that `Comonotonic()`, `GaussianCopula` or a model of your own moved, and no held column | Resamples by the unit above. The coverage of these intervals is unmeasured |
+  | Two columns or more of a block that `Comonotonic()`, `GaussianCopula` or a model of your own moved, and no held column | Resamples by the unit above. The study below measured these intervals under `Comonotonic()` and `GaussianCopula`; under a model of your own their coverage is unmeasured |
   | Anything else, which `built_together` leaves unflagged: an asset's own row, one asset's view, a hazard's view on its own loss, and every row under `Independent()` with the default `hold` | Resamples by the unit above, with the same draws and numbers as before |
 
   A row of both kinds, on a held `EmpiricalCopula` block, is re-dealt and
@@ -2536,13 +2536,9 @@ difference between them.
   with `PurePremium()`, 300 rows, 1,000 replications, 1,000 resamples each, and
   the true value from 600,000 rows or more. Each `EmpiricalCopula` had a
   reference of 30 years whose normal scores were correlated at +0.8 or -0.8, and
-  10 draws a year; the two hazards drew from the two assets' curves, with a
-  package of one cover each, once with their losses as damage ratios and once
-  with each hazard's loss on a stated value of 100 EUR and the covers' limits
-  100 times larger, so those rows' combined loss was made again from the
-  hazards' damages times the value; those rows come from a later run of the
-  study, with generators of their own. The held blocks had one asset, at sigma
-  0.3 and 1. The columns are those of
+  10 draws a year; the two hazards drew from the two assets' curves, with their
+  losses as damage ratios and a package of one cover each. The held blocks had
+  one asset, at sigma 0.3 and 1. The columns are those of
   `MetricOptions(betas=(0.9,), return_periods=(10.0,))`: "the means" are
   `expected_loss`, `expected_payout`, `expected_uncovered` and `coverage_ratio`,
   and "the tail columns" `tail_coverage`, `cvar_uncovered_to_loss` and the VaR
@@ -2561,14 +2557,89 @@ difference between them.
   | The same | the same | re-dealt | the tail columns, and `false_positive_rate` under +0.8 | 0.890 to 0.994 |
   | `EmpiricalCopula` of two hazards, damage ratios, `CappedSum(1.0)` | the package row and its covers' rows | re-dealt | the means, `payout_frequency`, `false_negative_rate`, `rmse` | 0.886 to 0.926 |
   | The same | the same | re-dealt | the tail columns, and `false_positive_rate` under +0.8 | 0.890 to 1.000; `var_loss` and `cvar_loss` 1.000, as the combined loss's tail is at the cap |
-  | `EmpiricalCopula` of two hazards, a stated value, `CompoundDamage()` | the package row and its covers' rows | re-dealt, from the damages times the value | the means, `payout_frequency`, `false_negative_rate`, `rmse` | 0.879 to 0.926 |
-  | The same | the same | the same | the tail columns, and `false_positive_rate` under +0.8 | 0.895 to 0.997 |
-  | `EmpiricalCopula` of two hazards, a stated value, `CappedSum(1.0)` | the package row and its covers' rows | re-dealt, from the damages times the value | the means, `payout_frequency`, `false_negative_rate`, `rmse` | 0.880 to 0.916 |
-  | The same | the same | the same | the tail columns, and `false_positive_rate` under +0.8 | 0.886 to 1.000; `var_loss` and `cvar_loss` 1.000, as the combined loss's tail is at the cap |
   | `HazardNoise(sigma, hold="hazard_distribution")`, sigma 0.3 and 1 | the asset's row | re-ranked | every column | 0.863 to 0.928 |
 
   On the rows re-dealt, `correlation` held the true value in 0.890 to 0.960 of
   the replications.
+
+  A second run, on the same setup and with 300 rows a block, measured the rows
+  the first left out, each resampled as the module resamples it: two assets
+  under `Comonotonic()`, `GaussianCopula(0.8)` and `GaussianCopula(-0.8)`; held
+  blocks of the two assets under `Independent()`, of 300 years of one asset's
+  per-year values drawn from its curve, of a pool of three independent runs of
+  100 years each (Gumbel locations 46, 50 and 54 mm/day, scale 10), and of the
+  two assets under each `EmpiricalCopula` above; the two assets under each
+  `EmpiricalCopula` on a window of two horizons, the second with locations 5
+  mm/day higher, and 5 draws a year in each member; held blocks of the two
+  hazards with damage ratios and `CompoundDamage()`, under `Independent()` and
+  under the `EmpiricalCopula` at +0.8; the two hazards under each
+  `EmpiricalCopula` with a stated value of 100 EUR, under `CappedSum(1.0)` and
+  `CompoundDamage()`, which kept the unit above (`"combined_loss_needs_value"`)
+  until samples kept each hazard's damage, and which a sample without damages
+  still keeps;
+  and the pooled rows of the five folds of a held block of one asset, or of two
+  under `Independent()`, cut by hand, which keep the unit above
+  (`"pooled_by_hand"`). Every held block had sigma 0.3. "The counts" are
+  `payout_frequency` and `false_negative_rate`. Each share has a Monte Carlo
+  error of at most 0.016.
+
+  | Block | Rows | Resampled | Columns | Share that held the true value |
+  | --- | --- | --- | --- | --- |
+  | `Comonotonic()`, two assets | an asset's own row | by year | every column | 0.870 to 0.916 |
+  | The same | the `"total"` row | by year | the means, the counts | 0.913 to 0.975 |
+  | The same | the `"total"` row | by year | `rmse`, the tail columns | 0.890 to 0.954 |
+  | The same | the `"total"` row | by year | `false_positive_rate` | 0.588 |
+  | `GaussianCopula(0.8)` and `GaussianCopula(-0.8)`, two assets | an asset's own row | by year | every column | 0.867 to 0.931 |
+  | `GaussianCopula(0.8)` | the `"total"` row | by year | the means, the counts | 0.892 to 0.960 |
+  | The same | the `"total"` row | by year | `rmse`, the tail columns | 0.878 to 0.946 |
+  | The same | the `"total"` row | by year | `false_positive_rate` | 0.807 |
+  | `GaussianCopula(-0.8)` | the `"total"` row | by year | the means, the counts | 0.774 to 0.894 |
+  | The same | the `"total"` row | by year | `rmse`, the tail columns | 0.854 to 0.902 |
+  | Held, two assets under `Independent()` | every row | re-ranked | every column | 0.851 to 0.934 |
+  | Held, per-year values | the asset's row | re-ranked | every column | 0.858 to 0.928 |
+  | Held, a pool of three runs | the asset's row | re-ranked | every column | 0.869 to 0.909 |
+  | Held `EmpiricalCopula` of two assets | an asset's own row | re-ranked | every column | 0.855 to 0.932 |
+  | The same | the `"total"` row | re-dealt and re-ranked | the means, the counts, `rmse` | 0.881 to 0.925 |
+  | The same | the `"total"` row | re-dealt and re-ranked | the tail columns | 0.943 to 0.994 |
+  | `EmpiricalCopula` of two assets, a window of two horizons | an asset's own row | by row | every column | 0.871 to 0.919 |
+  | The same | the `"total"` row | re-dealt | the means, the counts, `rmse` | 0.881 to 0.916 |
+  | The same | the `"total"` row | re-dealt | the tail columns, and `false_positive_rate` under +0.8 | 0.935 to 0.994 |
+  | Held, two hazards under `Independent()` | the package row and its covers' rows | re-ranked | every column | 0.883 to 0.936 |
+  | Held `EmpiricalCopula` of two hazards, +0.8 | the package row and its covers' rows | re-dealt and re-ranked | the means, the counts, `rmse` | 0.897 to 0.933 |
+  | The same | the same | re-dealt and re-ranked | the tail columns | 0.913 to 0.952 |
+  | `EmpiricalCopula` of two hazards, a stated value, without damages | the package row, +0.8 | by row | the means, the counts | 0.746 to 0.982 |
+  | The same | the package row, -0.8 | by row | the means, the counts | 0.549 to 0.894 |
+  | The same | the covers' rows | by row | the means, the counts | 0.842 to 0.929; `expected_loss`, which reads the combined loss, 0.928 and 0.929 under +0.8, 0.842 and 0.858 under -0.8 |
+  | The same | every row | by row | `rmse`, the tail columns | 0.847 to 1.000; `var_loss` and `cvar_loss` 0.973 to 1.000 |
+  | The same | every row, under +0.8 | by row | `false_positive_rate` | 0.768 to 0.849 |
+  | Pooled rows of held folds, one asset or two | every row | by year | the means, the counts | 0.884 to 0.998: `expected_uncovered` 0.987 to 0.998, `coverage_ratio` 0.948 to 0.972, the others 0.884 to 0.913 |
+  | The same | every row | by year | `rmse` | 0.972 to 0.989 |
+  | The same | every row | by year | the tail columns | 0.870 to 0.949 |
+  | The same | every row | by year | `false_positive_rate` | 0.754 to 0.787 |
+
+  On the rows rebuilt in that run, `correlation` held the true value in 0.883
+  to 0.955 of the replications, and on the `"total"` rows of `Comonotonic()`
+  and `GaussianCopula` in 0.898 to 0.922. Pooled rows of an `EmpiricalCopula`
+  block were not measured: the leakage checks refuse folds cut by hand from one
+  such block (`LeakageError`), so of the pooled rows only those of held blocks
+  can be made.
+
+  A third run, on the setup of the first and with generators of its own,
+  measured the two hazards under each `EmpiricalCopula` with a stated value of
+  100 EUR as they are resampled now that the samples keep each hazard's damage:
+  re-dealt, with each replicate's combined loss made again from the damages
+  times the value. The package's covers had the first run's limits times the
+  value, 60 EUR. Each share has a Monte Carlo error of at most 0.011.
+
+  | Block | Rows | Resampled | Columns | Share that held the true value |
+  | --- | --- | --- | --- | --- |
+  | `EmpiricalCopula` of two hazards, a stated value, `CompoundDamage()` | the package row and its covers' rows | re-dealt | the means, `payout_frequency`, `false_negative_rate`, `rmse` | 0.879 to 0.926 |
+  | The same | the same | re-dealt | the tail columns, and `false_positive_rate` under +0.8 | 0.895 to 0.997 |
+  | `EmpiricalCopula` of two hazards, a stated value, `CappedSum(1.0)` | the package row and its covers' rows | re-dealt | the means, `payout_frequency`, `false_negative_rate`, `rmse` | 0.880 to 0.916 |
+  | The same | the same | re-dealt | the tail columns, and `false_positive_rate` under +0.8 | 0.886 to 1.000; `var_loss` and `cvar_loss` 1.000, as the combined loss's tail is at the cap |
+
+  On those rows `correlation` held the true value in 0.906 to 0.951 of the
+  replications.
 
   On the same setup, with these rows resampled as independent rows as before,
   an earlier run of the study found the copula's `"total"` rows at 0.55 to
@@ -2599,13 +2670,13 @@ difference between them.
     `component(name)` reads one hazard and isn't flagged, and
     `component(name, loss="combined")` is flagged when its loss reads another
     hazard.
-  - Of the models that move draws, the study measured `EmpiricalCopula` alone.
-    Under `Comonotonic()` and `GaussianCopula` the rows of several columns are
+  - Under `Comonotonic()` and `GaussianCopula` the rows of several columns are
     exchangeable, not independent ([cuts of one
-    sample](#several-assets-from-fitted-curves)), and the coverage of their
-    intervals is unmeasured; they are flagged by construction, and so is a model
-    of your own. `Independent()` keeps every column in draw order. It was
-    measured, and isn't flagged.
+    sample](#several-assets-from-fitted-curves)). They are flagged by
+    construction, and the study's second run measured their `"total"` rows as
+    the unit above resamples them. A model of your own is flagged too, and the
+    coverage of its intervals is unmeasured. `Independent()` keeps every column
+    in draw order. It was measured, and isn't flagged.
 
   When a row is flagged, the setup text's `Intervals` line says how its rows
   were built and how they were resampled: for rows re-dealt or re-ranked, the
@@ -2902,7 +2973,7 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
 | --- | --- | --- |
 | amounts free, thresholds fixed (any built-in family, or a `LinearInAmounts` user family) | E[U], weighted CVaR | one LP (`route="lp"`) |
 | the same | MSE | one QP in the amounts (`route="qp"`); under a cost-of-capital budget, cutting planes over such QPs |
-| free thresholds on grids (attachment, exhaustion, breakpoints, knots, trigger) | any built-in | a grid over the thresholds, with the LP or QP at each point (`route="grid"`); with `DesignOptions(refine=True)`, then a refinement from the grid's best point, with the LP or QP at each point it evaluates: over the sample's index values for a step or binary payout, by a compass search otherwise |
+| free thresholds on grids (attachment, exhaustion, breakpoints, knots, trigger) | any built-in | a grid over the thresholds, with the LP or QP at each point (`route="grid"`); with `DesignOptions(refine=True)`, then a refinement from the grid's best point, with the LP or QP at each point it evaluates: over the sample's index values for a payout built from steps (a step or binary payout, a `StepGrid`, or a `SumOf` or `MaxOf` whose free thresholds are those of step and binary components), by a compass search otherwise |
 | a `UserObjective`, or a payout not linear in its amounts | any | a grid over every free parameter, evaluated in numpy; candidates that break the budget or the limit are dropped |
 | `SumOf`, `MaxOf`, `StepGrid` over several indices | any | one of the routes above, as [design on several indices](#design-on-several-indices) says |
 
@@ -2933,16 +3004,23 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
   dependency and solves with HiGHS alone, and never ends worse than the
   grid's best point. The grid is what searches the whole range.
 
-  - **A step or binary payout: over the sample's index values.** A
+  - **A payout built from steps: over the sample's index values.** A
     `StepPayout` or `BinaryPayout` pays from a threshold the years whose
     severity is at or beyond it: with an upper tail, the years whose index
     value is at or above it; with a lower tail, at or below it. So its
     objective is constant between two consecutive index values of the design
     sample and changes only where a threshold crosses one, and a threshold's
-    best value, the others held, is one of them. The refinement tries them:
+    best value, the others held, is one of them. The same holds for the
+    thresholds of a `StepGrid`, and for those of the step and binary
+    components of a `SumOf` or `MaxOf`, each on its own component's index
+    values. Such a payout takes this method when every free threshold is
+    one of these; a `SumOf` with a linear component's free attachment, say,
+    takes the compass search. The refinement tries them:
     - a threshold's candidates are the sample's distinct index values within
-      its window, and the window's two ends, which stand for the thresholds
-      beyond the last index value in it;
+      its window, on its own component, and the window's two ends, which
+      stand for the thresholds beyond the last index value in it;
+    - a band with a fixed or bounded level is also tried without a year (see
+      below);
     - a pass takes the free thresholds in the template's order. Holding the
       others, it tries the candidates nearest the threshold's current value,
       nearest first (the lower one first at equal distance): 2 in the first
@@ -2964,12 +3042,30 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
     best combination. A refined threshold lies on an index value, where the
     payout changes: on the design sample, every threshold between it and the
     next index value on the less severe side pays the same years.
-    `refine_tolerance` doesn't apply. Not tried, unless a window's end lies
-    there: a breakpoint between the next breakpoint and the last index value
-    below it, which leaves its band without a year. With that band's level
-    free, and its bounds allowing the level of the band below it, a
-    breakpoint at that index value does at least as well, since it can pay
-    the same.
+    `refine_tolerance` doesn't apply.
+
+    A band left without a year: a breakpoint above the last index value
+    below the next breakpoint of its part (in severity), and below that
+    breakpoint, leaves the band it opens without a year, whose years then
+    pay as the band below it, or nothing below the first. No index value
+    pays that set of years, and a window end does only if it lies between
+    the two. With the band's level `Free()`, bounded below by 0 alone, the
+    breakpoint at that index value does at least as well: setting the band's
+    level to the one below pays the same. With a fixed level, or a bounded
+    one, it might not: a fixed first level of 20 pays 20 on every year of
+    the band, loss or none. So for such a band (a `StepPayout` or component
+    level that is fixed or has bounds of its own, a `MaxOf`'s fixed
+    component levels, a row or column of a `StepGrid` with such a level)
+    the refinement also tries the midpoint between that index value and the
+    next breakpoint, when both lie in the window; when the next breakpoint
+    is free too, the midpoint moves with it. On six years with the index
+    values 1 to 6 and a loss of 100 in the last, a `StepPayout` with a free
+    first breakpoint on the grid 1 and 3 within bounds of 0 and 6, a second
+    fixed at 5.5 and the levels 20 (fixed) and `Free()`: every index value
+    puts the year at 5 in the first band, which pays it 20, and the
+    refinement ends at 5.25, where the first band is empty and the objective
+    0. `candidates` in the record counts the index values and the window's
+    ends; the midpoint is tried on top.
 
     One synthetic illustration, on the design sample itself: ten years with
     the index values 1, 2, 3, 4, 4.3, 4.31, 6, 7, 8 and 9, whose loss is 50
@@ -3085,6 +3181,29 @@ loaded.premium   # 1.5 × its expected payout + 25,000 EUR, at most 0.8 × E[L]
     values it tried near each threshold lead, and says so. A finer grid
     narrows the windows, and a larger `refine_max_points` lets the search
     finish.
+
+    Two neighbouring values pay the same years but one, so their LPs differ in
+    a few coefficients. Under E[U] and the weighted CVaR the search keeps up
+    to four HiGHS instances, each holding the LP of a point it solved: the
+    search's current point, the best point since its last move, and points on
+    either side. Each point's LP is solved on the instance that needs the
+    fewest years changed, after changing those years' coefficients, from the
+    optimal basis there: a few simplex iterations instead of a solve from
+    scratch. That LP leaves out the years without a loss, whose uncovered loss
+    is 0 at any payout (under the weighted CVaR they share one excess column),
+    which changes neither its optimum nor the amounts it allows. The amounts
+    then pass the same checks as at any point, and a point whose LP isn't
+    solved to optimality that way, or whose amounts fail a check, is solved
+    from scratch. So each point's objective is that of a solve from scratch,
+    to rounding. MSE's QP has one column per amount and is solved as at a grid
+    point. On one laptop, on 20,000 synthetic draws, a `StepPayout` with two
+    free breakpoints on grids of 6 and 5 points took about 10 ms a point under
+    E[U] (50 ms solved from scratch), 7 to 20 ms under a weighted CVaR (2.4 s)
+    and 5 to 9 ms under MSE, as before. Its windows held 5,558 and 442 index
+    values, and the search ended after 6,211 to 6,298 points, in about a
+    minute under each objective (after a grid of 35 to 60 s under the weighted
+    CVaR), where the default cap of 1,000 points stops it first: give it
+    `refine_max_points=10_000` at that size.
 - **Scaling.** Losses and payouts are divided by the largest loss of a draw (1
   if that is at most 1e-6) before solving; results are in payout units.
 - **Solver settings.** HiGHS's simplex for the LPs (a vertex solution). HiGHS's

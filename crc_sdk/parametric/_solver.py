@@ -5,11 +5,11 @@ constraint matrix and the Hessian in compressed sparse column form
 (`SparseColumns`: column pointers, row indices, values). No scipy. They
 return a `Solution`: the status, the values, the objective and the solver's
 own message, iterations and time, and on request an LP's optimal `Basis`.
-An `LPSession` solves a sequence of LPs that differ only in their costs and
-row bounds on one solver instance, each from the previous basis, and the
-first from a given basis. `identity()` names the solver and its version for
-the design record. So the backend can change without a change of the public
-API.
+An `LPSession` solves a sequence of LPs that differ in their costs, row
+bounds and coefficients on one solver instance, each from the previous
+basis, and the first from a given basis or another session's. `identity()`
+names the solver and its version for the design record. So the backend can
+change without a change of the public API.
 
 The backend is HiGHS through `highspy`, from the optional extra
 `crc-sdk[parametric]`. It is imported lazily: importing this module needs no
@@ -74,17 +74,18 @@ direct search: new perspectives on some classical and modern methods", SIAM
 Review 45(3), 2003, section 3, with complete polling and step halving.
 
 **A coordinate search over candidates.** `coordinate_search` minimises such
-a function when each parameter has finitely many candidate values, and a
-`key` names the class of a point: points of one class have the same
-objective, so each class is evaluated once. A pass takes each parameter in
-order and evaluates, with the others held, its candidates nearest the
-current value, skipping those in the current point's class: 2 in the first
-pass and twice as many in each pass after, so that a cap on the points
-reaches every parameter. It moves to the best of them if that improves on
-the current point by more than an allowance. It stops after a pass that
-tried every candidate of every parameter and moved none, or when it has
-evaluated a stated number of points. It is deterministic, and it never
-returns a point worse than its start.
+a function when each parameter has finitely many candidate values (some of
+which can depend on the other parameters), and a `key` names the class of a
+point: points of one class have the same objective, so each class is
+evaluated once. A pass takes each parameter in order and evaluates, with the
+others held, its candidates nearest the current value, skipping those in the
+current point's class: 2 in the first pass and twice as many in each pass
+after, so that a cap on the points reaches every parameter. It moves to the
+best of them if that improves on the current point by more than an
+allowance. It stops after a pass that tried every candidate of every
+parameter and moved none, or when it has evaluated a stated number of
+points. It is deterministic, and it never returns a point worse than its
+start.
 """
 
 from __future__ import annotations
@@ -582,14 +583,17 @@ def _run(
 class LPSession:
     """One HiGHS instance for a sequence of LPs on one programme.
 
-    The LPs differ only in their costs and row bounds. `LPSession(programme,
-    options, basis)` passes the programme to HiGHS once; `add_row`,
-    `change_row_bounds` and `change_cost` change the model in place, and
-    `solve()` solves it from the basis of the previous solve, a warm start
-    that skips the presolve. The first solve starts from `basis`, an optimal
-    basis of the same programme (`solve_lp(..., keep_basis=True)`), if one is
-    given, and from scratch otherwise; a row added after it enters the basis
-    as a basic row. `options` are HiGHS options on top of `LP_OPTIONS`, as
+    The LPs differ in their costs, row bounds and matrix coefficients.
+    `LPSession(programme, options, basis)` passes the programme to HiGHS
+    once; `add_row`, `change_row_bounds`, `change_cost` and
+    `change_coefficients` change the model in place, and `solve()` solves it
+    from the basis of the previous solve, a warm start that skips the
+    presolve. The first solve starts from `basis`, an optimal basis of the
+    same programme (`solve_lp(..., keep_basis=True)`), if one is given, and
+    from scratch otherwise; a row added after it enters the basis as a basic
+    row. `basis()` reads the basis of the last solve and `set_basis` sets
+    the one the next solve starts from, so one session's basis can start
+    another's solve. `options` are HiGHS options on top of `LP_OPTIONS`, as
     for `solve_lp`, and hold for every solve.
 
     Raises `SolverUnavailableError` without highspy, and `ValueError` for a
@@ -676,6 +680,59 @@ class LPSession:
             ),
             "the cost",
         )
+
+    def change_coefficients(
+        self,
+        rows: NDArray[np.int64],
+        columns: NDArray[np.int64],
+        values: FloatArray,
+    ) -> None:
+        """Set the matrix entries `(rows[i], columns[i])` to `values[i]`.
+
+        A value of 0 removes the entry. The basis is kept, so the next solve
+        starts from it. Raises `ValueError` for arrays of different lengths, a
+        position outside the matrix or a value that is not finite.
+        """
+        rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+        columns = np.asarray(columns, dtype=np.int64).reshape(-1)
+        values = np.asarray(values, dtype=np.float64).reshape(-1)
+        if not rows.shape == columns.shape == values.shape:
+            raise ValueError("rows, columns and values need one entry each")
+        if rows.size and (
+            rows.min() < 0
+            or rows.max() >= self._n_rows
+            or columns.min() < 0
+            or columns.max() >= self._n_columns
+        ):
+            raise ValueError("a coefficient lies outside the matrix")
+        if not np.isfinite(values).all():
+            raise ValueError("coefficients must be finite")
+        for row, column, value in zip(
+            rows.tolist(), columns.tolist(), values.tolist(), strict=True
+        ):
+            self._check(
+                self._highs.changeCoeff(row, column, value),
+                f"the coefficient ({row}, {column})",
+            )
+
+    def basis(self) -> Basis | None:
+        """The basis of the last solve, or `None` if HiGHS has no valid one."""
+        kept = self._highs.getBasis()
+        if not kept.valid:
+            return None
+        return Basis(self._n_columns, self._n_rows, kept)
+
+    def set_basis(self, basis: Basis) -> None:
+        """Start the next solve from `basis`, one of a programme of this shape.
+
+        Raises `ValueError` for a basis of another shape, or one HiGHS rejects.
+        """
+        if (basis.n_columns, basis.n_rows) != (self._n_columns, self._n_rows):
+            raise ValueError(
+                f"the basis is for {basis.n_columns} columns and {basis.n_rows} "
+                f"rows, the session has {self._n_columns} and {self._n_rows}"
+            )
+        self._check(self._highs.setBasis(basis.handle), "the basis")
 
     def solve(
         self, options: Mapping[str, bool | int | float | str] | None = None
@@ -1362,16 +1419,21 @@ def coordinate_search(
     max_points: int,
     allowance: Callable[[float], float],
     first_width: int = 2,
+    extra: Callable[[int, tuple[float, ...]], Sequence[float]] | None = None,
+    moved: Callable[[tuple[float, ...]], None] | None = None,
 ) -> CoordinateSearch:
     """Minimise `evaluate` over candidate values, one parameter at a time.
 
     `evaluate(point)` returns the objective at `point` and a status, or
     `None` and a status when the point has no objective; the search never
     moves to such a point. `value` is the objective at `start`, which is not
-    evaluated again. `candidates[i]` holds the values parameter `i` may take.
-    `key(point)` names the point's class: the caller states that the points
-    of one class have the same objective and status, so a class is evaluated
-    once. A point whose key is `None` is a class of its own.
+    evaluated again. `candidates[i]` holds the values parameter `i` may take,
+    and `extra(i, point)`, if given, more values that it may take at
+    `point`, which can depend on the other parameters there. `key(point)`
+    names the point's class: the caller states that the points of one class
+    have the same objective and status, so a class is evaluated once. A
+    point whose key is `None` is a class of its own. `moved(point)`, if
+    given, is told each point the search moves to.
 
     A pass takes each parameter in order, holds the others where they are,
     and tries its `width` candidates nearest the current value (the current
@@ -1417,10 +1479,18 @@ def coordinate_search(
     stopped: CoordinateStop = "no_move"
     while True:
         passes += 1
-        moved = full = False
+        any_move = full = False
+        covered = True
         for i in range(n):
+            values = lists[i]
+            if extra is not None:
+                more = {float(x) + 0.0 for x in extra(i, current)}
+                if not more <= set(values):
+                    values = sorted(set(values) | more)
+            widest = max(widest, len(values))
+            covered = covered and width >= len(values)
             tried: list[tuple[tuple[float, ...], float, Hashable | None]] = []
-            for x in _nearest_first(lists[i], current[i])[:width]:
+            for x in _nearest_first(values, current[i])[:width]:
                 trial = current[:i] + (x,) + current[i + 1 :]
                 name = key(trial)
                 if name is not None and name == current_key:
@@ -1448,13 +1518,15 @@ def coordinate_search(
                     item for item in better if item[1] - least <= allowance(least)
                 )
                 moves += 1
-                moved = True
+                any_move = True
+                if moved is not None:
+                    moved(current)
             if full:
                 break
         if full:
             stopped = "max_points"
             break
-        if not moved and width >= widest:
+        if not any_move and covered:
             break
         width = min(2 * width, max(widest, first_width))
     return CoordinateSearch(current, best, tuple(points), moves, passes, stopped)

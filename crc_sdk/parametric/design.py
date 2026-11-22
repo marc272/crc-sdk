@@ -51,7 +51,19 @@ grid).
   that tried every value moves no threshold, or until `refine_max_points`
   points. With one free threshold that is the best of every set of years a
   threshold in its window can pay; with several, a point that no single
-  threshold can improve within its window.
+  threshold can improve within its window. The same holds for the
+  thresholds of a `StepGrid`, and for those of the step and binary
+  components of a `SumOf` or `MaxOf` when every searched threshold is one,
+  each over the index values of its own component. A band whose levels are
+  fixed or bounded (anything but `Free()` bounded below by 0 alone) is also
+  tried empty, at the midpoint between the threshold that closes it and the
+  last index value below that one: the band then pays no year, which no
+  index value gives. Under E[U] and the weighted CVaR each point's LP is
+  solved from the optimal basis of a nearby point's, after changing the
+  coefficients of the years that change band, on an LP left without the
+  years without a loss, which has the same optimum (`_WarmLP`); a point
+  whose LP that doesn't solve, or whose amounts fail a check, is solved
+  from scratch.
 - Every other family is refined by a compass search
   (`_solver.compass_search`): from a step per free threshold of half the
   larger side of its window, each round evaluates the point one step up and
@@ -222,6 +234,8 @@ from crc_sdk.parametric.payouts import (
     BinaryPayout,
     LinearConstraints,
     LinearInAmounts,
+    MaxOf,
+    StepGrid,
     StepPayout,
     SumOf,
     _has_amounts,
@@ -328,8 +342,10 @@ class DesignOptions(_DefinitionModel):
       each an LP, solved on reduced LPs; see the module docstring).
     - `refine`: after a grid over free thresholds, refine its best point,
       with the amounts solved exactly at every point it evaluates: over the
-      sample's index values for a `StepPayout` or `BinaryPayout`, by a
-      compass search otherwise (see the module docstring).
+      sample's index values for a `StepPayout`, a `BinaryPayout`, a
+      `StepGrid`, and a `SumOf` or `MaxOf` whose searched thresholds are
+      those of step or binary components; by a compass search otherwise
+      (see the module docstring).
       `refine_tolerance` is the compass search's smallest step, as a share of
       each parameter's bounds (`upper - lower`), and `refine_max_points` the
       most points either evaluates. Both apply only with `refine=True`.
@@ -452,9 +468,10 @@ class DesignResult:
       A compass search (`method="compass_search"`) adds `tolerance`,
       `max_points`, `initial_steps` and `final_steps`, and stops at
       `"step_tolerance"` or `"max_points"`; a search over the index values
-      (`method="index_values"`, a step or binary payout) adds `max_points`,
+      (`method="index_values"`, a payout built from steps) adds `max_points`,
       `windows` (each threshold's `[lower, upper]`), `candidates` (how many
-      values each window holds) and `passes`, and stops at `"no_move"` or
+      index values each window holds, its ends included; an empty band's
+      value is tried on top) and `passes`, and stops at `"no_move"` or
       `"max_points"`. Objectives are in payout units (squared for MSE).
       `None` without a refinement. `refinement_profile` is a
       `pyarrow.Table` of the points it evaluated, in order: their values,
@@ -689,10 +706,14 @@ class _Block:
 
 @dataclass(frozen=True, eq=False)
 class _SolvedBlock:
-    """A block's amounts after the solve, the repair and the fill rule."""
+    """A block's amounts after the solve, the repair and the fill rule.
+
+    `programme` is the LP or QP solved, or `None` when a warm start solved
+    an equivalent LP of its own (`_WarmLP`), which never ranges.
+    """
 
     amounts: FloatArray
-    programme: _solver.Programme
+    programme: _solver.Programme | None
     solution: _solver.Solution
     route: Literal["lp", "qp"]
     ranging: bool
@@ -1439,6 +1460,7 @@ def _ranges(
     """
     solution = solved.solution
     assert solution.objective is not None and solution.values is not None
+    assert solved.programme is not None  # a ranged LP is never warm-started
     if not identified:
         return {}, True
     optimum = solution.objective
@@ -1616,11 +1638,18 @@ def _read_block(candidate: Cover, context: _Context) -> _Block:
 
 
 def _solve_block(
-    block: _Block, context: _Context, solves: _Solves, *, report: bool
+    block: _Block,
+    context: _Context,
+    solves: _Solves,
+    *,
+    report: bool,
+    warm: _WarmLP | None = None,
 ) -> _SolvedBlock:
     """Solve a block's amounts and apply the repair, the zeroing and the fill rule.
 
     With `report`, an LP keeps its basis for the ranges, when asked for.
+    Without it, `warm` may solve the LP from a neighbouring point's basis;
+    when it can't, the LP is solved here as usual.
     """
     names, basis, constraints, free = (
         block.names,
@@ -1639,11 +1668,18 @@ def _solve_block(
             "bounded amounts (a Free upper bound or a Limit): without either, any "
             "payout at least as large as the loss is optimal",
         )
-    programme, route, tail_row = _programme(basis, constraints, context)
-    ranging = report and route == "lp" and context.options.ranges
-    solution = _solve(
-        programme, route, context, solves, keep_basis=ranging, tail_row=tail_row
-    )
+    warmed = None if warm is None or report else warm.solve(block, solves)
+    programme: _solver.Programme | None = None
+    route: Literal["lp", "qp"] = "lp"
+    ranging = False
+    if warmed is not None:
+        solution = warmed
+    else:
+        programme, route, tail_row = _programme(basis, constraints, context)
+        ranging = report and route == "lp" and context.options.ranges
+        solution = _solve(
+            programme, route, context, solves, keep_basis=ranging, tail_row=tail_row
+        )
     assert solution.values is not None and solution.objective is not None
     edges, other = _order_edges(constraints)
     amounts = _repair(solution.values[: len(names)] * context.scale, constraints, edges)
@@ -1744,14 +1780,16 @@ def _design_amounts(
     solves: _Solves,
     *,
     report: bool,
+    warm: _WarmLP | None = None,
 ) -> _Amounts:
     """Solve the amounts of a cover whose thresholds are resolved.
 
     With `report`, compute the uniqueness report (ranges on the LP route,
-    when asked for; the eigenvalue rule on the QP route).
+    when asked for; the eigenvalue rule on the QP route). Without it, `warm`
+    may solve the LP from a neighbouring point's basis.
     """
     block = _read_block(candidate, context)
-    solved = _solve_block(block, context, solves, report=report)
+    solved = _solve_block(block, context, solves, report=report, warm=warm)
     cover, values = _resolve_amounts(candidate, block.names, solved.amounts, context)
     _, value, _ = _verify(
         context, cover, solved.amounts, block.basis, block.constraints
@@ -1803,6 +1841,7 @@ def _solved_point(
     point: Sequence[float],
     context: _Context,
     solves: _Solves,
+    warm: _WarmLP | None = None,
 ) -> tuple[float | None, str, str | None]:
     """The objective of a point of the thresholds, its amounts solved exactly.
 
@@ -1810,11 +1849,27 @@ def _solved_point(
     `"invalid"` when the values make no valid cover (unordered thresholds),
     or `"infeasible"` with the error's message when no payout meets the
     constraints there.
+
+    With `warm`, the LP is first solved from a neighbouring point's basis.
+    Its amounts pass the same checks; if they fail any, or that LP is not
+    solved to optimality, the point is solved again from scratch, which
+    gives what it gave without `warm`, errors included.
     """
     try:
         candidate = template.with_values(dict(zip(names, point, strict=True)))
     except CoverDefinitionError:
         return None, "invalid", None
+    if warm is not None:
+        try:
+            amounts = _design_amounts(
+                candidate, context, solves, report=False, warm=warm
+            )
+        except InfeasibleDesignError as error:
+            return None, "infeasible", str(error)
+        except DesignError:
+            warm.failed()
+        else:
+            return amounts.objective_value, "optimal", None
     try:
         amounts = _design_amounts(candidate, context, solves, report=False)
     except InfeasibleDesignError as error:
@@ -2034,14 +2089,119 @@ def _named(names: Sequence[str], values: Sequence[float]) -> dict[str, float]:
     return {name: float(value) + 0.0 for name, value in zip(names, values, strict=True)}
 
 
-def _on_index_values(payout: Any, context: _Context) -> bool:
-    """Whether a refinement searches `payout`'s thresholds over the index values.
+@dataclass(frozen=True, eq=False)
+class _Axis:
+    """What a free threshold of a step or binary part reads, and the band it opens.
+
+    `column` is the index column the threshold is compared with (`None` on
+    a one-column index), and `sign` is 1 for an upper tail and -1 for a lower
+    one, so that `sign * index` is the severity. `following` names the
+    threshold that closes the band it opens, the next one of its part, or is
+    `None` for its part's last; `levels` are the amounts paid in that band.
+    """
+
+    column: int | None
+    sign: float
+    following: str | None
+    levels: tuple[str, ...]
+
+
+def _sign(tail: str) -> float:
+    return 1.0 if tail == "upper" else -1.0
+
+
+def _part_axis(part: Any, name: str, prefix: str, column: int | None) -> _Axis | None:
+    """The axis of the threshold `name` of `part`, a step or binary payout."""
+    if type(part) is BinaryPayout and name == "trigger":
+        return _Axis(column, _sign(part.tail), None, (f"{prefix}amount",))
+    if type(part) is StepPayout and name.startswith("breakpoints["):
+        k = int(name[len("breakpoints[") : -1])
+        following = (
+            f"{prefix}breakpoints[{k + 1}]" if k + 1 < len(part.breakpoints) else None
+        )
+        return _Axis(column, _sign(part.tail), following, (f"{prefix}levels[{k}]",))
+    return None
+
+
+def _grid_axis(payout: StepGrid, name: str) -> _Axis | None:
+    """The axis of the threshold `name` of a `StepGrid`: a row or a column of cells."""
+    component, _, inner = name.partition(".")
+    if component not in payout.breakpoints or not inner.startswith("breakpoints["):
+        return None
+    k = int(inner[len("breakpoints[") : -1])
+    column = list(payout.breakpoints).index(component)
+    following = (
+        f"{component}.breakpoints[{k + 1}]"
+        if k + 1 < len(payout.breakpoints[component])
+        else None
+    )
+    rows, columns = len(payout.levels), len(payout.levels[0])
+    levels = (
+        tuple(f"levels[{k + 1},{j}]" for j in range(columns))
+        if column == 0
+        else tuple(f"levels[{i},{k + 1}]" for i in range(rows))
+    )
+    return _Axis(column, _sign(payout.tail[column]), following, levels)
+
+
+def _threshold_axes(
+    payout: Any, names: Sequence[str], context: _Context
+) -> list[_Axis] | None:
+    """Each threshold's axis, when every one of `names` opens a band of a step.
+
+    That holds for a `StepPayout` or `BinaryPayout` on a one-column index, a
+    `StepGrid`, and a `SumOf` or `MaxOf` whose components with a threshold
+    in `names` are step or binary payouts. Otherwise the result is `None`.
+    """
+    axes: list[_Axis | None]
+    if type(payout) in (StepPayout, BinaryPayout):
+        if context.index.ndim != 1:
+            return None
+        axes = [_part_axis(payout, name, "", None) for name in names]
+    elif context.index.ndim != 2:
+        return None
+    elif type(payout) in (SumOf, MaxOf):
+        components = cast(SumOf | MaxOf, payout).components
+        order = list(components)
+        axes = []
+        for name in names:
+            component, _, inner = name.partition(".")
+            axes.append(
+                _part_axis(
+                    components[component],
+                    inner,
+                    f"{component}.",
+                    order.index(component),
+                )
+                if component in components
+                else None
+            )
+    elif type(payout) is StepGrid:
+        axes = [_grid_axis(payout, name) for name in names]
+    else:
+        return None
+    if any(axis is None for axis in axes):
+        return None
+    return cast(list[_Axis], axes)
+
+
+def _on_index_values(payout: Any, names: Sequence[str], context: _Context) -> bool:
+    """Whether a refinement searches the thresholds `names` over the index values.
 
     A step or binary payout pays from a threshold the years whose severity is
     at least the threshold's, so its objective changes only where a threshold
-    crosses one of the sample's index values.
+    crosses one of the sample's index values; so does a payout built from
+    such parts, in the thresholds of those parts (`_threshold_axes`).
     """
-    return type(payout) in (StepPayout, BinaryPayout) and context.index.ndim == 1
+    return _threshold_axes(payout, names, context) is not None
+
+
+def _axis_values(context: _Context, axis: _Axis) -> FloatArray:
+    """The index values a threshold on `axis` is compared with."""
+    if axis.column is None:
+        return context.index
+    column: FloatArray = context.index[:, axis.column]
+    return column
 
 
 def _index_candidates(
@@ -2054,30 +2214,397 @@ def _index_candidates(
 
 
 def _paying_years(
-    template: Cover, names: Sequence[str], context: _Context
+    template: Cover, names: Sequence[str], axes: Sequence[_Axis], context: _Context
 ) -> Callable[[tuple[float, ...]], tuple[int, ...] | None]:
-    """The class of a point of a step or binary payout's free thresholds.
+    """The class of a point of the thresholds of step or binary parts.
 
     A threshold pays the years whose severity is at least its own (`>=`), so
-    two values of it that leave the same number of years below them pay the
-    same years: the class is that number for every free threshold. Two
-    points of one class have the same basis, so the same amounts, objective
-    and constraints. `None` when the values make no valid cover.
+    two values of it that leave the same number of years below them, on its
+    axis, pay the same years: the class is that number for every free
+    threshold. Two points of one class have the same basis, so the same
+    amounts, objective and constraints. `None` when the values make no valid
+    payout. Each point's class is worked out once.
     """
-    payout = cast(StepPayout | BinaryPayout, template.payout)
-    sign = 1.0 if payout.tail == "upper" else -1.0
-    severity = np.sort(sign * context.index)
+    severities = [np.sort(axis.sign * _axis_values(context, axis)) for axis in axes]
+    signs = [np.float64(axis.sign) for axis in axes]
+    known: dict[tuple[float, ...], tuple[int, ...] | None] = {}
 
     def key(point: tuple[float, ...]) -> tuple[int, ...] | None:
+        if point in known:
+            return known[point]
+        found: tuple[int, ...] | None
         try:
-            template.with_values(_named(names, point))
+            template.payout.with_values(_named(names, point))
         except CoverDefinitionError:
-            return None
-        thresholds = sign * np.asarray(point, dtype=np.float64)
-        below = np.searchsorted(severity, thresholds, side="left")
-        return tuple(int(count) for count in below.tolist())
+            found = None
+        else:
+            found = tuple(
+                int(np.searchsorted(severity, sign * value, side="left"))
+                for severity, sign, value in zip(severities, signs, point, strict=True)
+            )
+        known[point] = found
+        return found
 
     return key
+
+
+def _unbounded_level(value: Any) -> bool:
+    """Whether an amount is free, with only the non-negativity of every amount."""
+    return isinstance(value, Free) and value.lower == 0.0 and value.upper is None
+
+
+def _empty_bands(
+    template: Cover,
+    names: Sequence[str],
+    axes: Sequence[_Axis],
+    windows: Sequence[tuple[float, float]],
+    context: _Context,
+) -> Callable[[int, tuple[float, ...]], tuple[float, ...]] | None:
+    """The value of each threshold that leaves its band without a year.
+
+    A threshold above the last index value below the threshold that closes
+    its band (in severity), and below that one, leaves the band it opens
+    without a year: the years of that band pay as the band below it (or
+    nothing, below the first). No index value pays those years, and a window
+    end does only if it lies between the two. So the search tries the
+    midpoint between them, when both lie in the window.
+
+    With the band's levels free and only bounded below by 0, the index value
+    itself does at least as well: setting the band's levels to those of the
+    band below pays the same, and is allowed. So the value is tried only for
+    a band with a fixed or otherwise bounded level. Returns `extra(i, point)`
+    for `_solver.coordinate_search`, or `None` when no threshold has such a
+    value.
+    """
+    parameters = template.payout.parameters()
+    position = {name: i for i, name in enumerate(names)}
+    rules: list[tuple[_Axis, FloatArray, float, float] | None] = []
+    for axis, (below, above) in zip(axes, windows, strict=True):
+        if axis.following is None or all(
+            _unbounded_level(parameters[level]) for level in axis.levels
+        ):
+            rules.append(None)
+            continue
+        low, high = sorted((axis.sign * below, axis.sign * above))
+        severity = np.sort(axis.sign * _axis_values(context, axis))
+        rules.append((axis, severity, low, high))
+    if all(rule is None for rule in rules):
+        return None
+
+    def extra(i: int, point: tuple[float, ...]) -> tuple[float, ...]:
+        rule = rules[i]
+        if rule is None:
+            return ()
+        axis, severity, low, high = rule
+        following = cast(str, axis.following)
+        value = (
+            point[position[following]]
+            if following in position
+            else float(cast(float, parameters[following]))
+        )
+        closing = axis.sign * value
+        count = int(np.searchsorted(severity, closing, side="left"))
+        if count == 0:
+            return ()
+        last = float(severity[count - 1])
+        middle = 0.5 * (last + closing)
+        if last < low or closing > high or not last < middle < closing:
+            return ()
+        return (axis.sign * middle + 0.0,)
+
+    return extra
+
+
+# -- warm starts --------------------------------------------------------------
+#
+# Neighbouring points of a search over the index values pay the same years
+# but one or a few, so their LPs differ in a few coefficients: a year's
+# basis row, in its rows, and the budget's row. Each LP is solved on a HiGHS
+# instance that holds a nearby point's LP, after changing those
+# coefficients, from that point's optimal basis: a few simplex iterations
+# instead of a solve from scratch. The LP is the design LP over the years
+# with a loss (`_warm_programme`), which has the same optimum; the amounts
+# pass the checks of every other point, and a point whose warm-started LP
+# fails, or whose amounts fail a check, is solved again from scratch.
+
+WARM_SEATS = 4
+"""The most HiGHS instances a search over the index values keeps, each at a point.
+
+Two hold the search's current point and the best point it found since it
+last moved, where the next move most likely goes; the others walk out from
+the current point, one on each side.
+"""
+
+
+@dataclass(frozen=True, eq=False)
+class _Layout:
+    """Where the basis enters a warm-started LP.
+
+    Each of `blocks` is `(first, years, sign)`: row `first + r` holds `sign`
+    times the basis row of year `years[r]`, in the amounts' columns. `budget`
+    is the budget's row and the factor of `p @ basis` on the amounts there,
+    or `None` without a budget.
+    """
+
+    blocks: tuple[tuple[int, NDArray[np.int64], float], ...]
+    budget: tuple[int, float] | None
+
+
+def _warm_programme(
+    basis: FloatArray, constraints: LinearConstraints, context: _Context
+) -> tuple[_solver.Programme, _Layout]:
+    """`_programme`'s LP over the years with a loss, and where the basis enters it.
+
+    With a non-negative basis and non-negative amounts, a year without a
+    loss has no uncovered loss at any payout: its row `u + B theta >= L`
+    holds at `u = 0`. So its uncovered column and row are left out, and,
+    under a weighted CVaR, the years without a loss share one excess column,
+    `(-zeta)^+`, with their summed probability. The budget's row, and a
+    cost-of-capital premium's tail, keep every year. The LP's optimum, and
+    its feasible set's projection on the amounts, are those of `_programme`.
+    """
+    n, k = basis.shape
+    scale = context.scale
+    p = context.probability
+    loss = context.loss / scale
+    objective = context.objective
+    alpha = objective.alpha if isinstance(objective, WeightedCVaR) else 0.0
+    paying = np.flatnonzero(loss > 0.0)
+    m = paying.shape[0]
+    steps = np.arange(m)
+    builder = _Builder()
+    builder.variables(k, constraints.lower / scale, constraints.upper / scale, 0.0)
+    uncovered = builder.variables(m, 0.0, math.inf, (1.0 - alpha) * p[paying])
+    first = builder.constraints(m, loss[paying], math.inf)
+    _block(builder, first, basis[paying], 1.0)
+    builder.entries(first + steps, uncovered + steps, 1.0)
+    blocks: list[tuple[int, NDArray[np.int64], float]] = [(first, paying, 1.0)]
+    if isinstance(objective, WeightedCVaR) and alpha > 0.0:
+        beta = objective.beta
+        zeta = builder.variables(1, -math.inf, math.inf, alpha)
+        excess = builder.variables(m, 0.0, math.inf, alpha * p[paying] / (1.0 - beta))
+        rows = builder.constraints(m, 0.0, math.inf) + steps
+        builder.entries(rows, excess + steps, 1.0)
+        builder.entries(rows, uncovered + steps, -1.0)
+        builder.entries(rows, np.full(m, zeta), 1.0)
+        covered = _fsum(p[loss <= 0.0])
+        if covered > 0.0:
+            shared = builder.variables(1, 0.0, math.inf, alpha * covered / (1.0 - beta))
+            row = builder.constraints(1, 0.0, math.inf)
+            builder.entries([row, row], [shared, zeta], [1.0, 1.0])
+    budget: tuple[int, float] | None = None
+    if context.bound is not None:
+        expected = p @ basis
+        pricing = context.pricing
+        tail = _priced_tail(context)
+        if tail is not None:
+            years = np.arange(n)
+            eta = builder.variables(1, -math.inf, math.inf, 0.0)
+            premium_tail = builder.variables(n, 0.0, math.inf, 0.0)
+            first = builder.constraints(n, 0.0, math.inf)
+            builder.entries(first + years, premium_tail + years, 1.0)
+            _block(builder, first, basis, -1.0)
+            builder.entries(first + years, np.full(n, eta), 1.0)
+            blocks.append((first, years, -1.0))
+            row = builder.constraints(1, -math.inf, context.bound / scale)
+            builder.entries(np.full(k, row), np.arange(k), (1.0 - tail.rate) * expected)
+            builder.entries([row], [eta], tail.rate)
+            builder.entries(
+                np.full(n, row), premium_tail + years, tail.rate * p / (1.0 - tail.q)
+            )
+            budget = (row, 1.0 - tail.rate)
+        elif isinstance(pricing, ExpectedPayoutMultiple):
+            row = builder.constraints(
+                1, -math.inf, (context.bound - pricing.expense) / scale
+            )
+            builder.entries(np.full(k, row), np.arange(k), pricing.multiple * expected)
+            budget = (row, pricing.multiple)
+        else:
+            row = builder.constraints(1, -math.inf, context.bound / scale)
+            builder.entries(np.full(k, row), np.arange(k), expected)
+            budget = (row, 1.0)
+    count = constraints.a_ub.shape[0]
+    if count:
+        first = builder.constraints(count, -math.inf, constraints.b_ub / scale)
+        _block(builder, first, constraints.a_ub, 1.0)
+    return builder.programme(), _Layout(tuple(blocks), budget)
+
+
+@dataclass(eq=False)
+class _Seat:
+    """A HiGHS instance of a warm-started search, and the LP it holds.
+
+    `basis` is the basis matrix of the point whose LP it holds and `budget`
+    its budget row's coefficients; `point` and `objective` are that point's,
+    once it has been solved there to optimality (`None` before).
+    """
+
+    session: _solver.LPSession
+    basis: FloatArray
+    budget: FloatArray | None
+    point: tuple[float, ...] | None = None
+    objective: float | None = None
+
+
+class _WarmLP:
+    """The LPs of a search over the index values, each from a neighbour's basis.
+
+    `solve(block)` solves a point's LP on the seat that needs the fewest
+    years changed, or, when that seat holds the current point or the best
+    point since the last move, on another seat started from its basis. It
+    returns `None` when it can't: a basis with a negative entry, amounts that
+    may be negative, other amount constraints than the first point's, or an
+    LP not solved to optimality; the caller then solves the LP from scratch.
+    `solved(point, objective)` records what the last solve was, `moved` the
+    search's moves and `failed` a solution that failed its checks.
+    """
+
+    def __init__(self, context: _Context) -> None:
+        self._context = context
+        self._seats: list[_Seat] = []
+        self._layout: _Layout | None = None
+        self._constraints: LinearConstraints | None = None
+        self._last: _Seat | None = None
+        self._anchor: _Seat | None = None
+        self._best: _Seat | None = None
+
+    def _fits(self, block: _Block) -> bool:
+        constraints = block.constraints
+        if (block.basis < 0.0).any() or (constraints.lower < 0.0).any():
+            return False
+        known = self._constraints
+        if known is None:
+            self._constraints = constraints
+            return True
+        return all(
+            np.array_equal(getattr(known, name), getattr(constraints, name))
+            for name in ("a_ub", "b_ub", "lower", "upper")
+        )
+
+    def _budget(self, basis: FloatArray) -> FloatArray | None:
+        assert self._layout is not None
+        if self._layout.budget is None:
+            return None
+        _, factor = self._layout.budget
+        coefficients: FloatArray = factor * (self._context.probability @ basis)
+        return coefficients
+
+    def _pinned(self, seat: _Seat) -> bool:
+        return seat is self._anchor or seat is self._best
+
+    def _drop(self, seat: _Seat) -> None:
+        self._seats.remove(seat)
+        if self._anchor is seat:
+            self._anchor = None
+        if self._best is seat:
+            self._best = None
+
+    def _new(self, block: _Block, source: _Seat | None) -> _Seat:
+        """A new seat with the block's LP, started from `source`'s basis if given."""
+        programme, layout = _warm_programme(
+            block.basis, block.constraints, self._context
+        )
+        if self._layout is None:
+            self._layout = layout
+        start = None if source is None else source.session.basis()
+        seat = _Seat(
+            _solver.LPSession(programme, basis=start),
+            block.basis,
+            self._budget(block.basis),
+        )
+        self._seats.append(seat)
+        return seat
+
+    def _move(self, seat: _Seat, basis: FloatArray, differs: NDArray[np.bool_]) -> None:
+        """Change the seat's LP to that of `basis`, whose rows differ in `differs`."""
+        layout = self._layout
+        assert layout is not None
+        changed = np.flatnonzero(differs)
+        rows: list[NDArray[np.int64]] = []
+        columns: list[NDArray[np.int64]] = []
+        values: list[FloatArray] = []
+        for first, years, sign in layout.blocks:
+            position = np.searchsorted(years, changed)
+            inside = position < years.shape[0]
+            inside[inside] = years[position[inside]] == changed[inside]
+            held = changed[inside]
+            row, column = np.nonzero(seat.basis[held] != basis[held])
+            rows.append(first + position[inside][row])
+            columns.append(column.astype(np.int64))
+            values.append(sign * basis[held[row], column])
+        budget = self._budget(basis)
+        if layout.budget is not None:
+            assert budget is not None and seat.budget is not None
+            column = np.flatnonzero(budget != seat.budget)
+            rows.append(np.full(column.shape[0], layout.budget[0], dtype=np.int64))
+            columns.append(column.astype(np.int64))
+            values.append(budget[column])
+        seat.session.change_coefficients(
+            np.concatenate(rows), np.concatenate(columns), np.concatenate(values)
+        )
+        seat.basis, seat.budget = basis, budget
+        seat.point = seat.objective = None
+
+    def _seat(self, block: _Block) -> _Seat:
+        """The seat to solve the block's LP on, holding that LP and a nearby basis."""
+        basis = block.basis
+        if not self._seats:
+            return self._new(block, None)
+        differs = [np.any(seat.basis != basis, axis=1) for seat in self._seats]
+        distances = [int(np.count_nonzero(rows)) for rows in differs]
+        nearest = min(range(len(self._seats)), key=distances.__getitem__)
+        source = self._seats[nearest]
+        free = [i for i, seat in enumerate(self._seats) if not self._pinned(seat)]
+        if not self._pinned(source) or (not free and len(self._seats) >= WARM_SEATS):
+            if self._pinned(source):
+                self._anchor = self._best = None
+            self._move(source, basis, differs[nearest])
+            return source
+        if len(self._seats) < WARM_SEATS:
+            return self._new(block, source)
+        chosen = min(free, key=distances.__getitem__)
+        seat = self._seats[chosen]
+        self._move(seat, basis, differs[chosen])
+        start = source.session.basis()
+        if start is not None:
+            seat.session.set_basis(start)
+        return seat
+
+    def solve(self, block: _Block, solves: _Solves) -> _solver.Solution | None:
+        """Solve the block's LP from a nearby basis; `None` when it can't."""
+        self._last = None
+        if not self._fits(block):
+            return None
+        seat = self._seat(block)
+        solution = solves.add(seat.session.solve())
+        if solution.status != "optimal" or solution.values is None:
+            self._drop(seat)
+            return None
+        self._last = seat
+        return solution
+
+    def solved(self, point: tuple[float, ...], objective: float | None) -> None:
+        """Record the point and objective of the last solve, if it was warm."""
+        seat, self._last = self._last, None
+        if seat is None:
+            return
+        seat.point, seat.objective = point, objective
+        best = self._best
+        if objective is not None and (
+            best is None or best.objective is None or objective < best.objective
+        ):
+            self._best = seat
+
+    def failed(self) -> None:
+        """Drop the seat of the last solve, whose amounts failed a check."""
+        seat, self._last = self._last, None
+        if seat is not None:
+            self._drop(seat)
+
+    def moved(self, point: tuple[float, ...]) -> None:
+        """The search moved to `point`: keep the seat there, if one still is."""
+        self._anchor = next((seat for seat in self._seats if seat.point == point), None)
+        self._best = self._anchor
 
 
 def _refine(
@@ -2091,13 +2618,19 @@ def _refine(
     """Refine a grid's chosen candidate over `names`.
 
     Each threshold's window is the chosen value's neighbours on its grid (or
-    its bound, at an end of the grid). On a step or binary payout the search
-    (`_solver.coordinate_search`) tries, threshold by threshold, the sample's
-    distinct index values in the window and its two ends, one per set of
-    paying years: in each pass the values nearest the current one, 2 in the
-    first and twice as many in each pass after, until a pass that tried
-    every value moves no threshold, or until `refine_max_points` points.
-    Otherwise a compass search
+    its bound, at an end of the grid). When every threshold opens a band of
+    a step or binary payout, alone or as a part of a `SumOf`, `MaxOf` or
+    `StepGrid` (`_threshold_axes`), the search
+    (`_solver.coordinate_search`) tries, threshold by threshold, the
+    sample's distinct index values on its axis in the window and its two
+    ends, and, for a band with a fixed or bounded level, the value that
+    leaves the band without a year (`_empty_bands`), one per set of paying
+    years: in each pass the values nearest the current one, 2 in the first
+    and twice as many in each pass after, until a pass that tried every
+    value moves no threshold, or until `refine_max_points` points. Under
+    E[U] and the weighted CVaR each point's LP starts from a neighbouring
+    point's basis (`_WarmLP`), which gives the same objective as a solve
+    from scratch. Otherwise a compass search
     (`_solver.compass_search`) starts at the chosen candidate with a step per
     parameter of half the window's larger side, and stops when every step is
     at most `refine_tolerance` times its bounds' width, or after
@@ -2122,9 +2655,18 @@ def _refine(
         assert grid is not None  # the grid has checked it
         windows.append(_window(value, grid, low, high))
     objectives: dict[tuple[float, ...], float | None] = {}
+    warm: _WarmLP | None = None
 
     def evaluate(point: tuple[float, ...]) -> tuple[float | None, str]:
-        objective, status, _ = _solved_point(template, names, point, context, solves)
+        if warm is None:
+            objective, status, _ = _solved_point(
+                template, names, point, context, solves
+            )
+        else:
+            objective, status, _ = _solved_point(
+                template, names, point, context, solves, warm
+            )
+            warm.solved(point, objective)
         objectives[point] = objective
         return (None if objective is None else context.scaled(objective)), status
 
@@ -2133,18 +2675,27 @@ def _refine(
 
     start = context.scaled(outcome.objective)
     search: _solver.Search | _solver.CoordinateSearch
-    if _on_index_values(template.payout, context):
+    if _on_index_values(template.payout, names, context):
+        axes = _threshold_axes(template.payout, names, context)
+        assert axes is not None
         candidates = [
-            _index_candidates(context.index, below, above) for below, above in windows
+            _index_candidates(_axis_values(context, axis), below, above)
+            for axis, (below, above) in zip(axes, windows, strict=True)
         ]
+        if WARM_SEATS > 0 and isinstance(
+            context.objective, ExpectedUncovered | WeightedCVaR
+        ):
+            warm = _WarmLP(context)
         search = _solver.coordinate_search(
             evaluate,
             outcome.point,
             start,
             candidates=candidates,
-            key=_paying_years(template, names, context),
+            key=_paying_years(template, names, axes, context),
             max_points=options.refine_max_points,
             allowance=allowance,
+            extra=_empty_bands(template, names, axes, windows, context),
+            moved=None if warm is None else warm.moved,
         )
         settings: dict[str, Any] = {
             "method": INDEX_VALUES_METHOD,

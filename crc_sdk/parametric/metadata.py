@@ -200,12 +200,11 @@ _BUILT_TOGETHER = {
     ),
     "comonotonic": (
         "they read two or more assets or hazards whose draws Comonotonic() placed "
-        "by their rank over every row, where interval coverage is unmeasured"
+        "by their rank over every row"
     ),
     "gaussian_copula": (
         "they read two or more assets or hazards whose draws a GaussianCopula "
-        "placed by their rank over every row, where interval coverage is "
-        "unmeasured"
+        "placed by their rank over every row"
     ),
     "dependence_model": (
         "they read two or more assets or hazards whose draws a dependence model "
@@ -3461,9 +3460,12 @@ def _intervals(intervals: Mapping[str, Any]) -> str:
     return text + (
         ' crc-sdk\'s docs/parametric.md, "Rows built together", gives a synthetic '
         'coverage study, which measured these methods only on the "total" rows of '
-        "two assets under one EmpiricalCopula, on the rows of two hazards under one "
-        "EmpiricalCopula, with their losses as damage ratios and on a stated value, "
-        "and on one asset's held blocks of curves."
+        "two assets under one EmpiricalCopula, of curves and of a window of two "
+        "horizons, and on the rows of two hazards under one, with their losses as "
+        "damage ratios and on a stated value (re-dealt); on held blocks of the "
+        "curves of one asset or two, of per-year values, of a pool and of two "
+        "hazards with damage ratios (re-ranked); and on held EmpiricalCopula blocks "
+        "of two assets and of two hazards (both)."
     )
 
 
