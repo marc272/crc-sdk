@@ -2932,6 +2932,20 @@ def _check_arguments(
         raise TypeError(f"limit must be a Limit or None, got {type(limit).__name__}")
 
 
+def _check_not_cluster(template: Cover) -> None:
+    """Raise `DesignError` for a template on a `ClusterIndex`, a cluster's cover."""
+    cluster = template.cluster_index
+    if cluster is not None:
+        raise DesignError(
+            "the template pays on a ClusterIndex, the weighted mean of one index "
+            f"over the assets {list(cluster.members)}: a cluster's cover is "
+            "designed with the other clusters' by design_joint(templates, sample, "
+            "objective, scope=Clustered(...)), on the sample of all their assets, "
+            "each template on the IndexDefinition its assets read",
+            asset_id=template.asset_id,
+        )
+
+
 def _check_template(template: Cover, sample: OutcomeSample) -> None:
     if not template.free_parameters():
         raise ValueError(
@@ -3029,9 +3043,10 @@ def design(
     such as a budget below the pricing's fixed expense;
     `UnboundedDesignError` for an unbounded objective (never for `MSE`);
     `SolverLimitError` when a solve stops at its iteration or time limit;
-    `DesignError` for any other failed solve or check, and for
-    `DesignOptions(refine=True)` on a grid evaluated in numpy or on a
-    threshold without a finite upper bound; `SampleError` when the
+    `DesignError` for any other failed solve or check, for a template on a
+    `ClusterIndex`, a cluster's cover, which `design_joint` makes under
+    `Clustered`, and for `DesignOptions(refine=True)` on a grid evaluated in
+    numpy or on a threshold without a finite upper bound; `SampleError` when the
     sample holds several assets (take one with `sample.asset(asset_id)`), the
     template's units or asset differ from the sample's, its index's tail
     differs from the component's on a component's view or on a sample of
@@ -3041,6 +3056,7 @@ def design(
     arguments of the wrong type.
     """
     _check_inputs(template, sample, objective, pricing, budget, limit, options)
+    _check_not_cluster(template)
     _require_one_asset(sample, "design")
     _check_template(template, sample)
     loss = np.array(sample.loss[:, 0], dtype=np.float64)

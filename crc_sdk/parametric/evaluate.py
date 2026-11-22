@@ -37,9 +37,10 @@ id in `cluster_id` and its own premium, and the `"total"` row holds the sum of
 the clusters' premiums. Under `joint=True` it gets the `"total"` row alone, with
 the premium of one contract on the total, as a joint design does. Its allocated
 rows share each cluster's payout over that cluster's own assets, under the same
-rules. `compare_pooled`, `bootstrap_intervals`, `compare_scenarios`,
-`allocate_scenarios` and `payout_breakdown` don't take such a design yet, and a
-cluster's cover is refused on its own, as it reads several assets.
+rules. `compare_pooled`, `bootstrap_intervals`, `compare_scenarios` and
+`allocate_scenarios` take such a design too. `payout_breakdown` refuses it, as
+it refuses a joint design: a breakdown parts one asset's payout over its
+hazards. A cluster's cover is refused on its own, as it reads several assets.
 
 Per-asset rows of a joint design exist only under a stated rule, with
 `values=` giving every asset's value: `level="asset_by_value"` shares the total
@@ -716,27 +717,26 @@ EvaluationEntry = (
 """What `evaluate` and `compare` take: see their docstrings."""
 
 _Entry = _Item | _CoverSet | _JointEntry | CoverPackage
-"""An entry of the functions that take no design under `Clustered` yet."""
+"""An entry of a function that takes no design under `Clustered`."""
 
 _AnyEntry = _Entry | _ClusteredEntry
-"""An entry of `evaluate`, `compare` and `allocate`."""
-
-_CLUSTERED_ONLY_IN = "evaluate, compare and allocate"
-"""The functions that take a `ClusteredDesignResult` so far."""
+"""An entry of `evaluate`, `compare`, `allocate` and the functions built on them."""
 
 
 def _entry(entry: Any) -> _Entry:
-    """Read one entry, and refuse a `ClusteredDesignResult`.
+    """Read one entry of a payout breakdown, and refuse a `ClusteredDesignResult`.
 
-    `evaluate`, `compare` and `allocate` take one, through `_any_entry`. The
-    functions built on them that don't yet, such as `compare_pooled`,
-    `bootstrap_intervals` and `compare_scenarios`, read their entries here, so
-    they raise `EvaluationError` rather than misread its covers.
+    The other functions take one, through `_any_entry`. A breakdown parts one
+    asset's payout over its hazards, so `payout_breakdown` and
+    `payout_breakdown_scenarios` read their entries here, and raise
+    `EvaluationError` rather than misread a cluster's covers.
     """
     if isinstance(entry, ClusteredDesignResult):
         raise EvaluationError(
-            "a design under Clustered (a ClusteredDesignResult) is read by "
-            f"{_CLUSTERED_ONLY_IN} only, so far: evaluate it there"
+            "a payout breakdown parts one asset's payout over its hazards, but a "
+            "design under Clustered (a ClusteredDesignResult) pays one cover per "
+            "cluster on the mean index of several assets: compare gives its rows, "
+            "a 'cluster' row per cluster under joint=False"
         )
     if isinstance(entry, CoverPackage):
         return entry
@@ -2794,11 +2794,6 @@ def _checked_designs(designs: Any) -> Sequence[Any]:
 
 def _joint_entry(design: Any, position: int, also: str = "") -> _JointEntry:
     """A joint design of `allocate`; `also` names the other kinds it takes."""
-    if isinstance(design, ClusteredDesignResult):
-        raise EvaluationError(
-            "a design under Clustered (a ClusteredDesignResult) is read by "
-            f"{_CLUSTERED_ONLY_IN} only, so far: allocate it there"
-        )
     if not isinstance(design, JointDesignResult):
         raise TypeError(
             "allocate shares out a joint design's total payout, so designs must "
@@ -2808,15 +2803,8 @@ def _joint_entry(design: Any, position: int, also: str = "") -> _JointEntry:
     return _JointEntry(design, design.to_record())
 
 
-def _joint_entries(designs: Any) -> list[_JointEntry]:
-    """The joint designs of `allocate_scenarios`; raise for anything else."""
-    return [
-        _joint_entry(design, i) for i, design in enumerate(_checked_designs(designs))
-    ]
-
-
 def _allocated_entries(designs: Any) -> list[_JointEntry | _ClusteredEntry]:
-    """The designs of `allocate`, under `Joint()` or `Clustered`; raise otherwise."""
+    """The designs of `allocate` and its form across scenarios; raise for others."""
     return [
         (
             _ClusteredEntry(design, design.to_record())
@@ -3066,8 +3054,9 @@ def payout_breakdown(
     `split`, `fold` and `design_sample` are those of `evaluate`.
 
     Raises as `compare` does, `SampleError` for a sample of several assets, and
-    `EvaluationError` when a user family's parts are invalid or do not add up
-    to its payout.
+    `EvaluationError` for a design under `Clustered`, which pays on several
+    assets, and when a user family's parts are invalid or do not add up to its
+    payout.
     """
     entries = _entries(covers)
     _require_one_asset(_sample(sample, "sample"), "payout_breakdown")
