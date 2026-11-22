@@ -3782,12 +3782,15 @@ states their rule ([allocated rows](#allocated-rows-in-a-table-of-their-own)).
 
 ### The function route
 
-The plan's steps by hand, for the same two sites. With the plan's generators,
-the sample and the designs are the plan's:
+The plan's steps by hand, for the same two sites. The plan writes the template
+for each asset before it designs, so here `Cover(..., asset_id=...)` does the
+same. With the plan's generators, the sample and the design are then the
+plan's, `design_id` included:
 
 ```python
-from crc_sdk.parametric import (AnnualSeries, LossModel, OutcomeSample, allocate,
-                                compare, design_joint, holdout, sample_annual)
+from crc_sdk.parametric import (AnnualSeries, Cover, LossModel, OutcomeSample,
+                                allocate, compare, design_joint, holdout,
+                                sample_annual)
 
 sites = [("warehouse-a", 6.96, 50.94, 2e6), ("warehouse-b", 7.10, 51.10, 1.5e6)]
 children = np.random.SeedSequence(42).spawn(len(sites))
@@ -3804,7 +3807,10 @@ joined = OutcomeSample.join(
     for (asset, lon, lat, value), child in zip(sites, children)
 )
 joint_years, joint_held_out = holdout(joined, train_fraction=0.7)
-joint_design = design_joint([step, step], joint_years,
+templates = [Cover(step.index, step.payout, payout_unit=step.payout_unit,
+                   asset_id=asset, label=step.label)    # step, written for the asset
+             for asset, _, _, _ in sites]
+joint_design = design_joint(templates, joint_years,
                             WeightedCVaR(alpha=0.9, beta=0.9),
                             budget=Budget(ratio=0.8))
 joint_table = compare([joint_design], joint_held_out, split="out_of_sample")
@@ -3814,7 +3820,18 @@ joint_shares = allocate([joint_design], joint_held_out, split="out_of_sample",
 ```
 
 `joint_table` holds the owner's total row, which is what the design optimises,
-and `joint_shares` the allocated rows, in a table of their own.
+and `joint_shares` the allocated rows, in a table of their own. They are the
+plan's out-of-sample rows, but for the design's label, which the plan writes
+`"step (weighted_cvar alpha=0.9 beta=0.9)"`, and for the metrics: here
+`compare` and `allocate` take the default `MetricOptions`, so they hold more
+metrics than the plan's `.metrics(...)` asks for.
+
+The `design_id` hashes the templates as they are passed. `design_joint([step,
+step], ...)`, with `step` written for no asset, gives the same parameters,
+premium, covers and rows, but another `design_id`, in the design and in the
+`design_id` column of the `"total"` and allocated rows. Under `Clustered` the
+plan passes the template as stated, so there `[step, step]` gives the plan's
+`design_id` ([clusters on the plan](#clusters-on-the-plan)).
 
 ### The rows of a joint design
 

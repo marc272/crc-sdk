@@ -50,6 +50,7 @@ from crc_sdk.parametric import (
     WeightedCVaR,
     compare,
     design,
+    design_joint,
     sample_curve,
     setup_text,
     to_long,
@@ -355,10 +356,16 @@ def test_the_docs_joint_design_runs_as_written(
     assert set(result.allocated.column("level").to_pylist()) == {"asset_by_value"}
     assert "asset_by_value, one row per asset" in setup_text(result.allocated)
 
-    # The function route gives the plan's sample and design and its rows.
+    # The function route gives the plan's sample and design, design_id included,
+    # and its rows, but for the label and the metrics the plan doesn't ask for.
     (planned,) = result.designs
+    made = namespace["joint_design"]
     assert result.joint_sample.content_hash == namespace["joined"].content_hash
-    assert namespace["joint_design"].parameters == planned.parameters
+    assert made.design_id == planned.design_id
+    assert made.template_hashes == planned.template_hashes
+    assert made.parameters == planned.parameters
+    assert made.premium == planned.premium
+    assert made.covers_hash == planned.covers_hash
     columns = ("level", "asset_id", "premium", "expected_payout", "sample_hash")
     for by_hand, written in (
         (namespace["joint_table"], result.table),
@@ -366,6 +373,32 @@ def test_the_docs_joint_design_runs_as_written(
     ):
         held_out = written.filter(pc.equal(written["split"], "out_of_sample"))
         assert by_hand.select(columns).equals(held_out.select(columns))
+        assert set(held_out.column_names) <= set(by_hand.column_names)
+        shared = [name for name in held_out.column_names if name != "cover_label"]
+        assert by_hand.select(shared).to_pylist() == held_out.select(shared).to_pylist()
+    assert namespace["joint_table"].column("cover_label").to_pylist() == ["step"]
+    assert result.table.column("cover_label").unique().to_pylist() == [
+        "step (weighted_cvar alpha=0.9 beta=0.9)"
+    ]
+    # The templates as stated, written for no asset: the same design under
+    # another design_id, which the "total" row carries.
+    step = namespace["step"]
+    unwritten = design_joint(
+        [step, step],
+        namespace["joint_years"],
+        WeightedCVaR(alpha=0.9, beta=0.9),
+        budget=Budget(ratio=0.8),
+    )
+    assert unwritten.design_id != planned.design_id
+    assert unwritten.parameters == planned.parameters
+    assert unwritten.premium == planned.premium
+    assert unwritten.covers_hash == planned.covers_hash
+    (total,) = compare(
+        [unwritten], namespace["joint_held_out"], split="out_of_sample"
+    ).to_pylist()
+    (by_hand,) = namespace["joint_table"].to_pylist()
+    assert total["design_id"] == unwritten.design_id
+    assert {name for name in total if total[name] != by_hand[name]} == {"design_id"}
 
     # The clusters: one total row, and each cluster's payout shared over its
     # own sites.
