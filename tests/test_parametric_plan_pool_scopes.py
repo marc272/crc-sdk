@@ -1,11 +1,11 @@
 """A pool on the plan under `Joint()` and under `Clustered`.
 
 `pool=` with `.scopes(Joint())` or `.scopes(Clustered(...))`: the assets' pools
-are joined by `OutcomeSample.join` on the same (year, model, member) rows, and
-pools whose rows differ are refused, naming the model-years. The tests build
-tables only to check their rows and columns, and that the plan gives what the
-functions give; nothing here is a finding about a design. Every number is
-synthetic.
+are joined by `OutcomeSample.join` on the same (year, model, member) rows, under
+`LinearTrend` with a split fold by fold, and pools whose rows differ are refused,
+naming the model-years. The tests build tables only to check their rows and
+columns, and that the plan gives what the functions give; nothing here is a
+finding about a design. Every number is synthetic.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from crc_framework import PiecewiseLinearImpact
 from crc_sdk.parametric import (
     MSE,
     AnnualSeries,
+    AsRecorded,
     Budget,
     Clustered,
     ClusteredDesignResult,
@@ -35,7 +36,9 @@ from crc_sdk.parametric import (
     Individual,
     Joint,
     JointDesignResult,
+    KFold,
     LinearPayout,
+    LinearTrend,
     LossModel,
     MetricOptions,
     ModelPool,
@@ -49,6 +52,7 @@ from crc_sdk.parametric import (
     holdout,
     sample_annual,
     sample_annual_pool,
+    year_block_kfold,
 )
 from crc_sdk.types import SourceProvenance
 
@@ -159,10 +163,12 @@ def _plan(scope: Any, source: Any = None, **options: Any) -> Any:
     )
 
 
-def _pools_by_hand(table: Any = None, *, missing: Any = "raise") -> list[OutcomeSample]:
+def _pools_by_hand(
+    table: Any = None, *, trend: Any = None, missing: Any = "raise"
+) -> list[OutcomeSample]:
     """Each asset's pool, built as the plan builds it, with the plan's generators.
 
-    `table` defaults to `_table()`.
+    `table` defaults to `_table()` and `trend` to `AsRecorded()`.
     """
     table = _table() if table is None else table
     children = np.random.SeedSequence(SEED).spawn(len(ASSETS))
@@ -191,6 +197,7 @@ def _pools_by_hand(table: Any = None, *, missing: Any = "raise") -> list[Outcome
                 asset_id=asset,
                 rng=np.random.default_rng(child),
                 missing=missing,
+                trend=AsRecorded() if trend is None else trend,
             )
         )
     return pools
@@ -234,17 +241,29 @@ def _written_for_each_asset(cover: Cover) -> dict[str, Cover]:
 
 def _by_hand(made: Any, joined: OutcomeSample) -> Any:
     """`compare`'s rows of a design and of the linear cover, on both blocks."""
-    train, test = holdout(joined, 0.75)
+    return _fold_by_hand(made, *holdout(joined, 0.75))
+
+
+def _fold_by_hand(
+    made: Any, train: OutcomeSample, test: OutcomeSample, fold: int = 0
+) -> Any:
+    """`_by_hand` on one fold's design block `train` and held-out block `test`."""
     entries = [made, _written_for_each_asset(LINEAR)]
     return pa.concat_tables(
         [
             compare(
-                entries, train, split="in_sample", design_sample=train, options=OPTIONS
+                entries,
+                train,
+                split="in_sample",
+                fold=fold,
+                design_sample=train,
+                options=OPTIONS,
             ),
             compare(
                 entries,
                 test,
                 split="out_of_sample",
+                fold=fold,
                 design_sample=train,
                 options=OPTIONS,
             ),
@@ -667,3 +686,77 @@ def test_a_stated_years_resolves_pools_of_other_model_years(scope: Any) -> None:
     assert sorted({year for year, _, _ in _model_years(joined)}) == years
     assert len(joined) == 2 * len(years)
     assert len(plan.designs()) == 1
+
+
+# -- Clustered under LinearTrend with a split ------------------------------------
+
+# KFold(5) designs on 16 of the 20 years in every fold. Under KFold(2) to
+# KFold(4), one fold's fit on this table turns a value negative, which
+# LinearTrend refuses.
+SPLITS = {"holdout": Holdout(0.75), "kfold": KFold(5)}
+
+
+def _folds(
+    sample: OutcomeSample, rule: Any
+) -> list[tuple[OutcomeSample, OutcomeSample]]:
+    """`sample`'s (design, held-out) blocks under the plan's split `rule`."""
+    if isinstance(rule, Holdout):
+        return [holdout(sample, rule.train_fraction)]
+    return list(year_block_kfold(sample, rule.k))
+
+
+def _trend_of(sample: OutcomeSample) -> dict[str, Any]:
+    trend = sample.provenance.trend
+    assert trend is not None
+    return dict(trend)
+
+
+def _years_of(sample: OutcomeSample) -> list[int]:
+    return sorted({year for year, _, _ in _model_years(sample)})
+
+
+@pytest.mark.parametrize("rule", list(SPLITS.values()), ids=list(SPLITS))
+@pytest.mark.parametrize("joint", [True, False], ids=["joint", "separate"])
+def test_clustered_under_a_trend_with_a_split_joins_the_pools_per_fold(
+    tmp_path: Path, joint: bool, rule: Any
+) -> None:
+    plan = _plan(Clustered(REGIONS, joint=joint), trend=LinearTrend()).split(rule)
+    result = plan.write_parquet(tmp_path / "trend.parquet")
+    # The joint sample holds every year, each asset's pool fitted on all of them.
+    joined = plan.joint_sample()
+    assert result.joint_sample is not None
+    assert result.joint_sample.content_hash == joined.content_hash
+    assert list(_trend_of(joined)["fit_years"]) == YEARS.tolist()
+    scope = Clustered(REGIONS, values=VALUES, joint=joint)
+    folds = _folds(joined, rule)
+    assert len(result.designs) == len(folds) == (5 if isinstance(rule, KFold) else 1)
+    for fold, (planned, (block, held_out)) in enumerate(
+        zip(result.designs, folds, strict=True)
+    ):
+        # Fold by fold: each asset's pool fitted on the fold's design years,
+        # then the pools joined. So the design sees no held-out year.
+        years = _years_of(block)
+        assert not set(years) & set(_years_of(held_out))
+        refitted = OutcomeSample.join(
+            _pools_by_hand(trend=LinearTrend(fit_years=years))
+        )
+        train, test = _folds(refitted, rule)[fold]
+        assert isinstance(planned, ClusteredDesignResult)
+        assert planned.design_sample.content_hash == train.content_hash
+        trend = _trend_of(planned.design_sample)
+        assert list(trend["fit_years"]) == years
+        assert trend["reference_year"] == YEARS[-1]
+        # One fit per asset and run, on every asset of both clusters.
+        assert [(fit["asset_id"], fit["model"]) for fit in trend["fits"]] == [
+            (asset, model) for asset in ASSETS for model in sorted(MODELS)
+        ]
+        made = design_joint(
+            [STEP, STEP], train, MSE(), budget=Budget(ratio=0.8), scope=scope
+        )
+        assert planned.design_id == made.design_id
+        assert planned.parameters == made.parameters
+        assert planned.premium == made.premium
+        rows = result.table.filter(pc.equal(result.table.column("fold"), fold))
+        _same_rows(rows, _fold_by_hand(made, train, test, fold))
+        levels = {row["level"] for row in _rows(rows, "step (mse)", "out_of_sample")}
+        assert levels == ({"total"} if joint else {"cluster", "total"})
