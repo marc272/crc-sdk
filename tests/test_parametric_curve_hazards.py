@@ -406,6 +406,43 @@ def test_the_combined_loss_is_made_after_the_reorder(model: Any) -> None:
     np.testing.assert_allclose(compounded.loss[:, 0], (1.0 - kept) * 1e6)
 
 
+@pytest.mark.parametrize("model", [Comonotonic(), GaussianCopula(-0.5)])
+def test_a_rows_damage_moves_with_its_own_loss(model: Any) -> None:
+    # Each component keeps the impact the rule took, its damage, which the
+    # reorder moves with the row's own loss; the rule's result on the damages
+    # times the value is the combined loss.
+    for combine in (CappedSum(0.5), CompoundDamage()):
+        sample = _draws(model, combine=combine)
+        components = sample.index_components
+        assert components is not None
+        damage = {}
+        for name in NAMES:
+            component = components[name]
+            assert component.damage is not None and component.own_loss is not None
+            np.testing.assert_array_equal(component.own_loss, component.damage * 1e6)
+            damage[name] = component.damage[:, 0]
+        np.testing.assert_array_equal(sample.loss[:, 0], combine.combine(damage) * 1e6)
+        read = OutcomeSample.from_written_table(sample.to_table())
+        assert read.content_hash == sample.content_hash
+        assert read.index_components is not None
+        for name, kept in damage.items():
+            again = read.index_components[name].damage
+            assert again is not None
+            np.testing.assert_array_equal(again[:, 0], kept)
+    single = _single("rain")
+    rain = _draws(Independent()).index_components
+    assert rain is not None and rain["rain"].damage is not None
+    np.testing.assert_array_equal(rain["rain"].damage[:, 0] * 1e6, single.loss[:, 0])
+
+
+def test_a_component_without_impact_keeps_no_damage() -> None:
+    sample = _draws(Independent(), loss_models={"rain": _loss("rain")}, combine=None)
+    components = sample.index_components
+    assert components is not None
+    assert components["heat"].damage is None and components["heat"].own_loss is None
+    assert components["rain"].damage is not None
+
+
 def test_the_rule_is_recorded() -> None:
     combine = _draws(Independent(), combine=CappedSum(1.0)).provenance.combine
     assert combine is not None

@@ -31,7 +31,9 @@ one `IndexComponent` per hazard, the first being what `index` holds, while
 `loss` is the combined loss. Such a sample comes from the same years of several
 hazards (`sample_annual_hazards`), from fitted curves under a stated dependence
 (`sample_curve_hazards`) or from a user table.
-`OutcomeSample.component` takes one hazard's sample out of it.
+`OutcomeSample.component` takes one hazard's sample out of it. The samplers
+keep each component's damage, its impact before the rule for the combined loss,
+beside its own loss, so the combined loss can be made again from the rows.
 
 `holdout` and `year_block_kfold` split a sample into contiguous blocks of
 periods, so the held-out block of a per-year sample is its latest years. A
@@ -88,6 +90,7 @@ from crc_sdk.pathways import pathways_equivalent, resolve_pathway
 
 __all__ = [
     "SAMPLE_COMPONENTS_SCHEMA_VERSION",
+    "SAMPLE_DAMAGE_SCHEMA_VERSION",
     "SAMPLE_METADATA_KEY",
     "SAMPLE_SCHEMA_VERSION",
     "SAMPLE_SEMANTICS_VERSION",
@@ -113,6 +116,9 @@ SAMPLE_SCHEMA_VERSION = "1.0"
 
 SAMPLE_COMPONENTS_SCHEMA_VERSION = "1.1"
 """The `schema_version` of the same documents of a sample with index components."""
+
+SAMPLE_DAMAGE_SCHEMA_VERSION = "1.2"
+"""The `schema_version` of those documents when the components keep their damage."""
 
 SAMPLE_SEMANTICS_VERSION = "crc-parametric-sample/1"
 """The `semantics_version` of a sample's hash document and table metadata."""
@@ -390,7 +396,9 @@ def _hash_document(
 
     A sample with index components adds each one's values, in component order,
     under another `schema_version`; a one-hazard sample's document holds no
-    trace of them.
+    trace of them. Components that keep their damage add it, under a third
+    `schema_version`, so a sample without damages hashes as it did before they
+    were kept.
     """
     order = sorted(range(len(asset_ids)), key=lambda j: asset_ids[j].encode("utf-8"))
     n_assets = len(order)
@@ -430,7 +438,18 @@ def _hash_document(
             }
             for name, component in components.items()
         ]
+        if _keeps_damage(components):
+            document["schema_version"] = SAMPLE_DAMAGE_SCHEMA_VERSION
+            for entry, component in zip(
+                document["components"], components.values(), strict=True
+            ):
+                entry["damage"] = column(component.damage)
     return document
+
+
+def _keeps_damage(components: Mapping[str, IndexComponent]) -> bool:
+    """Whether a sample's components keep their damage beside their own loss."""
+    return any(component.damage is not None for component in components.values())
 
 
 def _is_monotone_function(index: FloatArray, loss: FloatArray) -> bool:
@@ -844,7 +863,7 @@ def _component_column(name: str, value: Any) -> FloatArray:
 
 @dataclass(frozen=True, eq=False)
 class IndexComponent:
-    """One named hazard of a sample: its index, unit, tail and own loss.
+    """One named hazard of a sample: its index, unit, tail, own loss and damage.
 
     `values` is the component's index, `(n, 1)`, finite; a 1-D array is read
     as one column. `unit` is its unit, and `tail` the severe side, `"upper"`
@@ -853,7 +872,11 @@ class IndexComponent:
     no loss reads, it is the hazard at the asset that a basis-risk model with
     `apply_hazard`, such as `HazardNoise`, gave. `own_loss` is the loss of
     this hazard alone, finite and non-negative, in the sample's loss unit, and
-    `None` for a component with no impact. The arrays are read-only copies,
+    `None` for a component with no impact. `damage` is this hazard's impact
+    before the rule for the combined loss, usually a damage ratio: what the
+    rule takes, and `own_loss` is it times the value. It is finite and
+    non-negative, held only beside an `own_loss`, and `None` where the sample
+    doesn't keep it, as on a table of yours. The arrays are read-only copies,
     and the repr prints none of them.
 
     Raises `SampleError` for any invalid field.
@@ -865,41 +888,58 @@ class IndexComponent:
     tail: Tail
     hazard: FloatArray | None = None
     own_loss: FloatArray | None = None
+    damage: FloatArray | None = None
 
     def __post_init__(self) -> None:
         values = _component_column("values", self.values)
         _identifier("unit", self.unit)
         if self.tail not in get_args(Tail):
             raise SampleError(f"tail must be 'upper' or 'lower', got {self.tail!r}")
-        hazard, own_loss = (
+        hazard, own_loss, damage = (
             None if value is None else _component_column(name, value)
-            for name, value in (("hazard", self.hazard), ("own_loss", self.own_loss))
+            for name, value in (
+                ("hazard", self.hazard),
+                ("own_loss", self.own_loss),
+                ("damage", self.damage),
+            )
         )
-        for name, column in (("hazard", hazard), ("own_loss", own_loss)):
+        for name, column in (
+            ("hazard", hazard),
+            ("own_loss", own_loss),
+            ("damage", damage),
+        ):
             if column is not None and column.shape != values.shape:
                 raise SampleError(
                     f"{name} must have the shape of values, {values.shape}; "
                     f"got {column.shape}"
                 )
-        if own_loss is not None and (own_loss < 0).any():
-            raise SampleError("own_loss must be non-negative")
+        for name, column in (("own_loss", own_loss), ("damage", damage)):
+            if column is not None and (column < 0).any():
+                raise SampleError(f"{name} must be non-negative")
+        if damage is not None and own_loss is None:
+            raise SampleError(
+                "damage goes with own_loss: a component with no impact has no damage"
+            )
         object.__setattr__(self, "values", values)
         object.__setattr__(self, "hazard", hazard)
         object.__setattr__(self, "own_loss", own_loss)
+        object.__setattr__(self, "damage", damage)
 
     def __repr__(self) -> str:
         """A short description, which prints no arrays and stays short at any size.
 
-        It gives the shape of `values`, the unit and the tail, and `hazard` and
-        `own_loss` as `...` when the component holds them and `None` when not.
+        It gives the shape of `values`, the unit and the tail, and `hazard`,
+        `own_loss` and `damage` as `...` when the component holds them and
+        `None` when not.
         """
-        hazard, own_loss = (
+        hazard, own_loss, damage = (
             "None" if column is None else "..."
-            for column in (self.hazard, self.own_loss)
+            for column in (self.hazard, self.own_loss, self.damage)
         )
         return (
             f"IndexComponent(shape={self.values.shape}, unit={self.unit!r}, "
-            f"tail={self.tail!r}, hazard={hazard}, own_loss={own_loss})"
+            f"tail={self.tail!r}, hazard={hazard}, own_loss={own_loss}, "
+            f"damage={damage})"
         )
 
     def _subset(self, rows: NDArray[np.bool_]) -> IndexComponent:
@@ -908,6 +948,7 @@ class IndexComponent:
             values=self.values[rows],
             hazard=None if self.hazard is None else self.hazard[rows],
             own_loss=None if self.own_loss is None else self.own_loss[rows],
+            damage=None if self.damage is None else self.damage[rows],
         )
 
 
@@ -947,6 +988,13 @@ def _checked_components(
         raise SampleError(
             f"a sample with index components holds exactly one asset, got {n_assets}: "
             "several assets with several hazards need a dependence model over both"
+        )
+    with_loss = [name for name, each in components.items() if each.own_loss is not None]
+    with_damage = [name for name, each in components.items() if each.damage is not None]
+    if with_damage and with_damage != with_loss:
+        raise SampleError(
+            "every component with an own loss keeps its damage, or none does: "
+            f"{with_loss} have an own loss, but only {with_damage} a damage"
         )
     first_name, first = next(iter(components.items()))
     if not np.array_equal(index, first.values):
@@ -1174,7 +1222,8 @@ class OutcomeSample:
         column), sorted by period and asset id, with the units, the
         semantics and the scenario, in the canonical JSON of cover documents.
         A sample with index components adds each one's name, unit, tail,
-        values, hazard and own loss. The provenance is not part of it.
+        values, hazard and own loss, and its damage when the components keep
+        it. The provenance is not part of it.
         """
         return content_hash(
             _hash_document(
@@ -1600,7 +1649,11 @@ class OutcomeSample:
         A sample with index components adds, per component, the columns
         `index[<name>]`, `hazard[<name>]` and `own_loss[<name>]`, null where it
         has none, and the metadata adds `components`, each one's name, unit
-        and tail, in order.
+        and tail, in order, under `schema_version` `"1.1"`. When the
+        components keep their damage, it adds `damage[<name>]` too, null on a
+        component with no impact, under `"1.2"`
+        (`SAMPLE_DAMAGE_SCHEMA_VERSION`), so a reader that knows only `"1.1"`
+        refuses the table rather than dropping the damages.
 
         A component's view (`component`, and its blocks) adds `view_of` to the
         metadata, `{"name": name, "tail": tail}`, the component it reads, so
@@ -1632,8 +1685,13 @@ class OutcomeSample:
             "semantics": self.semantics,
             "semantics_version": SAMPLE_SEMANTICS_VERSION,
         }
+        damaged = components is not None and _keeps_damage(components)
         if components is not None:
-            metadata["schema_version"] = SAMPLE_COMPONENTS_SCHEMA_VERSION
+            metadata["schema_version"] = (
+                SAMPLE_DAMAGE_SCHEMA_VERSION
+                if damaged
+                else SAMPLE_COMPONENTS_SCHEMA_VERSION
+            )
             metadata["components"] = [
                 {"name": name, "tail": component.tail, "unit": component.unit}
                 for name, component in components.items()
@@ -1672,6 +1730,7 @@ class OutcomeSample:
                 ("index", component.values),
                 ("hazard", component.hazard),
                 ("own_loss", component.own_loss),
+                *((("damage", component.damage),) if damaged else ()),
             ):
                 fields.append((f"{column}[{name}]", pa.float64()))
                 arrays.append(
@@ -1704,6 +1763,11 @@ class OutcomeSample:
         the metadata's `view_of` records, so a cover of another tail is
         refused on it as on the view that was written. A table without
         `view_of` reads back as a plain one-hazard sample.
+
+        A table of `schema_version` `"1.2"` gives each component its damage
+        back, from `damage[<name>]`. One of `"1.1"`, written before samples
+        kept the damage or from a table of yours, reads back without it, with
+        the content hash it was written with.
 
         Raises `SampleError` if the metadata is missing, unreadable or of
         another schema or semantics version, a column is missing or holds
@@ -1774,6 +1838,7 @@ class OutcomeSample:
 
         hazard = optional("hazard", "the hazard is the index")
         index_components: dict[str, IndexComponent] | None = None
+        damaged = metadata["schema_version"] == SAMPLE_DAMAGE_SCHEMA_VERSION
         if "components" in metadata:
             index_components = {
                 name: IndexComponent(
@@ -1783,6 +1848,11 @@ class OutcomeSample:
                     hazard=optional(f"hazard[{name}]", "the hazard is the index"),
                     own_loss=optional(
                         f"own_loss[{name}]", "the component has no impact"
+                    ),
+                    damage=(
+                        optional(f"damage[{name}]", "the component has no impact")
+                        if damaged
+                        else None
                     ),
                 )
                 for name, unit, tail in _written_components(metadata["components"])
@@ -2448,6 +2518,14 @@ _WRITTEN_KEYS = frozenset(
 )
 
 
+_WRITTEN_VERSIONS = (
+    SAMPLE_SCHEMA_VERSION,
+    SAMPLE_COMPONENTS_SCHEMA_VERSION,
+    SAMPLE_DAMAGE_SCHEMA_VERSION,
+)
+"""The `schema_version`s `from_written_table` reads."""
+
+
 def _written_metadata(table: Any) -> dict[str, Any]:
     """Return the `SAMPLE_METADATA_KEY` document of a table `to_table` wrote."""
     raw = (table.schema.metadata or {}).get(SAMPLE_METADATA_KEY.encode())
@@ -2466,13 +2544,14 @@ def _written_metadata(table: Any) -> dict[str, Any]:
     if not isinstance(document, dict):
         raise SampleError(f"the {SAMPLE_METADATA_KEY!r} metadata must be an object")
     version = document.get("schema_version", SAMPLE_SCHEMA_VERSION)
-    if version not in (SAMPLE_SCHEMA_VERSION, SAMPLE_COMPONENTS_SCHEMA_VERSION):
+    if version not in _WRITTEN_VERSIONS:
         raise SampleError(
             f"the written sample has schema_version {version!r}; this version of "
-            f"crc-sdk reads {SAMPLE_SCHEMA_VERSION!r} and "
-            f"{SAMPLE_COMPONENTS_SCHEMA_VERSION!r}"
+            f"crc-sdk reads {SAMPLE_SCHEMA_VERSION!r}, "
+            f"{SAMPLE_COMPONENTS_SCHEMA_VERSION!r} and "
+            f"{SAMPLE_DAMAGE_SCHEMA_VERSION!r}"
         )
-    with_components = version == SAMPLE_COMPONENTS_SCHEMA_VERSION
+    with_components = version != SAMPLE_SCHEMA_VERSION
     expected_keys = _WRITTEN_KEYS | ({"components"} if with_components else set())
     missing = sorted(expected_keys - set(document))
     if missing:

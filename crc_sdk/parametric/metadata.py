@@ -262,7 +262,9 @@ _KEPT_ROWS = {
 _KEPT_TODAY = {
     "combined_loss_needs_value": (
         "the combined loss of several hazards is the rule's result times the "
-        "asset value, which a record never holds"
+        "asset value, which a record never holds, and the sample keeps no damage "
+        "of its hazards to read the value from, as one written before samples "
+        "kept them"
     ),
     "caller_rule": (
         "the combined loss of several hazards comes from a rule of the caller's, "
@@ -274,6 +276,9 @@ _KEPT_TODAY = {
     ),
     "combined_loss_not_reproduced": (
         "the recorded rule doesn't give the sample's combined loss again"
+    ),
+    "value_not_found": (
+        "no one value gives each hazard's own loss as its damage times that value"
     ),
     "combined_view": (
         "a one-hazard view of the combined loss doesn't hold the draws of the "
@@ -3619,10 +3624,10 @@ def _intervals(intervals: Mapping[str, Any]) -> str:
         'coverage study, which measured these methods only on the "total" rows of '
         "two assets under one EmpiricalCopula, of curves and of a window of two "
         "horizons, and on the rows of two hazards under one, with their losses as "
-        "damage ratios (re-dealt); on held blocks of the curves of one asset or "
-        "two, of per-year values, of a pool and of two hazards with damage ratios "
-        "(re-ranked); and on held EmpiricalCopula blocks of two assets and of two "
-        "hazards (both)."
+        "damage ratios and on a stated value (re-dealt); on held blocks of the "
+        "curves of one asset or two, of per-year values, of a pool and of two "
+        "hazards with damage ratios (re-ranked); and on held EmpiricalCopula blocks "
+        "of two assets and of two hazards (both)."
     )
 
 

@@ -7,6 +7,7 @@ cover.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from typing import Any
 
@@ -677,7 +678,7 @@ _PINNED: dict[str, tuple[str, str]] = {
         "sha256:5058cd6e64e2a916c1cfae45ad94d488527113dd919a45e7db7f49cb4469a7df",
     ),
     "several hazards": (
-        "sha256:5e4d488978f940909d04aaae79cc35fe8906fc21d6cf4a05a1fcb1526c3165a8",
+        "sha256:96c4a116fe8008db3c9d1c3e17ac3973158d2733d06732af34773a33408cc9bc",
         "sha256:342be33478ae474ed56b5064a88c713937e4c88016486a1fae7cb7e5aaefd4fc",
     ),
     "pool": (
@@ -697,7 +698,7 @@ _PINNED: dict[str, tuple[str, str]] = {
         "sha256:fe4d51f2b42760eb93e1228d15c892c33017c2ca26e631f9bbb69b1dbee9a92a",
     ),
     "several hazards from curves": (
-        "sha256:e5eb2ac3de5615512f1972131a8f6e06211d9524ba5909c0cebefaf899772eee",
+        "sha256:1d6fa1c9746696880c9c206102633af6af0efecc8cbebad2adb63debab7eb200",
         "sha256:cd76cc4a26067d25ad96a65974dc66a4e735dbc186f5c46f8a5d5c812f041f7b",
     ),
     "table": (
@@ -709,10 +710,41 @@ _PINNED: dict[str, tuple[str, str]] = {
         "sha256:a29b6b4f40375873cd6d2114a89d71b4022f5feba1c7bc93af059bd06481a15e",
     ),
 }
-"""What these samples hashed to before sources were compared one by one."""
+"""What these samples hashed to before sources were compared one by one.
+
+The samples of several hazards keep each hazard's damage since, which is part
+of their content hash; their lineages are as they were.
+"""
+
+_PINNED_WITHOUT_DAMAGE = {
+    "several hazards": (
+        "sha256:5e4d488978f940909d04aaae79cc35fe8906fc21d6cf4a05a1fcb1526c3165a8"
+    ),
+    "several hazards from curves": (
+        "sha256:e5eb2ac3de5615512f1972131a8f6e06211d9524ba5909c0cebefaf899772eee"
+    ),
+}
+"""What the samples of several hazards hashed to before they kept the damage."""
 
 
 @pytest.mark.parametrize("kind", list(_KINDS))
 def test_hashes_and_lineages_stay_as_they_were(kind: str) -> None:
     sample = _KINDS[kind]()
     assert (sample.content_hash, sample.lineage) == _PINNED[kind]
+
+
+@pytest.mark.parametrize("kind", list(_PINNED_WITHOUT_DAMAGE))
+def test_a_sample_without_its_damages_hashes_as_before(kind: str) -> None:
+    # Without the damages, the hash document is the one written before they
+    # were kept, so a table written then reads back with its hash.
+    sample = _KINDS[kind]()
+    assert sample.index_components is not None
+    stripped = dataclasses.replace(
+        sample,
+        index_components={
+            name: dataclasses.replace(component, damage=None)
+            for name, component in sample.index_components.items()
+        },
+    )
+    assert stripped.content_hash == _PINNED_WITHOUT_DAMAGE[kind]
+    assert stripped.lineage == sample.lineage

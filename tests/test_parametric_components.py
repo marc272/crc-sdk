@@ -75,6 +75,7 @@ from crc_sdk.parametric.parameters import _resolve_values
 from crc_sdk.parametric.payouts import _REGISTRY
 from crc_sdk.parametric.sample import (
     SAMPLE_COMPONENTS_SCHEMA_VERSION,
+    SAMPLE_DAMAGE_SCHEMA_VERSION,
     SAMPLE_METADATA_KEY,
     SAMPLE_SCHEMA_VERSION,
 )
@@ -1082,6 +1083,174 @@ def test_a_written_component_is_null_in_every_row_or_in_none() -> None:
     )
     with pytest.raises(SampleError, match="null in 1 of 8"):
         OutcomeSample.from_written_table(edited)
+
+
+# -- each hazard's damage ------------------------------------------------------
+
+RAIN_DAMAGE = RAIN_LOSS / 20.0
+HEAT_DAMAGE = HEAT_LOSS / 20.0
+"""Each hazard's damage on a value of 20 EUR: its own loss is the damage times 20."""
+
+
+def _damaged(**overrides: Any) -> OutcomeSample:
+    """`_sample` whose components keep their damage."""
+    components = {
+        "rain": _component(RAIN_VALUES, own_loss=RAIN_LOSS, damage=RAIN_DAMAGE),
+        "heat": _component(HEAT_VALUES, "degC", own_loss=HEAT_LOSS, damage=HEAT_DAMAGE),
+    }
+    return _sample(**{"index_components": components, **overrides})
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    [
+        pytest.param({"damage": RAIN_DAMAGE}, "damage goes with own_loss", id="alone"),
+        pytest.param(
+            {"own_loss": RAIN_LOSS, "damage": -RAIN_DAMAGE - 1.0},
+            "damage must be non-negative",
+            id="negative",
+        ),
+        pytest.param(
+            {"own_loss": RAIN_LOSS, "damage": np.full(8, np.nan)},
+            "damage must be finite",
+            id="not finite",
+        ),
+        pytest.param(
+            {"own_loss": RAIN_LOSS, "damage": np.ones(7)},
+            "damage must have the shape of values",
+            id="shape",
+        ),
+    ],
+)
+def test_an_invalid_damage_raises(fields: dict[str, Any], message: str) -> None:
+    with pytest.raises(SampleError, match=message):
+        IndexComponent(RAIN_VALUES, unit="mm/day", tail="upper", **fields)
+
+
+def test_every_component_with_an_own_loss_keeps_its_damage_or_none_does() -> None:
+    mixed = {
+        "rain": _component(RAIN_VALUES, own_loss=RAIN_LOSS, damage=RAIN_DAMAGE),
+        "heat": _component(HEAT_VALUES, "degC", own_loss=HEAT_LOSS),
+    }
+    with pytest.raises(SampleError, match="keeps its damage, or none does"):
+        _sample(index_components=mixed)
+    # A component with no impact has neither.
+    no_impact = {
+        "rain": _component(RAIN_VALUES, own_loss=RAIN_LOSS, damage=RAIN_DAMAGE),
+        "heat": _component(HEAT_VALUES, "degC"),
+    }
+    assert _sample(index_components=no_impact).index_components is not None
+
+
+def test_the_damage_is_part_of_the_hash() -> None:
+    plain, damaged = _sample(), _damaged()
+    assert damaged.content_hash != plain.content_hash
+    other = _damaged(
+        index_components={
+            "rain": _component(
+                RAIN_VALUES, own_loss=RAIN_LOSS, damage=RAIN_DAMAGE * 2.0
+            ),
+            "heat": _component(
+                HEAT_VALUES, "degC", own_loss=HEAT_LOSS, damage=HEAT_DAMAGE
+            ),
+        }
+    )
+    assert other.content_hash not in (plain.content_hash, damaged.content_hash)
+
+
+def test_a_sample_without_damages_writes_its_table_as_before() -> None:
+    table = _sample().to_table()
+    assert not [name for name in table.schema.names if name.startswith("damage[")]
+    metadata = json.loads(table.schema.metadata[SAMPLE_METADATA_KEY.encode()])
+    assert metadata["schema_version"] == SAMPLE_COMPONENTS_SCHEMA_VERSION
+
+
+def test_a_sample_that_keeps_damages_writes_and_reads_them(tmp_path: Path) -> None:
+    sample = _damaged()
+    table = sample.to_table()
+    assert table.schema.names[-8:] == [
+        "index[rain]",
+        "hazard[rain]",
+        "own_loss[rain]",
+        "damage[rain]",
+        "index[heat]",
+        "hazard[heat]",
+        "own_loss[heat]",
+        "damage[heat]",
+    ]
+    assert table.column("damage[heat]").to_pylist() == HEAT_DAMAGE.tolist()
+    metadata = json.loads(table.schema.metadata[SAMPLE_METADATA_KEY.encode()])
+    assert metadata["schema_version"] == SAMPLE_DAMAGE_SCHEMA_VERSION
+    assert metadata["components"] == [
+        {"name": "rain", "tail": "upper", "unit": "mm/day"},
+        {"name": "heat", "tail": "upper", "unit": "degC"},
+    ]
+    path = tmp_path / "sample.parquet"
+    pq.write_table(table, path)
+    for written in (table, pq.read_table(path)):
+        read = OutcomeSample.from_written_table(written)
+        assert read.content_hash == sample.content_hash
+        assert read.provenance.to_document() == sample.provenance.to_document()
+        assert read.index_components is not None
+        for name, damage in (("rain", RAIN_DAMAGE), ("heat", HEAT_DAMAGE)):
+            kept = read.index_components[name].damage
+            assert kept is not None
+            np.testing.assert_array_equal(kept[:, 0], damage)
+        assert read.to_table().equals(table)
+
+
+def test_a_component_with_no_impact_writes_a_null_damage() -> None:
+    sample = _sample(
+        index_components={
+            "rain": _component(RAIN_VALUES, own_loss=RAIN_LOSS, damage=RAIN_DAMAGE),
+            "heat": _component(HEAT_VALUES, "degC"),
+        },
+        loss=RAIN_LOSS,
+    )
+    table = sample.to_table()
+    assert table.column("damage[heat]").null_count == 8
+    read = OutcomeSample.from_written_table(table)
+    assert read.index_components is not None
+    assert read.index_components["heat"].damage is None
+    assert read.content_hash == sample.content_hash
+
+
+def test_a_written_sample_with_damages_needs_them() -> None:
+    table = _damaged().to_table()
+    with pytest.raises(SampleError, match="damage\\[rain\\]"):
+        OutcomeSample.from_written_table(table.drop_columns(["damage[rain]"]))
+    position = table.schema.get_field_index("damage[heat]")
+    edited = table.set_column(
+        position,
+        "damage[heat]",
+        pa.array([None, *HEAT_DAMAGE[1:].tolist()], pa.float64()),
+    )
+    with pytest.raises(SampleError, match="null in 1 of 8"):
+        OutcomeSample.from_written_table(edited)
+    changed = table.set_column(
+        position, "damage[heat]", pa.array((HEAT_DAMAGE * 2).tolist(), pa.float64())
+    )
+    with pytest.raises(SampleError, match="content hash"):
+        OutcomeSample.from_written_table(changed)
+    # Read as a table of "1.1", it drops the damages, and its hash then differs.
+    with pytest.raises(SampleError, match="content hash"):
+        OutcomeSample.from_written_table(
+            _metadata_edited(table, schema_version=SAMPLE_COMPONENTS_SCHEMA_VERSION)
+        )
+
+
+def test_a_block_and_a_view_of_a_sample_with_damages() -> None:
+    sample = _damaged()
+    for block in (sample.select(PERIOD[2:6]), holdout(sample, 0.5)[1]):
+        assert block.index_components is not None
+        rows = np.isin(PERIOD, block.period)
+        kept = block.index_components["heat"].damage
+        assert kept is not None
+        np.testing.assert_array_equal(kept[:, 0], HEAT_DAMAGE[rows])
+    # A view holds one hazard, and its hash, table and loss are as before.
+    view, before = sample.component("rain"), _sample().component("rain")
+    assert view.content_hash == before.content_hash
+    assert view.to_table().schema.names == before.to_table().schema.names
 
 
 def test_join_refuses_a_sample_with_components() -> None:
