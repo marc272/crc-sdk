@@ -62,26 +62,26 @@ N = 40
 
 _BEFORE = {
     "assets gaussian": (
-        "sha256:72f83daa8c6b7eea1187183e53041153e7417b314a3889ff9374874c48061eaa"
+        "sha256:0fa81ac06138d3db8c7297579a2fe0fccfc7ee91ba54a311c1a59f9e58f39ed5"
     ),
     "assets comonotonic": (
-        "sha256:b69d2eb7c75ec2c8ae0eef1c5e866fa103080c50af68a84f21682b112e7f34b8"
+        "sha256:fe78b75b13b389fced81db1407966f4c2934f0de7f83d844512af9838d5de7f2"
     ),
     "hazards gaussian": (
-        "sha256:ec23aba3c667d426bd9ea59eae2afb0e48a439fbb0b98336444842253747499a"
+        "sha256:73b45cc22accb9f7e5bc859043ef8b1d33e568b5f7f96e25d99058f0e9f2f13c"
     ),
     "hazards comonotonic": (
-        "sha256:80350d37d7b61cff4a7dd8be2853b50531f3867a5e85ff4a0045dc54449db7d3"
+        "sha256:ec0416c37371689367fe9d1ff340c4b4b101ae45cb246ea9b27b5b7328e7ac80"
     ),
 }
 """What these samples (`_pinned`) hashed to before samples kept their latent ranks."""
 
 _KEPT = {
     "assets gaussian": (
-        "sha256:d51a7effa7e29f918d5e5a4bb1fece1592aea5d5d0d4c9ff97344a49a98f7cd1"
+        "sha256:fb44649ac17f8736eefbf4410a6ddc4f0272d08c4775bcb7191bcc58d920cf21"
     ),
     "hazards gaussian": (
-        "sha256:d2263c282c246369c6f29422d556d437a034ab8327417e911fe1139cb7abe305"
+        "sha256:a6f9ec2f985c19fd59947ce4f0eaba55677ac362a8733a5ca0d0dddd241e8a38"
     ),
 }
 """What the `GaussianCopula` samples hash to now that they keep them."""
@@ -143,9 +143,10 @@ def _hazards(model: Any, n: int = N) -> OutcomeSample:
 def _pinned(model: Any, *, hazards: bool = False) -> OutcomeSample:
     """A sample whose pinned hash is the same on every platform.
 
-    The recipe of the module's other pinned curve samples: one Gumbel curve, a
-    loss that only divides, no basis risk. `HazardNoise`'s factors, and other
-    curves and impact functions, can differ in the last bit between platforms.
+    The recipe and the draws of the module's other pinned curve samples (seeds
+    11 and 22): one Gumbel curve, a loss that only divides, no basis risk.
+    `HazardNoise`'s factors, and other draws, curves and impact functions, can
+    differ in the last bit between platforms.
     """
     curve = FittedDistribution.from_parameters("gumbel_r", location=50.0, scale=10.0)
     loss = LossModel(
@@ -157,7 +158,7 @@ def _pinned(model: Any, *, hazards: bool = False) -> OutcomeSample:
             dependence=model,
             metadata={h: _metadata(UNITS[h]) for h in HAZARDS},
             n_draws=N,
-            rngs={h: np.random.default_rng(21 + j) for j, h in enumerate(HAZARDS)},
+            rngs={h: np.random.default_rng(s) for h, s in zip(HAZARDS, (11, 22))},
             loss_models=dict.fromkeys(HAZARDS, loss),
             combine=CappedSum(1.0),
             basis_risk=NoBasisRisk(),
@@ -168,7 +169,7 @@ def _pinned(model: Any, *, hazards: bool = False) -> OutcomeSample:
         dependence=model,
         metadata={a: _metadata() for a in ASSETS},
         n_draws=N,
-        rngs={a: np.random.default_rng(11 + j) for j, a in enumerate(ASSETS)},
+        rngs={a: np.random.default_rng(s) for a, s in zip(ASSETS, (11, 22))},
         loss_models=dict.fromkeys(ASSETS, loss),
         basis_risk=NoBasisRisk(),
     )
@@ -362,10 +363,10 @@ def test_the_gaussian_samples_hashes_change_and_the_others_stay() -> None:
     }
     for name, sample in samples.items():
         if name in _KEPT:
-            assert sample.content_hash == _KEPT[name], name
             # Without its ranks it hashes as it did before they were kept, so a
             # table written then reads back with its hash.
             assert _without_ranks(sample).content_hash == _BEFORE[name], name
+            assert sample.content_hash == _KEPT[name], name
         else:
             assert sample.content_hash == _BEFORE[name], name
 
