@@ -1653,13 +1653,16 @@ def test_a_cluster_plan_designs_each_fold_of_the_sample_of_all_its_assets() -> N
         assert planned.parameters == made.parameters
 
 
-def test_a_cluster_plan_on_curves_equals_the_function_route(dataset: Path) -> None:
+@pytest.mark.parametrize("values", [VALUES, None], ids=["stated", "left-out"])
+def test_a_cluster_plan_on_curves_equals_the_function_route(
+    dataset: Path, values: dict[str, float] | None
+) -> None:
     budget = Budget(ratio=0.8)
     scope = _regions(False)
     plan = (
         _designed_on_curves(dataset)
         .split(FreshDraws(300, seed=7))
-        .scopes(scope)
+        .scopes(Clustered(REGIONS, values=values, joint=False))
         .dependence(Comonotonic())
     )
     result = plan.write_parquet(dataset.parent / "out.parquet")
@@ -1700,6 +1703,111 @@ def test_the_values_of_a_cluster_plan_are_its_loss_models() -> None:
         ratios.scopes(_regions()).joint_sample()
     ones = ratios.scopes(_regions(values=dict.fromkeys(ALL, 1.0)))
     assert ones.joint_sample().asset_ids == ALL
+
+
+@pytest.mark.parametrize("joint", [True, False], ids=["joint", "separate"])
+def test_a_cluster_plan_fills_in_the_values_it_leaves_out(
+    tmp_path: Path, joint: bool
+) -> None:
+    # Clustered(assignment) on a plan takes the values its loss model reads, so
+    # its rows, designs and allocated rows are those of the scope that states
+    # them, and so the function route's with values= those values.
+    def planned(scope: Clustered) -> ParametricPlan:
+        return (
+            _designed_per_year(_per_year())
+            .covers(_step(), _linear())
+            .objective(MSE(), ExpectedUncovered(), budget=Budget(ratio=0.8))
+            .split(Holdout(0.7))
+            .scopes(scope)
+            .allocation("value")
+        )
+
+    left_out = planned(Clustered(REGIONS, joint=joint))
+    stated = planned(_regions(joint))
+    assert left_out.explain(format="json") == stated.explain(format="json")
+    filled = left_out.write_parquet(tmp_path / "filled.parquet")
+    given = stated.write_parquet(tmp_path / "stated.parquet")
+    assert _comparable(filled.table).equals(_comparable(given.table))
+    assert filled.allocated is not None and given.allocated is not None
+    assert _comparable(filled.allocated).equals(_comparable(given.allocated))
+    assert setup_text(filled.metadata) == setup_text(given.metadata)
+    assert [d.design_id for d in filled.designs] == [d.design_id for d in given.designs]
+    for made, expected in zip(filled.designs, given.designs, strict=True):
+        assert isinstance(made, ClusteredDesignResult)
+        assert isinstance(expected, ClusteredDesignResult)
+        assert made.covers_hash == expected.covers_hash
+        assert made.parameters == expected.parameters
+    train, _ = holdout(_joined(_grid()), 0.7)
+    by_hand = design_joint(
+        [_step(), _step()],
+        train,
+        MSE(),
+        budget=Budget(ratio=0.8),
+        scope=_regions(joint),
+    )
+    assert filled.designs[0].design_id == by_hand.design_id
+    north = filled.designs[0].covers["north"].cluster_index
+    assert north is not None
+    assert dict(north.weights) == {"warehouse-a": 0.4, "depot-b": 0.6}
+
+
+def test_a_cluster_plan_on_damage_ratios_weights_each_asset_alike() -> None:
+    ratio_step = Cover(
+        INDEX,
+        StepPayout([60.0, 80.0, 100.0], [Free(), Free(), Free()]),
+        payout_unit="1",
+        label="step",
+    )
+    ratios = (
+        _per_year(value_column=None, value_unit="1")
+        .basis_risk(ImpactNoise(0.3, upper=1.0))
+        .covers(ratio_step)
+        .objective(MSE(), budget=Budget(ratio=0.8))
+        .split(Holdout(0.7))
+    )
+    (left_out,) = ratios.scopes(Clustered(REGIONS)).designs()
+    (stated,) = ratios.scopes(_regions(values=dict.fromkeys(ALL, 1.0))).designs()
+    assert isinstance(left_out, ClusteredDesignResult)
+    assert left_out.design_id == stated.design_id
+    assert left_out.parameters == stated.parameters
+    north = left_out.covers["north"].cluster_index
+    assert north is not None
+    assert dict(north.weights) == {"warehouse-a": 0.5, "depot-b": 0.5}
+
+
+class _CountedSource:
+    """A source plan that counts its reads."""
+
+    def __init__(self, table: Any) -> None:
+        self.table = table
+        self.reads = 0
+
+    def annual_extremes(self) -> Any:
+        self.reads += 1
+        return self.table
+
+
+def test_a_cluster_plan_checks_the_values_it_fills_in_before_reading() -> None:
+    # A cluster whose values are all zero gives its index no weights: with the
+    # values left out the plan raises as Clustered does for stated ones, before
+    # the source is read.
+    assets = _asset_table().set_column(
+        3, "value_eur", pa.array([0.0, 0.0, 1e6], pa.float64())
+    )
+    source = _CountedSource(_grid())
+    plan = _designed_per_year(_per_year(source, assets=assets)).scopes(
+        Clustered(REGIONS)
+    )
+    for run in (plan.joint_sample, plan.designs):
+        with pytest.raises(SampleError, match="cluster 'north'.*are all zero"):
+            run()
+    assert source.reads == 0
+    # With values that weigh, the same plan reads its source.
+    read = _CountedSource(_grid())
+    _per_year(read).basis_risk(ImpactNoise(0.3)).scopes(
+        Clustered(REGIONS)
+    ).joint_sample()
+    assert read.reads == 1
 
 
 def test_a_cluster_plan_checks_its_assignment(tmp_path: Path) -> None:

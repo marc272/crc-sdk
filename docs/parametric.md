@@ -306,7 +306,7 @@ ParametricPlan.for_annual_extremes(source, assets, *, impact, unit, provenance,
 | `.pricing(pricing)` | The plan's pricing, `PurePremium()`, `CostOfCapitalLoad(rate, q)` or `ExpectedPayoutMultiple(multiple, expense)` ([pricing](#pricing-and-the-premium-used)), for a plan of resolved covers that has no `.objective(...)` |
 | `.split(rule)` | `FreshDraws(n_draws, seed=...)` (fitted curves), `Holdout(train_fraction)` or `KFold(k)`, below |
 | `.metrics(options)` | The `MetricOptions` of every row |
-| `.scopes(*scopes)` | `Individual()`, the default, designs each asset on its own; `Joint()` designs each template on the owner's total ([joint design](#joint-design-over-several-assets)); `Clustered(assignment, values=..., joint=...)` one cover per cluster of the assets, its values those the plan's loss model reads ([clusters on the plan](#clusters-on-the-plan)) |
+| `.scopes(*scopes)` | `Individual()`, the default, designs each asset on its own; `Joint()` designs each template on the owner's total ([joint design](#joint-design-over-several-assets)); `Clustered(assignment, joint=...)` one cover per cluster of the assets, weighted by the values the plan's loss model reads ([clusters on the plan](#clusters-on-the-plan)) |
 | `.dependence(model)` | Fitted curves only, and required there with `Joint()`, `Clustered` and `.hazard(...)`: how the assets', or the hazards', draws are put side by side (`Independent()`, `Comonotonic()`, `EmpiricalCopula(reference)`, `GaussianCopula(correlation)` or a `DependenceModel` of your own). A plan on per-year values raises: its dependence is the data's own |
 | `.allocation(rule)` | With `Joint()`: adds a joint design's allocated rows, under `"value"` or `"loss"`, in a table and a file of their own ([allocated rows](#allocated-rows-in-a-table-of-their-own)) |
 | `.scenarios(set, *, design_on, premiums)` | Several scenarios, such as windows of horizons, each cover and design evaluated on every scenario's block, out of sample ([scenarios on the plan](#scenarios-on-the-plan)) |
@@ -3657,7 +3657,9 @@ columns.
 
 An owner may group the sites into clusters, a region each for example, and buy
 one cover per cluster, on an index of the cluster. `Clustered(assignment, *,
-values, joint=True)` is that scope of `design_joint`. It is a method: this
+values=None, joint=True)` is that scope of `design_joint`, which needs the
+values stated (a plan fills them in, [below](#clusters-on-the-plan)). It is a
+method: this
 section says what it does and what it optimises, and makes no statement about
 how a cluster design does against covers designed asset by asset or jointly, in
 either direction.
@@ -3778,11 +3780,12 @@ cluster_shares = allocate([cluster_design], book_held_out, split="out_of_sample"
 
 #### Clusters on the plan
 
-`.scopes(Clustered(assignment, values=..., joint=...))` runs the same design
-from a plan, as `.scopes(Joint())` does: each template is designed once per
-objective and block under that scope, one cover per cluster, on the sample of
-all the assets. Here the three sites above, from the same per-year table and
-the same seed, so the plan's sample and design are the function route's:
+`.scopes(Clustered(assignment, joint=...))` runs the same design from a plan,
+as `.scopes(Joint())` does: each template is designed once per objective and
+block under that scope, one cover per cluster, on the sample of all the assets.
+The plan fills in the values from the value column it already reads. Here the
+three sites above, from the same per-year table and the same seed, so the
+plan's sample, weights and design are the function route's:
 
 ```python
 from crc_sdk.parametric import Clustered
@@ -3804,7 +3807,7 @@ cluster_plan = (
     .covers(step)                              # one cover per cluster
     .objective(WeightedCVaR(alpha=0.9, beta=0.9), budget=Budget(ratio=0.8))
     .split(Holdout(0.7))
-    .scopes(Clustered(regions.assignment, values=book_values, joint=True))
+    .scopes(Clustered(regions.assignment, joint=True))   # values from value_eur
 )
 print(setup_text(cluster_plan.explain(format="json")))   # the setup; no I/O
 cluster_result = cluster_plan.write_parquet("cluster-comparison.parquet")
@@ -3813,17 +3816,21 @@ assert cluster_result.designs[0].design_id == cluster_design.design_id
 
 - **The values are the plan's.** A cluster's weights are the values the plan's
   loss model reads: the asset column `value_column`, or 1 for each asset when
-  the losses are damage ratios. So `values=` must be those, and execution
-  raises `ValueError` otherwise, before the source is read, naming the assets
-  whose values differ. Only their hash is written, and `explain()` states the
-  assignment and the setting, not the values.
+  the losses are damage ratios. Leave `values=` out and the plan fills them
+  in. Stated values must be those, exactly, and execution raises `ValueError`
+  otherwise, before the source is read, naming the assets whose values differ;
+  the design is the same either way. A cluster whose values are all zero
+  raises `SampleError`, before the source is read too. Only their hash is
+  written, and `explain()` states the assignment and the setting, not the
+  values.
 - **The assignment** must hold exactly the plan's assets: `.scopes(...)` raises
   `SampleError` when the asset table is in memory, and execution otherwise.
 - **As under `Joint()`:** at least two assets; on fitted curves
   `.dependence(...)`, and with `Holdout` or `KFold` `Independent()` only;
   each cover written for no asset, as it applies to every cluster; a resolved
   cover evaluated as one contract per asset (`scope` `"individual"`); under
-  `LinearTrend` the assets joined fold by fold; `.joint_sample()` for the
+  `LinearTrend` the assets joined fold by fold; under `pool=` the assets'
+  pools joined by `OutcomeSample.join`; `.joint_sample()` for the
   sample; `.allocation(rule)` for the allocated rows, each cluster's payout
   shared over its own assets, in their own file; and `.scenarios(...)`, with
   `compare_scenarios` and `allocate_scenarios` once per fold for all the

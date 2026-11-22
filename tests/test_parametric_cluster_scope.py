@@ -205,9 +205,51 @@ def test_clustered_refuses_an_invalid_assignment_or_values(
         UNTYPED_CLUSTERED(assignment, values=values, joint=joint)
 
 
-def test_clustered_needs_the_values() -> None:
-    with pytest.raises(TypeError, match="values"):
-        UNTYPED_CLUSTERED(ASSIGNMENT)
+def test_clustered_may_leave_its_values_out() -> None:
+    scope = Clustered(ASSIGNMENT, joint=False)
+    assert scope.values is None
+    assert scope == Clustered(ASSIGNMENT, values=None, joint=False)
+    assert hash(scope) == hash(Clustered(ASSIGNMENT, joint=False))
+    assert scope.cluster_ids == ("north", "south")
+    assert dict(scope.members) == {"north": ("A", "B"), "south": ("C",)}
+    # Its document and repr are those of the scope that states the values,
+    # which it doesn't equal.
+    assert scope.to_document() == _scope(False).to_document()
+    assert repr(scope) == repr(_scope(False))
+    assert scope != _scope(False)
+    assert pickle.loads(pickle.dumps(scope)) == scope
+    assert pickle.loads(pickle.dumps(_scope(False))) == _scope(False)
+    # The assignment and the setting are checked as before.
+    with pytest.raises(SampleError, match="an assignment of one asset or more"):
+        Clustered({})
+    with pytest.raises(TypeError, match="joint must be a bool"):
+        UNTYPED_CLUSTERED(ASSIGNMENT, joint=1)
+    # Without the values, the clusters have no weights.
+    for read in (lambda: scope.weights, lambda: scope.index("north", WIND)):
+        with pytest.raises(
+            SampleError, match=r"the clusters' weights need the assets' values"
+        ):
+            read()
+
+
+def test_design_joint_needs_the_values_of_its_clustered_scope() -> None:
+    for joint in (True, False):
+        with pytest.raises(
+            SampleError,
+            match=(
+                r"design_joint under Clustered needs the assets' values, which "
+                r"weight each cluster's index, but this Clustered leaves values= "
+                r"out: state Clustered\(assignment, values="
+            ),
+        ):
+            design_joint(
+                [_template(), _template()],
+                _sample(),
+                MSE(),
+                scope=Clustered(ASSIGNMENT, joint=joint),
+            )
+    # Stated values design as before.
+    assert _design().scope == Clustered(ASSIGNMENT).to_document()
 
 
 # -- ClusterIndex and the cluster's cover ------------------------------------------

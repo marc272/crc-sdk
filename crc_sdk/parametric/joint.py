@@ -44,7 +44,8 @@ cluster's cover pays on the value-weighted mean of its assets' indices, a
 are designed as `Joint()` designs the assets, on the owner's total; with
 `joint=False` each cluster is its own design problem, with its own budget. It
 returns a `ClusteredDesignResult`, keyed by cluster. The assignment is stated:
-the module clusters nothing itself.
+the module clusters nothing itself. The values are stated too; only a plan may
+leave them out, and it fills them in from the values its loss model reads.
 
 Everything here works in memory and does no I/O.
 """
@@ -679,7 +680,10 @@ class Clustered:
     of your choice; the clusters follow the order in which the assignment first
     names them, and each cluster's assets the order in which it names them.
     `values` maps every asset id to its value, in the loss unit, and weights
-    each cluster's index. `joint` says how the covers are designed:
+    each cluster's index. `design_joint` needs them stated. On a plan they may
+    be left out (`values=None`, the default): the plan then takes the values
+    its loss model reads, and checks stated values against them. `joint` says
+    how the covers are designed:
 
     - `joint=True`: one design problem over every cluster. The objective, the
       premium and the budget are on the owner's total, the sum over the
@@ -699,27 +703,30 @@ class Clustered:
 
     `to_document()` holds the assignment and the setting, not the values,
     which a comparison never writes; the weights are part of each cluster
-    cover's terms. Two scopes are equal when their assignments (in order),
-    values and settings are.
+    cover's terms. So a scope that leaves its values out has the document of
+    one that states them. Two scopes are equal when their assignments (in
+    order), values (or the lack of them) and settings are.
 
     Raises `TypeError` for arguments of the wrong type and `SampleError` for
-    an empty assignment, an invalid asset or cluster id, values that miss an
-    assigned asset or name another, a negative or non-finite value, or a
-    cluster whose values are all zero, which gives its index no weights.
-    `design_joint` raises `SampleError` for an asset of the sample left out of
-    the assignment and for an assigned asset that the sample doesn't hold,
-    naming any cluster left without an asset of the sample.
+    an empty assignment, an invalid asset or cluster id, stated values that
+    miss an assigned asset or name another, a negative or non-finite value, or
+    a cluster whose values are all zero, which gives its index no weights.
+    `weights` and `index()` raise `SampleError` when the values are left out,
+    and so does `design_joint`, naming `values=`. `design_joint` also raises
+    `SampleError` for an asset of the sample left out of the assignment and
+    for an assigned asset that the sample doesn't hold, naming any cluster
+    left without an asset of the sample.
     """
 
     assignment: Mapping[str, str]
-    values: Mapping[str, float]
+    values: Mapping[str, float] | None
     joint: bool
 
     def __init__(
         self,
         assignment: Mapping[str, str],
         *,
-        values: Mapping[str, float],
+        values: Mapping[str, float] | None = None,
         joint: bool = True,
     ) -> None:
         if isinstance(assignment, (str, bytes)) or not isinstance(assignment, Mapping):
@@ -733,37 +740,16 @@ class Clustered:
             _name(asset, "an asset id"): _name(cluster, "a cluster id")
             for asset, cluster in assignment.items()
         }
-        if isinstance(values, (str, bytes)) or not isinstance(values, Mapping):
-            raise TypeError(
-                "values must map each asset id to its value, got "
-                f"{type(values).__name__}"
-            )
-        missing = [asset for asset in checked if asset not in values]
-        unknown = sorted(str(asset) for asset in values if asset not in checked)
-        if missing or unknown:
-            raise SampleError(
-                "values= must give the value of every asset of the assignment, and "
-                f"of no other: it lacks {missing} and names {unknown}"
-            )
-        stated: dict[str, float] = {}
-        for asset in checked:
-            value = values[asset]
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float, np.number))
-                or not math.isfinite(float(value))
-                or float(value) < 0.0
-            ):
-                raise SampleError(
-                    f"the value of asset {asset!r} must be a finite number >= 0, "
-                    f"got {value!r}"
-                )
-            stated[asset] = float(value) + 0.0
+        stated = None if values is None else _stated_values(checked, values)
         if not isinstance(joint, bool):
             raise TypeError(f"joint must be a bool, got {type(joint).__name__}")
         object.__setattr__(self, "assignment", MappingProxyType(checked))
-        object.__setattr__(self, "values", MappingProxyType(stated))
+        object.__setattr__(
+            self, "values", None if stated is None else MappingProxyType(stated)
+        )
         object.__setattr__(self, "joint", joint)
+        if stated is None:
+            return
         for cluster, assets in self.members.items():
             if not math.fsum(stated[asset] for asset in assets) > 0.0:
                 raise SampleError(
@@ -790,24 +776,42 @@ class Clustered:
 
     @property
     def weights(self) -> Mapping[str, Mapping[str, float]]:
-        """Each cluster's weights: each asset's value over the cluster's total."""
+        """Each cluster's weights: each asset's value over the cluster's total.
+
+        Raises `SampleError` when the values are left out.
+        """
+        values = self._require_values("the clusters' weights need")
         weights: dict[str, Mapping[str, float]] = {}
         for cluster, assets in self.members.items():
-            total = math.fsum(self.values[asset] for asset in assets)
+            total = math.fsum(values[asset] for asset in assets)
             weights[cluster] = MappingProxyType(
-                {asset: self.values[asset] / total + 0.0 for asset in assets}
+                {asset: values[asset] / total + 0.0 for asset in assets}
             )
         return MappingProxyType(weights)
 
     def index(self, cluster: str, index: IndexDefinition) -> ClusterIndex:
-        """The `ClusterIndex` of `cluster`, on the `index` its assets read."""
+        """The `ClusterIndex` of `cluster`, on the `index` its assets read.
+
+        Raises `SampleError` when the values are left out.
+        """
         return ClusterIndex(index, self.weights[cluster])
+
+    def _require_values(self, needs: str) -> Mapping[str, float]:
+        """The stated values; raise `SampleError`, naming `values=`, without them."""
+        if self.values is None:
+            raise SampleError(
+                f"{needs} the assets' values, which weight each cluster's index, "
+                "but this Clustered leaves values= out: state "
+                "Clustered(assignment, values={asset: value, ...}); only a plan "
+                "fills them in, from the values its loss model reads"
+            )
+        return self.values
 
     def to_document(self) -> dict[str, Any]:
         """Return `{"kind": "clustered", "assignment": {...}, "joint": ...}`.
 
         The assignment maps each asset id to its cluster's id. The values are
-        not part of the document.
+        not part of the document, whether they are stated or left out.
         """
         return {
             "assignment": dict(self.assignment),
@@ -815,36 +819,63 @@ class Clustered:
             "kind": "clustered",
         }
 
+    def _values_key(self) -> tuple[tuple[str, float], ...] | None:
+        return None if self.values is None else tuple(self.values.items())
+
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Clustered):
             return NotImplemented
         return (
             tuple(self.assignment.items()) == tuple(other.assignment.items())
-            and tuple(self.values.items()) == tuple(other.values.items())
+            and self._values_key() == other._values_key()
             and self.joint == other.joint
         )
 
     def __hash__(self) -> int:
-        return hash(
-            (
-                tuple(self.assignment.items()),
-                tuple(self.values.items()),
-                self.joint,
-            )
-        )
+        return hash((tuple(self.assignment.items()), self._values_key(), self.joint))
 
     def __repr__(self) -> str:
         return f"Clustered({dict(self.assignment)!r}, joint={self.joint})"
 
     def __reduce__(self) -> tuple[Any, ...]:
-        return (
-            _clustered,
-            (dict(self.assignment), dict(self.values), self.joint),
+        values = None if self.values is None else dict(self.values)
+        return (_clustered, (dict(self.assignment), values, self.joint))
+
+
+def _stated_values(
+    assignment: Mapping[str, str], values: Mapping[str, float]
+) -> dict[str, float]:
+    """`Clustered`'s stated values, in the assignment's order, each checked."""
+    if isinstance(values, (str, bytes)) or not isinstance(values, Mapping):
+        raise TypeError(
+            f"values must map each asset id to its value, got {type(values).__name__}"
         )
+    missing = [asset for asset in assignment if asset not in values]
+    unknown = sorted(str(asset) for asset in values if asset not in assignment)
+    if missing or unknown:
+        raise SampleError(
+            "values= must give the value of every asset of the assignment, and "
+            f"of no other: it lacks {missing} and names {unknown}"
+        )
+    stated: dict[str, float] = {}
+    for asset in assignment:
+        value = values[asset]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float, np.number))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise SampleError(
+                f"the value of asset {asset!r} must be a finite number >= 0, "
+                f"got {value!r}"
+            )
+        stated[asset] = float(value) + 0.0
+    return stated
 
 
 def _clustered(
-    assignment: dict[str, str], values: dict[str, float], joint: bool
+    assignment: dict[str, str], values: dict[str, float] | None, joint: bool
 ) -> Clustered:
     return Clustered(assignment, values=values, joint=joint)
 
@@ -1231,6 +1262,7 @@ def _design_clustered(
     scope: Clustered,
 ) -> ClusteredDesignResult:
     """`design_joint` under `Clustered`: one cover per cluster."""
+    scope._require_values("design_joint under Clustered needs")
     _check_cluster_templates(templates, sample, objective, scope)
     _solver.require()
     clusters = scope.cluster_ids
@@ -1434,8 +1466,9 @@ def design_joint(
     the fill rule per asset and whether the LP route ranges the optimal set.
     It returns a `JointDesignResult`.
 
-    Under `scope=Clustered(assignment, values=..., joint=...)`, `templates`
-    holds one `Cover` per cluster, in the order of `scope.cluster_ids`, each
+    Under `scope=Clustered(assignment, values=..., joint=...)`, with the
+    assets' values stated, `templates` holds one `Cover` per cluster, in the
+    order of `scope.cluster_ids`, each
     on the `IndexDefinition` its assets read and written for its cluster or
     for none. Each resolved cover pays on its cluster's `ClusterIndex` and is
     written for the cluster. Under `joint=True` the objective, the premium
@@ -1460,9 +1493,9 @@ def design_joint(
     suit the sample, or a template's index `hazard_name` differs from the
     hazard the sample records for its asset, and under `Clustered` for an
     assignment that leaves out an asset of the sample or names one it doesn't
-    hold, and for a template on a `ClusterIndex` or a `CompositeIndex`;
-    `ValueError` when no template has free parameters; and `TypeError` for
-    arguments of the wrong type.
+    hold, for a template on a `ClusterIndex` or a `CompositeIndex`, and for a
+    scope that leaves `values=` out; `ValueError` when no template has free
+    parameters; and `TypeError` for arguments of the wrong type.
     """
     templates = _check_templates(templates, scope)
     _check_terms(sample, objective, pricing, budget, limit, options)
