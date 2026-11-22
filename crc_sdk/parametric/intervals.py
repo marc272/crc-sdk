@@ -74,7 +74,9 @@ combined loss can't be made again (a rule of the caller's, a table's loss, or
 a stated value or a value column on a sample without damages), a one-hazard
 view whose combined loss reads hazards it doesn't hold, a selection of a held
 sample, whose hazards at the asset came from rows it doesn't hold, a record of
-an `EmpiricalCopula` without its draws per reference year, a `GaussianCopula`
+an `EmpiricalCopula` without its draws per reference year, an `EmpiricalCopula`
+block whose record says a basis-risk model of the caller's changed an index,
+which then may not order the draws as the copula dealt them, a `GaussianCopula`
 sample without its latent ranks (written before samples kept them), a
 `Comonotonic()` block whose indices don't rise together (a basis-risk model of
 the caller's moved one), a block that several models moved, and pooled rows of
@@ -1559,6 +1561,7 @@ _VALUE_NOT_FOUND = "value_not_found"
 _HELD_SELECT = "held_select"
 _HELD_LOSS_NOT_ONE = "held_loss_not_one"
 _COPULA_WITHOUT_K = "copula_without_k"
+_INDEX_MOVED = "index_moved"
 _GAUSSIAN_WITHOUT_RANKS = "gaussian_without_ranks"
 _INDEX_NOT_COMONOTONE = "index_not_comonotone"
 _SEVERAL_MODELS = "several_models"
@@ -1794,12 +1797,37 @@ def _combine(sample: OutcomeSample, columns: Sequence[_Column]) -> _Combine:
     return rule
 
 
+def _index_moved(sample: OutcomeSample) -> bool:
+    """Whether the record says a basis-risk model changed a column's index.
+
+    Each column's own provenance, in `parts` or `components`, holds its
+    basis-risk model's summary, where the sampler recorded whether the index
+    the model returned differs from the one it was given (`index_changed`).
+    No built-in model changes it, so there the index is the curve's draw.
+    """
+    own = sample.provenance.parts or sample.provenance.components or {}
+    for document in own.values():
+        details = document.get("details") if isinstance(document, Mapping) else None
+        summary = details.get("basis_risk") if isinstance(details, Mapping) else None
+        if isinstance(summary, Mapping) and summary.get("index_changed") is True:
+            return True
+    return False
+
+
 def _reference_years(sample: OutcomeSample) -> tuple[tuple[IntArray, IntArray], ...]:
     """Each member's rows of an `EmpiricalCopula` block, with each row's year.
 
     A row's period is its draw number in the call that built the sample, and
     the copula deals within each member of a window (row `d` reads member
     `d mod m`), `k` rows to each reference year, in reference-year order.
+
+    The re-deal reads each row's rank in its column from the index. The
+    copula ranked the draws by their uniforms, which the sample doesn't keep,
+    and the curve's draw rises with its uniform, so the index gives that order
+    wherever it is the draw. Raises `_Unbuildable` when the record doesn't
+    state `k`, and when it says a basis-risk model of the caller's changed an
+    index: that index may not give the copula's order, and nothing in a block
+    of one row per reference year would show it.
     """
     record = (
         sample.provenance.dependence
@@ -1814,6 +1842,8 @@ def _reference_years(sample: OutcomeSample) -> tuple[tuple[IntArray, IntArray], 
         or k < 1
     ):
         raise _Unbuildable(_COPULA_WITHOUT_K)
+    if _index_moved(sample):
+        raise _Unbuildable(_INDEX_MOVED)
     window = sample.provenance.details.get("window")
     m = 1 if window is None else len(window["members"])
     period = sample.period.astype(np.int64)
@@ -2615,9 +2645,9 @@ def bootstrap_intervals(
     damages, with a stated value or a value column), `"caller_rule"`,
     `"table_loss"`, `"combined_loss_not_reproduced"`, `"value_not_found"`,
     `"combined_view"`, `"held_select"`, `"held_loss_not_one"`,
-    `"copula_without_k"`, `"gaussian_without_ranks"`, `"index_not_comonotone"`,
-    `"several_models"` or `"pooled_by_hand"`. The key is left out when there
-    is none.
+    `"copula_without_k"`, `"index_moved"`, `"gaussian_without_ranks"`,
+    `"index_not_comonotone"`, `"several_models"` or `"pooled_by_hand"`. The
+    key is left out when there is none.
 
     The table has `to_long`'s columns and, for each wide row and metric column:
 
