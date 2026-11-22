@@ -44,7 +44,8 @@ with sorted keys. It holds:
   one-line definition;
 - `covers`: every cover's label, hash and full document, the hash of every
   set of covers a `"total"` or allocated row names, with the asset ids and
-  cover hashes it is made of, and the hash of every package a `"package"` row
+  cover hashes it is made of (`kind` `"cluster_set"` and the cluster ids for a
+  design under `Clustered`), and the hash of every package a `"package"` row
   names, with the component names and cover hashes it is made of;
 - `designs`: the record of every design evaluated, with the label of its
   cover as evaluated (`cover_label`), and for a pooled row an entry of `kind`
@@ -67,10 +68,11 @@ or without an evaluation's `level`, `scope` and `allocation` or a sample's
 without `trend` has none recorded, which on per-year values reads as the years
 as recorded, and a sample without `pool` is no pool. A comparison without the
 metric column `payout_frequency` or `unidentified_share` reads as null there, as
-does one without the column `design_scenario`, `pathway`, `horizon`, `product` or
-`n_rows`, or without the rank-block columns `copula_reference_years` and
-`copula_block_tail_b<beta>` or the short-block flags `short_block_b<beta>` and
-`short_block_rp<T>`, and a document without `intervals` has no intervals.
+does one without the column `design_scenario`, `pathway`, `horizon`, `product`,
+`n_rows` or `cluster_id`, or without the rank-block columns
+`copula_reference_years` and `copula_block_tail_b<beta>` or the short-block flags
+`short_block_b<beta>` and `short_block_rp<T>`, and a document without
+`intervals` has no intervals.
 
 The module claims no licence of its own for a comparison: it is derived data
 under its inputs' terms, which `licences` lists.
@@ -2890,8 +2892,22 @@ def _unidentified(record: Mapping[str, Any], where: str) -> list[str]:
     ]
 
 
-def _cluster_members(scope: Mapping[str, Any], where: str) -> dict[str, list[str]]:
-    """Each cluster's assets, by the scope's assignment, in its order."""
+def _cluster_members(record: Mapping[str, Any], where: str) -> dict[str, list[str]]:
+    """Each cluster's assets, in the order of the clusters and of their assets.
+
+    A design's record lists them (`cluster_ids`, `members`), as JSON keeps the
+    order of a list; without them, the scope's assignment gives them.
+    """
+    listed = _list(record, "cluster_ids", where)
+    named = _get(record, "members", Mapping, where) or {}
+    if listed and named:
+        return {
+            str(cluster): [
+                str(asset) for asset in _list(named, cluster, f"{where}.members")
+            ]
+            for cluster in listed
+        }
+    scope = _get(record, "scope", Mapping, where) or {}
     assignment = _get(scope, "assignment", Mapping, f"{where}.scope") or {}
     members: dict[str, list[str]] = {}
     for asset, cluster in assignment.items():
@@ -2906,9 +2922,10 @@ def _clusters_words(members: Mapping[str, Sequence[str]]) -> str:
     )
 
 
-def _cluster_scope_words(scope: Mapping[str, Any], where: str) -> str:
+def _cluster_scope_words(record: Mapping[str, Any], where: str) -> str:
     """A design's scope under `Clustered`, in words: the clusters and the setting."""
-    members = _cluster_members(scope, where)
+    members = _cluster_members(record, where)
+    scope = _get(record, "scope", Mapping, where) or {}
     together = _get(scope, "joint", bool, f"{where}.scope") is not False
     setting = (
         "designed together, with one objective, one budget and one premium on "
@@ -2934,7 +2951,7 @@ def _design_terms(record: Mapping[str, Any], unit: str, where: str) -> list[str]
     on_total = " on the total" if joint else " on each cluster" if by_cluster else ""
     parts: list[str] = []
     if clustered:
-        parts.append(_cluster_scope_words(scope, where))
+        parts.append(_cluster_scope_words(record, where))
     elif joint:
         assets = [str(asset) for asset in _list(record, "asset_ids", where)]
         parts.append(
@@ -3310,18 +3327,23 @@ def _named(
 def _clustered_records(
     designs: Sequence[Mapping[str, Any]],
 ) -> list[Mapping[str, Any]]:
-    """The scopes of the designs under `Clustered`, in order."""
-    scopes: list[Mapping[str, Any]] = []
-    for record in designs:
-        scope = record.get("scope")
-        if isinstance(scope, Mapping) and scope.get("kind") == "clustered":
-            scopes.append(scope)
-    return scopes
+    """The records of the designs under `Clustered`, in order."""
+    return [
+        record
+        for record in designs
+        if isinstance(record.get("scope"), Mapping)
+        and record["scope"].get("kind") == "clustered"
+    ]
 
 
-def _cluster_setting(scopes: Sequence[Mapping[str, Any]]) -> str:
+def _is_together(record: Mapping[str, Any]) -> bool:
+    """Whether a design under `Clustered` is one problem on the total."""
+    return bool(record["scope"].get("joint") is not False)
+
+
+def _cluster_setting(records: Sequence[Mapping[str, Any]]) -> str:
     """How the designs under `Clustered` were made: together, apart or both."""
-    settings = {scope.get("joint") is not False for scope in scopes}
+    settings = {_is_together(record) for record in records}
     if settings == {True}:
         return (
             "designed together, with one objective and one budget on the owner's total"
@@ -3364,8 +3386,8 @@ def _levels_of(
     each = _join(assets) or "the assets not stated"
     clustered = _clustered_records(designs)
     members: dict[str, list[str]] = {}
-    for i, scope in enumerate(clustered):
-        for cluster, own in _cluster_members(scope, f"designs[{i}]").items():
+    for i, record in enumerate(clustered):
+        for cluster, own in _cluster_members(record, f"designs[{i}]").items():
             members.setdefault(cluster, own)
     shared = (
         "the joint design's total payout"
@@ -4623,12 +4645,12 @@ def setup_text(
     if "joint" in scopes:
         priced += " A joint design's premium is that of one contract on the total."
     clustered = _clustered_records(designs)
-    if any(scope.get("joint") is not False for scope in clustered):
+    if any(_is_together(record) for record in clustered):
         priced += (
             " A design under Clustered(joint=True) has the premium of one contract "
             "on the total."
         )
-    if any(scope.get("joint") is False for scope in clustered):
+    if not all(_is_together(record) for record in clustered):
         priced += (
             " Under Clustered(joint=False) each cluster row holds its cluster's "
             "design premium, and the total row the sum of the clusters' premiums, "

@@ -822,3 +822,46 @@ def test_the_functions_not_built_for_clusters_yet_refuse_a_cluster_design() -> N
         compare_scenarios([result], scenarios)
     with pytest.raises(EvaluationError, match=message):
         UNTYPED_SCENARIOS([result], scenarios, allocation="value", values=VALUES)
+
+
+def test_a_cluster_design_is_read_in_its_loss_unit_only() -> None:
+    sample = _sample()
+    result = _design(sample=sample)
+    other = OutcomeSample(
+        asset_ids=sample.asset_ids,
+        period=sample.period,
+        probability=sample.probability,
+        index=sample.index,
+        loss=sample.loss,
+        hazard=None,
+        index_unit="m/s",
+        loss_unit="USD",
+        semantics="annual",
+        provenance=sample.provenance,
+    )
+    with pytest.raises(SampleError, match="pays in 'EUR'"):
+        evaluate(result, other, split="out_of_sample", design_sample=None)
+
+
+def test_the_setup_text_states_each_clusters_degenerate_tail() -> None:
+    sample = _sample()
+    # South's loss is zero in more than half the years, north's in fewer.
+    south = sample.loss[:, 2] == 0.0
+    north = (sample.loss[:, 0] == 0.0) & (sample.loss[:, 1] == 0.0)
+    assert north.mean() < 0.5 < south.mean()
+    flagged = _design(False, sample, objective=WeightedCVaR(alpha=0.9, beta=0.5))
+    assert flagged.clusters is not None
+    assert flagged.clusters["south"].degenerate_tail == "expected_uncovered"
+    assert flagged.clusters["north"].degenerate_tail is None
+    rows = evaluate(flagged, sample, split="in_sample").to_pylist()
+    assert [row["degenerate_tail"] for row in rows] == [
+        None,
+        "expected_uncovered",
+        None,
+    ]
+    text = setup_text(evaluate(flagged, sample, split="in_sample"))
+    assert "degenerate tail of the clusters: south (expected_uncovered)" in text
+    plain = _design(False, sample, objective=WeightedCVaR(alpha=0.9, beta=0.9))
+    assert "tail: not degenerate in any cluster" in setup_text(
+        evaluate(plain, sample, split="in_sample")
+    )

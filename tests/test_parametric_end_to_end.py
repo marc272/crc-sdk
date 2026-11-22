@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 import warnings
 from collections.abc import Iterator
 from pathlib import Path
@@ -324,7 +325,7 @@ def test_the_docs_joint_design_runs_as_written(
     quick_start = _python_blocks("### From a fitted curve, with the plan")
     per_year = _python_blocks("## Next step: per-year values")
     joint = _python_blocks("## Joint design over several assets")
-    assert len(joint) == 2
+    assert len(joint) == 3
     monkeypatch.chdir(tmp_path)
     namespace: dict[str, Any] = {}
     with warnings.catch_warnings():
@@ -365,6 +366,28 @@ def test_the_docs_joint_design_runs_as_written(
     ):
         held_out = written.filter(pc.equal(written["split"], "out_of_sample"))
         assert by_hand.select(columns).equals(held_out.select(columns))
+
+    # The clusters: one total row, and each cluster's payout shared over its
+    # own sites.
+    clustered = namespace["cluster_design"]
+    assert clustered.cluster_ids == ("north", "south")
+    assert dict(namespace["north"].weights) == pytest.approx(
+        {"warehouse-a": 2e6 / 3.5e6, "warehouse-b": 1.5e6 / 3.5e6}
+    )
+    table = namespace["cluster_table"]
+    assert table.column("level").to_pylist() == ["total"]
+    assert table.column("scope").to_pylist() == ["cluster"]
+    shares = namespace["cluster_shares"].to_pylist()
+    assert [row["asset_id"] for row in shares] == [
+        "warehouse-a",
+        "warehouse-b",
+        "depot-c",
+    ]
+    assert math.fsum(row["expected_payout"] for row in shares) == pytest.approx(
+        table.column("expected_payout")[0].as_py(), rel=1e-12
+    )
+    text = setup_text(table)
+    assert "north of warehouse-a and warehouse-b, south of depot-c" in text
 
 
 def test_the_docs_comparison_table_lists_every_identity_column() -> None:

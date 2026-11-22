@@ -6,7 +6,8 @@
   covers as rows and metrics as columns, the layout of crc-sdk's portfolio
   output.
 - `allocate(designs, sample, *, split, allocation, values, ...)` returns a joint
-  design's allocated rows, in a table of their own.
+  design's allocated rows, or those of a design under `Clustered`, in a table of
+  their own.
 - `write_comparison(table, path)` writes a comparison table to one Parquet
   file atomically, with its metadata under `crc.parametric.evaluation`.
 - `to_long(table)` gives the tidy form, one row per cover and metric.
@@ -27,6 +28,18 @@ against the sum of their payouts, draw by draw; the `scope` column says
 - A joint design gets one `"total"` row, with the premium of one contract on
   the total. It gets no `"asset"` row, because the split of the total payout
   across the assets is the solver's choice and is often not identified.
+
+**Clusters.** A design under `Clustered` (a `ClusteredDesignResult`) has one
+cover per cluster of the sample's assets, on the cluster's `ClusterIndex`; its
+rows have `scope` `"cluster"`. Under `joint=False` each cluster is its own
+design problem and contract, so it gets a `"cluster"` row, with the cluster's
+id in `cluster_id` and its own premium, and the `"total"` row holds the sum of
+the clusters' premiums. Under `joint=True` it gets the `"total"` row alone, with
+the premium of one contract on the total, as a joint design does. Its allocated
+rows share each cluster's payout over that cluster's own assets, under the same
+rules. `compare_pooled`, `bootstrap_intervals`, `compare_scenarios`,
+`allocate_scenarios` and `payout_breakdown` don't take such a design yet, and a
+cluster's cover is refused on its own, as it reads several assets.
 
 Per-asset rows of a joint design exist only under a stated rule, with
 `values=` giving every asset's value: `level="asset_by_value"` shares the total
@@ -2630,7 +2643,10 @@ def evaluate(
     covers or all designs, each designed on that asset's own sample). The rows
     are then those of the module docstring: a mapping gives one `"asset"` row per
     asset and one `"total"` row, and a joint design one `"total"` row and, under
-    `allocation`, one allocated row per asset. On a sample with index components,
+    `allocation`, one allocated row per asset. A `ClusteredDesignResult` gives,
+    under `joint=False`, one `"cluster"` row per cluster and the `"total"` row,
+    and under `joint=True` the `"total"` row; under `allocation`, each cluster's
+    payout is shared over its own assets. On a sample with index components,
     `cover` may be a `CoverPackage`, which gives one `"asset"` row per contract
     and one `"package"` row. `split` is `"in_sample"` (on the
     design sample) or `"out_of_sample"` (on a sample that shares no period
@@ -2662,7 +2678,8 @@ def evaluate(
     `design_id`, `asset_id`, `level`, `scope`, `scenario`, `design_scenario`,
     `pathway`, `horizon`, `product`, `split`, `fold`, `sample_hash`, `n_rows`,
     `premium_basis`, `unique`, `ties`, `degenerate_tail`, `components`,
-    `design_budget`), then the rank-block columns (`copula_reference_years`,
+    `design_budget`, `cluster_id`), then the rank-block columns
+    (`copula_reference_years`,
     `copula_block_tail_b<beta>`) and the short-block flags
     (`short_block_b<beta>`, `short_block_rp<T>`, one per level of `options`;
     see the module docstring), and one float64 column per metric, null where
@@ -2680,8 +2697,10 @@ def evaluate(
     the probability that the cover pays, and `unidentified_share` the
     probability of the draws whose payout reads an amount that the design's
     fill rule set (see the module docstring).
-    `asset_id` is null on `"total"` rows. `premium_basis`, `premium` and the
-    net-loss columns are null on allocated rows. On `"total"` and allocated
+    `asset_id` is null on `"total"` and `"cluster"` rows, and `cluster_id` names
+    the cluster of a `"cluster"` row and is null on every other row.
+    `premium_basis`, `premium` and the net-loss columns are null on allocated
+    rows. On `"total"` and allocated
     rows, `cover_hash` is the hash of the set of covers and `cover_label` their
     shared label, or else the first 12 hex digits of that hash; on a
     `"package"` row, `cover_hash` is the `package_hash` and `cover_label` the
@@ -2827,7 +2846,9 @@ def allocate(
     `compare` gives each joint design. `compare` holds the owner's total, which
     is what a joint design optimises.
 
-    `designs` are `JointDesignResult`s on `sample`, a sample of their assets.
+    `designs` are `JointDesignResult`s on `sample`, a sample of their assets,
+    or `ClusteredDesignResult`s, whose rows share each cluster's payout over
+    that cluster's own assets, the sums running over the cluster.
     `allocation` is the rule, with no default, because how to share out a
     total is an accounting choice: `"value"` shares each draw's total payout in
     proportion to the assets' `values`, and `"loss"` in proportion to their
