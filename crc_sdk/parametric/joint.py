@@ -44,8 +44,8 @@ cluster's cover pays on the value-weighted mean of its assets' indices, a
 are designed as `Joint()` designs the assets, on the owner's total; with
 `joint=False` each cluster is its own design problem, with its own budget. It
 returns a `ClusteredDesignResult`, keyed by cluster. The assignment is stated:
-the module clusters nothing itself. So are the values here; a plan may leave
-them out and fill them from the values its loss model reads.
+the module clusters nothing itself. The values are stated too; only a plan may
+leave them out, and it fills them in from the values its loss model reads.
 
 Everything here works in memory and does no I/O.
 """
