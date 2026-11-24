@@ -2578,13 +2578,15 @@ difference between them.
   | A `Comonotonic()` block whose columns' indices don't rise together over the rows, as where a basis-risk model of yours moved an index | `"index_not_comonotone"` |
   | A block whose columns more than one dependence model moved, which only a provenance made by hand records | `"several_models"` |
   | Pooled rows of `EmpiricalCopula` and held blocks, from folds built by hand, as `year_block_kfold` refuses such samples | `"pooled_by_hand"` |
+  | A cut of a `Comonotonic()` or `GaussianCopula` sample evaluated alone: a holdout's block, one fold's block or a selection of periods. The model dealt each column over every row of the sample, so the cut's rows, dealt again alone, wouldn't repeat that deal | `"cut_of_deal"` |
 
   Pooled rows of `Comonotonic()` and `GaussianCopula` blocks, whose folds
-  `year_block_kfold` cuts, are re-dealt fold by fold: each year pays the
-  contract of its own fold, so each replicate deals every fold's held-out block
-  again on its own, as a row of that block is, and joins the blocks' rows in
-  fold order, as `compare_pooled` joins them. A row that one fold can't deal
-  again keeps the unit above, with that fold's reason.
+  `year_block_kfold` cuts, are re-dealt over the joined held-out blocks: the
+  blocks are cuts of one sample, so each replicate deals them again together,
+  as a row of that sample is, and cuts the rows into their folds again, where
+  each year pays the contract of its own fold, as `compare_pooled` reads it. A
+  row whose joined blocks can't be dealt again, as the folds of a cut, keeps
+  the unit above, with the reason.
 
   Three more reasons guard against a sample whose rows contradict its record:
   `"combined_loss_not_reproduced"`, when the recorded rule doesn't give the
@@ -2731,7 +2733,9 @@ difference between them.
   Under `GaussianCopula(-0.8)` `false_positive_rate` was undefined in more than
   100 replications in both runs. On the re-dealt rows `correlation` held the
   true value in 0.912 to 0.920 of the replications, and in 0.898 to 0.922 by
-  year.
+  year. Under `GaussianCopula` the counts held it in 0.866 to 0.886 re-dealt,
+  and in 0.852 to 0.862 on the sixth run's blocks, from other generators
+  (below).
 
   A fifth run, on the setup of the second and with generators of its own,
   measured the rows of a design under `Clustered`, and rows of `Comonotonic()`
@@ -2774,11 +2778,6 @@ difference between them.
   | The same | the `"total"` row | re-dealt and re-ranked | the means, the counts, `rmse` | 0.883 to 0.926 |
   | The same | the `"total"` row | re-dealt and re-ranked | the tail columns | 0.931 to 0.982 |
   | `Comonotonic()`, `GaussianCopula(0.8)` and `GaussianCopula(-0.8)`, two assets, pooled over five folds | an asset's own row | by year | every column | 0.858 to 0.921 |
-  | `Comonotonic()`, pooled | the `"total"` row | re-dealt fold by fold | the means, `rmse` | 0.893 to 0.917 |
-  | The same | the `"total"` row | re-dealt fold by fold | the counts | 0.724 to 0.759 |
-  | `GaussianCopula(0.8)` and `GaussianCopula(-0.8)`, pooled | the `"total"` row | re-dealt fold by fold | the means, the counts, `rmse` | 0.858 to 0.910 |
-  | The three models, pooled | the `"total"` row | re-dealt fold by fold | the tail columns | 0.934 to 0.977 |
-  | `Comonotonic()` and `GaussianCopula(0.8)`, pooled | the `"total"` row | re-dealt fold by fold | `false_positive_rate` | 0.999 |
 
   Under the `EmpiricalCopula` at +0.8, the payout frequency of the cluster of
   two was a whole number of reference years: on the large blocks every draw of
@@ -2792,13 +2791,57 @@ difference between them.
   the cluster design's `"total"` rows, on the row of the cluster of two at -0.8
   and on the held block, on the second asset's allocated row on the held block,
   and on the second asset's own row and the `"total"` row of the held
-  `Comonotonic()` block and the pooled `"total"` row of `GaussianCopula(-0.8)`.
-  `correlation` held the true value in 0.902 to 0.982 of the replications on
-  the re-dealt cluster rows, 0.882 to 0.901 on the held ones, 0.918 on the held
-  `Comonotonic()` `"total"` row and 0.909 to 0.935 on the pooled `"total"`
-  rows. Rows of a cluster under `Comonotonic()`, `GaussianCopula` or a model of
-  your own, allocated rows by loss, and clusters of more than two assets were
-  not measured.
+  `Comonotonic()` block. `correlation` held the true value in 0.902 to 0.982
+  of the replications on the re-dealt cluster rows, 0.882 to 0.901 on the held
+  ones and 0.918 on the held `Comonotonic()` `"total"` row. Rows of a cluster
+  under `Comonotonic()`, `GaussianCopula` or a model of your own, allocated
+  rows by loss, and clusters of more than two assets were not measured.
+
+  A sixth run measured the fifth's pooled `"total"` rows again, on its blocks,
+  folds, designs and generators, as they are resampled now: re-dealt over the
+  joined held-out blocks. The fifth run had re-dealt them within each fold's
+  block, as the module then did, and under `Comonotonic()` their counts had
+  held the true value in 0.724 and 0.759 of the replications. The sixth run
+  also measured a cut evaluated alone, which keeps the unit above
+  (`"cut_of_deal"`): the first of those folds' held-out blocks, 60 rows, with
+  that fold's designs, out of sample; `cvar_net_loss`, which reads that
+  fold's premium, is left out there. And it measured two assets
+  under `Comonotonic()` whose covers pay equally often, on blocks from
+  generators of their own: the second asset's cover attached at 61 mm/day, the
+  quantile of its curve that the first cover's 55 mm/day is of the first's, on
+  one block with the covers given as is, and pooled over five folds as above.
+  Each share has a Monte Carlo error of at most 0.014.
+
+  | Block | Rows | Resampled | Columns | Share that held the true value |
+  | --- | --- | --- | --- | --- |
+  | `Comonotonic()`, two assets, pooled over five folds | the `"total"` row | re-dealt over the joined blocks | the means, the counts, `rmse` | 0.895 to 0.924 |
+  | `GaussianCopula(0.8)` and `GaussianCopula(-0.8)`, pooled | the `"total"` row | re-dealt over the joined blocks | the means, `rmse` | 0.883 to 0.909 |
+  | The same | the `"total"` row | re-dealt over the joined blocks | the counts | 0.852 to 0.862 |
+  | The three models, pooled | the `"total"` row | re-dealt over the joined blocks | the tail columns | 0.941 to 0.982 |
+  | `Comonotonic()` and `GaussianCopula(0.8)`, pooled | the `"total"` row | re-dealt over the joined blocks | `false_positive_rate` | 0.998 |
+  | The three models, the first fold's held-out block alone, 60 rows | an asset's own row | by year | every column | 0.799 to 0.904 |
+  | The same | the `"total"` row | by year (`"cut_of_deal"`) | the means, the counts, `rmse` | 0.841 to 0.906 |
+  | The same | the `"total"` row | by year (`"cut_of_deal"`) | the tail columns | 0.776 to 0.914 |
+  | `Comonotonic()`, covers that pay equally often, one block and pooled over five folds | an asset's own row | by year | every column | 0.863 to 0.920 |
+  | The same, one block | the `"total"` row | re-dealt | the counts | 0.793 to 0.828 |
+  | The same, pooled | the `"total"` row | re-dealt over the joined blocks | the counts | 0.817 to 0.852 |
+  | The same, one block and pooled | the `"total"` row | as in the two rows above | every other column | 0.879 to 0.997: the means and `rmse` 0.879 to 0.920, the tail columns 0.915 to 0.980, `false_positive_rate` 0.997 |
+
+  With the same covers on every fold, a pooled row's counts read nothing of a
+  fold, so their intervals are exactly those of the joined blocks re-dealt as
+  one block, and the pooled counts above are that re-deal's on these blocks.
+  Under `Comonotonic()` the draws of equal rank share a row, so the `"total"`
+  row pays in the years of the asset whose cover pays more often in the block:
+  its payout frequency is the larger of the two assets'. Where the covers pay
+  equally often, that number was 0.59 to 0.61 of its standard deviation above
+  the true value on average, and of the 207 and 183 intervals that missed the
+  true `payout_frequency`, 205 and 181 lay above it. `false_positive_rate` was
+  undefined in more than 100 replications on the pooled `"total"` row of
+  `GaussianCopula(-0.8)`, and on a cut's `"total"` row and its second asset's
+  own row. `correlation` held the true value in 0.915 to 0.939 of the
+  replications on the pooled `"total"` rows, 0.864 to 0.896 on the cuts'
+  `"total"` rows and 0.889 to 0.908 on those of the covers that pay equally
+  often.
 
   On the same setup, with these rows resampled as independent rows as before,
   an earlier run of the study found the copula's `"total"` rows at 0.55 to
@@ -2806,7 +2849,7 @@ difference between them.
   blocks' rows at 0.78 to 0.99. These numbers describe this synthetic setup,
   nothing more.
 
-  **What no run measured.** These rows built together are in none of the five
+  **What no run measured.** These rows built together are in none of the six
   runs, so no number on this page describes their coverage:
 
   - held blocks of `Comonotonic()` other than the fifth run's two assets, and
@@ -2816,8 +2859,10 @@ difference between them.
     either model;
   - blocks of three columns or more under `Comonotonic()` or `GaussianCopula`:
     the runs gave them two;
-  - pooled rows re-dealt fold by fold whose folds' covers differ: in the fifth
-    run every fold held the same covers;
+  - pooled rows whose folds hold different covers: in the fifth and sixth runs
+    every fold held the same covers, and a pooled row's counts are then those
+    of the joined blocks re-dealt as one block, whatever the folds; and cuts
+    other than a fifth of a block of 300 rows;
   - draws tied in their index, as at a hurdle curve's atom or a tabulated curve
     clamped at its knots, which the re-deal of an `EmpiricalCopula` or a
     `Comonotonic()` block orders by the block's rows, as above, where the model
@@ -2857,9 +2902,10 @@ difference between them.
     sample](#several-assets-from-fitted-curves)). They are flagged by
     construction, and re-dealt; the study's second run measured their `"total"`
     rows as the unit above resampled them before, its fourth run as they are
-    re-dealt, and its fifth run their `"total"` rows pooled over the folds of
-    `year_block_kfold`, re-dealt fold by fold, and those of a held block of two
-    assets under `Comonotonic()`, re-dealt and re-ranked. Their other rows,
+    re-dealt, its fifth run those of a held block of two assets under
+    `Comonotonic()`, re-dealt and re-ranked, and its sixth run their `"total"`
+    rows pooled over the folds of `year_block_kfold`, re-dealt over the joined
+    blocks, and on one fold's block alone, by year. Their other rows,
     across hazards, on a window of horizons, with three columns or more and on
     held blocks beyond that one, are among those no run measured, above. A
     model of your own is flagged too, and the coverage of its intervals is
@@ -2879,8 +2925,8 @@ difference between them.
   years' rows, in the order drawn. A call that re-deals a row then draws, for
   each column of the block in order and each member of a window in order, one
   call `rng.integers(0, n_m, size=(n_bootstrap, n_m))` for the member's n_m rows,
-  and every entry's re-dealt rows read them; on folds, the same for each fold's
-  held-out block, in fold order. One set of replicates serves every
+  and every entry's re-dealt rows read them; on folds, the same for the joined
+  held-out blocks. One set of replicates serves every
   entry and every metric of a call, within each method. Nothing is solved again.
 - **The premium.** A design's premium is a fixed price, so on one block its
   interval is the value itself. On pooled folds, the mean of the years' premiums
