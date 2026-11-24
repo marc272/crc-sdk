@@ -863,7 +863,7 @@ def test_a_cut_of_a_deal_is_resampled_by_year(model: Any, kind: str) -> None:
         table = _kept([_covers()], cut, [{"kind": kind, "reason": "cut_of_deal"}])
         line = _line(table)
         assert UNMEASURED_TEXT in line and REBUILT_TEXT not in line
-        assert "the block is a cut of a sample, as a holdout's block" in line
+        assert "the block is a cut of a sample (a holdout's block" in line
 
 
 # -- the record and the setup text ------------------------------------------------

@@ -61,6 +61,7 @@ from crc_sdk.parametric.intervals import (
     _Arrays,
     _block,
     _Evaluated,
+    _joined_blocks,
     _pooled,
     _Read,
     _replicates,
@@ -1265,6 +1266,19 @@ def test_pooled_folds_of_a_pool() -> None:
     text = setup_text(table)
     assert "36 pooled model-years" in text
     assert text.count("Pool:") == 1
+
+
+def test_the_held_out_blocks_join_to_the_sample_they_were_cut_from() -> None:
+    # A pool's folds hold every run's rows of their years, so they interleave.
+    sample = _pool()
+    tests = [test for _, test in year_block_kfold(sample, 3)]
+    joined, rows = _joined_blocks(tests)
+    for name in ("period", "probability", "index", "loss"):
+        assert np.array_equal(getattr(joined, name), getattr(sample, name)), name
+    assert joined.provenance.pool == sample.provenance.pool
+    assert joined.provenance.selection == sample.provenance.selection
+    for test, own in zip(tests, rows, strict=True):
+        assert np.array_equal(joined.period[own], test.period)
 
 
 def test_folds_with_their_own_trend_fits_read_each_years_own_loss() -> None:

@@ -331,9 +331,9 @@ _KEPT_TODAY = {
         "deals them again"
     ),
     "cut_of_deal": (
-        "the block is a cut of a sample, as a holdout's block, one fold's block or "
-        "a selection of periods, and the model dealt each column over every row of "
-        "that sample, so the cut's rows alone don't give the deal again"
+        "the block is a cut of a sample (a holdout's block, one fold's block or a "
+        "selection of periods), and the model dealt each column over every row of "
+        "that sample, so the cut's rows alone don't give that deal again"
     ),
 }
 """Why a call kept rows built together on today's method, by `kept_today` reason."""
