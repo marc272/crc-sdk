@@ -330,6 +330,11 @@ _KEPT_TODAY = {
         "more than one dependence model moved the block's columns, so no one rule "
         "deals them again"
     ),
+    "cut_of_deal": (
+        "the block is a cut of a sample, as a holdout's block, one fold's block or "
+        "a selection of periods, and the model dealt each column over every row of "
+        "that sample, so the cut's rows alone don't give the deal again"
+    ),
 }
 """Why a call kept rows built together on today's method, by `kept_today` reason."""
 
