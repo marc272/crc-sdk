@@ -44,6 +44,7 @@ from crc_sdk.parametric import (
     compare,
     design,
     design_joint,
+    holdout,
     sample_curve_hazards,
     sample_curves,
     setup_text,
@@ -601,14 +602,14 @@ def test_a_held_block_is_re_dealt_and_re_ranked() -> None:
 # -- pooled folds ----------------------------------------------------------------
 
 
-def _fold_designs(folds: Any) -> list[dict[str, Any]]:
+def _fold_designs(folds: Any, payout: Any = None) -> list[dict[str, Any]]:
     """Each fold's designs, one per asset on its design block's asset."""
     return [
         {
             asset: design(
                 Cover(
                     INDEX,
-                    StepPayout([60.0], [Free()]),
+                    StepPayout([60.0], [Free()]) if payout is None else payout,
                     payout_unit="EUR",
                     asset_id=asset,
                     label=asset,
@@ -622,23 +623,30 @@ def _fold_designs(folds: Any) -> list[dict[str, Any]]:
     ]
 
 
-def test_pooled_rows_are_re_dealt_fold_by_fold() -> None:
-    # Each year pays its own fold's contract, so each fold's held-out block is
-    # re-dealt on its own and the blocks' rows are pooled again.
-    sample = _assets(Comonotonic(), n=24)
+@pytest.mark.parametrize(
+    "model", [Comonotonic, lambda: GaussianCopula(RHO)], ids=["comonotonic", "gaussian"]
+)
+def test_pooled_rows_are_re_dealt_over_the_joined_blocks(model: Any) -> None:
+    # The held-out blocks are cuts of one deal over every row, so they are
+    # re-dealt together, as the sample they were cut from, and each row of a
+    # replicate pays its own fold's contract.
+    sample = _assets(model(), n=24)
     folds = year_block_kfold(sample, 3)
     designs = _fold_designs(folds)
     rng = np.random.default_rng(6)
     table = UNTYPED_INTERVALS([designs], folds, rng=rng, n_bootstrap=1, options=FEW)
     copy = np.random.default_rng(6)
     copy.integers(0, 24, size=(1, 24), dtype=np.int64)
-    loss, payout, premium = [], [], []
+    ranks = sample.latent_ranks
+    keys = _comonotonic_keys(sample) if ranks is None else np.asarray(ranks)
+    sources = _expected_sources(keys, copy, 1)
+    index = [sample.index[sources[j][0], j] for j in range(2)]
+    payout, premium = [], []
     for fold, ((_, test), made) in enumerate(zip(folds, designs, strict=True)):
-        sources = _expected_sources(_comonotonic_keys(test), copy, 1)
-        loss.append(sum(test.loss[sources[j][0], j] for j in range(2)))
+        held_out = np.isin(sample.period, test.period)
         payout.append(
             sum(
-                made[asset].cover.payout_values(test.index[sources[j][0], j])
+                made[asset].cover.payout_values(index[j][held_out])
                 for j, asset in enumerate(ASSETS)
             )
         )
@@ -648,7 +656,7 @@ def test_pooled_rows_are_re_dealt_fold_by_fold() -> None:
         total = next(row for row in rows if row["level"] == "total")
         premium.append(np.full(len(test), total["premium"]))
     expected = metric_values(
-        np.concatenate(loss),
+        np.asarray(sum(sample.loss[sources[j][0], j] for j in range(2))),
         np.concatenate(payout),
         np.full(24, 1.0 / 24.0),
         premium=np.concatenate(premium),
@@ -658,10 +666,52 @@ def test_pooled_rows_are_re_dealt_fold_by_fold() -> None:
     _check_single_replicate(
         _bounds(table, "total"), expected, frozenset({"unidentified_share"})
     )
+    # Today's draw, then one per column of the joined blocks.
     assert rng.integers(0, 2**62) == copy.integers(0, 2**62)
     record = _record(table)
     assert record["unit"] == "as_built"
     assert "kept_today" not in record
+
+
+@pytest.mark.parametrize(
+    "model",
+    [Comonotonic, lambda: GaussianCopula(-0.8)],
+    ids=["comonotonic", "gaussian"],
+)
+def test_pooled_counts_are_the_one_block_re_deal_when_the_covers_agree(
+    model: Any,
+) -> None:
+    # With the same covers on every fold a pooled row's counts read nothing of
+    # a fold, so they are those of the joined blocks re-dealt as one block.
+    sample = _assets(model(), n=24)
+    folds = year_block_kfold(sample, 3)
+    designs = _fold_designs(folds, LinearPayout(55.0, 90.0, Free(60.0, 60.0)))
+    pooled = _bounds(_intervals([designs], folds, n_bootstrap=30), "total")
+    block = _bounds(_intervals([_covers()], sample, n_bootstrap=30), "total")
+    counts = [
+        name
+        for name in NAMES
+        if name.startswith(("payout_frequency", "false_negative_rate"))
+    ]
+    assert len(counts) == 2
+    for name in counts:
+        assert pooled[name] == block[name] and None not in pooled[name], name
+        assert pooled[name][0] < pooled[name][1], name
+
+
+def test_pooled_rows_whose_joined_blocks_cant_be_dealt_keep_todays_method() -> None:
+    # The folds of a selection join to that selection, itself a cut of a deal.
+    sample = _assets(Comonotonic(), n=24)
+    folds = year_block_kfold(sample.select(sample.period[:18]), 3)
+    rng, copy = np.random.default_rng(6), np.random.default_rng(6)
+    table = UNTYPED_INTERVALS(
+        [_fold_designs(folds)], folds, rng=rng, n_bootstrap=3, options=FEW
+    )
+    copy.integers(0, 18, size=(3, 18), dtype=np.int64)
+    assert rng.integers(0, 2**62) == copy.integers(0, 2**62)
+    record = _record(table)
+    assert record["unit"] == "year"
+    assert record["kept_today"] == [{"kind": "comonotonic", "reason": "cut_of_deal"}]
 
 
 def test_pooled_asset_rows_keep_todays_numbers() -> None:
@@ -794,6 +844,26 @@ def test_a_block_moved_by_two_models_keeps_todays_method() -> None:
         odd,
         [{"kind": "comonotonic", "reason": "several_models"}],
     )
+
+
+@pytest.mark.parametrize(
+    ("model", "kind"),
+    [(Comonotonic, "comonotonic"), (lambda: GaussianCopula(RHO), "gaussian_copula")],
+    ids=["comonotonic", "gaussian"],
+)
+def test_a_cut_of_a_deal_is_resampled_by_year(model: Any, kind: str) -> None:
+    # The model dealt each column over every row of the sample, so the rows of
+    # a cut, dealt again alone, would not repeat that deal.
+    sample = _assets(model(), n=24)
+    for cut in (
+        holdout(sample)[1],
+        year_block_kfold(sample, 3)[0][1],
+        sample.select(sample.period[4:]),
+    ):
+        table = _kept([_covers()], cut, [{"kind": kind, "reason": "cut_of_deal"}])
+        line = _line(table)
+        assert UNMEASURED_TEXT in line and REBUILT_TEXT not in line
+        assert "the block is a cut of a sample (a holdout's block" in line
 
 
 # -- the record and the setup text ------------------------------------------------
